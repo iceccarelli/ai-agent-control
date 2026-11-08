@@ -781,12 +781,15 @@ def test_mutation_without_the_key_basis_check_hand_built_series_would_be_accepte
 def test_mutation_without_the_closed_without_delivery_exclusion_the_symbol_would_load(tmp_path, offline):
     m = _mutant("if rec.get(\"status\") in RH.ENDED_STATUSES and not (", "if False and not (")
     root, uni, _ = _hist(tmp_path, spot=False, old_delivery=0)
-    series, _info = m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    approve_all = lambda rec, w0, w1, st, q: (True, "", [])            # noqa: E731 - a classifier that wrongly lets the Closed contract without a delivery time through
+    with pytest.raises(CR.RH.HarnessError, match="closed_without_delivery"):
+        CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV, classifier=approve_all)            # defence in depth: the loader itself still refuses it
+    series, _info = m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV, classifier=approve_all)
     assert "OLDUSDT" in {x.symbol for x in series}
 
 
 def test_mutation_without_the_closed_in_series_check_survivors_would_be_labelled_delistings(tmp_path, offline):
-    m = _mutant("closed_missing = sorted(sy for sy, r in recs.items() if", "closed_missing = [] if True else sorted(sy for sy, r in recs.items() if")
+    m = _mutant("closed_missing = sorted(fn.ended_unaccounted)", "closed_missing = []")
     root, uni, _ = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",))
     assert m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[1]["survivorship"] == "DELISTINGS_OBSERVED"
 
@@ -1300,3 +1303,21 @@ def test_mutation_the_sibling_finding_removed_leaves_the_empty_list_silent():
     finally:
         import shutil
         shutil.rmtree(d)
+
+
+# ================================================================== one funnel / short diagnostics (worker B)
+def test_a_short_history_run_is_labelled_a_diagnostic_and_names_the_exact_required_span(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), mark_interval=MARK_IV)
+    assert out["status"] == "TOO_FEW_HOLDING_ROWS" and out["verdict"] == "INSUFFICIENT_DATA"
+    assert out["evidence_class"] == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE"
+    assert out["required_span"]["window_days_required"] == 457 and out["history_shortfall"]["required_days"] == 457 and "457 days" in out["reason"]
+    assert out["history_shortfall"]["loaded_history_window_days"] < 457 and "never be quoted" in out["history_shortfall"]["note"]
+    assert out["input"]["history_window"]["days"] == out["history_shortfall"]["loaded_history_window_days"]
+
+
+def test_the_loader_embeds_the_one_funnel_and_loads_exactly_its_loadable_list(tmp_path, offline):
+    import backfill_plan as BP
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert [x.symbol for x in series] == info["funnel"]["loadable"] and info["funnel"]["funnel_digest"] == BP.funnel(uni, root, window=tuple(info["funnel"]["window"].values())).report()["funnel_digest"]

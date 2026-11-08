@@ -457,3 +457,59 @@ def test_replay_values_open_positions_at_the_exit_side_in_the_ledger_the_group_r
     assert net == pytest.approx(r.pnl["net"], abs=1e-6)                     # the per-group end-of-run valuation is the SAME exit-side one
     assert not any(g.mid_fallback for g in r.groups.values())
     assert RP.build_report([r])["pnl"]["valuation"] == "EXIT_SIDE"
+
+
+# ------------------------------------------------------------------------------------------------ a taker walks the book it SEES: a book of any age is not a quote
+
+def _stale_world(book_ts, **cfg_kw):
+    import ms_execution as EXX
+    import ms_fillmodel as FMM
+    import ms_types as TT
+    t0 = 1_700_000_000_000
+    marks = tuple((t0 + i * 3_600_000, 100.0) for i in range(0, 30))
+    bk = ((book_ts, (TT.BookLevel(99.99, 1e6),), (TT.BookLevel(100.01, 1e6),)),)
+    s = RP.ReplaySeries("XXXUSDT", ((t0 + 8 * 3_600_000, 1.0),), marks, 480, "XXX", books=bk)
+    cfg = RP.ReplayConfig(start_ms=t0, end_ms=t0 + 20 * 3_600_000, fill=FMM.FillParams(), **cfg_kw)
+    w = RP.World([s], cfg)
+    tr = RP.ReplayTransport(w, cfg)
+    return t0, tr, EXX, TT
+
+
+def _req(EXX, TT, side, *, reduce_only, link):
+    return EXX.OrderRequest("g1", "c1", "d" * 8, TT.LegPlan("l1", "XXXUSDT", "linear", side, "1", "Market", None, reduce_only=reduce_only), link)
+
+
+def check_stale_taker(book_age_ms, *, exit_cap=None):
+    kw = {} if exit_cap is None else {"exit_book_max_age_ms": exit_cap}
+    t0, tr, EXX, TT = _stale_world(None or 1_700_000_000_000, **kw)
+    tr.now = t0 + book_age_ms
+    ack = tr.send_order(_req(EXX, TT, "Sell", reduce_only=False, link="g1-e1"))
+    entry_filled = bool(tr.pending)
+    tr.venue.book["linear:XXXUSDT"] = -1.0
+    tr.pending.clear()
+    ack_x = tr.send_order(_req(EXX, TT, "Buy", reduce_only=True, link="g1-x1"))
+    return ack, entry_filled, ack_x, bool(tr.pending), tr.stats
+
+
+def test_a_taker_entry_against_a_six_hour_old_book_is_refused_and_a_fresh_book_fills():
+    ack, filled, _ax, _xf, stats = check_stale_taker(6 * 3_600_000)
+    assert ack.status == "REJECTED" and ack.reason == "STALE_QUOTE" and not filled and stats["refused"]["STALE_QUOTE"] >= 1
+    ack, filled, *_ = check_stale_taker(2_000)                                                 # positive control: a fresh book fills
+    assert ack.status != "REJECTED" and filled
+
+
+def test_a_reduce_only_exit_may_use_only_the_explicit_wider_cap_and_it_is_counted():
+    _a, _f, ax, xf, stats = check_stale_taker(6 * 3_600_000)                                  # default cap 1 h: a 6 h book is refused for exits too
+    assert ax.status == "REJECTED" and ax.reason == "STALE_QUOTE" and not xf and stats["exits_refused_stale_quote"] == 1
+    _a, _f, ax, xf, stats = check_stale_taker(6 * 3_600_000, exit_cap=12 * 3_600_000)         # an explicit, configured wider cap: the exit fills and the use is counted, never silent
+    assert ax.status != "REJECTED" and xf and stats["exits_on_wider_book_cap"] == 1
+    _a, _f, ax, xf, stats = check_stale_taker(2_000)                                          # fresh: no cap used
+    assert xf and stats.get("exits_on_wider_book_cap", 0) == 0
+
+
+def test_mutation_a_taker_that_ignores_book_age_is_caught(monkeypatch):
+    check_stale_taker(6 * 3_600_000)
+    real = RP.World.book
+    monkeypatch.setattr(RP.World, "book", lambda self, sym, cat, t: real(self, sym, cat, t)[:2] + (0,))           # the transport sees every book as fresh
+    with pytest.raises(AssertionError):
+        test_a_taker_entry_against_a_six_hour_old_book_is_refused_and_a_fresh_book_fills()

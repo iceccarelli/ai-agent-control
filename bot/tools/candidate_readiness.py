@@ -993,7 +993,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                                                        if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
                            "universe_info_verified": verdict is not None,
                            "skipped_legs_without_marks": 0, "terminal_exit_unpriced": 0,
-                           "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
+                           "evidence_class": "NOT_EVALUATED", "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
                            "time_mode": "REPLAY_OBSERVATION_TIME", "hedgeability_basis": HEDGE_BASIS, "pit_label_note": PIT_LABEL_NOTE}
     for s in series:
         out["hedgeability_counts"][hedgeability(s)] = out["hedgeability_counts"].get(hedgeability(s), 0) + 1
@@ -1044,7 +1044,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     if n_rows < min_rows:
         for name in out["variants_tried"]:
             ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping holding rows (< {min_rows})")
-        out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family": fam, "n_variants_counted": ledger.n_variants,
+        out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "evidence_class": "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE", "family": fam, "n_variants_counted": ledger.n_variants,
                     "n_variants_tried_in_call": len(out["variants_tried"]),
                     "required_span": grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows, span_days=(t1 - t0) / MS_DAY),
                     "reason": f"{n_rows} non-overlapping {hold_days}-day holding rows after the formation lead-in; need >= {min_rows}, which needs "
@@ -1075,7 +1075,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
     if out["terminal_exit_unpriced"] or unkeyed:
         verdict = "INSUFFICIENT_DATA"                   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
-    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
+    out.update({"status": "WALK_FORWARD_DONE", "evidence_class": "FULL_SPAN_WALK_FORWARD_NOT_PROFIT_EVIDENCE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
                 "correction": "holm", "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean,
                 "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"], "p_adjusted": adj, "selected_per_fold": chosen,
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
@@ -1179,7 +1179,8 @@ def _survivorship_info(uinfo: Mapping[str, Any]) -> Tuple[str, str]:
     return (DELISTINGS_OBSERVED if obs == "OBSERVED" and closed == "OBSERVED_ROWS" else SURVIVORS_ONLY), note
 
 
-def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None) -> Tuple[List[SymbolSeries], Dict[str, Any]]:
+def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, window: Optional[Tuple[int, int]] = None,
+                      include_statuses: Sequence[str] = ('Trading', 'Closed'), quote_coins: Optional[Sequence[str]] = ('USDT',), classifier: Optional[Any] = None) -> Tuple[List[SymbolSeries], Dict[str, Any]]:
     """Series from a market_history root written by ``tools/market_history.py``: ``<root>/funding``, ``<root>/mark-kline-<interval>`` (rows.jsonl per symbol), plus a verified
     universe_capture directory (launch / delivery / fundingInterval_min) and optionally a spot-instruments snapshot (hedgeability).
 
@@ -1188,7 +1189,10 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     (bps = rate * 1e4); the mark is the kline close, KEYED BY ITS ``observation_time`` (candle start + interval; a row claiming earlier raises LookAheadError). Each funding print is
     normalised by the interval of its own manifest segment (a symbol with unknown intervals for any print is excluded and listed). ``info['survivorship']`` is SURVIVORS_ONLY unless the
     Closed partition served rows (then DELISTINGS_OBSERVED); SURVIVORS_ONLY adds a loud warning. No point-in-time claim is made here (``point_in_time_claim`` is False). Symbols must be in both datasets AND the universe; CONFLICTED / UNVERIFIED symbols and symbols missing anywhere are
-    excluded and LISTED in ``info['excluded']``; other non-COMPLETE symbol statuses are kept and reported in ``info['non_complete_symbols']``. Gaps are never filled."""
+    excluded and LISTED in ``info['excluded']``; other non-COMPLETE symbol statuses are kept and reported in ``info['non_complete_symbols']``. Gaps are never filled.
+
+    THE FUNNEL. Which symbols are loaded is decided by ``backfill_plan.funnel`` (the same function ``plan``, ``diagnose`` and the audit call), not here: this function loads EXACTLY ``funnel.loadable``
+    and embeds the funnel report as ``info['funnel']``. ``window`` = the (from_ms, to_ms) the history must cover (default: the window the funding manifest itself requested)."""
     from decimal import Decimal, InvalidOperation
     if not isinstance(universe_dir, str) or not universe_dir:
         raise RH.HarnessError("universe_dir is required: instrument attributes do not live in the history manifests")
@@ -1201,6 +1205,13 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     mark_name, mark_iv = _mark_dataset_name(root, mark_interval)
     fman, fdir = _verified_dataset(root, MH.FUNDING)
     mman, mdir = _verified_dataset(root, mark_name)
+    import backfill_plan as BP            # lazy: backfill_plan imports this module lazily too
+    try:
+        fn = BP.funnel(universe_dir, root, window=window, window_source=BP.WINDOW_FROM_EXPLICIT if window is not None else BP.WINDOW_FROM_FUNDING_MANIFEST, include_statuses=include_statuses,
+                       quote_coins=quote_coins, required_datasets=(MH.FUNDING, MH.MARK), intervals={MH.MARK: mark_iv}, report_datasets=(MH.FUNDING, MH.MARK), classifier=classifier,
+                       universe=(recs, uinfo), pre_verified=(MH.FUNDING, mark_name))
+    except BP.PlanError as exc:
+        raise RH.HarnessError(str(exc)) from exc
     verdicts: Dict[str, str] = {}
     hedge_info: Optional[Dict[str, Any]] = None
     if spot_dir is not None:
@@ -1211,7 +1222,6 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         verdicts = {k: x["verdict"] for k, x in h["by_symbol"].items()}
         hedge_info = {"spot_snapshot": h["spot_snapshot"], "counts": h["counts"], "basis": HEDGE_BASIS,
                       "note": "spot_listed / hedgeability come from ONE current spot snapshot; they label legs and never enter a historical decision"}
-    excluded: List[Dict[str, str]] = []
     non_complete: Dict[str, Dict[str, str]] = {}
     mismatch: List[str] = []
     warnings: List[str] = []
@@ -1223,26 +1233,12 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     for nm, man in (("funding", fman), (mark_name, mman)):
         if man.get("dataset_status") != "COMPLETE":
             warnings.append(f"dataset {nm} dataset_status {man.get('dataset_status')!r}: the evaluation inherits that")
-    allsyms = sorted(set(fman["symbols"]) | set(mman["symbols"]))
+    excluded = [{"symbol": sy, "reason": why} for sy, why in sorted(fn.reasons_for_symbols_in_datasets().items())]
     series: List[SymbolSeries] = []
-    for sym in allsyms:
-        why = None
-        if sym not in recs:
-            why = "not_in_universe"
-        elif sym not in fman["symbols"]:
-            why = "not_in_funding_dataset"
-        elif sym not in mman["symbols"]:
-            why = "not_in_mark_dataset"
-        else:
-            sts = {"funding": fman["symbols"][sym].get("status"), mark_name: mman["symbols"][sym].get("status")}
-            bad = {k: v for k, v in sts.items() if v in EXCLUDED_SYMBOL_STATUSES or v is None}
-            if bad:
-                why = "symbol_status:" + ",".join(f"{k}={v}" for k, v in sorted(bad.items()))
-            elif any(v != "COMPLETE" for v in sts.values()):
-                non_complete[sym] = {k: str(v) for k, v in sts.items() if v != "COMPLETE"}
-        if why:
-            excluded.append({"symbol": sym, "reason": why})
-            continue
+    for sym in fn.loadable:
+        sts = {"funding": fman["symbols"][sym].get("status"), mark_name: mman["symbols"][sym].get("status")}
+        if any(v != "COMPLETE" for v in sts.values()):
+            non_complete[sym] = {k: str(v) for k, v in sts.items() if v != "COMPLETE"}
         try:
             frows = _rows(fdir, sym)
             mrows = _rows(mdir, sym)
@@ -1260,39 +1256,29 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
             raise
         except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
             raise RH.HarnessError(f"{sym}: rows.jsonl unreadable after verification: {type(exc).__name__}") from exc
-        if not fund or not mark:
-            excluded.append({"symbol": sym, "reason": "no_rows"})
-            continue
         segs, seg_why = funding_interval_segments(fman["symbols"][sym], [t for t, _ in fund])
-        if segs is None:
-            excluded.append({"symbol": sym, "reason": seg_why or "funding_interval_unknown"})
-            continue
+        if not fund or not mark or segs is None:
+            raise RH.HarnessError(f"FUNNEL_DISAGREES_WITH_LOADER: {sym} passed the funnel but its rows are unusable ({'no_rows' if not fund or not mark else seg_why})")
         if "interval_disagrees_with_record" in (fman["symbols"][sym].get("reasons") or []):
             mismatch.append(sym)
         rec = recs[sym]
         iv = rec.get("fundingInterval_min")
         d = rec.get("deliveryTime")
         if rec.get("status") in RH.ENDED_STATUSES and not (isinstance(d, int) and not isinstance(d, bool) and d > 0):
-            excluded.append({"symbol": sym, "reason": "closed_without_delivery"})          # an ended contract with no delivery time would be immortal (stale exit price)
-            continue
+            raise RH.HarnessError(f"closed_without_delivery: {sym} is an ended contract with no delivery time (it would be immortal: stale exit price) but the lifecycle classifier let it through")
         launch = rec.get("launchTime")
         series.append(SymbolSeries(sym, iv if isinstance(iv, int) and not isinstance(iv, bool) and iv > 0 else None, fund, mark,
                                    launch if isinstance(launch, int) and not isinstance(launch, bool) and launch > 0 else 0,
                                    d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None,
                                    funding_intervals=segs, key_basis=_KEY_BASIS_OBSERVED,
                                    mark_interval_ms=iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None))
+    if [x.symbol for x in series] != fn.loadable:
+        raise RH.HarnessError("FUNNEL_DISAGREES_WITH_LOADER: the loaded series are not the funnel's loadable symbols")
     in_series = {x.symbol for x in series}
-    w0 = min((x.funding[0][0] for x in series), default=None)
-    w1 = max((x.funding[-1][0] for x in series), default=None)
-
-    def _overlaps(r: Mapping[str, Any]) -> bool:
-        dl, ln = r.get("deliveryTime"), r.get("launchTime")
-        dl = dl if isinstance(dl, int) and not isinstance(dl, bool) and dl > 0 else None
-        ln = ln if isinstance(ln, int) and not isinstance(ln, bool) and ln > 0 else None
-        return (w0 is None or dl is None or dl >= w0) and (w1 is None or ln is None or ln <= w1)
-    closed_missing = sorted(sy for sy, r in recs.items() if r.get("status") in RH.ENDED_STATUSES and sy not in in_series and _overlaps(r))
+    w0, w1 = fn.window
+    closed_missing = sorted(fn.ended_unaccounted)
     closed_info = {"count": len(closed_missing), "names": closed_missing[:NAMES_CAP], "names_truncated": len(closed_missing) > NAMES_CAP,
-                   "window_ms": [w0, w1], "rule": "every Closed/Delivering perpetual of the universe record overlapping the study window must be in the evaluated series"}
+                   "window_ms": [w0, w1], "rule": "every Closed/Delivering contract must be in the evaluated series or excluded for a reason that PROVES it out of scope (backfill_plan.EXPLAINED_EXCLUSION_PREFIXES); closed_without_delivery and unknown classes are unaccounted"}
     if closed_missing:
         if survivorship == DELISTINGS_OBSERVED:
             survivorship = SURVIVORS_ONLY
@@ -1300,22 +1286,26 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                         f"(first: {closed_missing[:5]}): the evaluated series is survivors-only whatever the universe capture observed")
     if non_complete:
         warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
+    short_cov = sorted(set(fn.loadable) - set(fn.complete) - set(non_complete))
+    if short_cov:
+        warnings.append(f"{len(short_cov)} loaded symbols are not COMPLETE over the required window {w0}..{w1} (their datasets are shorter than the window; first: {short_cov[:5]})")
     if excluded:
         warnings.append(f"{len(excluded)} symbols excluded (listed in excluded)")
-    ended_or_trading = [sy for sy, r in recs.items() if r.get("status") in ("Trading",) + tuple(RH.ENDED_STATUSES) and r.get("quoteCoin", "USDT") == "USDT"]
-    cov_frac = (len(series) / len(ended_or_trading)) if ended_or_trading else None
-    history_cov = {"universe_eligible_symbols": len(ended_or_trading), "symbols_in_history": len(series), "fraction": cov_frac,
+    n_elig = len(fn.eligible)
+    cov_frac = (len(series) / n_elig) if n_elig else None
+    history_cov = {"universe_eligible_symbols": n_elig, "symbols_in_history": len(series), "fraction": cov_frac,
                    "status": "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" if cov_frac is not None and cov_frac < 0.5 else ("OK" if cov_frac is not None else "NO_ELIGIBLE_SYMBOLS"),
-                   "note": "eligible = Trading + Closed/Delivering USDT perpetuals in the universe record; the history datasets hold only the symbols they were collected for (an explicit --symbols list "
-                           "gives a small cross-section): the evaluation is over THOSE symbols, not the venue"}
+                   "note": "eligible = the funnel's lifecycle-eligible perpetuals (Trading + Closed/Delivering overlapping the window); the history datasets hold only the symbols they were collected for "
+                           "(an explicit --symbols list gives a small cross-section): the evaluation is over THOSE symbols, not the venue"}
     if history_cov["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS":
-        warnings.append(f"HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS: the history datasets hold {len(series)} of {len(ended_or_trading)} eligible universe symbols; collect the rest (backfill_plan.plan) before trusting a cross-section")
+        warnings.append(f"HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS: the history datasets hold {len(series)} of {n_elig} eligible universe symbols; collect the rest (backfill_plan.plan) before trusting a cross-section")
     info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
                             "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols"),
                                          "delisting_observability": uinfo.get("delisting_observability"), "status_coverage": uinfo.get("status_coverage"), "delisting_note": delisting_note},
-                            "survivorship": survivorship, "closed_in_universe_not_in_series": closed_info, "point_in_time_claim": False,
+                            "survivorship": survivorship, "funnel": fn.report(), "history_window": {"from_ms": w0, "to_ms": w1, "days": round((w1 - w0) / MS_DAY, 3), "source": fn.window_source},
+                            "not_complete_over_window": sorted(set(fn.loadable) - set(fn.complete)), "closed_in_universe_not_in_series": closed_info, "point_in_time_claim": False,
                             "point_in_time_note": "this loader builds series from capture snapshots; it makes no point-in-time claim (use PointInTimeUniverse.from_capture_dirs for that). " + PIT_LABEL_NOTE,
                             "time_basis": "marks and funding are keyed by observation_time (replay mode: receipt time is not stored per row)",
                             "interval_mismatch_symbols": mismatch,
@@ -1688,6 +1678,10 @@ def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], 
         raise RH.HarnessError("LEDGER_PATH_REQUIRED: a cross-sectional evaluation records its variants in a persistent ledger so the family count survives a restart")
     series, info = load_history_root(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
     out = {"input": info, **evaluate_ranked_funding(series, universe_info=info, ledger_path=ledger_path, spec=spec, **kw)}
+    hw = info.get("history_window") or {}
+    if out.get("evidence_class") == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE" and isinstance(out.get("required_span"), dict):
+        out["history_shortfall"] = {"required_days": out["required_span"].get("window_days_required"), "loaded_history_window_days": hw.get("days"),
+                                    "note": "this run is a SHORT DIAGNOSTIC: it must never be quoted as evidence for or against the strategy"}
     stem = os.path.splitext(ledger_path)[0]
     out["families"] = {k: evaluate_family(series, k, ledger_path=f"{stem}.{k.lower()}.jsonl", universe_info=info) for k in FAMILIES}
     return out

@@ -197,3 +197,239 @@ def test_no_state_leaks_between_calls_and_replay_of_the_same_ticks_is_identical(
     a = FM.advance(o, ticks, 6_000, P)
     b = FM.advance(o, ticks, 6_000, P)
     assert a == b
+
+
+# ====================================================================== collector-backed path: recorded book + recorded trade tape (fixtures from the REAL collector writer)
+
+sys.path.insert(0, HERE)
+import carry_costs as CC  # noqa: E402
+import ms_microstructure as MS  # noqa: E402
+import test_ms_microstructure as TMS  # noqa: E402
+
+SYM, T0 = TMS.SYM, TMS.T0
+
+
+def row(off, price, size, side="Sell"):
+    return (T0 + off, str(price), str(size), side)
+
+
+BASE = row(100, "100.0", "0.1")                      # the oldest recorded trade: proves the tape reaches back to the order's go-live time; a non-through touch
+
+
+def world(tmp_path, rows1, *, books=None, tapes=None, verify=True, name="c"):
+    root = str(tmp_path / name)
+    tp = {1: TMS.tape(1, [BASE] + list(rows1))}
+    tp.update(tapes or {})
+    TMS.build(root, books=books, tapes=tp)
+    return MS.load_cycles(root, verify=verify)
+
+
+def d0_of(ds):
+    return TMS.snaps(ds)[0].local_receive_ms + 10
+
+
+def place(ds, side="Buy", qty=2.0, price=100.0, now=None, **kw):
+    return FM.place_maker_from_micro(ds, order_id="o1", group_id="g", leg_id="l", symbol=SYM, category=kw.pop("category", "linear"), side=side, qty=qty, price=price,
+                                     now_ms=d0_of(ds) if now is None else now, params=P, **kw)
+
+
+def run(ds, rows_ok=True, side="Buy", qty=2.0, price=100.0, upto=None, cancel_at=None):
+    pl = place(ds, side=side, qty=qty, price=price)
+    assert pl.order is not None, pl
+    o = pl.order if cancel_at is None else FM.request_cancel(pl.order, cancel_at)
+    return pl, FM.advance_with_trades(o, ds, TMS.snaps(ds)[1].tape_recv_ms if upto is None else upto, P)
+
+
+def test_micro_placement_takes_queue_from_the_visible_size_at_the_price(tmp_path):
+    ds = world(tmp_path, [])
+    pl = place(ds)
+    assert pl.reasons == () and pl.provenance == FM.PROV_MEASURED and pl.order is not None
+    assert pl.visible_at_price == 2.0 and pl.queue_ahead == pytest.approx(2.0 * P.queue_pessimism) and pl.order.queue_basis == "VISIBLE_AT_PRICE"
+    assert pl.order.micro_ref == f"{SYM}@cycle-{T0}:{T0 - 100}" and pl.snapshot_ts == T0 - 100 and pl.book_age_ms == 10
+    assert place(ds, price=99.9).queue_ahead == pytest.approx(3.0 * P.queue_pessimism)             # a deeper level: its own visible size
+    assert place(ds, price=99.5).order.queue_basis == "BEYOND_VISIBLE_DEPTH_PESSIMISTIC"             # beyond the recorded ladder: the whole side is ahead
+    assert FM.PROV_MEASURED == MS.PROV_MEASURED and FM.PROV_MODELLED == MS.PROV_MODELLED and FM.PROV_REJECTED == MS.PROV_REJECTED
+
+
+def test_micro_placement_is_refused_without_a_contemporaneous_valid_snapshot(tmp_path):
+    ds = world(tmp_path, [])
+    r0 = TMS.snaps(ds)[0].local_receive_ms
+    stale = place(ds, now=r0 + 5_001)
+    assert stale.order is None and stale.provenance == FM.PROV_REJECTED and "STALE_SNAPSHOT" in stale.reasons
+    fut = place(ds, now=r0 - 1)
+    assert fut.order is None and "FUTURE_SNAPSHOT_NOT_USED" in fut.reasons                      # the book of the future is not attached
+    assert place(ds, price=100.1).reasons == ("POST_ONLY_WOULD_CROSS",)
+    assert place(ds, category="spot").reasons == ("NO_RECORDED_BOOK_FOR_CATEGORY",)             # the collector records linear only
+    assert place(ds, qty=0).reasons == ("BAD_QTY_OR_PRICE",)
+    bad = world(tmp_path, [], books={0: TMS.book(0, bids=[["100.2", "1"]], asks=[["100.1", "1"]])}, name="crossed")
+    assert "CROSSED_BOOK" in place(bad, now=TMS.snaps(bad)[0].local_receive_ms + 10).reasons
+    disc = world(tmp_path, [], books={1: TMS.book(1, u=2)}, name="disc")
+    assert "DISCONTINUOUS" in place(disc, now=TMS.snaps(disc)[1].local_receive_ms + 10).reasons
+
+
+def test_unverified_data_never_claims_measured_provenance(tmp_path):
+    ds = world(tmp_path, [row(5_000, "99.9", 10)], verify=False)
+    pl, adv = run(ds)
+    assert pl.provenance == FM.PROV_MODELLED and adv.provenance == FM.PROV_MODELLED and adv.fills and all(f.provenance == FM.PROV_MODELLED for f in adv.fills)
+
+
+def test_touch_without_through_fills_nothing_however_large(tmp_path):
+    ds = world(tmp_path, [row(5_000, "100.0", 500)])                                           # a huge trade AT the price
+    _pl, adv = run(ds)
+    assert adv.fills == () and adv.through_volume == 0.0 and adv.order.filled == 0.0 and not adv.order.closed
+    assert adv.provenance == FM.PROV_MEASURED and adv.tape_complete and adv.reasons == ()
+
+
+def test_same_side_trades_below_the_bid_are_not_through_evidence(tmp_path):
+    ds = world(tmp_path, [row(5_000, "99.9", 500, "Buy")])                                      # priced through but labelled a taker BUY: not the opposing side
+    _pl, adv = run(ds)
+    assert adv.fills == () and adv.through_volume == 0.0
+
+
+def test_through_volume_below_the_queue_is_no_fill_and_the_excess_is_partial(tmp_path):
+    ds = world(tmp_path, [row(5_000, "99.9", 2.0)])                                             # queue ahead = 2 x 1.5 = 3.0
+    _pl, adv = run(ds)
+    assert adv.fills == () and adv.through_volume == 2.0 and adv.queue_ahead == pytest.approx(3.0)
+    ds = world(tmp_path, [row(5_000, "99.9", 2.0), row(6_000, "99.8", 1.5)], name="c2")           # 3.5 through: 0.5 excess
+    _pl, adv = run(ds)
+    assert [round(f.sim.fill.qty, 9) for f in adv.fills] == [0.5] and adv.order.filled == pytest.approx(0.5) and not adv.order.closed
+    assert adv.fills[0].sim.fill.price == 100.0 and adv.fills[0].sim.fill.liquidity == "MAKER" and adv.fills[0].sim.fill.prov == "MODELLED"
+    assert adv.fills[0].queue_basis == "VISIBLE_AT_PRICE" and adv.fills[0].sim.fill.fee_usd >= 0
+
+
+def test_through_with_enough_volume_fills_in_full_and_closes(tmp_path):
+    ds = world(tmp_path, [row(5_000, "99.9", 6.0)])
+    _pl, adv = run(ds)
+    assert sum(f.sim.fill.qty for f in adv.fills) == pytest.approx(2.0) and adv.order.closed and adv.order.remaining == pytest.approx(0.0, abs=1e-9)
+    big = world(tmp_path, [row(5_000, "99.9", 600.0)], name="c3")
+    assert sum(f.sim.fill.qty for f in run(big)[1].fills) == pytest.approx(2.0)                   # never more than the order size
+
+
+def test_sell_side_is_symmetric_needs_buys_strictly_above(tmp_path):
+    ds = world(tmp_path, [row(5_000, "100.1", 50, "Buy")])                                      # a buy AT the ask: a touch
+    assert run(ds, side="Sell", qty=1.0, price=100.1)[1].fills == ()
+    ds = world(tmp_path, [row(5_000, "100.2", 1.9, "Buy")], name="c2")                           # queue ahead = 1 x 1.5; 1.9 through -> 0.4 fills
+    adv = run(ds, side="Sell", qty=1.0, price=100.1)[1]
+    assert [round(f.sim.fill.qty, 9) for f in adv.fills] == [0.4]
+
+
+def test_tape_gap_is_unknown_so_no_fill_even_if_later_trades_were_through(tmp_path):
+    ds = world(tmp_path, [], tapes={1: TMS.tape(1, [row(30_000, "99.0", 500)])})                # the file starts at +30 s: the first 30 s after the order is NOT recorded
+    _pl, adv = run(ds)
+    assert adv.fills == () and adv.provenance == FM.PROV_REJECTED and "TAPE_GAP" in adv.reasons and adv.order.closed and not adv.tape_complete
+    nxt = FM.advance_with_trades(adv.order, ds, TMS.snaps(ds)[1].tape_recv_ms + 100, P)
+    assert nxt.fills == () and nxt.reasons == ("ORDER_CLOSED",)                                    # the unknown order is not resurrected
+
+
+def test_interval_beyond_the_last_recorded_tape_is_a_gap_not_no_trades(tmp_path):
+    ds = world(tmp_path, [])
+    _pl, adv = run(ds, upto=TMS.snaps(ds)[2].tape_recv_ms + 5_000)
+    assert adv.provenance == FM.PROV_REJECTED and "TAPE_GAP" in adv.reasons and adv.fills == ()
+
+
+def test_book_traded_through_without_recorded_trades_is_a_tape_gap(tmp_path):
+    thru_book = TMS.book(1, bids=[["99.6", "1"]], asks=[["99.8", "1"]])                           # the next book's ask is BELOW our bid, yet the tape shows no trade through
+    ds = world(tmp_path, [row(5_000, "100.0", 9)], books={1: thru_book})
+    _pl, adv = run(ds)
+    assert adv.fills == () and adv.provenance == FM.PROV_REJECTED and "BOOK_TRADED_THROUGH_WITHOUT_RECORDED_TRADES" in adv.reasons
+    ok = world(tmp_path, [row(5_000, "99.7", 9)], books={1: thru_book}, name="c2")                # with recorded through-trades there is evidence: no gap, a fill
+    adv2 = run(ok)[1]
+    assert adv2.provenance != FM.PROV_REJECTED and adv2.fills
+
+
+def test_cancel_latency_race_a_trade_inside_the_window_fills_after_it_does_not(tmp_path):
+    d0 = T0 + 52
+    cancel = d0 + 2_000                                                                           # effective at cancel + 300
+    inside = world(tmp_path, [row(2_100 + 52, "99.9", 10)])
+    adv = run(inside, cancel_at=cancel)[1]
+    assert sum(f.sim.fill.qty for f in adv.fills) == pytest.approx(2.0)                            # the cancel had not taken effect yet
+    late = FM.advance_with_trades(FM.request_cancel(place(inside).order, cancel), inside, TMS.snaps(inside)[2].tape_recv_ms + 10_000, P)
+    assert late.provenance != FM.PROV_REJECTED and sum(f.sim.fill.qty for f in late.fills) == pytest.approx(2.0)     # a cancelled order needs tape only until the cancel is effective
+    after = world(tmp_path, [row(2_400 + 52, "99.9", 10)], name="c2")
+    adv = run(after, cancel_at=cancel)[1]
+    assert adv.fills == () and adv.order.closed
+
+
+def test_markout_is_measured_from_the_next_snapshot_mid_and_adverse_is_positive(tmp_path):
+    down = TMS.book(1, bids=[["99.5", "1"]], asks=[["99.7", "1"]])                                # mid 99.6 after we BOUGHT at 100.0: adverse 40 bps
+    ds = world(tmp_path, [row(5_000, "99.9", 10)], books={1: down})
+    f = run(ds)[1].fills[0]
+    assert f.markout_basis == FM.MARKOUT_MEASURED and f.provenance == FM.PROV_MEASURED and f.mid_after == pytest.approx(99.6)
+    assert f.markout_signed_bps == pytest.approx((100.0 - 99.6) / 100.0 * 1e4) and f.sim.markout_bps == pytest.approx(f.markout_signed_bps) and f.sim.markout_bps > 0
+    assert f.sim.markout_usd == pytest.approx(f.sim.fill.qty * 100.0 * f.sim.markout_bps / 1e4) and f.markout_horizon_ms > 0
+    up = TMS.book(1, bids=[["100.4", "1"]], asks=[["100.6", "1"]])                                # price rose after the buy: favourable, never booked as a gain
+    ds = world(tmp_path, [row(5_000, "99.9", 10)], books={1: up}, name="c2")
+    f = run(ds)[1].fills[0]
+    assert f.markout_signed_bps < 0 and f.sim.markout_bps == 0.0 and f.sim.markout_usd == 0.0
+    ds = world(tmp_path, [row(5_000, "100.2", 3.0, "Buy")], books={1: TMS.book(1, bids=[["100.3", "1"]], asks=[["100.4", "1"]])}, name="c3")   # a SELL at 100.1, mid rose to 100.35
+    f = run(ds, side="Sell", qty=1.0, price=100.1)[1].fills[0]
+    assert f.markout_signed_bps == pytest.approx((100.35 - 100.1) / 100.1 * 1e4) and f.markout_signed_bps > 0
+
+
+def test_without_a_later_valid_snapshot_the_markout_is_modelled_and_the_fill_says_so(tmp_path):
+    crossed2 = TMS.book(2, bids=[["100.2", "1"]], asks=[["100.1", "1"]])
+    ds = world(tmp_path, [row(5_000, "99.9", 10)], books={1: TMS.book(1, bids=[["100.0", "1"]], asks=[["100.5", "1"]]), 2: crossed2})
+    f = run(ds)[1].fills[0]
+    assert ds.next_valid_after(SYM, f.sim.fill.ts_ms).cycle == f"cycle-{T0 + TMS.STEP}"
+    # remove the only later valid snapshot by asking for a fill after it
+    ds2 = world(tmp_path, [], books={2: crossed2}, tapes={2: TMS.tape(2, [row(TMS.STEP + 100, "100.0", "0.1"), row(TMS.STEP + 5_000, "99.9", 10)])}, name="c2")
+    snap1 = TMS.snaps(ds2)[1]
+    pl = FM.place_maker_from_micro(ds2, order_id="o2", group_id="g", leg_id="l", symbol=SYM, category="linear", side="Buy", qty=2.0, price=100.0, now_ms=snap1.local_receive_ms + 10, params=P)
+    adv = FM.advance_with_trades(pl.order, ds2, TMS.snaps(ds2)[2].tape_recv_ms, P)
+    assert adv.fills and all(x.markout_basis == FM.MARKOUT_MODELLED and x.provenance == FM.PROV_MODELLED and x.markout_signed_bps is None for x in adv.fills)
+    assert adv.provenance == FM.PROV_MODELLED
+
+
+def test_taker_walk_is_priced_from_the_recorded_depth_with_separate_components(tmp_path):
+    ds = world(tmp_path, [])
+    t = FM.taker_from_micro(ds, fill_id="f", group_id="g", leg_id="perp", symbol=SYM, category="linear", side="Buy", qty=3.0, decision_ms=d0_of(ds), params=P)
+    mid, raw = 100.05, (100.1 + 2 * 100.2) / 3
+    base = 3.0 * mid
+    assert t.provenance == FM.PROV_MEASURED and t.reasons == () and t.mid == pytest.approx(mid)
+    assert t.half_spread_bps == pytest.approx(0.05 * 3 / base * 1e4) and t.depth_walk_bps == pytest.approx((raw - 100.1) * 3 / base * 1e4)
+    assert t.latency_slip_bps == pytest.approx(raw * P.taker_extra_slip_bps / 1e4 * 3 / base * 1e4)
+    vwap = raw * (1 + P.taker_extra_slip_bps / 1e4)
+    assert t.result.vwap == pytest.approx(vwap) and t.fee_bps == pytest.approx(CC.TAKER_BPS_PERP * 3 * vwap / base)
+    assert t.total_cost_bps == pytest.approx(t.half_spread_bps + t.depth_walk_bps + t.latency_slip_bps + t.fee_bps)
+    assert dict(t.component_prov) == {"half_spread": FM.PROV_MEASURED, "depth_walk": FM.PROV_MEASURED, "latency_slip": FM.PROV_MODELLED, "fee": "VENUE_STATED"}
+    small = FM.taker_from_micro(ds, fill_id="f", group_id="g", leg_id="perp", symbol=SYM, category="linear", side="Buy", qty=0.5, decision_ms=d0_of(ds), params=P)
+    assert small.depth_walk_bps == pytest.approx(0.0, abs=1e-9) and t.depth_walk_bps > small.depth_walk_bps and t.total_cost_bps > small.total_cost_bps        # slippage grows with size
+    short = FM.taker_from_micro(ds, fill_id="f", group_id="g", leg_id="perp", symbol=SYM, category="linear", side="Buy", qty=50.0, decision_ms=d0_of(ds), params=P)
+    assert short.reasons == ("DEPTH_EXHAUSTED",) and short.result.unfilled_qty == pytest.approx(45.0)
+
+
+def test_hedge_leg_costs_are_separate_and_an_unrecorded_book_is_rejected_not_borrowed(tmp_path):
+    ds = world(tmp_path, [])
+    d = d0_of(ds)
+    legs = [dict(fill_id="a", group_id="g", leg_id="perp", symbol=SYM, category="linear", side="Sell", qty=1.0),
+            dict(fill_id="b", group_id="g", leg_id="spot", symbol=SYM, category="spot", side="Buy", qty=1.0)]
+    perp, spot = FM.taker_legs_from_micro(ds, legs, decision_ms=d, params=P)
+    assert perp.provenance == FM.PROV_MEASURED and perp.leg_id == "perp" and perp.total_cost_bps > 0
+    assert spot.provenance == FM.PROV_REJECTED and spot.reasons == ("NO_RECORDED_BOOK_FOR_CATEGORY",) and spot.total_cost_bps is None and spot.result is None
+    stale = FM.taker_from_micro(ds, fill_id="f", group_id="g", leg_id="perp", symbol=SYM, category="linear", side="Buy", qty=1.0, decision_ms=d + 30_000, params=P)
+    assert stale.provenance == FM.PROV_REJECTED and "STALE_SNAPSHOT" in stale.reasons
+
+
+def test_capacity_is_bounded_by_the_edge_or_the_depth_fraction(tmp_path):
+    ds = world(tmp_path, [])
+    d = d0_of(ds)
+
+    def cap(edge, frac=0.10):
+        return FM.capacity_from_micro(ds, symbol=SYM, decision_ms=d, side="Buy", edge_bps=edge, params=P, depth_fraction=frac)
+    wide = cap(50.0)
+    assert wide.binding == "DEPTH_FRACTION" and wide.qty == pytest.approx(0.5) and wide.usd == pytest.approx(0.5 * 100.05) and wide.provenance == FM.PROV_MEASURED
+    assert cap(4.0).qty == 0.0 and cap(4.0).binding == "SLIPPAGE_EDGE" and cap(4.0).reasons == ("EDGE_BELOW_TOUCH_COST",)          # the touch already costs more than the edge
+    c = cap(8.0, 1.0)
+    assert c.binding == "SLIPPAGE_EDGE" and c.qty == pytest.approx(1.334, rel=2e-3) and c.slippage_bps_at_capacity == pytest.approx(8.0, abs=1e-3)
+    bigger = FM.capacity_from_micro(ds, symbol=SYM, decision_ms=d, side="Buy", edge_bps=8.0, params=P, depth_fraction=1.0)
+    assert bigger.qty == c.qty and cap(12.0, 1.0).qty > c.qty > cap(6.0, 1.0).qty                                                   # monotone in the stated edge
+    rej = FM.capacity_from_micro(ds, symbol=SYM, decision_ms=d + 30_000, side="Buy", edge_bps=8.0, params=P)
+    assert rej.binding == FM.PROV_REJECTED and rej.qty == 0.0 and "STALE_SNAPSHOT" in rej.reasons
+
+
+def test_the_default_bar_policy_still_fills_nothing_and_micro_orders_replay_identically(tmp_path):
+    ds = world(tmp_path, [row(5_000, "99.9", 6.0)])
+    pl, a1 = run(ds)
+    _pl, a2 = run(ds)
+    assert a1 == a2                                                                               # pure: same data, same answer
+    assert FM.bar_ticks(FM.Bar(10_000, 50.0, 100.0, 1e9), pl.order, P) == [] and P.bar_policy == "NO_FILL"

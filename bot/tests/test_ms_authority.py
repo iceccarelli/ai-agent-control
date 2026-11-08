@@ -208,12 +208,15 @@ def test_capability_wrapped_simulation_is_not_a_simulation(env, tmp_path):
 def _wrapped(venue="testnet", role=RC.TESTNET_EXECUTOR):
     inner = SimT()
     cap = RC.Capability.for_role(role, venue=venue, credential_class=RC.TESTNET_CREDENTIAL_CLASS if role == RC.TESTNET_EXECUTOR else None)
+    if role == RC.TESTNET_EXECUTOR and venue == "testnet":
+        import ms_testnet_transport as TT
+        return TT.TestnetTransport(inner, cap), inner
     return RC.CapabilityTransport(inner, cap), inner
 
 
 def _build_testnet(env, tmp_path, *, policy=None, transport=None, binding="default"):
     t = transport or _wrapped()[0]
-    b = MA.TestnetBinding("BYBIT_TESTNET_DEDICATED_API_KEY") if binding == "default" else binding
+    b = MA.TestnetBinding("BYBIT_TESTNET_API_KEY") if binding == "default" else binding
     return MA.MultiSymbolAuthority(policy=policy or pol(), transport=t, state_dir=str(tmp_path / "st"), strategy="s", state_provider=env.state_provider,
                                    snapshot_provider=lambda: env.snaps, kill_switch_reader=lambda: env.kill, testnet=b)
 
@@ -235,7 +238,13 @@ def test_testnet_all_three_conditions_still_need_the_rest(env, tmp_path, monkeyp
                      (dict(binding=MA.TestnetBinding("BYBIT_TESTNET_LIVE_KEY")), "CREDENTIAL_NAME_NON_TESTNET_WORD"), (dict(binding=MA.TestnetBinding("x")), "CREDENTIAL_NAME_INVALID"),
                      (dict(policy=pol(venue="demo")), "VENUE_NOT_TESTNET"), (dict(transport=bc.RequestsTransport()), "TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY"),
                      (dict(transport=_wrapped(role=RC.READ_ONLY_MONITOR)[0]), "TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY"),
-                     (dict(transport=FakeBybit()), "TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY")):
+                     (dict(transport=FakeBybit()), "TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY"),
+                     # ADMISSION SEAM (reason: the real testnet transport is exactly ms_testnet_transport.TestnetTransport; a generic CapabilityTransport with the same
+                     # capability, a subclass, or a binding that names another dedicated variable is NOT admitted)
+                     (dict(transport=RC.CapabilityTransport(SimT(), RC.Capability.for_role(RC.TESTNET_EXECUTOR, venue="testnet", credential_class=RC.TESTNET_CREDENTIAL_CLASS))),
+                      "TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY"),
+                     (dict(binding=MA.TestnetBinding("BYBIT_TESTNET_DEDICATED_API_KEY")), "CREDENTIAL_NAME_NOT_THE_DEDICATED_TESTNET_KEY"),
+                     (dict(binding=MA.TestnetBinding("BYBIT_TESTNET_API_SECRET")), "CREDENTIAL_NAME_NOT_THE_DEDICATED_TESTNET_KEY")):
         with pytest.raises(MA.AuthorityConfigError, match=code):
             _build_testnet(env, tmp_path, **kw)
 
@@ -245,7 +254,7 @@ def test_mainnet_policy_can_never_reach_any_transport(env, tmp_path, monkeypatch
     for t in (SimT(), _wrapped()[0]):
         with pytest.raises(MA.AuthorityConfigError, match="POLICY_VENUE"):
             MA.MultiSymbolAuthority(policy=pol(venue="mainnet"), transport=t, state_dir=str(tmp_path), strategy="s", state_provider=env.state_provider,
-                                    snapshot_provider=lambda: env.snaps, kill_switch_reader=lambda: (False, ""), testnet=MA.TestnetBinding("BYBIT_TESTNET_DEDICATED_API_KEY"))
+                                    snapshot_provider=lambda: env.snaps, kill_switch_reader=lambda: (False, ""), testnet=MA.TestnetBinding("BYBIT_TESTNET_API_KEY"))
 
 
 class _Cfg:
@@ -903,3 +912,31 @@ def test_release_exit_needs_an_open_reservation_and_never_gives_back_fill_consum
     assert a.exit_refusal(exit_b("X2", "6")) is None
     assert a.exit_refusal(exit_b("X3", "0.3")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"      # 4 consumed + 6 re-reserved + 0.3 > 10.2: the cumulative exit never exceeds the entry
     assert a.release_exit("G1-X1") is False                                         # the unfilled part is already back: a second release is a no-op
+
+
+def test_admission_refuses_a_subclass_of_the_testnet_transport(env, tmp_path, monkeypatch):
+    """Reason: exact-class admission. A subclass can override request() and is not the reviewed transport."""
+    import ms_testnet_transport as TT
+    monkeypatch.setattr(AD, "enabled", lambda path=None: True)
+
+    class Sub(TT.TestnetTransport):
+        pass
+    cap = RC.Capability.for_role(RC.TESTNET_EXECUTOR, venue="testnet", credential_class=RC.TESTNET_CREDENTIAL_CLASS)
+    with pytest.raises(MA.AuthorityConfigError, match="TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY"):
+        _build_testnet(env, tmp_path, transport=Sub(SimT(), cap))
+
+
+# ---- reopen: a LATE FILL on a resolved group may be exited, never re-entered (red team: EXIT_GROUP_RESOLVED left real exposure with no authorised exit)
+def test_reopen_authorises_the_exit_of_a_resolved_group_and_nothing_else(env, tmp_path):
+    a, _t = make(env, tmp_path)
+    reg(a)
+    a.resolve_group("G1")
+    x = body("G1", "x1", side="Buy", reduceOnly=True)
+    assert a.is_resolved("G1") and a.exit_refusal(x) == "EXIT_GROUP_RESOLVED"                                      # resolved: no exit
+    assert a.reopen_group("nope") is False and a.reopen_group("G1") is True and a.reopen_group("G1") is False
+    assert not a.is_resolved("G1") and a.exit_refusal(x) is None                                                   # reopened: the reduce-only exit is authorised
+    assert a.exit_refusal(dict(x, qty="50")) in ("EXIT_QTY_EXCEEDS_ENTRY", "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY")    # the other exit bounds still apply
+    assert a.exit_refusal(dict(x, reduceOnly=False)) is not None
+    assert "GROUP_RESOLVED" in refused(a, body("G1", "P"))                                                         # an ENTRY of a resolved group stays refused even after reopen
+    a.resolve_group("G1")
+    assert a.is_resolved("G1")                                                                                     # resolve after reopen resolves again

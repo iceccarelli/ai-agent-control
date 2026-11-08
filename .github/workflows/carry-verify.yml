@@ -55,7 +55,7 @@ jobs:
   carry-correctness:
     name: carry correctness (python ${{ matrix.python }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90          # the gate grew (multi-symbol, Testnet and control-centre suites): 3.11 took ~26 min and 3.12 hit the old 40-minute limit (reported as 'cancelled')
     strategy:
       fail-fast: false
       matrix:
@@ -127,9 +127,14 @@ jobs:
           tests/test_suite_isolation.py
           tests/test_ms_risk.py
           tests/test_ms_accounting.py
+          tests/test_ms_reconcile.py
+          tests/test_canonical_contracts.py
           tests/test_ms_economics.py
           tests/test_ms_authority.py
           tests/test_ms_testnet_adapter.py
+          tests/test_ms_testnet_transport.py
+          tests/test_ms_testnet_executor.py
+          tests/test_ms_testnet_session.py
           tests/test_md_storage_policy.py
           tests/test_frozen_and_lineage.py
           tests/test_fingerprint.py
@@ -188,13 +193,16 @@ jobs:
           tests/test_market_history.py
           tests/test_data_freshness_audit.py
           tests/test_backfill_plan.py
+          tests/test_funnel_contracts.py
           tests/test_economic_model.py
           tests/test_economic_faults.py
+          tests/test_ms_microstructure.py
           tests/test_ms_fillmodel.py
           tests/test_ms_portfolio.py
           tests/test_ms_execution.py
           tests/test_ms_replay.py
           tests/test_ms_pipeline.py
+          tests/test_ms_pipeline_cli.py
           tests/test_cost_contracts.py
           tests/test_research_harness.py
           tests/test_candidate_templates.py

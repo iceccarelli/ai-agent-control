@@ -1476,8 +1476,9 @@ def test_describe_scope_never_trusts_the_manifest_and_blocks_on_raw_tampering(tm
         refresh_sha(dd, f)
     r, dst = retarget(tmp_path, d, lie, "lie")
     s = UC.describe_scope(dst)
-    assert r["ok"] is False and s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and "Closed" in s["statuses"]["refused_or_failed"]
-    assert {"STATUS_Closed_REFUSED_BY_VENUE", "DELISTING_NOT_OBSERVED"} <= {b["code"] for b in s["blockers"]}
+    assert r["ok"] is False and s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and ("Closed" in s["statuses"]["refused_or_failed"] or any("UNIVERSE_FILE_DIFFERS" in x for x in s["integrity_problems"]))        # the universe file no longer matches the re-derived pages: a hard integrity failure
+    codes = {b["code"] for b in s["blockers"]}
+    assert {"STATUS_Closed_REFUSED_BY_VENUE", "DELISTING_NOT_OBSERVED"} <= codes or "RAW_INTEGRITY" in codes          # the stale universe file no longer matches the pages: integrity blocks first
     open(os.path.join(dst, "linear_Closed_page0001.json"), "ab").write(b" ")                     # hash now differs from the manifest: integrity blocker
     s = UC.describe_scope(dst)
     assert s["raw_integrity_ok"] is False and s["blockers"][0]["code"] == "RAW_INTEGRITY" and s["dataset_status"] == "UNVERIFIED"
@@ -1581,6 +1582,7 @@ def test_mutation_scope_that_ignores_partial_would_call_a_partial_capture_comple
     real = UC.verify_capture_dir
 
     def cosmetic(path, **kw):
+        kw.pop("_entries", None)                                                                     # the cosmetic mutation also hides the per-row lifecycle derivation
         r = real(path, **kw)
         r["coverage"] = dict(r["coverage"], dataset_status="COMPLETE", delisting_observability="OBSERVED", conflicts=[], partitions=[
             dict(p, outcome="OBSERVED_ROWS", complete=True, anomalies=[], status_mismatch=dict(p["status_mismatch"], count=0, rows=[])) for p in r["coverage"]["partitions"]])
@@ -1715,3 +1717,315 @@ def test_mutation_probe_rows_made_usable_again_would_enter_the_universe(tmp_path
     exec(compile(src.replace(old, 'if not (outcome in ("OBSERVED_ROWS", "PARTIAL", "UNDOCUMENTED_STATUS_ROWS") or'), UC.__file__, "exec"), mod.__dict__)
     assert [r["symbol"] for r in mod.derive_partition("linear", "Settling", [env([inst("SETUSDT", status="Settling")])])["usable_rows"]] == ["SETUSDT"]
     assert UC.derive_partition("linear", "Settling", [env([inst("SETUSDT", status="Settling")])])["usable_rows"] == []
+
+
+# ================================================================ universe lifecycle classification (owner evidence: five PendingOpen rows inside status=Closed)
+# The owner's real capture is NOT available here: every fixture below is built from the SHAPES the owner reported (two dated LinearFutures and three
+# LinearPerpetual rows whose own status is PendingOpen with a historical deliveryTime, inside the status=Closed responses). No byte of the real dataset appears.
+
+SRV = NOW
+PAST = str(NOW - 86_400_000)
+EVID_NONE = {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}
+
+
+def lc(row, requested="Closed", observed=None, evidence=None, srv=SRV):
+    return UC.classify_lifecycle(row, requested_status=requested, server_time_ms=srv, observed_in=observed or {}, evidence=evidence)
+
+
+def pend(sym, **over):
+    over.setdefault("symbolId", f"sid-{sym}"[:40])
+    return inst(sym, status="PendingOpen", deliveryTime=PAST, launchTime="1000", **over)
+
+
+def dated(sym):
+    return inst(sym, contractType="LinearFutures", status="PendingOpen", deliveryTime=PAST, launchTime="1000", quoteCoin="USD", settleCoin="BTC")
+
+
+def test_contract_constants_and_dataclass_are_frozen():
+    assert {UC.LC_OUT_OF_SCOPE_DATED_FUTURE, UC.LC_CONFIRMED_CLOSED_PERPETUAL, UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING, UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN,
+            UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION} <= set(UC.LIFECYCLE_CLASSES)
+    v = lc(pend("DATAOLD01USDT"))
+    with pytest.raises(Exception):
+        v.klass = "X"                                                                                   # frozen
+    assert set(v.__dataclass_fields__) == {"klass", "scope_eligible", "research_eligible_window", "reasons", "evidence_used"}
+
+
+def test_dated_futures_are_out_of_scope_not_errors():
+    for sym in ("BTC-24MAR23", "ETH-24MAR23"):
+        v = lc(dated(sym))
+        assert v.klass == UC.LC_OUT_OF_SCOPE_DATED_FUTURE and v.scope_eligible is False and v.research_eligible_window is None and "LinearFutures" in v.reasons[0]
+    assert lc(inst("BTC-24MAR23", status="Trading")).klass == UC.LC_OUT_OF_SCOPE_DATED_FUTURE      # a hyphenated symbol is out of scope even if the type were lost
+
+
+def test_closed_perpetual_with_a_past_delivery_is_confirmed_closed_with_a_window():
+    v = lc(inst("OLDUSDT", status="Closed", deliveryTime=PAST, launchTime="1000"))
+    assert v.klass == UC.LC_CONFIRMED_CLOSED_PERPETUAL and v.scope_eligible and v.research_eligible_window == (1000, int(PAST))
+    assert lc(inst("OLDUSDT", status="Closed", deliveryTime=str(NOW + 5))).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION       # delivery in the future
+    assert lc(inst("OLDUSDT", status="Closed", deliveryTime="0")).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+
+
+def test_cancelled_before_opening_needs_positive_history_evidence():
+    assert lc(pend("LITENTRYUSDT")).klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN                  # timestamps alone are not enough
+    assert lc(pend("LITENTRYUSDT"), observed={"linear:PendingOpen": UC.ABSENT}).klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN     # nor is absence from the live partition
+    v = lc(pend("LITENTRYUSDT"), evidence=EVID_NONE)
+    assert v.klass == UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING and v.research_eligible_window is None and v.scope_eligible
+    for weak in ({"funding_rows": 0, "kline_rows": 0}, {"funding_rows": 0, "kline_rows": 0, "coverage_complete": False}, {"funding_rows": 0, "coverage_complete": True},
+                 {"funding_rows": "0", "kline_rows": 0, "coverage_complete": True}, {"funding_rows": False, "kline_rows": 0, "coverage_complete": True}, {}):
+        assert lc(pend("LITENTRYUSDT"), evidence=weak).klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN, weak
+
+
+def test_a_pending_open_perpetual_with_history_rows_traded_so_it_is_a_contradiction():
+    for ev in ({"funding_rows": 3, "kline_rows": 0, "coverage_complete": True}, {"funding_rows": 0, "kline_rows": 7, "coverage_complete": False}):
+        v = lc(pend("MONPROUSDT"), evidence=ev)
+        assert v.klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION and any("traded" in r for r in v.reasons)
+
+
+def test_unknown_or_missing_status_and_cross_partition_contradictions_are_unexplained():
+    for bad in ("Weird", "", None):
+        r = pend("MONPROUSDT")
+        r["status"] = bad
+        if bad is None:
+            del r["status"]
+        assert lc(r).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+    assert lc(pend("MONPROUSDT"), observed={"linear:default": "Trading"}).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+    live = inst("MONPROUSDT", status="PendingOpen", deliveryTime="0")                                   # not terminal: absence from PendingOpen IS a contradiction
+    assert lc(live, observed={"linear:PendingOpen": UC.ABSENT}).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+    assert lc(live).klass == UC.LC_ACTIVE_PERPETUAL
+    assert lc(pend("MONPROUSDT"), observed={"symbolId_lineage": "INVALID_RENAME_CHAIN"}).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+
+
+def test_a_non_usdt_perpetual_is_out_of_scope_other_not_a_dated_future():
+    assert lc(inst("BTCPERP", quoteCoin="USDC", settleCoin="USDC", status="Trading")).klass == UC.LC_OUT_OF_SCOPE_OTHER_CONTRACT
+
+
+# ---------------------------------------------------------------- the owner's five-row mix wired through capture, verify, scope and eligible_instruments
+
+CLOSED_OK = [inst("OLDUSDT", status="Closed", deliveryTime="1700000000000", launchTime="1585526400000", symbolId="sid-old", upperFundingRate="", lowerFundingRate="")]
+FIVE = [dated("BTC-24MAR23"), dated("ETH-24MAR23"), pend("DATAOLD01USDT"), pend("LITENTRYUSDT"), pend("MONPROUSDT")]
+PERPS3 = ["DATAOLD01USDT", "LITENTRYUSDT", "MONPROUSDT"]
+
+
+def five_run(tmp_path, name="five", extra_closed=(), over=None):
+    """status=Closed carries 1 genuine Closed row plus the five PendingOpen rows; PendingOpen/default/Trading are as the owner saw them (the five absent)."""
+    pages = chain([CLOSED_OK + list(extra_closed) + FIVE])
+    p = {("linear", "Closed"): pages}
+    p.update(over or {})
+    m, d = owner_run(tmp_path, name=name, over=p)
+    return m, d
+
+
+def counts(x):
+    return x["lifecycle"]["class_counts"]
+
+
+def test_five_rows_without_history_evidence_are_explained_but_unresolved_never_cancelled(tmp_path):
+    m, d = five_run(tmp_path)
+    p = part_of(m, "Closed")
+    assert p["outcome"] == UC.EXPLAINED_OUTCOME == "PARTIAL:STATUS_MISMATCH_EXPLAINED" and p["complete"] is False and p["rows_total"] == 6
+    sm = p["status_mismatch"]
+    assert sm["count"] == 5 and sm["by_verdict"] == {"EXPLAINED": 5} and sm["by_lifecycle_class"] == {UC.LC_OUT_OF_SCOPE_DATED_FUTURE: 2, UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN: 3}
+    assert m["conflicts"] == [] and m["dataset_status"] == UC.DS_EXPLAINED and m["delisting_observability"] == "NOT_OBSERVED"      # honest: Closed is NOT a complete partition
+    assert "Closed" in m["required_status_coverage"]["uncovered"]
+    assert counts(m) == {UC.LC_ACTIVE_PERPETUAL: 4, UC.LC_CONFIRMED_CLOSED_PERPETUAL: 1, UC.LC_OUT_OF_SCOPE_DATED_FUTURE: 2, UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN: 3}
+    assert UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING not in counts(m)
+    s = UC.describe_scope(d)
+    assert s["complete_for_scope"] is False and s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and s["eligible_for_research"] is True and s["research_blockers"] == []
+    assert s["dataset_status"] == UC.DS_EXPLAINED and s["delisting_observability"] == "NOT_OBSERVED" and s["statuses"]["partial_explained"] == ["Closed"]
+    assert {b["code"] for b in s["blockers"] if b["explained"]} == {"STATUS_Closed_PARTIAL", "DELISTING_NOT_OBSERVED", "DATASET_COMPLETE_WITH_EXPLAINED_MISMATCH"}
+    u = s["eligible_perpetual_lifecycle_universe"]
+    assert u["usable"] is True and set(u["symbols"]) == {"BTCUSDT", "ETHUSDT", "SOLUSDT", "OLDUSDT"}                       # nothing of the five, nothing PreLaunch
+    assert u["excluded_by_class"] == {UC.LC_OUT_OF_SCOPE_DATED_FUTURE: 2, UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN: 3}
+    assert u["instruments"]["OLDUSDT"]["window_ms"] == [1585526400000, 1700000000000] and any("UNRESOLVED" in x for x in s["limits"])
+    assert UC.verify_capture_dir(d)["ok"] is True
+
+
+def test_five_rows_with_verified_history_evidence_split_cancelled_from_unresolved(tmp_path):
+    _m, d = five_run(tmp_path)
+    ev = {"DATAOLD01USDT": EVID_NONE, "LITENTRYUSDT": EVID_NONE, "MONPROUSDT": {"funding_rows": 0, "kline_rows": 0, "coverage_complete": False}}
+    s = UC.describe_scope(d, history_evidence=ev)
+    assert counts(s) == {UC.LC_ACTIVE_PERPETUAL: 4, UC.LC_CONFIRMED_CLOSED_PERPETUAL: 1, UC.LC_OUT_OF_SCOPE_DATED_FUTURE: 2,
+                         UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING: 2, UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN: 1}
+    assert s["eligible_for_research"] is True and "MONPROUSDT" not in s["eligible_perpetual_lifecycle_universe"]["symbols"]
+    assert UC.verify_capture_dir(d, history_evidence=ev)["coverage"]["lifecycle"]["class_counts"] == counts(s)
+
+
+def test_a_pending_open_perp_that_has_funding_rows_traded_so_it_blocks_research(tmp_path):
+    _m, d = five_run(tmp_path)
+    s = UC.describe_scope(d, history_evidence={"MONPROUSDT": {"funding_rows": 12, "kline_rows": 0, "coverage_complete": True}})
+    assert counts(s)[UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION] == 1
+    assert s["eligible_for_research"] is False and "LIFECYCLE_UNEXPLAINED" in {b["code"] for b in s["research_blockers"]}
+    assert s["eligible_perpetual_lifecycle_universe"]["usable"] is False and s["eligible_perpetual_lifecycle_universe"]["symbols"] == []
+    e = UC.eligible_instruments(d, history_evidence={"MONPROUSDT": {"funding_rows": 12, "kline_rows": 0, "coverage_complete": True}})
+    assert e["usable"] is False and e["eligible"] == {}
+
+
+def test_a_pending_open_perp_that_another_partition_shows_as_trading_is_conflicted_not_explained(tmp_path):
+    other = dict(pend("MONPROUSDT"), status="Trading", deliveryTime="0")
+    m, d = five_run(tmp_path, over={("linear", "Trading"): chain([TRD + [other]]), ("linear", None): chain([TRD + [other]])})
+    p = part_of(m, "Closed")
+    assert p["outcome"] == "CONFLICTED:STATUS_MISMATCH" and p["status_mismatch"]["by_verdict"]["CONTRADICTED"] == 1 and m["dataset_status"] == "CONFLICTED"
+    s = UC.describe_scope(d)
+    assert s["eligible_for_research"] is False and "STATUS_Closed_CONFLICTED" in {b["code"] for b in s["research_blockers"]}
+
+
+def test_a_pending_open_perp_that_is_not_terminal_stays_a_contradiction(tmp_path):
+    live = inst("LIVEPOUSDT", status="PendingOpen", deliveryTime="0", symbolId="sid-livepo")                   # no past delivery: absence from PendingOpen has no explanation
+    m, _d = five_run(tmp_path, extra_closed=[live])
+    assert part_of(m, "Closed")["outcome"] == "CONFLICTED:STATUS_MISMATCH"
+
+
+def test_an_unknown_status_inside_the_closed_partition_is_unexplained(tmp_path):
+    odd = inst("ODDUSDT", symbolId="sid-odd", status="Weird")
+    m, d = five_run(tmp_path, extra_closed=[odd])
+    assert part_of(m, "Closed")["outcome"] == "CONFLICTED:STATUS_MISMATCH" and UC.describe_scope(d)["eligible_for_research"] is False
+
+
+def test_symbolid_lineage_a_pending_open_row_sharing_a_trading_symbols_id_is_not_explained(tmp_path):
+    shared = pend("DATAOLD01USDT", symbolId=TRD[0]["symbolId"])
+    m, _d = owner_run(tmp_path, name="lin", over={("linear", "Closed"): chain([CLOSED_OK + [shared]])})
+    assert part_of(m, "Closed")["outcome"] == "CONFLICTED:STATUS_MISMATCH"
+    assert any("symbolId" in x for x in part_of(m, "Closed")["status_mismatch"]["rows"][0]["reconciliation"]["evidence"])
+
+
+def test_symbolid_rename_chain_of_an_ended_name_stays_explained(tmp_path):
+    older = pend("DATAOLD01USDT", symbolId="sid-ren2")
+    newer = inst("DATANEWUSDT", symbolId="sid-ren2", launchTime=str(NOW - 1000))
+    trd = TRD + [newer]
+    m, _d = owner_run(tmp_path, name="ren", over={("linear", "Closed"): chain([CLOSED_OK + [older]]), ("linear", None): chain([trd]), ("linear", "Trading"): chain([trd])})
+    assert part_of(m, "Closed")["outcome"] == UC.EXPLAINED_OUTCOME and m["conflicts"] == []
+    assert m["renames"] == [{"category": "linear", "symbolId": "sid-ren2", "from": "DATAOLD01USDT", "to": "DATANEWUSDT"}]
+
+
+def test_query_and_actual_status_are_separate_fields_and_the_raw_bytes_are_untouched(tmp_path):
+    m, d = five_run(tmp_path)
+    p = part_of(m, "Closed")
+    raw = open(os.path.join(d, p["pages"][0]["file"]), "rb").read()
+    body = json.loads(raw)["result"]["list"]
+    assert [r["status"] for r in body] == ["Closed"] + ["PendingOpen"] * 5                                      # the bytes still say PendingOpen: never relabelled
+    for e in p["status_mismatch"]["rows"]:
+        assert e["query_status"] == "Closed" and e["returned_status"] == "PendingOpen" == e["actual_status"] and e["lifecycle"]["klass"] in UC.LIFECYCLE_CLASSES
+    assert [e["row_sha256"] for e in p["status_mismatch"]["rows"]] == [UC._row_sha(r) for r in FIVE]
+    ent = {e["symbol"]: e for e in UC.describe_scope(d)["lifecycle"]["notable"]}
+    assert ent["LITENTRYUSDT"]["query_partitions"] == [{"query": "Closed", "partition": "linear:Closed", "page": 1}] and ent["LITENTRYUSDT"]["returned_status"] == "PendingOpen"
+    rows = {r["symbol"]: r for r in uni2(m, d)}
+    assert rows["LITENTRYUSDT"]["status"] == "PendingOpen" and "BTC-24MAR23" not in rows                         # perps kept as-is; dated futures stay in the rejected count, not the universe
+
+
+def test_verify_scope_and_eligible_instruments_report_identical_class_counts(tmp_path):
+    _m, d = five_run(tmp_path)
+    v = UC.verify_capture_dir(d)
+    s = UC.describe_scope(d)
+    e = UC.eligible_instruments(d)
+    assert v["ok"] is True and counts(v["coverage"]) == counts(s) == counts(e) and counts(e)[UC.LC_OUT_OF_SCOPE_DATED_FUTURE] == 2
+    assert e["usable"] is True and e["eligible"] == s["eligible_perpetual_lifecycle_universe"]["instruments"] and e["manifest_sha256"] == v["manifest_sha256"] == s["manifest_sha256"]
+    assert e["complete_for_scope"] is False and e["raw_integrity_ok"] is True
+    assert v["coverage"]["lifecycle"] == s["lifecycle"] == e["lifecycle"]
+    assert UC.main(["scope", "--dir", d]) == 3                                                                  # the CLI is the same derivation (not complete, hence 3)
+
+
+def test_the_manifest_class_counts_are_never_trusted(tmp_path):
+    _m, d = five_run(tmp_path)
+    dst = str(tmp_path / "forged")
+    shutil.copytree(d, dst)
+
+    def lie(x):
+        x["lifecycle"]["class_counts"] = {UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING: 3, UC.LC_OUT_OF_SCOPE_DATED_FUTURE: 2}
+        pc = part_of(x, "Closed")
+        pc["status_mismatch"]["by_lifecycle_class"] = {UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING: 3}
+    edit_manifest(lie)(dst)
+    v = UC.verify_capture_dir(dst)
+    assert v["ok"] is False and any("lifecycle claim" in p for p in v["problems"]) and counts(v["coverage"])[UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN] == 3
+    s = UC.describe_scope(dst)
+    assert counts(s)[UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN] == 3 and UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING not in counts(s) and s["legacy_claim_differences"]
+    assert UC.eligible_instruments(dst)["lifecycle"]["class_counts"] == counts(s)                              # stale claims never block, and never change the answer
+
+
+def test_a_capture_written_under_the_old_rules_is_still_judged_from_its_bytes(tmp_path):
+    _m, d = five_run(tmp_path)
+    dst = str(tmp_path / "old")
+    shutil.copytree(d, dst)
+
+    def old(x):                                                                                                # what rules_version 2 wrote: no lifecycle block, old partition verdicts
+        x["rules_version"] = 2
+        x.pop("lifecycle")
+        pc = part_of(x, "Closed")
+        pc["outcome"] = "CONFLICTED:STATUS_MISMATCH"
+        x["dataset_status"] = "CONFLICTED"
+    edit_manifest(old)(dst)
+    assert UC.verify_capture_dir(dst)["ok"] is False
+    e = UC.eligible_instruments(dst)
+    assert e["usable"] is True and e["legacy_manifest"] is True and e["raw_integrity_ok"] is True and counts(e)[UC.LC_OUT_OF_SCOPE_DATED_FUTURE] == 2
+
+
+def test_tampered_raw_bytes_make_nothing_eligible(tmp_path):
+    _m, d = five_run(tmp_path)
+    fp = os.path.join(d, "linear_Closed_page0001.json")
+    with open(fp, "ab") as f:
+        f.write(b" ")
+    e = UC.eligible_instruments(d)
+    assert e["usable"] is False and e["eligible"] == {} and e["raw_integrity_ok"] is False
+
+
+def test_positive_control_a_clean_owner_shaped_capture_has_an_eligible_universe_and_is_complete(tmp_path):
+    _m, d = owner_run(tmp_path, name="clean")
+    s = UC.describe_scope(d)
+    assert s["complete_for_scope"] is True and s["verdict"] == "COMPLETE_FOR_SCOPE" and s["eligible_for_research"] is True and s["research_blockers"] == []
+    assert set(s["eligible_perpetual_lifecycle_universe"]["symbols"]) == {"BTCUSDT", "ETHUSDT", "SOLUSDT", "OLDUSDT"}
+    assert counts(s) == {UC.LC_ACTIVE_PERPETUAL: 4, UC.LC_CONFIRMED_CLOSED_PERPETUAL: 1}
+
+
+# ---------------------------------------------------------------- mutations: each guard switched off must change an outcome the tests above pin
+
+def test_mutation_promoting_unresolved_to_cancelled_without_evidence(tmp_path, monkeypatch):
+    real = UC.classify_lifecycle
+
+    def promote(row, **kw):
+        v = real(row, **kw)
+        if v.klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN:
+            return UC.LifecycleVerdict(UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING, v.scope_eligible, None, v.reasons, v.evidence_used)
+        return v
+    _m, d = five_run(tmp_path)
+    assert counts(UC.describe_scope(d))[UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN] == 3
+    monkeypatch.setattr(UC, "classify_lifecycle", promote)
+    c = counts(UC.describe_scope(d))
+    assert c.get(UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING) == 3 and UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN not in c       # the forbidden verdict: caught by the assertions above
+
+
+def test_mutation_dated_futures_treated_as_in_scope(tmp_path, monkeypatch):
+    real = UC.classify_lifecycle
+
+    def inscope(row, **kw):
+        if isinstance(row, dict) and row.get("contractType") == "LinearFutures":
+            row = dict(row, contractType=UC.PERP_TYPE, quoteCoin="USDT", settleCoin="USDT", symbol=row["symbol"].replace("-", "") + "USDT")
+        return real(row, **kw)
+    monkeypatch.setattr(UC, "classify_lifecycle", inscope)
+    m, d = five_run(tmp_path)
+    assert part_of(m, "Closed")["status_mismatch"]["by_lifecycle_class"].get(UC.LC_OUT_OF_SCOPE_DATED_FUTURE, 0) == 0          # the real run counts 2
+    assert part_of(m, "Closed")["status_mismatch"]["by_lifecycle_class"][UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN] == 5
+
+
+def test_mutation_dropping_the_query_actual_separation(tmp_path, monkeypatch):
+    real = UC.apply_status_contract
+
+    def drop(parts):
+        real(parts)
+        for p in parts:
+            for e in p["status_mismatch"]["rows"]:
+                e.pop("query_status"), e.pop("returned_status")
+    monkeypatch.setattr(UC, "apply_status_contract", drop)
+    m, d = five_run(tmp_path)
+    assert "query_status" not in part_of(m, "Closed")["status_mismatch"]["rows"][0]
+    monkeypatch.undo()
+    assert UC.verify_capture_dir(d)["ok"] is False                                                             # real verification refuses a manifest without the separate fields
+
+
+def test_mutation_trusting_the_manifest_class_counts(tmp_path, monkeypatch):
+    _m, d = five_run(tmp_path)
+    dst = str(tmp_path / "trust")
+    shutil.copytree(d, dst)
+    edit_manifest(lambda x: x["lifecycle"].update(class_counts={UC.LC_CONFIRMED_CLOSED_PERPETUAL: 99}))(dst)
+    assert UC.verify_capture_dir(dst)["ok"] is False
+    real_entries = UC.lifecycle_entries
+    monkeypatch.setattr(UC, "lifecycle_summary", lambda entries, **kw: json.load(open(os.path.join(dst, "manifest.json")))["lifecycle"])
+    assert UC.verify_capture_dir(dst)["ok"] is True and counts(UC.verify_capture_dir(dst)["coverage"]) == {UC.LC_CONFIRMED_CLOSED_PERPETUAL: 99}   # what trusting the claim would report
+    assert real_entries is UC.lifecycle_entries

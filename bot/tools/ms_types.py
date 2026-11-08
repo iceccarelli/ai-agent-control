@@ -226,3 +226,43 @@ def funding_bps_per_day(bps_per_print: Optional[float], interval_min: Optional[i
     if bps_per_print is None or interval_min is None or isinstance(interval_min, bool) or interval_min <= 0 or 1440 % interval_min:
         return None
     return bps_per_print * (1440.0 / interval_min)
+
+
+# ---------------------------------------------------------------- run identity and modes (lead-owned; every artifact, journal and ledger carries it)
+
+MODES = ("REPLAY", "PAPER", "TESTNET")         # MAINNET does not exist in this layer: there is no value for it and no code may add one
+EXECUTION_MODES_WITH_REAL_TRANSPORT = ("TESTNET",)
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    """One identity for one run, stamped on EVERY artifact, journal record and ledger the run produces so a consumer can prove that two files belong together.
+    ``data_digest`` is the digest of the verified inputs (manifest digests of the history/universe/collector datasets) and ``code_revision`` the git SHA the run executed
+    (or 'UNKNOWN'); neither may be invented: an unknown value is the string 'UNKNOWN' and a consumer treats it as unverified."""
+    run_id: str
+    mode: str
+    candidate_id: str
+    spec_digest: str
+    data_digest: str
+    code_revision: str
+    generated_ms: int
+
+    def __post_init__(self) -> None:
+        if self.mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}")
+        for k in ("run_id", "candidate_id", "spec_digest", "data_digest", "code_revision"):
+            if not isinstance(getattr(self, k), str) or not getattr(self, k):
+                raise ValueError(f"{k} must be a non-empty string ('UNKNOWN' when not known)")
+        if isinstance(self.generated_ms, bool) or not isinstance(self.generated_ms, int) or self.generated_ms <= 0:
+            raise ValueError("generated_ms must be a positive integer (injected, never the wall clock inside a pure module)")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"run_id": self.run_id, "mode": self.mode, "candidate_id": self.candidate_id, "spec_digest": self.spec_digest, "data_digest": self.data_digest,
+                "code_revision": self.code_revision, "generated_ms": self.generated_ms}
+
+
+def derive_run_id(*, mode: str, candidate_id: str, spec_digest: str, data_digest: str, generated_ms: int) -> str:
+    """Deterministic run id: same inputs and fixed clock => same id."""
+    import hashlib
+    h = hashlib.sha256("|".join((mode, candidate_id, spec_digest, data_digest, str(int(generated_ms)))).encode("utf-8")).hexdigest()
+    return "run_" + h[:20]

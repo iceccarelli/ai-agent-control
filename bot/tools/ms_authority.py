@@ -24,7 +24,7 @@ What an order must satisfy (every refusal is a stable code; all are reported):
 TRANSPORT BINDING. The authority is bound to ONE transport (``bound_transport``); the client approves nothing on another. Construction is refused unless the transport is an
 in-process SIMULATION (``is_simulated_transport``: a WHITELIST of concrete classes, never a self-declared attribute) or ALL of: the owner's testnet capability is enabled (``ms_testnet_adapter.enabled()``, False unless an owner-set capability file with
 a signed-off manifest digest exists), the venue is the registry's ``testnet``, a dedicated testnet credential variable name is declared (generic Bybit names refused) and the
-transport is a ``runtime_capability.CapabilityTransport`` for the TESTNET_EXECUTOR role with the dedicated credential class. None of that exists in this repository state.
+transport is EXACTLY ``ms_testnet_transport.TestnetTransport`` (a ``CapabilityTransport`` for the TESTNET_EXECUTOR role, dedicated credential class) and the binding names its dedicated key variable ``BYBIT_TESTNET_API_KEY``. The capability file is created only by the owner; in this repository state it does not exist, so only simulated transports are admitted.
 """
 from __future__ import annotations
 
@@ -295,9 +295,16 @@ class MultiSymbolAuthority:
             why.append("TESTNET_BINDING_MISSING")
         else:
             why += credential_name_refusals(testnet.credential_env_name)
-        cap = getattr(transport, "capability", None)
-        if not (isinstance(transport, RC.CapabilityTransport) and cap is not None and cap.role == RC.TESTNET_EXECUTOR and cap.venue == "testnet"
-                and cap.credential_class == RC.TESTNET_CREDENTIAL_CLASS):
+        # ADMISSION SEAM: the real testnet transport is admitted ONLY as the exact ``ms_testnet_transport.TestnetTransport`` class (TESTNET_EXECUTOR capability, testnet registry host,
+        # dedicated credential class) AND with the binding naming exactly its dedicated key variable. A generic ``CapabilityTransport`` (any inner object) is no longer enough.
+        try:
+            import ms_testnet_transport as _tt
+            exact = _tt.is_testnet_executor_transport(transport)
+            if testnet is not None and testnet.credential_env_name != _tt.KEY_ENV:
+                why.append("CREDENTIAL_NAME_NOT_THE_DEDICATED_TESTNET_KEY")
+        except Exception:                                          # noqa: BLE001
+            exact = False
+        if not exact:
             why.append("TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY")
         if why:
             raise AuthorityConfigError("TRANSPORT_NOT_SIMULATED:" + ",".join(why))
@@ -363,6 +370,39 @@ class MultiSymbolAuthority:
         """The account's own position read now reflects this leg: stop counting it as a pending reservation (otherwise it is counted twice, which is conservative)."""
         self._groups.append({"event": "settle", "group_id": group_id, "leg_id": leg_id, "at_ms": self._now_ms()})
 
+    @staticmethod
+    def _resolved_sets(rows: Sequence[Mapping[str, Any]]) -> Tuple[set, set]:
+        """(ever_resolved, effectively_resolved). A ``reopen`` after the last ``resolve`` makes the group effectively unresolved again (a LATE FILL after it was closed): it may then be
+        EXITED (reduce-only) and still counts as active, but ``ever_resolved`` keeps refusing new ENTRY orders for it."""
+        ever: set = set()
+        eff: set = set()
+        for r in rows:
+            if r["event"] == "resolve":
+                ever.add(r["group_id"])
+                eff.add(r["group_id"])
+            elif r["event"] == "reopen":
+                eff.discard(r["group_id"])
+        return ever, eff
+
+    def is_resolved(self, group_id: str) -> bool:
+        """True while the group is effectively resolved. An unreadable ledger reads as resolved (the cautious answer for 'may I treat it as closed')."""
+        try:
+            return group_id in self._resolved_sets(self._rows())[1]
+        except (OSError, ValueError):
+            return True
+
+    def reopen_group(self, group_id: str) -> bool:
+        """A resolved group has exposure again (a fill arrived after it was closed). Appends a ``reopen`` so its EXITS are authorised again; entries stay refused. False if it was not
+        resolved (nothing to reopen) or the ledger cannot be read. Never weakens an exit check: the reduce-only / quantity / symbol bounds still apply."""
+        try:
+            rows = self._rows()
+        except (OSError, ValueError):
+            return False
+        if group_id not in self._resolved_sets(rows)[1]:
+            return False
+        self._groups.append({"event": "reopen", "group_id": group_id, "at_ms": self._now_ms()})
+        return True
+
     def resolve_group(self, group_id: str) -> None:
         """The group is closed / abandoned and flat per the venue's own read: it no longer counts as pending or active."""
         self._groups.append({"event": "resolve", "group_id": group_id, "at_ms": self._now_ms()})
@@ -378,7 +418,7 @@ class MultiSymbolAuthority:
         except Exception:                                          # noqa: BLE001
             return ms_risk.RiskDecision(False, ("STATE_UNAVAILABLE",), {})
         registered = self._registered(rows)
-        resolved = {r["group_id"] for r in rows if r["event"] == "resolve"}
+        resolved = self._resolved_sets(rows)[1]
         settled = {(r["group_id"], r["leg_id"]) for r in rows if r["event"] == "settle"}
         reserved_links = self._reserved_links()
         # RESERVATION POLICY. A registered group's legs are reserved AS A WHOLE from the moment it is registered (sent or not), until each leg settles or the group resolves: a
@@ -432,7 +472,7 @@ class MultiSymbolAuthority:
         plan = self._registered(rows).get(sp[0])
         if plan is None:
             return None, "EXIT_GROUP_NOT_OPENED"
-        if any(r["event"] == "resolve" and r["group_id"] == sp[0] for r in rows):
+        if sp[0] in self._resolved_sets(rows)[1]:
             return None, "EXIT_GROUP_RESOLVED"
         if any(l.leg_id == sp[1] for l in plan.legs):
             return None, "EXIT_LINK_REUSES_ENTRY_LEG"

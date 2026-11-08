@@ -1319,10 +1319,10 @@ def test_a_schema_2_capture_whose_rederived_status_is_not_acceptable_is_refused(
     d = _universe_dir(tmp_path)
     real = UC.verify_capture_dir
     for bad in ("UNVERIFIED", "CONFLICTED", "STALE"):
-        monkeypatch.setattr(UC, "verify_capture_dir", lambda p, bad=bad: dict(real(p), coverage=dict(real(p)["coverage"], dataset_status=bad)))
+        monkeypatch.setattr(UC, "verify_capture_dir", lambda p, bad=bad, **kw: dict(real(p, **kw), coverage=dict(real(p, **kw)["coverage"], dataset_status=bad)))
         with pytest.raises(MH.HistoryError, match=bad):
             MH.load_universe_dir(str(d))
-    monkeypatch.setattr(UC, "verify_capture_dir", lambda p: dict(real(p), ok=False, problems=["x"]))
+    monkeypatch.setattr(UC, "verify_capture_dir", lambda p, **kw: dict(real(p, **kw), ok=False, problems=["x"]))
     with pytest.raises(MH.HistoryError):
         MH.load_universe_dir(str(d))
 
@@ -1404,3 +1404,67 @@ def test_a_closed_contract_is_asked_only_up_to_its_delivery_time_in_every_datase
         key = MH.DATASETS[ds]["end"]
         ends = [int(u.split(f"{key}=")[1].split("&")[0]) for u in v.urls]
         assert ends and max(ends) == delivery, ds                  # the first page asks exactly the delivery time, none asks beyond it
+
+
+# ---------------------------------------------------------------- red team: a rewritten universe jsonl must never be believed
+
+def _rewrite_universe(d, edit):
+    """Edit the universe jsonl AND rewrite the manifest's sha256/rows to match (the attacker's best case); returns nothing."""
+    mp = d / "manifest.json"
+    man = json.loads(mp.read_text())
+    uf = d / man["universe_file"]["file"]
+    lines = uf.read_bytes().splitlines()
+    rows = [json.loads(x) for x in lines]
+    rows = edit(rows)
+    raw = b"".join(json.dumps(r, sort_keys=True, separators=(",", ":")).encode() + b"\n" for r in rows)
+    uf.write_bytes(raw)
+    man["universe_file"]["sha256"] = MH._sha(raw)
+    man["universe_file"]["rows"] = len(rows)
+    mp.write_text(json.dumps(man, indent=2, sort_keys=True) + "\n")
+
+
+def _add_fake(rows):
+    r = dict(next(x for x in rows if x["symbol"] == "BTCUSDT"))
+    r["symbol"] = "FAKEUSDT"
+    return rows + [r]
+
+
+def _edit_field(field, value):
+    def f(rows):
+        for r in rows:
+            if r["symbol"] == "ETHUSDT":
+                r[field] = value
+        return rows
+    return f
+
+
+@pytest.mark.parametrize("edit", [_add_fake, _edit_field("deliveryTime", 5), _edit_field("status", "Closed"), _edit_field("fundingInterval_min", 60)])
+def test_a_rewritten_universe_file_is_refused_by_scope_loader_and_funnel(tmp_path, edit):
+    import backfill_plan as BP
+    d = _universe_dir(tmp_path)
+    recs, _ = MH.load_universe_dir(str(d))                                                    # positive control: the good capture loads
+    assert sorted(recs) == ["BTCUSDT", "ETHUSDT", "NEWUSDT"] and UC.describe_scope(str(d))["raw_integrity_ok"] is True
+    _rewrite_universe(d, edit)
+    sc = UC.describe_scope(str(d))
+    assert sc["raw_integrity_ok"] is False and any("universe" in p for p in sc["integrity_problems"])
+    assert UC.eligible_instruments(str(d))["usable"] is False
+    with pytest.raises(MH.HistoryError):
+        MH.load_universe_dir(str(d))
+    with pytest.raises(BP.PlanError):
+        BP.funnel(str(d), None, window=(1, 2))
+
+
+def test_a_true_legacy_manifest_still_loads_and_its_records_come_from_the_raw_pages(tmp_path):
+    d = _universe_dir(tmp_path)
+    mp = d / "manifest.json"
+    man = json.loads(mp.read_text())
+    man.pop("rules_version")
+    mp.write_text(json.dumps(man, indent=2, sort_keys=True) + "\n")
+    recs, info = MH.load_universe_dir(str(d))
+    assert sorted(recs) == ["BTCUSDT", "ETHUSDT", "NEWUSDT"] and info["capture_schema"] == 2
+    _rewrite_universe(d, _add_fake)                                                          # even a legacy manifest cannot smuggle a row in: records are re-derived from the pages
+    try:
+        recs2, _ = MH.load_universe_dir(str(d))
+    except MH.HistoryError:
+        return
+    assert "FAKEUSDT" not in recs2

@@ -49,6 +49,7 @@ A missing file => section shows an empty state. A malformed/oversize/symlink/NaN
   ledger_pnl.json       schema "ledger_pnl/v1"      basis: SIMULATED | MEASURED | EXCHANGE_REPORTED | OWNER_SUPPLIED_UNVERIFIED
       period_start_ms int|null, period_end_ms int|null
       realised_gross_usd num|null, fees_usd num|null, funding_usd num|null, realised_net_usd num|null, unrealised_usd num|null
+      taker_slippage_usd num|null, adverse_selection_usd num|null (OPTIONAL modelled costs, shown as slippage / adverse selection with their source field)
       net_usd num|null (OPTIONAL: the TOTAL net, = realised_net_usd + unrealised_usd, the same figure as replay_report net_pnl_usd; absent = not stated)
       (a SIMULATED ledger is shown as simulated P&L, never as realised; net is never inferred from gross)
   competition.json      schema "competition/v1"     basis: ESTIMATED | SIMULATED | CALCULATED
@@ -60,6 +61,23 @@ A missing file => section shows an empty state. A malformed/oversize/symlink/NaN
                prov PROV, exclusions [str]} ]
   OPP_KIND = SPOT_PERP_CARRY | PERP_FUNDING_SPREAD | PERP_DIRECTIONAL_FUNDING;  PROV = MEASURED|VENUE_STATED|DERIVED|MODELLED|ASSUMED|UNKNOWN (ms_types.PROVS).
   Rule the UI enforces: only SPOT_PERP_CARRY with spot_hedge HEDGEABLE_ON_BYBIT is called carry; a PERP_ONLY / unknown-hedge symbol is "directional funding (not carry)".
+
+RUN IDENTITY. Every artifact SHOULD carry ``identity`` = ms_types.RunIdentity.as_dict() {run_id, mode REPLAY|PAPER|TESTNET, candidate_id, spec_digest, data_digest, code_revision,
+generated_ms}. A file without it is accepted as LEGACY_NO_IDENTITY and the whole state is flagged UNVERIFIED. The simulated "run family" (every file but testnet_session.json) must agree on
+run_id, candidate_id, data_digest and mode; a disagreement is INCONSISTENT_RUN: a loud banner, and NO figure that needs two files (net, gross, fees, funding, realised, unrealised, the
+plain-language answers) is combined or shown. testnet_session.json is a different family: its mode must be TESTNET and nothing in it is ever added to a simulated number.
+
+More artifacts (all optional; missing = empty state; ``basis`` is not required for these):
+  pipeline_summary.json  "pipeline_summary/v1"   outcome (or outcome_code) in OUTCOME_CODES, reason?, required_span{}, data_digest_parts{}, evidence_basis{}
+  testnet_session.json   "testnet_session/v1"    venue 'Testnet', endpoint_host (must be the registered testnet host), credential_state{dedicated_key_present, dedicated_secret_present,
+                         generic_credentials_ignored}, preflight{status NOT_RUN|PASS|FAIL, checked_ms, checks[{name, ok, detail}]}, plan{digest, manifest_digest, legs[], notional_usd}|null,
+                         confirmation{state NOT_REQUESTED|CONFIRMED, plan_digest_confirmed}, orders[], executions[], final_position{}|null, flat_verified bool|null,
+                         basis NOT_RUN|EXCHANGE_REPORTED, net{fees_usd, funding_usd, price_pnl_usd, note}
+  reconcile_report.json  "reconcile_report/v1"   findings[{code, detail, severity}], halt_new_exposure bool, views_compared[str]
+  universe_scope.json    "universe_scope/v1"     scope verdict, eligible_perpetual_lifecycle_universe, lifecycle class counts (all optional)
+  funnel.json            "funnel/v1"             steps [{name,count}] or counts{}, exclusion_reasons{} (all optional)
+ONE COHERENT STATE: ``build_state`` reads every file once and derives every displayed money figure ONCE (``state["figures"]``: net = the replay's net_pnl_usd; each figure carries
+``concept`` and ``src``). Every view reads those same values; the accounting identities (gross - fees = net, realised + unrealised = net, ...) are checked and shown, never assumed.
 """
 from __future__ import annotations
 
@@ -86,6 +104,7 @@ import ms_types as MST  # noqa: E402
 import owner_console as OC  # noqa: E402
 import promotion_gate as PG  # noqa: E402
 import universe_capture as UC  # noqa: E402
+import venues as VEN  # noqa: E402                    # the registry of what a venue name means (pure; no client, no transport)
 
 SCHEMA = "control_centre/v1"
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_centre_static")
@@ -253,7 +272,8 @@ def _v_risk(o: Mapping[str, Any]) -> Dict[str, Any]:
 def _v_ledger(o: Mapping[str, Any]) -> Dict[str, Any]:
     return {"period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), **{k: _num(o, k) for k in
             ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd")},
-            "net_usd": _num(o, "net_usd") if "net_usd" in o else None}          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
+            "net_usd": _num(o, "net_usd") if "net_usd" in o else None,          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
+            **{k: (_num(o, k) if k in o else None) for k in ("taker_slippage_usd", "adverse_selection_usd")}}      # optional modelled costs the producer states; absent / null = unknown (MISSING), never zero
 
 
 def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
@@ -279,14 +299,187 @@ def _v_opps(o: Mapping[str, Any]) -> Dict[str, Any]:
     return {"decision_ms": _int(o, "decision_ms"), "est_net_usd_per_day": _num(o, "est_net_usd_per_day"), "items": items}
 
 
+OUTCOME_CODES = ("NO_OPPORTUNITY", "REJECTED_CANDIDATE", "INADEQUATE_HISTORY", "INADEQUATE_SAMPLE", "NO_ALLOCATION", "RISK_REFUSAL", "NO_FILL", "SIMULATED_EXECUTION", "UNKNOWN_OR_UNRECONCILED")
+OUTCOME_TEXT = {
+    "NO_OPPORTUNITY": ("No opportunity cleared the cost-aware screen.", "Nothing to do until a new scan finds a positive-net opportunity."),
+    "REJECTED_CANDIDATE": ("The candidate was rejected on the evidence.", "Read the rejection reason; a rejected candidate is not retried without new evidence."),
+    "INADEQUATE_HISTORY": ("The history does not cover the required span.", "Backfill the missing history (see the required span) and re-run; do not shorten the requirement."),
+    "INADEQUATE_SAMPLE": ("There are too few observations to conclude anything.", "Collect more observations; a small sample is not evidence."),
+    "NO_ALLOCATION": ("The allocator assigned no capital.", "Check why the allocator gave nothing (policy, risk, evidence)."),
+    "RISK_REFUSAL": ("The risk gate refused.", "Read the refusal code in Risk; nothing proceeds until the cause is fixed."),
+    "NO_FILL": ("Orders were sent but nothing filled.", "Inspect the order book and the order states in Execution before any retry."),
+    "SIMULATED_EXECUTION": ("Execution happened in simulation only.", "A simulation is not cash: the next step is the owner-run testnet session, then prospective evidence."),
+    "UNKNOWN_OR_UNRECONCILED": ("The outcome is unknown or unreconciled.", "Reconcile against the venue before reading any result."),
+}
+IDENT_KEYS = ("run_id", "mode", "candidate_id", "spec_digest", "data_digest", "code_revision")
+RUN_FAMILY, TESTNET_FAMILY = "run", "testnet"
+
+
+def _identity(o: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """None = the file carries no identity (LEGACY_NO_IDENTITY). A present but malformed identity is a refusal of the whole file."""
+    if "identity" not in o:
+        return None
+    i = o["identity"]
+    if not isinstance(i, dict):
+        raise _bad("'identity' must be an object")
+    out: Dict[str, Any] = {k: _str(i, k) for k in IDENT_KEYS}
+    if out["mode"] not in MST.MODES:
+        raise _bad(f"identity.mode must be one of {list(MST.MODES)}")
+    out["generated_ms"] = _int(i, "generated_ms")
+    return out
+
+
+def _scalar_map(o: Mapping[str, Any], k: str, *, maxn: int = 40) -> Dict[str, Any]:
+    """An optional {short key: scalar} object. Nested values are shown as compact text. Control characters refuse the file."""
+    if k not in o or o[k] is None:
+        return {}
+    x = o[k]
+    if not isinstance(x, dict) or len(x) > maxn:
+        raise _bad(f"{k!r} must be an object of at most {maxn} entries")
+    out: Dict[str, Any] = {}
+    for kk, vv in x.items():
+        if not isinstance(kk, str) or not kk or len(kk) > 64 or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", kk):
+            raise _bad(f"{k!r} has an invalid key")
+        if vv is None or isinstance(vv, bool):
+            out[kk] = vv
+        elif isinstance(vv, (int, float)):
+            if not math.isfinite(vv) or abs(vv) > 1e15:
+                raise _bad(f"{k!r}.{kk[:20]} must be finite")
+            out[kk] = vv
+        elif isinstance(vv, str):
+            if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", vv):
+                raise _bad(f"{k!r}.{kk[:20]} contains control characters")
+            out[kk] = vv[:MAX_STR]
+        else:
+            out[kk] = json.dumps(vv, sort_keys=True, default=str)[:160]
+    return out
+
+
+def _v_pipeline(o: Mapping[str, Any]) -> Dict[str, Any]:
+    st = o.get("status")
+    code = o.get("outcome", o.get("outcome_code", st.get("primary") if isinstance(st, dict) else None))      # ms_pipeline writes status.primary
+    if isinstance(code, dict):
+        code = code.get("code")
+    if code not in OUTCOME_CODES:
+        raise _bad(f"'outcome' must be one of {list(OUTCOME_CODES)}")
+    reason = o.get("reason")
+    if reason is not None and (not isinstance(reason, str) or len(reason) > MAX_STR or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", reason)):
+        raise _bad("'reason' must be a short plain string or null")
+    return {"outcome": code, "reason": reason, "required_span": _scalar_map(o, "required_span") or _scalar_map(o, "history"), "data_digest_parts": _scalar_map(o, "data_digest_parts") or _scalar_map(o, "data_parts"),
+            "evidence_basis": _scalar_map(o, "evidence_basis")}
+
+
+def _v_reconcile(o: Mapping[str, Any]) -> Dict[str, Any]:
+    fnd = []
+    for r in _dicts(o, "findings"):
+        sev = _str(r, "severity") if "severity" in r else "ERROR"          # ms_reconcile findings carry no severity: any finding is a disagreement (active)
+        fnd.append({"code": _str(r, "code"), "detail": _str(r, "detail", nonempty=False), "severity": str(sev).upper()[:24]})
+    comp = o.get("compared")
+    views = _strs(o, "views_compared") if "views_compared" in o else (sorted(str(k)[:64] for k in comp) if isinstance(comp, dict) else [])
+    return {"findings": fnd, "halt_new_exposure": _bool(o, "halt_new_exposure"), "views_compared": views}
+
+
+def _v_scope(o: Mapping[str, Any]) -> Dict[str, Any]:
+    verdict = o.get("scope_verdict", o.get("verdict"))
+    if verdict is not None and (not isinstance(verdict, str) or len(verdict) > MAX_STR or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", verdict)):
+        raise _bad("the scope verdict must be a short plain string")
+    elig = o.get("eligible_perpetual_lifecycle_universe")
+    if isinstance(elig, dict):
+        elig_map = _scalar_map(o, "eligible_perpetual_lifecycle_universe")
+    elif isinstance(elig, int) and not isinstance(elig, bool) and 0 <= elig <= 10 ** 9:
+        elig_map = {"count": elig}
+    elif elig is None:
+        elig_map = {}
+    else:
+        raise _bad("'eligible_perpetual_lifecycle_universe' must be a count or an object")
+    classes = _scalar_map(o, "lifecycle_class_counts") or _scalar_map(o, "lifecycle_classes")
+    return {"scope_verdict": verdict, "eligible": elig_map, "lifecycle_classes": classes}
+
+
+def _v_funnel(o: Mapping[str, Any]) -> Dict[str, Any]:
+    steps: List[Dict[str, Any]] = []
+    if isinstance(o.get("steps"), list):
+        for r in o["steps"][:MAX_ITEMS]:
+            if not isinstance(r, dict):
+                raise _bad("every funnel step must be an object")
+            name = r.get("name", r.get("step"))
+            cnt = r.get("count")
+            if not isinstance(name, str) or not name or len(name) > MAX_STR or isinstance(cnt, bool) or not isinstance(cnt, int) or cnt < 0:
+                raise _bad("a funnel step needs a name and a non-negative integer count")
+            steps.append({"name": name, "count": cnt})
+    else:
+        for kk, vv in _scalar_map(o, "counts").items():
+            if isinstance(vv, bool) or not isinstance(vv, int) or vv < 0:
+                raise _bad("funnel counts must be non-negative integers")
+            steps.append({"name": kk, "count": vv})
+    return {"steps": steps, "exclusion_reasons": _scalar_map(o, "exclusion_reasons")}
+
+
+def _v_testnet(o: Mapping[str, Any]) -> Dict[str, Any]:
+    if o.get("venue") != "Testnet":
+        raise _bad("'venue' must be 'Testnet'")
+    host = _str(o, "endpoint_host")
+    if str(host).lower() != VEN.rest_hosts().get("testnet"):
+        raise _bad("endpoint_host is not the registered testnet host (refused: this page never shows a non-testnet endpoint as a testnet session)")
+    basis = _enum(o, "basis", ("NOT_RUN", "EXCHANGE_REPORTED"))
+    cs = o.get("credential_state")
+    if not isinstance(cs, dict):
+        raise _bad("'credential_state' must be an object")
+    cred = {k: _bool(cs, k) for k in ("dedicated_key_present", "dedicated_secret_present", "generic_credentials_ignored")}
+    pf = o.get("preflight")
+    if not isinstance(pf, dict):
+        raise _bad("'preflight' must be an object")
+    checks = [{"name": _str(c, "name"), "ok": _bool(c, "ok"), "detail": _str(c, "detail", nonempty=False)} for c in _dicts(pf, "checks")]
+    preflight = {"status": _enum(pf, "status", ("NOT_RUN", "PASS", "FAIL")), "checked_ms": _int(pf, "checked_ms", null=True), "checks": checks}
+    plan = o.get("plan")
+    if plan is not None:
+        if not isinstance(plan, dict):
+            raise _bad("'plan' must be an object or null")
+        legs = [{"symbol": _str(l, "symbol"), "side": _str(l, "side"), "order_type": _str(l, "order_type"), "qty": _num(l, "qty"), "price": _num(l, "price"), "notional_usd": _num(l, "notional_usd")}
+                for l in _dicts(plan, "legs")]
+        plan = {"digest": _str(plan, "digest"), "manifest_digest": _str(plan, "manifest_digest", null=True), "legs": legs, "notional_usd": _num(plan, "notional_usd")}
+    cf = o.get("confirmation")
+    if not isinstance(cf, dict):
+        raise _bad("'confirmation' must be an object")
+    conf = {"state": _enum(cf, "state", ("NOT_REQUESTED", "CONFIRMED")), "plan_digest_confirmed": _str(cf, "plan_digest_confirmed", null=True)}
+    orders = [{"link_id": _str(r, "link_id"), "order_id": _str(r, "order_id", null=True), "symbol": _str(r, "symbol"), "side": _str(r, "side"), "qty": _num(r, "qty"),
+               "status": _str(r, "status"), "filled_qty": _num(r, "filled_qty"), "avg_price": _num(r, "avg_price")} for r in _dicts(o, "orders")]
+    execs = [{"exec_id": _str(r, "exec_id"), "link_id": _str(r, "link_id", null=True), "symbol": _str(r, "symbol"), "side": _str(r, "side"), "qty": _num(r, "qty"), "price": _num(r, "price"),
+              "fee_usd": _num(r, "fee_usd"), "ts_ms": _int(r, "ts_ms", null=True)} for r in _dicts(o, "executions")]
+    fp = o.get("final_position")
+    if fp is not None:
+        if not isinstance(fp, dict) or len(fp) > 200:
+            raise _bad("'final_position' must be an object or null")
+        fp = {_str({"k": k}, "k"): _num({"q": q}, "q", null=False) for k, q in fp.items()}
+    fv = o.get("flat_verified")
+    if fv is not None and not isinstance(fv, bool):
+        raise _bad("'flat_verified' must be true, false or null")
+    net = o.get("net")
+    if not isinstance(net, dict):
+        raise _bad("'net' must be an object")
+    netv = {"fees_usd": _num(net, "fees_usd"), "funding_usd": _num(net, "funding_usd"), "price_pnl_usd": _num(net, "price_pnl_usd"), "note": _str(net, "note", null=True) if "note" in net else None}
+    if basis == "NOT_RUN" and (orders or execs or fp or conf["state"] == "CONFIRMED" or preflight["status"] != "NOT_RUN"):
+        raise _bad("basis NOT_RUN contradicts orders, executions, a position, a confirmation or a preflight result in the same file")
+    if conf["state"] == "CONFIRMED" and plan is None:
+        raise _bad("a confirmation without a plan")
+    return {"venue": "Testnet", "endpoint_host": host, "basis": basis, "credential_state": cred, "preflight": preflight, "plan": plan, "confirmation": conf, "orders": orders,
+            "executions": execs, "final_position": fp, "flat_verified": fv, "net": netv}
+
+
 _ALL_OWNER = ("SIMULATED", "MEASURED", "EXCHANGE_REPORTED", "OWNER_SUPPLIED_UNVERIFIED")
-ARTIFACTS: Dict[str, Tuple[str, Tuple[str, ...], Callable[[Mapping[str, Any]], Dict[str, Any]]]] = {
-    "replay_report.json": ("replay_report/v1", ("SIMULATED",), _v_replay),
-    "portfolio_state.json": ("portfolio_state/v1", _ALL_OWNER, _v_portfolio),
-    "risk_state.json": ("risk_state/v1", ("CALCULATED", "MEASURED", "SIMULATED"), _v_risk),
-    "ledger_pnl.json": ("ledger_pnl/v1", _ALL_OWNER, _v_ledger),
-    "competition.json": ("competition/v1", ("ESTIMATED", "SIMULATED", "CALCULATED"), _v_competition),
-    "opportunities.json": ("opportunities/v1", ("ESTIMATED", "CALCULATED"), _v_opps),
+#: file -> (schema, allowed bases or None when the file has no basis field, validator, family)
+ARTIFACTS: Dict[str, Tuple[str, Optional[Tuple[str, ...]], Callable[[Mapping[str, Any]], Dict[str, Any]], str]] = {
+    "replay_report.json": ("replay_report/v1", ("SIMULATED",), _v_replay, RUN_FAMILY),
+    "portfolio_state.json": ("portfolio_state/v1", _ALL_OWNER, _v_portfolio, RUN_FAMILY),
+    "risk_state.json": ("risk_state/v1", ("CALCULATED", "MEASURED", "SIMULATED"), _v_risk, RUN_FAMILY),
+    "ledger_pnl.json": ("ledger_pnl/v1", _ALL_OWNER, _v_ledger, RUN_FAMILY),
+    "competition.json": ("competition/v1", ("ESTIMATED", "SIMULATED", "CALCULATED"), _v_competition, RUN_FAMILY),
+    "opportunities.json": ("opportunities/v1", ("ESTIMATED", "CALCULATED"), _v_opps, RUN_FAMILY),
+    "pipeline_summary.json": ("pipeline_summary/v1", None, _v_pipeline, RUN_FAMILY),
+    "reconcile_report.json": ("reconcile_report/v1", None, _v_reconcile, RUN_FAMILY),
+    "universe_scope.json": ("universe_scope/v1", None, _v_scope, RUN_FAMILY),
+    "funnel.json": ("funnel/v1", None, _v_funnel, RUN_FAMILY),
+    "testnet_session.json": ("testnet_session/v1", ("NOT_RUN", "EXCHANGE_REPORTED"), _v_testnet, TESTNET_FAMILY),
 }
 
 
@@ -313,11 +506,12 @@ def _read_regular(path: str) -> bytes:
 
 
 def load_artifact(artifacts_dir: Optional[str], name: str, now_ms: int) -> Dict[str, Any]:
-    """One artifact -> {file, state EMPTY|OK|ERROR, error, basis, generated_ms, age_ms, stale, data}. Never raises; never guesses a value."""
-    res: Dict[str, Any] = {"file": name, "state": "EMPTY", "error": None, "basis": None, "generated_ms": None, "age_ms": None, "stale": False, "data": None}
+    """One artifact -> {file, state EMPTY|OK|ERROR, error, basis, generated_ms, age_ms, stale, identity, identity_status, family, data}. Never raises; never guesses a value."""
     if name not in ARTIFACTS:
         raise KeyError(name)
-    schema, bases, validator = ARTIFACTS[name]
+    schema, bases, validator, family = ARTIFACTS[name]
+    res: Dict[str, Any] = {"file": name, "state": "EMPTY", "error": None, "basis": None, "generated_ms": None, "age_ms": None, "stale": False, "identity": None, "identity_status": None,
+                           "family": family, "data": None}
     if not artifacts_dir or not os.path.isdir(artifacts_dir):
         return res
     path = os.path.join(artifacts_dir, name)
@@ -339,13 +533,21 @@ def load_artifact(artifacts_dir: Optional[str], name: str, now_ms: int) -> Dict[
         if obj.get("schema") != schema:
             raise _bad(f"schema must be {schema!r}")
         basis = obj.get("basis")
-        if basis not in bases:
+        if bases is not None and basis not in bases:
             raise _bad(f"basis must be one of {list(bases)} (got {str(basis)[:40]!r})")
-        gen = _int(obj, "generated_ms")
-        if gen is not None and gen > now_ms + FUTURE_SKEW_MS:
-            raise _bad("generated_ms is in the future")
+        ident = _identity(obj)
+        if "generated_ms" in obj:
+            gen = _int(obj, "generated_ms")
+        elif ident is not None:
+            gen = ident["generated_ms"]
+        else:
+            raise _bad("missing key 'generated_ms'")
+        for g in (gen, ident["generated_ms"] if ident else None):
+            if g is not None and g > now_ms + FUTURE_SKEW_MS:
+                raise _bad("generated_ms is in the future")
         data = validator(obj)
-        res.update(state="OK", basis=basis, generated_ms=gen, age_ms=now_ms - gen, stale=(now_ms - gen) > ARTIFACT_STALE_MS, data=data)
+        res.update(state="OK", basis=basis if isinstance(basis, str) else None, generated_ms=gen, age_ms=now_ms - gen, stale=(now_ms - gen) > ARTIFACT_STALE_MS, data=data, identity=ident,
+                   identity_status="IDENTIFIED" if ident else "LEGACY_NO_IDENTITY")
     except OSError as exc:
         res.update(state="ERROR", error=("a symbolic link is refused" if exc.errno == errno.ELOOP else f"unreadable ({type(exc).__name__})"))
     except (ArtifactError, ValueError, RecursionError, UnicodeDecodeError) as exc:
@@ -442,7 +644,7 @@ def _research(cand_rows: Sequence[Mapping[str, Any]], comp: Dict[str, Any], opps
                            "economics_loaded": econ_loaded,
                            "note": "Sufficient evidence is not authorisation: authorisation is the owner's act (config.is_live_authorized AND the signed promotion gate)."
                                    + ("" if econ_loaded else " In-sample corpus economics are not loaded (slow); start with --with-economics to include rejection reasons from them.")}
-    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"),
+    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps", "per closed group, as the producer states it; the multi-symbol pipeline uses the ledger's net (after fees, taker slippage and adverse selection)"),
                                                                        }
                                                                       for c in d["candidates"]]},
                                       empty="No competition result yet. Run the candidate competition CLI to write competition.json into the artifacts directory.")
@@ -457,7 +659,12 @@ def _opp_view(d: Mapping[str, Any]) -> Dict[str, Any]:
         items.append({**{k: it[k] for k in ("candidate_id", "kind", "symbols", "spot_hedge", "is_carry", "label", "exclusions")}, "hold_days": val(it["hold_days"], "ESTIMATED", "days"),
                       "gross": val(it["gross_bps_horizon"], b, "bps", "before costs"), "net": val(it["net_bps_horizon"], b, "bps", "after the costs the scanner knows; not computed from gross here"),
                       "capacity": val(it["capacity_usd"], b, "USD"), "eligible": (not it["exclusions"]) and it["net_bps_horizon"] is not None})
-    elig = [i for i in items if i["eligible"]]
+    elig = sorted([i for i in items if i["eligible"]], key=lambda i: -i["net"]["v"])
+    for rank, i in enumerate(elig, 1):
+        i["rank"] = rank                                           # 1 = best known net; an item with an unknown net has no rank (it is never ranked by its gross)
+    for i in items:
+        i.setdefault("rank", None)
+    items = elig + [i for i in items if not i["eligible"]]
     pos = [i for i in elig if i["net"]["v"] > 0]
     return {"items": items, "n_items": len(items), "n_eligible": len(elig), "n_positive_net": len(pos),
             "best_net": val(max((i["net"]["v"] for i in elig), default=None), "ESTIMATED", "bps", "best eligible item; an upper bound, not a forecast"),
@@ -473,47 +680,53 @@ def _artifact_view(a: Dict[str, Any], view: Callable[[Dict[str, Any]], Dict[str,
     return {**base, "state": "OK", **view(a["data"])}
 
 
-def _pnl_view(a: Dict[str, Any]) -> Dict[str, Any]:
+def _pnl_view(a: Dict[str, Any], F: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ledger's view. Every money value is the SAME object ``figures`` holds (one source per concept); this function only places them."""
     base = {"file": a["file"], "age_ms": a["age_ms"], "stale": a["stale"], "generated_ms": a["generated_ms"], "basis": a["basis"]}
     if a["state"] == "EMPTY":
         return {**base, "state": "NO_DATA", "empty": "No P&L ledger yet. Run the accounting CLI to write ledger_pnl.json, or import an owner export with tools/owner_ledger.py."}
     if a["state"] == "ERROR":
         return {**base, "state": "ERROR", "error": f"{a['file']}: {a['error']}"}
-    d, b = a["data"], a["basis"]
+    b = a["basis"]
     simulated = b == "SIMULATED"
     # A simulated ledger fills the 'simulated_*' group and leaves 'realised_*' EMPTY: simulated is never realised. Gross and net are separate fields; net is never derived here.
     grp = "simulated" if simulated else "realised"
     other = "realised" if simulated else "simulated"
-    out = {**base, "state": "OK", "kind": "SIMULATED_NOT_REALISED" if simulated else ("OWNER_IMPORT_UNVERIFIED" if b == "OWNER_SUPPLIED_UNVERIFIED" else "ACCOUNT_REALISED"),
-           f"{grp}_gross": val(d["realised_gross_usd"], b, "USD", "before fees; GROSS"), f"{grp}_fees": val(d["fees_usd"], b, "USD"), f"{grp}_funding": val(d["funding_usd"], b, "USD"),
-           f"{grp}_net": val(d["realised_net_usd"], b, "USD", "after fees; NET (as stated by the ledger)"),
-           f"{other}_gross": val(None, "MISSING"), f"{other}_net": val(None, "MISSING"), "unrealised": val(d["unrealised_usd"], b, "USD", "mark-to-market; not cash"),
-           "total_net": val(d["net_usd"], b, "USD", "TOTAL net = realised + unrealised, after fees; as stated by the producer"),
-           "period": [d["period_start_ms"], d["period_end_ms"]]}
-    return out
+    return {**base, "state": "OK", "kind": "SIMULATED_NOT_REALISED" if simulated else ("OWNER_IMPORT_UNVERIFIED" if b == "OWNER_SUPPLIED_UNVERIFIED" else "ACCOUNT_REPORTED_UNRECONCILED"),
+            f"{grp}_gross": F["closed_gross"], f"{grp}_fees": F["fees"], f"{grp}_funding": F["funding"], f"{grp}_net": F["closed_net"],
+            f"{other}_gross": val(None, "MISSING"), f"{other}_net": val(None, "MISSING"), "unrealised": F["unrealised"], "total_net": F["net"],
+            "period": [a["data"]["period_start_ms"], a["data"]["period_end_ms"]]}
 
 
-def _portfolio(a: Dict[str, Any], ledger: Dict[str, Any]) -> Dict[str, Any]:
+def _portfolio(a: Dict[str, Any], ledger: Dict[str, Any], F: Mapping[str, Any]) -> Dict[str, Any]:
     def view(d: Mapping[str, Any]) -> Dict[str, Any]:
-        b = a["basis"]
-        pos = [{**{k: p[k] for k in ("symbol", "kind", "spot_hedge", "is_carry", "label", "side", "group_id")}, "notional": val(p["notional_usd"], b, "USD"),
-                "entry_price": val(p["entry_price"], b, "USD"), "mark_price": val(p["mark_price"], b, "USD"), "unrealised": val(p["unrealised_pnl_usd"], b, "USD")} for p in d["positions"]]
-        return {"equity": val(d["equity_usd"], b, "USD"), "gross_exposure": val(d["gross_exposure_usd"], b, "USD"), "net_exposure": val(d["net_exposure_usd"], b, "USD"),
-                "unrealised": val(d["unrealised_pnl_usd"], b, "USD", "mark-to-market; not cash"), "positions": pos, "n_positions": len(pos),
-                "simulated": b == "SIMULATED"}
+        bs = a["basis"]
+        pos = [{**{k: p[k] for k in ("symbol", "kind", "spot_hedge", "is_carry", "label", "side", "group_id")}, "notional": val(p["notional_usd"], bs, "USD"),
+                "entry_price": val(p["entry_price"], bs, "USD"), "mark_price": val(p["mark_price"], bs, "USD"), "unrealised": val(p["unrealised_pnl_usd"], bs, "USD")} for p in d["positions"]]
+        gross = d["gross_exposure_usd"]
+        big = max(d["positions"], key=lambda p: abs(p["notional_usd"]), default=None)
+        lev = (gross / d["equity_usd"]) if (d["equity_usd"] and d["equity_usd"] > 0) else None
+        conc = (abs(big["notional_usd"]) / gross) if (big is not None and gross and gross > 0) else None
+        no_field = "portfolio_state/v1 has no such field"
+        return {"equity": val(d["equity_usd"], bs, "USD"), "gross_exposure": val(d["gross_exposure_usd"], bs, "USD"), "net_exposure": val(d["net_exposure_usd"], bs, "USD"),
+                "unrealised": F["unrealised"], "positions": pos, "n_positions": len(pos), "simulated": bs == "SIMULATED",
+                "available_balance": val(None, "MISSING", note=no_field), "reserved_capital": val(None, "MISSING", note=no_field), "margin": val(None, "MISSING", note=no_field),
+                "drawdown": val(None, "MISSING", note=no_field + "; a drawdown limit, if any, is in Risk"),
+                "leverage": val(lev, "CALCULATED", "x", "gross exposure / equity, both from this file; not a margin figure"),
+                "concentration": val(None if conc is None else round(conc * 100, 2), "CALCULATED", "% of gross", None if big is None else "largest position: " + big["symbol"])}
     out = _artifact_view(a, view, empty="No portfolio state yet. Run the portfolio CLI to write portfolio_state.json into the artifacts directory. Nothing is held that this page can see.")
-    out["pnl"] = _pnl_view(ledger)
+    out["pnl"] = _pnl_view(ledger, F)
     return out
 
 
-def _execution(replay: Dict[str, Any], oc: Mapping[str, Any]) -> Dict[str, Any]:
+def _execution(replay: Dict[str, Any], oc: Mapping[str, Any], F: Mapping[str, Any]) -> Dict[str, Any]:
     def view(d: Mapping[str, Any]) -> Dict[str, Any]:
         sym = [{**{k: s[k] for k in ("symbol", "kind", "spot_hedge", "is_carry", "label", "n_groups")}, "gross": val(s["gross_pnl_usd"], "SIMULATED", "USD", "before fees; GROSS"),
                 "fees": val(s["fees_usd"], "SIMULATED", "USD"), "net": val(s["net_pnl_usd"], "SIMULATED", "USD", "after fees; NET")} for s in d["symbols"]]
         unhedged = d["groups_by_state"].get("UNHEDGED", 0) + d["groups_by_state"].get("UNKNOWN_OUTCOME", 0)
         return {"universe_scope": d["universe_scope"], "n_groups": d["n_groups"], "groups_by_state": d["groups_by_state"], "unhedged_or_unknown": unhedged,
-                "gross": val(d["gross_pnl_usd"], "SIMULATED", "USD", "before fees; GROSS; simulated"), "fees": val(d["fees_usd"], "SIMULATED", "USD"),
-                "net": val(d["net_pnl_usd"], "SIMULATED", "USD", "after fees; NET; simulated, not realised"), "period": [d["period_start_ms"], d["period_end_ms"]], "symbols": sym}
+                "gross": F["gross"], "fees": F["fees"], "net": F["net"], "period": [d["period_start_ms"], d["period_end_ms"]], "symbols": sym,
+                "order_level": val(None, "MISSING", note="replay_report/v1 carries order-group states only: no orders, acks, fills, cancels or rejections per order")}
     out = _artifact_view(replay, view, empty="No replay yet. Run the replay CLI to write replay_report.json into the artifacts directory.")
     out["mode"] = "REPLAY / PAPER ONLY"
     out["testnet_offline_qualification"] = val(oc["testnet"].get("offline_qualification"), "CALCULATED", note="guard probes only; it reads nothing from a venue")
@@ -560,8 +773,19 @@ def _freshness(data_root: Optional[str], universe_dir: Optional[str], now_ms: in
             "code_correctness": ax["code_correctness"]["verdict"], "issues": issues, "readiness_issues": [str(i.get("detail") or i.get("code"))[:200] for i in ax["research_readiness"]["issues"]][:10],
             "latest_cycle": None if not cyc else {"cycle": str(cyc["cycle"]), "age_ms": val(cyc["age_ms"], tsb, "ms")}, "datasets": hist, "verified_this_run": bool(verify),
             "backups": {k: (None if rep["backups"].get(k) is None else True) for k in ("backup", "restore_check", "seal")},
+            "collector": _collector(rep.get("collector_health")),
             "status_partitions": {"present": list(rep["status_partitions"].get("present") or []), "missing": list(rep["status_partitions"].get("missing") or [])},
             "note": "Three separate axes; they are never merged into one light. Code correctness is not assessed here."}
+
+
+def _collector(h: Any) -> Dict[str, Any]:
+    """health.json is unauthenticated: whatever it says is UNVERIFIED here (the audit's own verdict is what turns green)."""
+    if not isinstance(h, dict):
+        return {"state": "NO_DATA", "empty": "No health.json was found (the collector has not reported, or is not running)."}
+    cf = h.get("consecutive_failures")
+    return {"state": "OK", "status": val(str(h.get("status"))[:40], "UNVERIFIED", note="from health.json, an unauthenticated file"),
+            "consecutive_failures": val(cf if isinstance(cf, int) and not isinstance(cf, bool) else None, "UNVERIFIED"),
+            "interval_ms": val(h.get("interval_ms") if isinstance(h.get("interval_ms"), int) and not isinstance(h.get("interval_ms"), bool) else None, "UNVERIFIED", "ms")}
 
 
 def _capture(universe_dir: Optional[str]) -> Dict[str, Any]:
@@ -581,22 +805,424 @@ def _capture(universe_dir: Optional[str]) -> Dict[str, Any]:
     else:
         integrity = val(None, "MISSING", note="verification failed: " + "; ".join(str(p) for p in (rep.get("problems") or [])[:3])[:300])
     return {"state": "OK" if ok else "ERROR", "ok": ok, "integrity": integrity, "dataset_status": str(cov.get("dataset_status")),
+            "manifest_sha256": val(rep.get("manifest_sha256") if ok else None, "CALCULATED", note="hash of the manifest bytes read now; identifies them, does not authenticate them"),
             "survivorship": surv if ok else CR.SURVIVORS_ONLY, "survivorship_note": surv_note[:300], "problems": [str(p)[:200] for p in (rep.get("problems") or [])[:8]],
             "error": None if ok else "capture verification failed; no value from it is trusted"}
 
 
 def _stamp(a: Mapping[str, Any]) -> Dict[str, Any]:
-    return {"file": a["file"], "state": "NO_DATA" if a["state"] == "EMPTY" else a["state"], "error": a["error"], "basis": a["basis"], "age_ms": a["age_ms"], "stale": a["stale"]}
+    ident = a.get("identity") or {}
+    return {"file": a["file"], "state": "NO_DATA" if a["state"] == "EMPTY" else a["state"], "error": a["error"], "basis": a["basis"], "age_ms": a["age_ms"], "stale": a["stale"],
+            "identity_status": a.get("identity_status"), "run_id": ident.get("run_id"), "mode": ident.get("mode"), "family": a.get("family")}
+
+
+# ======================================================================== coherence, figures, accounting
+TOL = 0.0101
+FAMILY_FIELDS = ("run_id", "candidate_id", "data_digest", "mode")
+
+
+def _coherence(art: Mapping[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Do the loaded artifacts belong to ONE run? The simulated family must agree on run_id, candidate_id, data_digest and mode; testnet_session.json must say TESTNET and is never combined
+    with the family. 'UNKNOWN' (the producer did not know) is unverified, not a match and not a mismatch."""
+    runs: List[Dict[str, Any]] = []
+    for name, a in art.items():
+        if a["state"] != "OK":
+            continue
+        ident = a["identity"]
+        runs.append({"file": name, "family": a["family"], "status": a["identity_status"], **({k: ident[k] for k in (*IDENT_KEYS, "generated_ms")} if ident else {})})
+    fam = [r for r in runs if r["family"] == RUN_FAMILY]
+    idf = [r for r in fam if r["status"] == "IDENTIFIED"]
+    mism: List[Dict[str, Any]] = []
+    for f in FAMILY_FIELDS:
+        vals = {r[f] for r in idf if r[f] != "UNKNOWN"}
+        if len(vals) > 1:
+            mism.append({"field": f, "values": {r["file"]: r[f] for r in idf}})
+    for r in idf:
+        if r["mode"] == "TESTNET" and art[r["file"]]["basis"] == "SIMULATED":                    # a SIMULATED figure may never belong to a TESTNET run
+            mism.append({"field": "mode", "values": {r["file"]: "TESTNET"}, "why": "a simulated-family artifact may not claim mode TESTNET"})
+    for r in runs:
+        if r["family"] == TESTNET_FAMILY and r["status"] == "IDENTIFIED" and r["mode"] != "TESTNET":
+            mism.append({"field": "mode", "values": {r["file"]: r["mode"]}, "why": "testnet_session.json must carry identity.mode TESTNET"})
+    legacy = [r["file"] for r in runs if r["status"] == "LEGACY_NO_IDENTITY"]
+    unknown = sorted({f"{r['file']}:{k}" for r in runs if r["status"] == "IDENTIFIED" for k in ("run_id", "candidate_id", "data_digest", "code_revision", "spec_digest") if r[k] == "UNKNOWN"})
+    if not runs:
+        verdict, banner = "NO_ARTIFACTS", "No artifact is loaded, so there is no run to identify."
+    elif mism:
+        verdict = "INCONSISTENT_RUN"
+        banner = ("INCONSISTENT_RUN: the artifacts do not belong to one run (" + "; ".join(sorted({m["field"] for m in mism})) + " differ). No figure that needs two files is combined or shown until they match.")
+    elif legacy or unknown:
+        verdict = "UNVERIFIED"
+        banner = ("UNVERIFIED: " + (f"{len(legacy)} file(s) carry no run identity ({', '.join(legacy[:4])}); " if legacy else "") +
+                  (f"unknown identity fields ({', '.join(unknown[:4])}); " if unknown else "") + "nothing proves these files belong together.")
+    else:
+        verdict, banner = "CONSISTENT", "Every loaded artifact carries a run identity and they agree."
+    primary = None
+    if verdict in ("CONSISTENT", "UNVERIFIED") and idf:
+        primary = {k: idf[0][k] for k in (*IDENT_KEYS, "generated_ms")}
+    revs = sorted({r["code_revision"] for r in runs if r["status"] == "IDENTIFIED"})
+    return {"verdict": verdict, "banner": banner, "runs": runs, "mismatches": mism, "legacy_files": legacy, "unknown_fields": unknown, "primary": primary,
+            "code_revisions": revs, "n_compared": len(idf), "combined_numbers_withheld": verdict == "INCONSISTENT_RUN",
+            "note": "Identity is self-declared by unauthenticated local files: agreement shows files were written together, not that they are true."}
+
+
+def _fig(concept: str, v: Optional[float], basis: str, src: Optional[str], note: Optional[str] = None) -> Dict[str, Any]:
+    d = val(v, basis, "USD", note)
+    d["concept"] = concept
+    d["src"] = src if d["v"] is not None else None
+    return d
+
+
+def _figures(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """THE money figures of the page: one value and one source field per concept. Every view (and every sentence) reads these; none recomputes."""
+    withheld = bool(coh["combined_numbers_withheld"])
+    rp, lg, pf = art["replay_report.json"], art["ledger_pnl.json"], art["portfolio_state.json"]
+    R = rp["data"] if rp["state"] == "OK" else {}
+    L = lg["data"] if lg["state"] == "OK" else {}
+    P = pf["data"] if pf["state"] == "OK" else {}
+
+    def pick(concept: str, cands: Sequence[Tuple[Any, Optional[str], str]], note: str) -> Dict[str, Any]:
+        if withheld:
+            return _fig(concept, None, "MISSING", None, "withheld: INCONSISTENT_RUN (the artifacts are not from one run)")
+        for v, b, src in cands:
+            if v is not None and b:
+                return _fig(concept, v, b, src, note)
+        return _fig(concept, None, "MISSING", None, note + "; no artifact states it")
+    lb, pb = lg["basis"], pf["basis"]
+    nobackend = "no backend artifact carries this yet"
+    F = {
+        "net": pick("net", [(R.get("net_pnl_usd"), "SIMULATED", "replay_report.json:net_pnl_usd"), (L.get("net_usd"), lb, "ledger_pnl.json:net_usd")], "NET: after fees; the one net of this page (total = realised + unrealised)"),
+        "gross": pick("gross", [(R.get("gross_pnl_usd"), "SIMULATED", "replay_report.json:gross_pnl_usd")], "GROSS: before fees"),
+        "fees": pick("fees", [(R.get("fees_usd"), "SIMULATED", "replay_report.json:fees_usd"), (L.get("fees_usd"), lb, "ledger_pnl.json:fees_usd")], "fees paid or modelled"),
+        "funding": pick("funding", [(L.get("funding_usd"), lb, "ledger_pnl.json:funding_usd")], "funding received less paid, as the ledger states it"),
+        "closed_gross": pick("closed_gross", [(L.get("realised_gross_usd"), lb, "ledger_pnl.json:realised_gross_usd")], "realised price result before fees; GROSS"),
+        "closed_net": pick("closed_net", [(L.get("realised_net_usd"), lb, "ledger_pnl.json:realised_net_usd")], "realised after fees and funding; NET of the realised part"),
+        "unrealised": pick("unrealised", [(L.get("unrealised_usd"), lb, "ledger_pnl.json:unrealised_usd")] + ([] if lg["state"] == "OK" else [(P.get("unrealised_pnl_usd"), pb, "portfolio_state.json:unrealised_pnl_usd")]), "mark-to-market; not cash"),
+        "slippage": pick("slippage", [(L.get("taker_slippage_usd"), lb, "ledger_pnl.json:taker_slippage_usd")], "modelled taker walk of the book (inside the fill prices, charged once)"),
+        "hedge_cost": pick("hedge_cost", [], nobackend),
+        "adverse_selection": pick("adverse_selection", [(L.get("adverse_selection_usd"), lb, "ledger_pnl.json:adverse_selection_usd")], "modelled post-fill markout"),
+    }
+    checks: List[Dict[str, Any]] = []
+
+    def chk(cid: str, label: str, lhs: Optional[float], rhs: Optional[float], detail: str) -> None:
+        if withheld:
+            checks.append({"id": cid, "label": label, "state": "NOT_CHECKABLE", "detail": "withheld: INCONSISTENT_RUN"})
+        elif lhs is None or rhs is None:
+            checks.append({"id": cid, "label": label, "state": "NOT_CHECKABLE", "detail": "an input is missing (unknown, not zero)"})
+        else:
+            ok = abs(lhs - rhs) <= TOL
+            checks.append({"id": cid, "label": label, "state": "PASS" if ok else "FAIL", "detail": f"{detail}: {lhs:,.2f} vs {rhs:,.2f}"})
+    g, f, n = R.get("gross_pnl_usd"), R.get("fees_usd"), R.get("net_pnl_usd")
+    chk("gross_minus_fees", "gross - fees = net (replay)", None if g is None or f is None else g - f, n, "replay gross - fees vs net")
+    syms = R.get("symbols") or []
+    sn = [s["net_pnl_usd"] for s in syms]
+    chk("symbols_sum", "sum of symbol nets = net (replay)", None if (not syms or any(x is None for x in sn)) else sum(sn), n, "symbols vs total")
+    rg, rf, fu, rn, un = (L.get(k) for k in ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd"))
+    chk("ledger_components", "realised gross + funding - fees = realised net (ledger)", None if None in (rg, rf, fu) else rg + fu - rf, rn, "components vs realised net")
+    tot = F["net"]["v"]
+    chk("realised_plus_unrealised", "realised net + unrealised = net", None if (rn is None or un is None) else rn + un, tot, "realised + unrealised vs the one net")
+    if L.get("net_usd") is not None and n is not None:
+        chk("ledger_net_matches_replay", "ledger net = replay net", L["net_usd"], n, "ledger vs replay")
+    if L.get("fees_usd") is not None and f is not None:
+        chk("fees_match", "ledger fees = replay fees", L["fees_usd"], f, "ledger vs replay")
+    if L.get("unrealised_usd") is not None and P.get("unrealised_pnl_usd") is not None:
+        chk("unrealised_matches_portfolio", "ledger unrealised = portfolio unrealised", L["unrealised_usd"], P["unrealised_pnl_usd"], "ledger vs portfolio")
+    pu = [p["unrealised_pnl_usd"] for p in (P.get("positions") or [])]
+    if P and P.get("unrealised_pnl_usd") is not None and pu:
+        chk("positions_sum", "sum of position unrealised = portfolio unrealised", None if any(x is None for x in pu) else sum(pu), P["unrealised_pnl_usd"], "positions vs total")
+    used = {a["basis"] for a, k in ((rp, R), (lg, L), (pf, P)) if k}
+    if len(used) > 1 and not withheld:
+        checks.append({"id": "bases_agree", "label": "all contributing files declare one basis", "state": "FAIL", "detail": "mixed bases: " + ", ".join(sorted(str(u) for u in used))})
+    return F, checks
+
+
+def _venue_recon(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any], integrity: str) -> Dict[str, Any]:
+    """VENUE_RECONCILED needs: a ledger that is itself EXCHANGE_REPORTED, a reconcile report that compared a venue view with no active finding and no halt, one consistent run, and
+    passing accounting identities. Anything less is INTERNAL_CONSISTENCY_ONLY. A simulated ledger can never be venue reconciled."""
+    lg, rc = art["ledger_pnl.json"], art["reconcile_report.json"]
+    why: List[str] = []
+    if lg["state"] != "OK":
+        why.append("no ledger_pnl.json")
+    elif lg["basis"] != "EXCHANGE_REPORTED":
+        why.append(f"the ledger basis is {lg['basis']}, not EXCHANGE_REPORTED")
+    if rc["state"] != "OK":
+        why.append("no reconcile_report.json")
+    else:
+        d = rc["data"]
+        if not any(("venue" in v.lower() or "exchange" in v.lower()) for v in d["views_compared"]):
+            why.append("the reconcile report compared no venue view (views: " + (", ".join(d["views_compared"]) or "none") + ")")
+        if d["halt_new_exposure"]:
+            why.append("the reconcile report halts new exposure")
+        if [x for x in d["findings"] if x["severity"] != "INFO"]:
+            why.append("the reconcile report has active findings")
+    for name, a in (("ledger_pnl.json", lg), ("reconcile_report.json", rc)):                 # self-attestation is not enough: both files must NAME a TESTNET run (a REPLAY / PAPER / SimVenue view never counts)
+        if a["state"] == "OK":
+            ident = a.get("identity")
+            if not ident or ident.get("mode") != "TESTNET":
+                why.append(f"{name} does not carry a TESTNET run identity (mode {ident.get('mode') if ident else 'absent'})")
+    if coh["verdict"] != "CONSISTENT":
+        why.append(f"run identity is {coh['verdict']}")
+    if integrity != "PASS":
+        why.append(f"accounting identities: {integrity}")
+    ok = not why
+    return {"status": "VENUE_RECONCILED" if ok else "INTERNAL_CONSISTENCY_ONLY", "why_not": why,
+            "meaning": ("INTERNAL_CONSISTENCY_ONLY: the files agree with each other; nothing here was compared with the venue." if not ok else
+                        "VENUE_RECONCILED: the reconcile report compared the ledger with a venue view. This is not mainnet cash: the run mode names its environment.")}
+
+
+def _accounting(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any], F: Mapping[str, Dict[str, Any]], checks: List[Dict[str, Any]], pnl: Mapping[str, Any], testnet: Mapping[str, Any]) -> Dict[str, Any]:
+    withheld = bool(coh["combined_numbers_withheld"])
+    fails = [c for c in checks if c["state"] == "FAIL"]
+    integrity = "WITHHELD" if withheld else "FAIL" if fails else ("PASS" if any(c["state"] == "PASS" for c in checks) else "NOT_CHECKABLE")
+    recon = _venue_recon(art, coh, integrity)
+    have = art["replay_report.json"]["state"] == "OK" or art["ledger_pnl.json"]["state"] == "OK"
+    order = [("gross", "Gross (before fees)"), ("fees", "Fees"), ("funding", "Funding"), ("slippage", "Slippage"), ("hedge_cost", "Hedge cost"), ("adverse_selection", "Adverse selection"),
+             ("closed_gross", "Realised gross"), ("closed_net", "Realised net"), ("unrealised", "Unrealised (mark-to-market)"), ("net", "Net (after fees; the one net)")]
+    required = ("gross", "fees", "funding", "closed_net", "unrealised", "net")
+    missing = [k for k in required if F[k]["v"] is None]
+    nets = F["net"]
+    simulated_basis = nets["basis"] == "SIMULATED" or art["ledger_pnl.json"]["basis"] == "SIMULATED"
+    complete = (not withheld) and not missing and integrity == "PASS" and recon["status"] == "VENUE_RECONCILED" and not simulated_basis
+    why_incomplete = ([] if complete else
+                      (["INCONSISTENT_RUN: numbers withheld"] if withheld else []) + ([f"missing: {', '.join(missing)}"] if missing and not withheld else []) +
+                      ([f"accounting identities {integrity}"] if integrity != "PASS" and not withheld else []) + (["the figures are simulated"] if simulated_basis else []) +
+                      ([recon["meaning"]] if recon["status"] != "VENUE_RECONCILED" else []))
+    def label(k: str, lbl: str) -> str:                           # a simulated figure is never labelled "realised"
+        return {"closed_gross": "Simulated closed-leg gross", "closed_net": "Simulated closed-leg net"}[k] if (k in ("closed_gross", "closed_net") and F[k]["basis"] == "SIMULATED") else lbl
+    out: Dict[str, Any] = {"state": "OK" if have else "NO_DATA", "withheld": withheld, "components": [{"key": k, "label": label(k, lbl), "value": F[k]} for k, lbl in order], "checks": checks,
+                           "integrity": integrity, "venue_reconciliation": recon, "complete": complete, "why_incomplete": why_incomplete, "pnl_kind": pnl.get("kind"),
+                           "simulated": {"label": "SIMULATED (replay / paper): never realised cash", "net": F["net"] if simulated_basis else val(None, "MISSING", "USD", "no simulated figure loaded"),
+                                         "unrealised": F["unrealised"] if simulated_basis else val(None, "MISSING", "USD")},
+                           "testnet": {"label": "TESTNET (venue sandbox, fake money): not owner profit", "state": testnet.get("state"), "fees": testnet.get("fees", val(None, "MISSING", "USD")),
+                                       "funding": testnet.get("funding", val(None, "MISSING", "USD")), "price_pnl": testnet.get("price_pnl", val(None, "MISSING", "USD")),
+                                       "note": "Components only. Nothing from the testnet session is ever added to a simulated number."},
+                           "mainnet_cash": {"label": "REALISED MAINNET CASH", "status": "NOT_AVAILABLE", "realised": val(None, "MISSING", "USD"),
+                                            "note": "No artifact in this repository can carry mainnet cash: the run identity has no MAINNET mode and live trading is not authorised."}}
+    if not have:
+        out["empty"] = "No replay_report.json or ledger_pnl.json yet. Run the replay and accounting CLIs to write them into the artifacts directory."
+    return out
+
+
+# ======================================================================== testnet, pipeline, reconcile
+TESTNET_BANNER = "TESTNET results are not owner profit. A testnet fill proves a code path against a sandbox with fake money; it is not an edge and not cash."
+
+
+def _ostat(status: str) -> str:
+    s = status.lower()
+    if "partial" in s:
+        return "partial"
+    if "cancel" in s:
+        return "cancelled"
+    if "reject" in s:
+        return "rejected"
+    if "fill" in s:
+        return "filled"
+    return "open"
+
+
+def _testnet_view(a: Dict[str, Any], oc: Mapping[str, Any]) -> Dict[str, Any]:
+    base = {"file": a["file"], "age_ms": a["age_ms"], "stale": a["stale"], "generated_ms": a["generated_ms"], "banner": TESTNET_BANNER,
+            "offline_qualification": val(oc["testnet"].get("offline_qualification"), "CALCULATED", note="guard probes only; it reads nothing from a venue")}
+    if a["state"] == "EMPTY":
+        return {**base, "state": "NO_DATA", "session_state": "NOT_RUN", "pill": "NO_DATA",
+                "empty": "NOT_RUN: no testnet_session.json. The owner runs the read-only testnet preflight and, separately, a confirmed session (RUNBOOKS: testnet); until then there is nothing to show. NOT_RUN is not a pass."}
+    if a["state"] == "ERROR":
+        return {**base, "state": "ERROR", "session_state": "ERROR", "pill": "FAIL", "error": f"{a['file']}: {a['error']}"}
+    d, run = a["data"], a["data"]["basis"]
+    flags: List[str] = []
+    pf = d["preflight"]
+    eff = pf["status"]
+    if eff == "PASS" and (not pf["checks"] or any(not c["ok"] for c in pf["checks"])):
+        eff = "FAIL"
+        flags.append("PREFLIGHT_PASS_CONTRADICTS_CHECKS: the file says PASS but a check failed or none is listed; treated as FAIL")
+    plan, conf = d["plan"], d["confirmation"]
+    if conf["state"] == "CONFIRMED" and plan is not None and conf["plan_digest_confirmed"] != plan["digest"]:
+        flags.append("CONFIRMATION_DIGEST_MISMATCH: the confirmed digest is not the plan's digest")
+    if d["orders"] and conf["state"] != "CONFIRMED":
+        flags.append("ORDERS_WITHOUT_CONFIRMATION: orders exist but no confirmation of a plan is recorded")
+    fp, fv = d["final_position"], d["flat_verified"]
+    nonzero = sorted(k for k, q in (fp or {}).items() if abs(q) > 1e-12)
+    flat = fp is not None and fv is True and not nonzero
+    if fv is True and (fp is None or nonzero):
+        flags.append("FLAT_CLAIM_NOT_SUPPORTED: flat_verified is true but the final position is missing or not zero; not shown as flat")
+    fees = [e["fee_usd"] for e in d["executions"]]
+    if d["net"]["fees_usd"] is not None and fees and None not in fees and abs(sum(fees) - d["net"]["fees_usd"]) > TOL:
+        flags.append("FEES_DO_NOT_MATCH_EXECUTIONS: net.fees_usd differs from the sum of the execution fees")
+    if run == "NOT_RUN":
+        state = "NOT_RUN"
+    elif eff == "FAIL":
+        state = "PREFLIGHT_FAILED"
+    elif eff == "NOT_RUN":
+        state = "PREFLIGHT_NOT_RUN"
+    elif plan is None:
+        state = "PREFLIGHT_PASSED_NO_PLAN"
+    elif d["orders"]:
+        state = "EXECUTED_FLAT_VERIFIED" if flat else ("EXECUTED_NOT_FLAT" if nonzero else "EXECUTED_FLAT_UNVERIFIED")
+    elif conf["state"] == "CONFIRMED":
+        state = "CONFIRMED_NO_ORDERS"
+    else:
+        state = "PLANNED_UNCONFIRMED"
+    pill = ("NO_DATA" if state in ("NOT_RUN", "PREFLIGHT_NOT_RUN") else "FAIL" if state in ("PREFLIGHT_FAILED", "EXECUTED_NOT_FLAT") or flags else
+            "INFO" if state == "EXECUTED_FLAT_VERIFIED" else "ATTENTION")
+    xb = "EXCHANGE_REPORTED" if run == "EXCHANGE_REPORTED" else "MISSING"           # venue-sourced fields carry a venue basis only when the file declares it
+    st = [_ostat(o["status"]) for o in d["orders"]]
+    cred = d["credential_state"]
+    return {**base, "state": "OK", "session_state": state, "pill": pill, "flags": flags, "run_basis": run, "identity_status": a["identity_status"],
+            "identity": a["identity"],
+            "venue": val("Testnet", "CALCULATED", note="the registered testnet host; checked against venues.py"), "endpoint_host": d["endpoint_host"],
+            "credentials": {"dedicated_key_present": val(cred["dedicated_key_present"], "MEASURED"), "dedicated_secret_present": val(cred["dedicated_secret_present"], "MEASURED"),
+                            "generic_credentials_ignored": val(cred["generic_credentials_ignored"], "MEASURED"), "note": "Booleans only: no value is read or shown."},
+            "preflight": {"status": eff, "declared_status": pf["status"], "checked_ms": pf["checked_ms"], "checks": pf["checks"]},
+            "plan": None if plan is None else {"digest": val(plan["digest"], "CALCULATED"), "manifest_digest": val(plan["manifest_digest"], "CALCULATED"), "notional": val(plan["notional_usd"], "CALCULATED", "USD"),
+                                               "legs": [{**{k: l[k] for k in ("symbol", "side", "order_type")}, "qty": val(l["qty"], "CALCULATED"), "price": val(l["price"], "CALCULATED", "USD"),
+                                                         "notional": val(l["notional_usd"], "CALCULATED", "USD")} for l in plan["legs"]]},
+            "confirmation": {"state": conf["state"], "plan_digest_confirmed": conf["plan_digest_confirmed"], "matches_plan": bool(plan and conf["plan_digest_confirmed"] == plan["digest"])},
+            "orders": [{**{k: o[k] for k in ("link_id", "order_id", "symbol", "side", "status")}, "qty": val(o["qty"], xb), "filled_qty": val(o["filled_qty"], xb), "avg_price": val(o["avg_price"], xb, "USD")} for o in d["orders"]],
+            "executions": [{**{k: e[k] for k in ("exec_id", "link_id", "symbol", "side", "ts_ms")}, "qty": val(e["qty"], xb), "price": val(e["price"], xb, "USD"), "fee": val(e["fee_usd"], xb, "USD")} for e in d["executions"]],
+            "counts": {"orders": len(d["orders"]), "acked": sum(1 for o in d["orders"] if o["order_id"]), "filled": st.count("filled"), "partial": st.count("partial"), "cancelled": st.count("cancelled"),
+                       "rejected": st.count("rejected"), "open": st.count("open"), "executions": len(d["executions"])},
+            "final_position": None if fp is None else {k: val(q, xb) for k, q in fp.items()}, "flat": {"verified_flat": flat, "declared": fv, "nonzero": nonzero},
+            "fees": val(d["net"]["fees_usd"], xb, "USD", "TESTNET; not owner profit"), "funding": val(d["net"]["funding_usd"], xb, "USD", "TESTNET; not owner profit"),
+            "price_pnl": val(d["net"]["price_pnl_usd"], xb, "USD", "TESTNET; not owner profit"), "net_note": d["net"]["note"],
+            "evidence": {"file": a["file"], "basis": run, "plan_digest": plan["digest"] if plan else None, "manifest_digest": plan["manifest_digest"] if plan else None}}
+
+
+def _pipeline_view(a: Dict[str, Any]) -> Dict[str, Any]:
+    def view(d: Mapping[str, Any]) -> Dict[str, Any]:
+        mean, nxt = OUTCOME_TEXT[d["outcome"]]
+        return {"outcome": d["outcome"], "meaning": mean, "next": nxt, "reason": d["reason"], "required_span": d["required_span"], "data_digest_parts": d["data_digest_parts"],
+                "evidence_basis": d["evidence_basis"], "blocking": d["outcome"] != "SIMULATED_EXECUTION"}
+    return _artifact_view(a, view, empty="No pipeline summary yet. Run the pipeline CLI to write pipeline_summary.json into the artifacts directory; until then nothing says what the engine last did.")
+
+
+def _scope_view(a: Dict[str, Any]) -> Dict[str, Any]:
+    return _artifact_view(a, lambda d: {"scope_verdict": d["scope_verdict"], "eligible": d["eligible"], "lifecycle_classes": d["lifecycle_classes"]},
+                          empty="No universe scope yet. Run the universe scope check to write universe_scope.json into the artifacts directory.")
+
+
+def _funnel_view(a: Dict[str, Any]) -> Dict[str, Any]:
+    return _artifact_view(a, lambda d: {"steps": d["steps"], "exclusion_reasons": d["exclusion_reasons"]}, empty="No funnel yet. Run the funnel report to write funnel.json into the artifacts directory.")
+
+
+def _reconcile_view(a: Dict[str, Any]) -> Dict[str, Any]:
+    def view(d: Mapping[str, Any]) -> Dict[str, Any]:
+        active = [x for x in d["findings"] if x["severity"] != "INFO"]
+        return {"findings": d["findings"], "active": active, "halt_new_exposure": d["halt_new_exposure"], "views_compared": d["views_compared"],
+                "has_venue_view": any(("venue" in v.lower() or "exchange" in v.lower()) for v in d["views_compared"])}
+    return _artifact_view(a, view, empty="No reconcile report yet. Run the reconciliation CLI to write reconcile_report.json; until then nothing compares the internal views with each other or with the venue.")
+
+
+ENV_FLAGS = ("LIVE_TRADING_ACK", "USE_TESTNET", "PAPER_TRADING", "BYBIT_API_KEY", "BYBIT_API_SECRET", "OWNER_ATTESTATION_KEY")
+
+
+def _env_flags(env: Mapping[str, str]) -> List[Dict[str, str]]:
+    """PRESENCE only: 'set' or 'unset'. No value of any variable is ever read into the state."""
+    return [{"name": n, "presence": "set" if str(env.get(n, "") or "").strip() else "unset"} for n in ENV_FLAGS]
+
+
+def _usd(x: Optional[Mapping[str, Any]]) -> str:
+    return "not stated (MISSING)" if not x or x.get("v") is None else f"${x['v']:,.2f}"
+
+
+def _next_steps(c: Mapping[str, Any]) -> List[str]:
+    """What must happen next, computed from the blocking reasons actually present. The gate line is always last and is the owner's."""
+    out: List[str] = []
+    coh = c["coh"]
+    if coh["verdict"] == "INCONSISTENT_RUN":
+        out.append("Regenerate the artifacts from ONE run: " + ", ".join(sorted({m["field"] for m in coh["mismatches"]})) + " differ between files. Combined numbers stay withheld until they match.")
+    rc = c["reconcile"]
+    if rc.get("state") == "OK" and (rc["halt_new_exposure"] or rc["active"]):
+        out.append("Resolve the reconciliation findings (" + ", ".join(sorted({x["code"] for x in rc["active"]})[:4]) + "); new exposure stays halted" + (" by the report" if rc["halt_new_exposure"] else "") + ".")
+    if c["risk"].get("state") == "OK" and c["risk"]["halted"]:
+        out.append("Trading is halted by the risk state: " + "; ".join(c["risk"]["halt_reasons"][:2]) + ". Clear the cause; the page cannot.")
+    bad = [f for f, a in c["art"].items() if a["state"] == "ERROR"]
+    if bad:
+        out.append("Fix or regenerate the refused file(s): " + ", ".join(bad[:5]) + ".")
+    fv = c["fresh"].get("verdict")
+    if fv == "NO_DATA":
+        out.append("Capture market data: start tools/market_collector.py run-continuous --out-root DIR, then check it with tools/data_freshness_audit.py.")
+    elif fv in ("STALE", "PARTIAL") or c["fresh"].get("state") == "ERROR":
+        out.append(f"Market data is {fv or 'unreadable'}: see Evidence and run tools/data_freshness_audit.py before trusting any result.")
+    pl = c["pipeline"]
+    if pl["state"] == "OK" and pl["blocking"]:
+        out.append(f"Pipeline outcome {pl['outcome']}: {pl['next']}")
+    elif pl["state"] == "NO_DATA":
+        out.append("Run the pipeline so it writes pipeline_summary.json; until then the engine's last outcome is unknown.")
+    absent = [f for f in ("replay_report.json", "portfolio_state.json", "ledger_pnl.json", "risk_state.json") if c["art"][f]["state"] == "EMPTY"]
+    if absent:
+        out.append("Produce the missing artifact(s): " + ", ".join(absent) + ".")
+    if coh["verdict"] == "UNVERIFIED":
+        out.append("Regenerate the artifacts with a run identity so they can be shown to belong together.")
+    if c["accounting"]["state"] == "OK" and c["accounting"]["integrity"] == "FAIL":
+        out.append("Fix the accounting identity failure(s): " + ", ".join(k["id"] for k in c["accounting"]["checks"] if k["state"] == "FAIL")[:200] + ".")
+    tn = c["testnet"]
+    if tn["session_state"] in ("NOT_RUN", "PREFLIGHT_NOT_RUN"):
+        out.append("Owner: run the read-only testnet preflight (RUNBOOKS: testnet). It has not been run; TESTNET results are never owner profit.")
+    elif tn.get("flags"):
+        out.append("Investigate the testnet session flags: " + "; ".join(f.split(":")[0] for f in tn["flags"][:3]) + ".")
+    elif tn["session_state"] == "PREFLIGHT_FAILED":
+        out.append("The testnet preflight failed: fix the failing check(s) before any session.")
+    if not c["gate"]["allows_live"]:
+        out.append(f"The promotion gate is {c['gate']['decision']} ({c['gate']['complete']} of {c['gate']['total']} items); only the owner can sign it and nothing on this page can.")
+    return out
+
+
+def _answers(c: Mapping[str, Any]) -> List[Dict[str, str]]:
+    """The seven plain-language questions, answered ONLY from the one state (figures, sections), never from constants. Money is not mentioned when the run is inconsistent."""
+    F, coh, pl, pf, ex, tn, acc, rc = c["F"], c["coh"], c["pipeline"], c["portfolio"], c["execution"], c["testnet"], c["accounting"], c["reconcile"]
+    wh = bool(coh["combined_numbers_withheld"])
+    A: List[Dict[str, str]] = []
+    eng = [f"Live trading is {'ARMED (stop and check it is intended)' if c['live'] else 'not armed'}; this is a paper and testnet system."]
+    eng.append(f"Last pipeline outcome: {pl['outcome']}, {pl['meaning'].lower()}" if pl["state"] == "OK" else "No pipeline_summary.json, so nothing says what the engine last did.")
+    eng.append(f"Market data: {c['fresh'].get('verdict', 'NO_DATA')}.")
+    if c["risk"].get("state") == "OK" and c["risk"]["halted"]:
+        eng.append("Trading is HALTED by the risk state.")
+    A.append({"q": "What is the engine doing?", "a": " ".join(eng), "basis": "CALCULATED"})
+    if wh:
+        cap = "Withheld: the artifacts are not from one run (INCONSISTENT_RUN)."
+    elif pf.get("state") == "OK":
+        cap = (f"No real money: {'simulated ' if pf['simulated'] else ''}gross exposure {_usd(pf['gross_exposure'])}, net {_usd(pf['net_exposure'])} (basis {pf['gross_exposure']['basis']})."
+               if pf["simulated"] else f"Gross exposure {_usd(pf['gross_exposure'])}, net {_usd(pf['net_exposure'])} per portfolio_state.json (basis {pf['gross_exposure']['basis']}).")
+    else:
+        cap = "Unknown (MISSING): there is no portfolio_state.json."
+    cap += f" Capital allocated by the owner console: {_usd(c['capital'])}."
+    A.append({"q": "What capital is at risk?", "a": cap, "basis": "MISSING" if pf.get("state") != "OK" or wh else pf["gross_exposure"]["basis"]})
+    pos = (f"{pf['n_positions']} position(s) in portfolio_state.json" + (" (simulated)." if pf["simulated"] else ".")) if pf.get("state") == "OK" else "Unknown: no portfolio_state.json."
+    if tn.get("state") == "OK" and tn["final_position"] is not None:
+        pos += " Testnet final position: " + ("flat, verified." if tn["flat"]["verified_flat"] else "not verified flat.")
+    A.append({"q": "Are there positions?", "a": pos, "basis": "SIMULATED" if pf.get("simulated") else "MISSING"})
+    if acc["complete"]:
+        pa = f"Yes: every required component is present, the identities pass and the ledger is venue reconciled. Net {_usd(F['net'])}."
+    else:
+        pa = ("No. " + "; ".join(acc["why_incomplete"][:3])) if acc["why_incomplete"] else "No."
+        if not wh and F["net"]["v"] is not None:
+            pa += f" The one net on file is {_usd(F['net'])} ({F['net']['basis']}); unrealised {_usd(F['unrealised'])}."
+    A.append({"q": "Is P&L complete?", "a": pa, "basis": "CALCULATED"})
+    done = []
+    if ex.get("state") == "OK":
+        done.append(f"Replay: {ex['n_groups']} order group(s) (SIMULATED, never cash).")
+    if tn.get("state") == "OK" and tn["counts"]["orders"]:
+        done.append(f"Testnet: {tn['counts']['orders']} order(s), {tn['counts']['executions']} execution(s) (not owner profit).")
+    done.append("No mainnet order has been sent from here and none can be.")
+    A.append({"q": "What has executed?", "a": " ".join(done), "basis": "SIMULATED" if ex.get("state") == "OK" else "CALCULATED"})
+    blk = [b["label"] for b in c["actions"]["items"] if not b["permitted"]]
+    restr = [r["text"] for r in c["restrictions"]][:3]
+    A.append({"q": "What is blocked?", "a": ("Blocked: " + "; ".join(blk) + "." if blk else "Nothing the repository's checks block.") + (" Restrictions: " + " | ".join(restr) if restr else ""), "basis": "CALCULATED"})
+    steps = c["next_steps"]
+    A.append({"q": "What must happen next?", "a": steps[0] if steps else "Nothing is blocking and nothing is pending (verify independently).", "basis": "CALCULATED"})
+    return A
 
 
 def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifacts_dir: Optional[str], env: Mapping[str, str], now_ms: int,
                 with_economics: bool = False, economics: Optional[Dict[str, Any]] = None, verify: bool = False) -> Dict[str, Any]:
-    """Pure aggregation of real sources (no network, no write). Every number carries a basis; every missing source is an explicit NO_DATA/ERROR section."""
+    """Pure aggregation of real sources (no network, no write). Every number carries a basis; every missing source is an explicit NO_DATA/ERROR section.
+    ONE state: every artifact is read once; ``coherence`` and ``figures`` are derived once; every section below reads them."""
     now_ms = int(now_ms)
     art = {name: load_artifact(artifacts_dir, name, now_ms) for name in ARTIFACTS}
     oc = OC.build(dict(env), now_ms=now_ms)
     gate = _gate()
     actions = _actions(oc, gate)
+    coh = _coherence(art)
+    F, fig_checks = _figures(art, coh)
 
     def cand() -> Dict[str, Any]:
         scan = CR.scan_data_root(data_root)
@@ -605,11 +1231,31 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
     cr = _safe(cand, "candidate_readiness")
     research = (_research(cr["rows"], art["competition.json"], art["opportunities.json"], cr["econ"], gate) if cr.get("state") == "OK" else
                 {"state": "ERROR", "error": cr.get("error"), "candidates": [], "rejected": [], "sufficient_evidence": [], "stage_counts": {}, "note": ""})
+    pipeline = _pipeline_view(art["pipeline_summary.json"])
+    research["pipeline"] = pipeline
+    research["universe_scope"] = _scope_view(art["universe_scope.json"])
+    research["funnel"] = _funnel_view(art["funnel.json"])
     fresh = _safe(lambda: _freshness(data_root, universe_dir, now_ms, verify), "data_freshness_audit")
     capture = _safe(lambda: _capture(universe_dir), "universe_capture")
-    portfolio = _portfolio(art["portfolio_state.json"], art["ledger_pnl.json"])
-    execution = _execution(art["replay_report.json"], oc)
+    portfolio = _portfolio(art["portfolio_state.json"], art["ledger_pnl.json"], F)
+    execution = _execution(art["replay_report.json"], oc, F)
     risk = _risk(art["risk_state.json"], oc)
+    reconcile = _reconcile_view(art["reconcile_report.json"])
+    testnet = _testnet_view(art["testnet_session.json"], oc)
+    accounting = _accounting(art, coh, F, fig_checks, portfolio["pnl"], testnet)
+    rc_ok = reconcile.get("state") == "OK"
+    execution["reconciliation"] = reconcile
+    execution["testnet"] = {k: testnet.get(k) for k in ("state", "session_state", "pill", "counts", "orders", "executions", "empty", "error", "banner", "run_basis")}
+    risk["halt_flags"] = ([{"source": "risk_state.json", "halted": bool(risk["halted"]), "why": "; ".join(risk["halt_reasons"]) or "not halted"}] if risk.get("state") == "OK" else []) + \
+                         ([{"source": "reconcile_report.json", "halted": bool(reconcile["halt_new_exposure"]), "why": "halt_new_exposure"}] if rc_ok else []) + \
+                         [{"source": "promotion gate", "halted": not gate["allows_live"], "why": f"{gate['decision']}: live entry is closed"}]
+    risk["kill_switch"] = val(None, "MISSING", note="no artifact carries a kill-switch state; risk_state/v1 has only halted and halt_reasons")
+    risk["stress"] = val(None, "MISSING", note="no stress result artifact exists; see the unmeasured limits in the policy block")
+    risk["recovery"] = ({"state": "RECOVERY_REQUIRED" if (reconcile["halt_new_exposure"] or reconcile["active"]) else "NO_RECOVERY_REPORTED", "basis": "CALCULATED", "why": "from reconcile_report.json"}
+                        if rc_ok else {"state": "MISSING", "basis": "MISSING", "why": "no reconcile_report.json: recovery status is unknown, not fine"})
+    risk["exposure"] = ({"gross": portfolio["gross_exposure"], "net": portfolio["net_exposure"]} if portfolio.get("state") == "OK" else {"gross": val(None, "MISSING"), "net": val(None, "MISSING")})
+    risk["refusals"] = {"outcome": pipeline["outcome"] if pipeline.get("state") == "OK" and pipeline["outcome"] == "RISK_REFUSAL" else None, "without_policy": risk["policy"]["refusals_without_policy"],
+                        "alerts": [a for a in risk.get("alerts", []) if a["severity"] != "INFO"]}
 
     # Survivorship: a result is survivorship-free only if the file CLAIMS delistings were observed AND this run's capture check corroborates it.
     rp = art["replay_report.json"]
@@ -621,6 +1267,13 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
                                      "text": ("Delistings observed and corroborated by a verified universe capture." if free else
                                               "SURVIVORS ONLY: contracts that were delisted are missing, so this result must not be read as survivorship-free.")}
 
+    us = research["universe_scope"]
+    if us.get("state") == "OK":                                   # a file's claim of more than survivors is shown only when a verified capture here corroborates it
+        v = str(us["scope_verdict"] or "")
+        claims_free = bool(re.search(r"SURVIVORSHIP_FREE|DELISTINGS_OBSERVED", v.upper()))
+        us["scope_verdict_shown"] = v if (not claims_free or corroborated) else "SURVIVORS_ONLY (the file claims more; no verified capture here corroborates it)"
+        us["corroborated_here"] = corroborated
+
     # ---- attention list (every red/amber, with the source)
     att: List[Dict[str, str]] = []
 
@@ -630,6 +1283,10 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
         flag("FAIL" if oc["environment"]["live_authorized"] else "ATTENTION", "environment", f)
     if gate["allows_live"] or oc["environment"]["live_authorized"]:
         flag("FAIL", "safety", "Live trading looks armed or the gate allows it. This repository must stay paper/testnet.")
+    if coh["verdict"] == "INCONSISTENT_RUN":
+        flag("FAIL", "coherence", coh["banner"])
+    elif coh["verdict"] == "UNVERIFIED":
+        flag("ATTENTION", "coherence", coh["banner"])
     fv = fresh.get("verdict")
     if fresh.get("state") == "ERROR":
         flag("FAIL", "data", str(fresh.get("error")))
@@ -655,6 +1312,35 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
                 flag("FAIL", "risk", f"limit breached: {lim['name']}")
     if execution.get("state") == "OK" and execution["unhedged_or_unknown"]:
         flag("ATTENTION", "execution", f"{execution['unhedged_or_unknown']} order group(s) UNHEDGED or UNKNOWN_OUTCOME in the replay")
+    if rc_ok:
+        for x in reconcile["active"]:
+            flag("FAIL" if x["severity"] in ("CRITICAL", "ERROR", "HALT", "HIGH") else "ATTENTION", "reconcile", f"{x['code']}: {x['detail']}")
+        if reconcile["halt_new_exposure"]:
+            flag("FAIL", "reconcile", "The reconcile report halts new exposure.")
+    if accounting["state"] == "OK" and accounting["integrity"] == "FAIL":
+        flag("FAIL", "accounting", "Accounting identity failure: " + ", ".join(k["id"] for k in accounting["checks"] if k["state"] == "FAIL"))
+    for fl in testnet.get("flags") or []:
+        flag("FAIL", "testnet", fl)
+    if testnet.get("session_state") == "PREFLIGHT_FAILED":
+        flag("ATTENTION", "testnet", "The testnet preflight failed.")
+
+    # ---- restrictions and incidents
+    restrictions: List[Dict[str, str]] = []
+    if not gate["allows_live"]:
+        restrictions.append({"source": "promotion gate", "severity": "INFO", "text": f"Live entry is closed: the promotion gate is {gate['decision']} ({gate['complete']} of {gate['total']} items)."})
+    if not oc["environment"]["live_authorized"]:
+        restrictions.append({"source": "environment", "severity": "INFO", "text": "Live trading is not authorised: " + str(oc["environment"]["reason"])})
+    if not oc["risk"].get("policy_active"):
+        restrictions.append({"source": "risk policy", "severity": "INFO", "text": "No owner-approved risk policy: every entry is refused."})
+    if risk.get("state") == "OK" and risk["halted"]:
+        restrictions.append({"source": "risk_state.json", "severity": "FAIL", "text": "Halted: " + "; ".join(risk["halt_reasons"][:3])})
+    if rc_ok and reconcile["halt_new_exposure"]:
+        restrictions.append({"source": "reconcile_report.json", "severity": "FAIL", "text": "New exposure is halted by the reconcile report."})
+    if coh["verdict"] == "INCONSISTENT_RUN":
+        restrictions.append({"source": "coherence", "severity": "FAIL", "text": "Combined figures are withheld: the artifacts are not from one run."})
+    if fv in ("STALE", "PARTIAL", "NO_DATA") or fresh.get("state") == "ERROR":
+        restrictions.append({"source": "market data", "severity": "ATTENTION", "text": f"Market data is {fv or 'unreadable'}: no result should be relied on."})
+    incidents = [{"code": x["code"], "detail": x["detail"], "severity": x["severity"], "source": "reconcile_report.json"} for x in (reconcile["active"] if rc_ok else [])]
 
     # ---- overview cards: green only when a checker returned it from real data
     def card(cid: str, title: str, status: str, text: str, basis: str, link: str) -> Dict[str, Any]:
@@ -663,7 +1349,7 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
     env_ok = oc["environment"]["status"] == "VERIFIED" and not oc["environment"]["live_authorized"] and not gate["allows_live"]
     cards.append(card("safety", "Safety posture", "INFO" if env_ok else "FAIL" if (oc["environment"]["live_authorized"] or gate["allows_live"]) else "ATTENTION",
                       f"Live trading: {'ARMED' if oc['environment']['live_authorized'] else 'not armed'}. Promotion gate: {gate['decision']} ({gate['complete']} of {gate['total']} items). Capital allocated: ${oc['capital']['capital_usd']:.0f}.",
-                      "CALCULATED", "execution"))
+                      "CALCULATED", "overview"))
     dm = {"HEALTHY": "OK", "PARTIAL": "ATTENTION", "STALE": "FAIL", "NO_DATA": "NO_DATA"}.get(str(fv), "FAIL" if fresh.get("state") == "ERROR" else "NO_DATA")
     cards.append(card("data", "Market data", dm, {"NO_DATA": "No market data captured yet. Run tools/market_collector.py to start capturing.", "OK": "Complete, fresh, backed up and verified in this run.",
                       "ATTENTION": "Data exists but is partial or unproved. See Evidence.", "FAIL": "Data is stale or the audit could not run. See Evidence."}[dm],
@@ -678,35 +1364,51 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
         ops_text = risk.get("error") or "No runtime risk state is available, so nothing can say the system is operating correctly."
         ops_basis = "MISSING"
     cards.append(card("operations", "System operations", ops, ops_text, ops_basis, "risk"))
-    st = research.get("stage_counts", {})
     cards.append(card("research", "Research pipeline", "INFO", f"{len(research.get('candidates', []))} candidate(s) under study; {len(research.get('rejected', []))} rejection(s) on record; "
                       f"{len(research.get('sufficient_evidence', []))} with sufficient evidence. None is authorised.", "CALCULATED", "research"))
+    if pipeline.get("state") == "OK":
+        cards.append(card("pipeline", "Pipeline outcome", "INFO" if not pipeline["blocking"] else "ATTENTION", f"{pipeline['outcome']}: {pipeline['meaning']}", art["pipeline_summary.json"]["basis"] or "CALCULATED", "research"))
+    else:
+        cards.append(card("pipeline", "Pipeline outcome", "FAIL" if pipeline.get("state") == "ERROR" else "NO_DATA", pipeline.get("error") or pipeline.get("empty", ""), "MISSING", "research"))
     op = research.get("opportunities", {})
     if op.get("state") == "OK":
         cards.append(card("opportunity", "Estimated net opportunity", "INFO", f"{op['n_positive_net']} of {op['n_items']} scanned item(s) have positive NET after known costs. Estimates, not results.", "ESTIMATED", "research"))
     else:
         cards.append(card("opportunity", "Estimated net opportunity", "FAIL" if op.get("state") == "ERROR" else "NO_DATA", op.get("error") or op.get("empty", ""), "MISSING", "research"))
-    if portfolio.get("state") == "OK":
-        pb = portfolio["basis"]
+    if coh["combined_numbers_withheld"] and portfolio.get("state") == "OK":
+        cards.append(card("exposure", "Portfolio exposure", "FAIL", "Withheld: the artifacts are not from one run (INCONSISTENT_RUN).", "MISSING", "portfolio"))
+    elif portfolio.get("state") == "OK":
+        pb = portfolio["gross_exposure"]["basis"]
         cards.append(card("exposure", "Portfolio exposure", "INFO", f"Gross ${portfolio['gross_exposure']['v']:,.0f}, net ${portfolio['net_exposure']['v']:,.0f} across {portfolio['n_positions']} position(s)." +
                           (" Simulated." if pb == "SIMULATED" else ""), pb, "portfolio"))
     else:
         cards.append(card("exposure", "Portfolio exposure", "FAIL" if portfolio.get("state") == "ERROR" else "NO_DATA", portfolio.get("error") or portfolio.get("empty", ""), "MISSING", "portfolio"))
     pnl = portfolio["pnl"]
-    if pnl.get("state") == "OK":
+    if pnl.get("state") == "OK" and coh["combined_numbers_withheld"]:
+        cards.append(card("pnl", "Realised and unrealised P&L", "FAIL", "Withheld: the artifacts are not from one run (INCONSISTENT_RUN).", "MISSING", "accounting"))
+    elif pnl.get("state") == "OK":
         sim = pnl["kind"] == "SIMULATED_NOT_REALISED"
         g = "simulated" if sim else "realised"
-        usd = lambda x: f"${x['v']:,.2f}" if x["v"] is not None else "not stated (MISSING)"       # noqa: E731
         if sim:                                                    # ONE net: the total simulated net (= the Execution tab / replay report net_pnl_usd), realised and unrealised beside it
-            text = (f"Simulated net (total): {usd(pnl['total_net'])}; of which realised {usd(pnl[g + '_net'])} and unrealised {usd(pnl['unrealised'])} (mark-to-market). "
+            text = (f"Simulated net (total): {_usd(pnl['total_net'])}; of which realised {_usd(pnl[g + '_net'])} and unrealised {_usd(pnl['unrealised'])} (mark-to-market). "
                     "This is a simulation, not realised cash.")
         else:
-            text = f"Realised net: {usd(pnl[g + '_net'])}; unrealised {usd(pnl['unrealised'])}."
-        cards.append(card("pnl", "Realised and unrealised P&L", "INFO", text, pnl["basis"], "portfolio"))
+            text = f"Realised net: {_usd(pnl[g + '_net'])}; unrealised {_usd(pnl['unrealised'])}. Not reconciled with the venue unless Accounting says so."
+        cards.append(card("pnl", "Realised and unrealised P&L", "FAIL" if accounting["integrity"] == "FAIL" else "INFO", text, pnl["basis"], "accounting"))
     else:
-        cards.append(card("pnl", "Realised and unrealised P&L", "FAIL" if pnl.get("state") == "ERROR" else "NO_DATA", pnl.get("error") or pnl.get("empty", ""), "MISSING", "portfolio"))
+        cards.append(card("pnl", "Realised and unrealised P&L", "FAIL" if pnl.get("state") == "ERROR" else "NO_DATA", pnl.get("error") or pnl.get("empty", ""), "MISSING", "accounting"))
+    if rc_ok:
+        cards.append(card("reconcile", "Reconciliation", "FAIL" if (reconcile["halt_new_exposure"] or reconcile["active"]) else ("OK" if reconcile["has_venue_view"] else "INFO"),
+                          f"{len(reconcile['active'])} active finding(s) over {len(reconcile['views_compared'])} view(s)" + ("" if reconcile["has_venue_view"] else "; no venue view was compared, so this is internal only") +
+                          ("; new exposure is HALTED" if reconcile["halt_new_exposure"] else "") + ".", "CALCULATED", "execution"))
+    else:
+        cards.append(card("reconcile", "Reconciliation", "FAIL" if reconcile.get("state") == "ERROR" else "NO_DATA", reconcile.get("error") or reconcile.get("empty", ""), "MISSING", "execution"))
+    cards.append(card("testnet", "Testnet session", testnet["pill"], {"NOT_RUN": "NOT_RUN: no testnet session has run. This is not a pass."}.get(testnet["session_state"], f"Session state {testnet['session_state']}. TESTNET results are not owner profit."),
+                      testnet.get("run_basis") or "MISSING", "testnet"))
     core = [c for c in cards if c["id"] in ("safety", "data", "operations")]
-    if any(c["status"] == "FAIL" for c in core):
+    if coh["verdict"] == "INCONSISTENT_RUN" or (rc_ok and reconcile["halt_new_exposure"]):
+        head = ("FAIL", "INCONSISTENT_RUN: artifacts from different runs" if coh["verdict"] == "INCONSISTENT_RUN" else "New exposure is halted by the reconcile report")
+    elif any(c["status"] == "FAIL" for c in core):
         head = ("FAIL", "Needs attention now")
     elif any(c["status"] == "ATTENTION" for c in core):
         head = ("ATTENTION", "Running, with items that need a look")
@@ -715,22 +1417,60 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
     else:
         head = ("OK", "Checks that ran are passing")
     permitted = [a["label"] for a in actions["items"] if a["permitted"]]
-    overview = {"headline": {"status": head[0], "text": head[1]}, "cards": cards, "attention": att, "permitted_now": permitted,
-                "blocked_now": [{"label": a["label"], "reasons": a["reasons"]} for a in actions["items"] if not a["permitted"]]}
+    ctx = {"coh": coh, "F": F, "pipeline": pipeline, "portfolio": portfolio, "execution": execution, "testnet": testnet, "accounting": accounting, "reconcile": reconcile, "risk": risk, "fresh": fresh,
+           "art": art, "gate": gate, "actions": actions, "restrictions": restrictions, "live": bool(oc["environment"]["live_authorized"]), "capital": val(oc["capital"]["capital_usd"], "CALCULATED", "USD")}
+    ctx["next_steps"] = _next_steps(ctx)
+    overview = {"headline": {"status": head[0], "text": head[1]}, "answers": _answers(ctx), "next_steps": ctx["next_steps"], "cards": cards, "attention": att, "permitted_now": permitted,
+                "blocked_now": [{"label": a["label"], "reasons": a["reasons"]} for a in actions["items"] if not a["permitted"]], "restrictions": restrictions, "incidents": incidents,
+                "engine": {"mode": "REPLAY / PAPER; testnet only by the owner; live not authorised" if not oc["environment"]["live_authorized"] else "LIVE LOOKS ARMED: stop",
+                           "run": coh["primary"], "pipeline_outcome": pipeline.get("outcome"), "halted": bool(risk.get("halted")) if risk.get("state") == "OK" else None},
+                "market_data": {"verdict": fv or "NO_DATA", "state": fresh.get("state"), "readiness": fresh.get("readiness"), "collector": fresh.get("collector"),
+                                "latest_cycle": fresh.get("latest_cycle"), "empty": fresh.get("empty"), "error": fresh.get("error")},
+                "environment": {"flags": _env_flags(env), "live_authorized": bool(oc["environment"]["live_authorized"]), "note": "Presence only: 'set' or 'unset'. No value is read or shown."}}
 
     evidence = {"sources": [_stamp(a) for a in art.values()], "freshness": fresh, "universe_capture": capture,
                 "owner_console": {"headline": oc["headline"], "evidence": {"status": oc["evidence"]["status"], "why": oc["evidence"].get("why") or oc["evidence"].get("reading")},
                                   "backup": {"status": oc["backup"]["status"], "why": oc["backup"].get("why") or oc["backup"].get("note")},
                                   "owner_pnl": {"status": oc["pnl"]["actual_realised"]["status"], "why": oc["pnl"]["actual_realised"].get("why")}},
+                "coverage": fresh.get("datasets", []) if fresh.get("state") == "OK" else [],
+                "digests": {"data_digest_parts": pipeline.get("data_digest_parts", {}) if pipeline.get("state") == "OK" else {}, "run_data_digest": (coh["primary"] or {}).get("data_digest"),
+                            "capture_manifest_sha256": capture.get("manifest_sha256") if capture.get("state") == "OK" else None,
+                            "evidence_basis": pipeline.get("evidence_basis", {}) if pipeline.get("state") == "OK" else {}},
+                "operations": fresh.get("backups") if fresh.get("state") == "OK" else None,
+                "software": {"code_revisions": coh["code_revisions"], "note": "identity.code_revision as each artifact declares it; unauthenticated"},
+                "ci": {"state": "NOT_AVAILABLE_OFFLINE", "text": "CI status is not available offline: this page fetches nothing, so it cannot say whether CI is green."},
                 "caveats": ["RAW_RESPONSES_VERIFIED means captured bytes are self-consistent; it is NOT authentication that the exchange produced them.",
                             "health.json in a data root is unauthenticated; an ok record in it that was not re-checked is never counted as HEALTHY.",
                             "Artifact files are unauthenticated local files; their basis is what they declare and is restricted per file."]}
     state = {"schema": SCHEMA, "as_of_ms": now_ms, "legend": {"basis": [{"code": k, "meaning": v} for k, v in BASIS_MEANING.items()],
                                                               "status": [{"code": k, "meaning": v} for k, v in STATUS_MEANING.items()]},
-             "overview": overview, "research": research, "portfolio": portfolio, "execution": execution, "risk": risk, "evidence": evidence, "actions": actions,
-             "environment": {"live_authorized": bool(oc["environment"]["live_authorized"]), "reason": oc["environment"]["reason"], "secrets": oc["environment"]["secrets"],
-                             "values": oc["environment"]["values"], "gate": gate, "capital_usd": val(oc["capital"]["capital_usd"], "CALCULATED", "USD", oc["capital"]["note"])}}
-    return _clean(state)
+             "coherence": coh, "figures": F, "overview": overview, "research": research, "portfolio": portfolio, "execution": execution, "accounting": accounting, "risk": risk,
+             "testnet": testnet, "evidence": evidence, "actions": actions,
+             "environment": {"live_authorized": bool(oc["environment"]["live_authorized"]), "reason": oc["environment"]["reason"], "flags": overview["environment"]["flags"], "gate": gate,
+                             "capital_usd": val(oc["capital"]["capital_usd"], "CALCULATED", "USD", oc["capital"]["note"])}}
+    return _scrub(_clean(state), env)
+
+
+_HIDE_MIN = {"LIVE_TRADING_ACK": 3, "BYBIT_API_KEY": 3, "BYBIT_API_SECRET": 3, "BYBIT_TESTNET_API_KEY": 3, "BYBIT_TESTNET_API_SECRET": 3, "OWNER_ATTESTATION_KEY": 3, "USE_TESTNET": 4, "PAPER_TRADING": 4, "BYBIT_VENUE": 4}
+
+
+def _scrub(o: Any, env: Mapping[str, str]) -> Any:
+    """Presence only: a variable's VALUE never appears in the state, not even inside a message another module composed (e.g. 'PAPER_TRADING=...is not a recognised boolean')."""
+    hide = sorted({str(env.get(n)).strip() for n, k in _HIDE_MIN.items() if env.get(n) and len(str(env.get(n)).strip()) >= k}, key=len, reverse=True)
+    if not hide:
+        return o
+
+    def walk(x: Any) -> Any:
+        if isinstance(x, str):
+            for v in hide:
+                x = x.replace(v, "[value hidden]")
+            return x
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        return x
+    return walk(o)
 
 
 def _clean(o: Any) -> Any:

@@ -245,7 +245,7 @@ def _plan_assessment(plan_file: Optional[str], root: str) -> Dict[str, Any]:
     ok = bool(fresh["readiness"]["research_ready"]) and fresh["same_universe_as_sealed_plan"] and fresh["same_symbol_set_as_sealed_plan"]
     return {"verdict": "RESEARCH_READY" if ok else "NOT_RESEARCH_READY", "plan_digest": doc["plan_digest"], "window_days": fresh["window"]["effective_days"], "eligible_symbols": fresh["eligible_count"],
             "unmet": fresh["readiness"]["unmet"], "blockers": fresh["blockers"], "same_universe_as_sealed_plan": fresh["same_universe_as_sealed_plan"],
-            "same_symbol_set_as_sealed_plan": fresh["same_symbol_set_as_sealed_plan"], "basis": "backfill_plan re-derived now from the sealed plan's parameters against this root"}
+            "same_symbol_set_as_sealed_plan": fresh["same_symbol_set_as_sealed_plan"], "funnel": fresh["funnel"], "basis": "backfill_plan re-derived now from the sealed plan's parameters against this root"}
 
 
 def _status_partitions(root: str, explicit: Optional[str], issues: List[Dict[str, Any]]) -> Dict[str, Any]:

@@ -1,4 +1,5 @@
 """ms_accounting: unknown != zero, unreconciled != profit, duplicate fills, funding sign. Offline, pure."""
+import json
 import os
 import sys
 
@@ -330,3 +331,303 @@ def test_a_matching_venue_read_does_not_make_an_inconsistent_ledger_claimable():
     assert p["reconciliation_basis"] == "VENUE_POSITION_READ_MATCHED" and p["venue_reconciled"] is False and p["venue_claimable_profit"] is None
     for bad in ([], "x", 3):
         assert closed_pair().pnl(venue_positions=bad)["reconciliation_basis"] == "VENUE_READ_INVALID"
+
+
+# =============================================================================================== exact arithmetic (Decimal), idempotency, order independence
+import random  # noqa: E402
+from decimal import Decimal as D  # noqa: E402
+
+
+def _state(L):
+    p = L.pnl_exact()
+    return {k: p[k] for k in ("price_leg", "funding", "fees", "slippage", "realised", "unrealised", "realised_price", "qty", "net", "claimable_profit", "status", "flags", "n_legs")} | {
+        "legs": {k: (v["qty"], v["realised_price"], v["fees"], v["unrealised_price"]) for k, v in p["per_leg"].items()}}
+
+
+def test_float_inputs_are_converted_by_str_and_the_arithmetic_is_exact():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Buy", 0.1, 100.0, 0.0, prov="MEASURED", leg="P"))
+    L.record_fill(fill("b", "Buy", 0.2, 100.0, 0.0, prov="MEASURED", leg="P", ts=1001))
+    L.record_fill(fill("c", "Sell", 0.3, 101.0, 0.0, prov="MEASURED", leg="P", ts=1002))
+    p = L.pnl_exact()
+    assert p["per_leg"]["G1/P"]["qty"] == D(0) and p["per_leg"]["G1/P"]["dust_qty"] == D(0)      # 0.1 + 0.2 - 0.3 is exactly 0
+    assert p["realised_price"] == D("0.3") and isinstance(p["realised_price"], D)
+    assert 0.1 + 0.2 - 0.3 != 0                                                      # the float arithmetic this replaces would leave 5.5e-17
+
+
+def test_fee_sum_is_exact_and_floats_appear_only_at_the_boundary():
+    L = A.Ledger()
+    for i in range(10):
+        L.record_fill(fill(f"f{i}", "Buy" if i % 2 == 0 else "Sell", 1, 100, 0.1, ts=1000 + i))
+    assert L.pnl_exact()["fees"] == D("1.0")
+    naive = 0.0
+    for _ in range(10):
+        naive += 0.1                                  # plain float accumulation drifts on every Python version (sum() is compensated on 3.12)
+    assert naive != 1.0
+    out = L.pnl()
+    assert isinstance(out["fees"], float) and isinstance(out["per_leg"]["G1/P"]["qty"], float) and out["fees"] == 1.0
+
+
+def test_partial_close_books_realised_on_the_closed_part_and_stays_unreconciled():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Sell", 3, 100, 0.1))
+    L.record_fill(fill("b", "Buy", 1, 99, 0.1, ts=2000))
+    L.record_fill(fill("m", "Buy", 1, 1, 0.1, ts=2001, leg="X"))     # (unrelated leg: just to have two legs)
+    L.record_funding("BTCUSDT", 1500, 0.0, "MEASURED")
+    L.mark("BTCUSDT", 3000, 98.0)
+    p = L.pnl_exact()["per_leg"]["G1/P"]
+    assert p["realised_price"] == D(1) and p["qty"] == D(-2) and p["unrealised_price"] == D(4)
+    assert L.pnl()["claimable_profit"] is None and L.pnl()["status"] == "UNRECONCILED"
+
+
+def test_partial_close_cost_rounding_is_the_only_division_and_a_full_close_is_exact():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Buy", 3, 100.0, 0.1, prov="MEASURED"))
+    L.record_fill(fill("b", "Sell", 1, 101.0, 0.1, ts=2000))
+    L.record_fill(fill("c", "Sell", 2, 101.0, 0.1, ts=3000))
+    p = L.pnl_exact()["per_leg"]["G1/P"]
+    assert p["qty"] == D(0) and p["realised_price"] == D(3)
+
+
+def test_unknown_mark_is_explicit_none_never_zero():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Sell", 1, 100, 0.1))
+    L.declare_no_funding("BTCUSDT", "held between prints")
+    p = L.pnl_exact()
+    assert p["unrealised"] is None and p["net"] is None and p["price_leg"] is None and any(f.startswith("NO_MARK_FOR_OPEN_LEG") for f in p["flags"])
+    assert L.pnl()["net"] is None and L.canonical_net()["net"] is None and L.account()["equity"] is None
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_random_orderings_and_duplicates_give_the_same_state(seed):
+    rnd = random.Random(1000 + seed)
+    base = []
+    pos = 0
+    for i in range(rnd.randint(4, 12)):
+        side = rnd.choice(["Buy", "Sell"])
+        q = rnd.choice([1, 2, 0.5, 0.1, 0.3, 1.25])
+        base.append(fill(f"f{i:02d}", side, q, round(rnd.uniform(90, 110), 2), rnd.choice([0.05, 0.1, 0.0123]), leg=rnd.choice(["P", "S"]), ts=1000 + i))
+    funding = [(1500 + 10 * i, rnd.choice([0.5, -0.25, 0.1])) for i in range(3)]
+    ref = A.Ledger()
+    for f in base:
+        ref.record_fill(f, category="linear")
+    for ts, a in funding:
+        ref.record_funding("BTCUSDT", ts, a, "MEASURED")
+    ref.mark("BTCUSDT", 9000, 100.5)
+    want = _state(ref)
+    for trial in range(6):
+        seq = base + [rnd.choice(base) for _ in range(rnd.randint(0, 6))]            # duplicates
+        rnd.shuffle(seq)
+        L = A.Ledger()
+        fseq = funding + [rnd.choice(funding) for _ in range(3)]
+        rnd.shuffle(fseq)
+        for f in seq:
+            L.record_fill(f)
+        for ts, a in fseq:
+            L.record_funding("BTCUSDT", ts, a, "MEASURED")
+        L.mark("BTCUSDT", 8000, 1.0)                                                # an older mark arrives late...
+        L.mark("BTCUSDT", 9000, 100.5)
+        L.mark("BTCUSDT", 8500, 2.0)                                                # ...and one in between: neither replaces the newest
+        assert _state(L) == want
+        assert L.duplicates_ignored == len(seq) - len(base)
+
+
+def test_conflicting_duplicate_fill_is_flagged_in_either_arrival_order():
+    a, b = fill("x", "Buy", 1, 100), fill("x", "Buy", 2, 100)
+    for first, second in ((a, b), (b, a)):
+        L = A.Ledger()
+        L.record_fill(first)
+        assert L.record_fill(second) is False
+        p = L.pnl()
+        assert "DUPLICATE_FILL_CONFLICT:x" in p["flags"] and p["status"] == "UNRECONCILED" and p["claimable_profit"] is None
+        assert L.integrity_flags() == ["DUPLICATE_FILL_CONFLICT:x"]
+
+
+def test_funding_is_idempotent_by_symbol_and_ts_and_conflict_is_an_integrity_flag():
+    L = closed_pair()
+    n0 = L.pnl()["net"]
+    assert L.record_funding("BTCUSDT", 1500, 0.5, "MEASURED") is False and L.pnl()["net"] == n0 and L.integrity_flags() == []
+    assert L.record_funding("BTCUSDT", 1500, 0.7, "MEASURED") is False
+    assert L.integrity_flags() == ["FUNDING_CONFLICT:BTCUSDT:1500"] and L.pnl()["claimable_profit"] is None and L.pnl()["net"] == n0       # the first record stays
+
+
+def test_orphan_fill_is_accepted_flagged_and_cleared_by_the_acknowledgement():
+    L = A.Ledger(track_acks=True)
+    L.record_fill(fill("a", "Sell", 1, 100, 0.1))
+    L.record_fill(fill("c", "Buy", 1, 99, 0.1, ts=2000))
+    L.declare_no_funding("BTCUSDT", "x")
+    p = L.pnl()
+    assert "ORPHAN_FILL:G1:P" in p["flags"] and p["status"] == "UNRECONCILED" and p["claimable_profit"] is None and p["net"] == pytest.approx(0.8)
+    assert L.integrity_flags() == ["ORPHAN_FILL:G1:P"]
+    L.acknowledge("G1", "P", "O1")
+    p = L.pnl()
+    assert "ORPHAN_FILL:G1:P" not in p["flags"] and p["status"] == "RECONCILED" and L.integrity_flags() == []
+    plain = A.Ledger()                                                                  # tracking is opt-in: the old behaviour is unchanged
+    plain.record_fill(fill("a", "Sell", 1, 100, 0.1))
+    assert not any("ORPHAN" in f for f in plain.pnl()["flags"])
+
+
+def test_inputs_roundtrip_rebuilds_the_same_ledger_in_any_order():
+    L = closed_pair()
+    d = L.export_inputs()
+    d["fills"] = list(reversed(d["fills"]))
+    M = A.Ledger.from_inputs(json.loads(json.dumps(d)))
+    assert _state(M) == _state(L) and json.loads(M.to_json())["fills"] == L.export_inputs()["fills"]
+
+
+def test_deposits_and_withdrawals_move_the_balance_never_the_net():
+    L = closed_pair()
+    net0 = L.pnl()["net"]
+    assert L.account()["balance"] is None and "OPENING_BALANCE_UNKNOWN" in L.account()["flags"] and L.account()["equity"] is None
+    L.set_opening_balance(1000.0)
+    L.record_account_event("d1", 5000, "DEPOSIT", 250.0)
+    L.record_account_event("w1", 5001, "WITHDRAWAL", 40.0)
+    assert L.record_account_event("d1", 5000, "DEPOSIT", 250.0) is False
+    a = L.account()
+    assert L.pnl()["net"] == net0 == pytest.approx(2.1) and L.pnl_exact()["net"] == D("2.1")
+    assert a["balance"] == pytest.approx(1000 + 250 - 40 + 2.1) and a["equity"] == a["balance"] and a["deposits"] == 250.0 and a["withdrawals"] == 40.0
+    assert a["margin_known"] is False and a["margin_used_usd"] is None and a["net_pnl_excludes_deposits_and_withdrawals"] is True
+    L.set_margin(100.0, 900.0, 7000)
+    assert L.account()["margin_known"] is True and L.account()["margin_used_usd"] == 100.0
+    L.record_account_event("d1", 5000, "DEPOSIT", 999.0)
+    assert "ACCOUNT_EVENT_CONFLICT:d1" in L.integrity_flags()
+    with pytest.raises(A.LedgerError):
+        L.record_account_event("d2", 5000, "DEPOSIT", -1.0)
+
+
+def test_equity_is_balance_plus_unrealised_with_explicit_components():
+    L = A.Ledger()
+    L.set_opening_balance(1000)
+    L.record_fill(fill("a", "Buy", 1, 100, 0.1))
+    L.declare_no_funding("BTCUSDT", "x")
+    L.mark("BTCUSDT", 2000, 103.0)
+    a = L.account()
+    assert a["realised_net"] == pytest.approx(-0.1) and a["unrealised"] == pytest.approx(3.0) and a["balance"] == pytest.approx(999.9) and a["equity"] == pytest.approx(1002.9)
+
+
+# ---------------------------------------------------------------- the single net definition
+def test_canonical_net_values_open_legs_at_the_exit_side_and_charges_slippage_once():
+    L = A.Ledger()
+    L.set_exit_fee_bps(5.5, 0.0)
+    L.record_fill(fill("a", "Buy", 2, 100.5, 0.1))                          # taker walk: the fill is 0.5 above the 100.0 mid
+    L.declare_no_funding("BTCUSDT", "x")
+    L.record_slippage(1.0, "taker", "BTCUSDT")                               # 2 * 0.5
+    L.record_slippage(0.25, "adverse", "BTCUSDT")
+    L.mark("BTCUSDT", 2000, 100.0, bid=99.9, ask=100.1)
+    c = L.canonical_net()
+    assert c["valuation"] == "EXIT_SIDE" and c["taker_slippage"] == 1.0 and c["adverse_selection"] == 0.25
+    # price leg at mid: (100 - 100.5) * 2 + 1.0 taker add-back = 0; exit adj = (99.9 - 100) * 2 - 2 * 99.9 * 5.5e-4
+    adj = (99.9 - 100.0) * 2 - 2 * 99.9 * 5.5 / 1e4
+    assert c["exit_adjustment"] == pytest.approx(adj) and c["net"] == pytest.approx(0.0 + adj - 0.1 - 1.0 - 0.25)
+    assert c["ledger_net"] == pytest.approx(-1.1)                              # ms_accounting's own net is a different (price-leg) figure
+    assert L.record_slippage(9, "taker", "BTCUSDT", key="k") is True and L.record_slippage(9, "taker", "BTCUSDT", key="k") is False
+
+
+def test_canonical_net_without_an_exit_book_is_flagged_and_strict_makes_it_none():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Buy", 1, 100, 0.1))
+    L.declare_no_funding("BTCUSDT", "x")
+    L.mark("BTCUSDT", 2000, 101.0)
+    c = L.canonical_net()
+    assert c["valuation"] == "MID_FALLBACK" and "EXIT_PRICE_MISSING" in c["flags"] and c["net"] == pytest.approx(0.9)
+    assert L.canonical_net(strict_exit=True)["net"] is None
+
+
+# ---------------------------------------------------------------- venue reconciliation
+def venue_read(L=None, **over):
+    ex = [{"execId": "a", "orderLinkId": "G1-P", "symbol": "BTCUSDT", "side": "Sell", "execQty": "1", "execPrice": "100", "execFee": "0.1"},
+          {"execId": "b", "orderLinkId": "G1-S", "symbol": "BTCUSDT", "side": "Buy", "execQty": "1", "execPrice": "100", "execFee": "0.1"}]
+    kw = {"executions": ex, "positions": {"BTCUSDT": "-1", "SPOT:BTCUSDT": "1"}, "wallet": {"balance_change_usd": "-0.2"}, "fees": "0.2"}
+    kw.update(over)
+    return kw
+
+
+def open_pair():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Sell", 1, 100, 0.1, leg="P"))
+    L.record_fill(fill("b", "Buy", 1, 100, 0.1, leg="S"), category="spot")
+    L.declare_no_funding("BTCUSDT", "x")
+    return L
+
+
+def codes(r):
+    return sorted({f["code"] for f in r["findings"]})
+
+
+def test_reconcile_with_venue_exact_agreement_sets_venue_reconciled():
+    L = closed_pair()
+    ex = [{"execId": i, "orderLinkId": f"G1-{leg}", "symbol": "BTCUSDT", "side": s, "execQty": "1", "execPrice": px, "execFee": "0.1"}
+          for i, leg, s, px in (("a", "P", "Sell", "100"), ("b", "S", "Buy", "100"), ("c", "P", "Buy", "99"), ("d", "S", "Sell", "101"))]
+    assert L.pnl()["venue_reconciled"] is False
+    r = L.reconcile_with_venue(ex, {"BTCUSDT": "0", "SPOT:BTCUSDT": "0"}, {"balance_change_usd": "2.1"}, "0.4")
+    assert r["venue_reconciled"] is True and r["findings"] == []
+    p = L.pnl()
+    assert p["venue_reconciled"] is True and p["venue_claimable_profit"] == pytest.approx(2.1) and p["reconciliation_basis"] == "VENUE_EXECUTIONS_POSITIONS_FEES"
+    L.record_fill(fill("z", "Buy", 1, 100, 0.1, ts=9000))                       # anything booked afterwards makes the reconciliation stale
+    p = L.pnl()
+    assert p["venue_reconciled"] is False and "VENUE_RECONCILIATION_STALE" in p["flags"] and p["venue_claimable_profit"] is None
+
+
+def test_reconcile_with_venue_open_pair_matches_and_internal_status_is_not_venue_status():
+    L = open_pair()
+    r = L.reconcile_with_venue(**venue_read())
+    assert r["venue_reconciled"] is True and L.pnl()["status"] == "UNRECONCILED"          # open legs: still not a claimable profit
+    assert L.pnl()["venue_reconciled"] is False or L.pnl()["internally_consistent"] is True
+
+
+@pytest.mark.parametrize("over,code", [
+    ({"executions": venue_read()["executions"][:1]}, "EXEC_MISSING_IN_VENUE"),
+    ({"executions": venue_read()["executions"] + [{"execId": "q", "symbol": "BTCUSDT", "side": "Buy", "execQty": "1", "execPrice": "100", "execFee": "0.1"}]}, "EXEC_MISSING_IN_LEDGER"),
+    ({"executions": [dict(venue_read()["executions"][0], execQty="1.5"), venue_read()["executions"][1]]}, "EXEC_QTY_MISMATCH"),
+    ({"executions": [dict(venue_read()["executions"][0], execPrice="100.5"), venue_read()["executions"][1]]}, "EXEC_PRICE_MISMATCH"),
+    ({"executions": [dict(venue_read()["executions"][0], execFee="0.2"), venue_read()["executions"][1]]}, "EXEC_FEE_MISMATCH"),
+    ({"executions": [dict(venue_read()["executions"][0], side="Buy"), venue_read()["executions"][1]]}, "EXEC_SIDE_MISMATCH"),
+    ({"executions": [dict(venue_read()["executions"][0], orderLinkId="G1-X"), venue_read()["executions"][1]]}, "EXEC_LINK_MISMATCH"),
+    ({"executions": None}, "VENUE_EXECUTIONS_UNKNOWN"),
+    ({"fees": "0.3"}, "FEES_MISMATCH"),
+    ({"fees": None}, "VENUE_FEES_UNKNOWN"),
+    ({"positions": {"BTCUSDT": "-1.5", "SPOT:BTCUSDT": "1"}}, "POSITION_QTY_MISMATCH"),
+    ({"positions": {"BTCUSDT": "-1"}}, "VENUE_POSITION_UNKNOWN"),
+    ({"positions": {"BTCUSDT": "-1", "SPOT:BTCUSDT": "1", "ETHUSDT": "2"}}, "VENUE_POSITION_NOT_IN_LEDGER"),
+    ({"positions": None}, "VENUE_POSITIONS_UNKNOWN"),
+    ({"positions": {"BTCUSDT": {"qty": "-1", "avg_price": "101"}, "SPOT:BTCUSDT": "1"}}, "POSITION_AVG_PRICE_MISMATCH"),
+    ({"wallet": {"balance_change_usd": "-0.5"}}, "WALLET_MISMATCH"),
+    ({"wallet": {"balance_change_usd": None}}, "VENUE_WALLET_UNKNOWN"),
+])
+def test_reconcile_with_venue_every_mismatch_is_a_finding_and_not_a_reconciliation(over, code):
+    L = open_pair()
+    r = L.reconcile_with_venue(**venue_read(**over))
+    assert r["venue_reconciled"] is False and code in codes(r)
+    p = L.pnl()
+    assert p["venue_reconciled"] is False and p["venue_claimable_profit"] is None and p["reconciliation_basis"] == "VENUE_RECONCILIATION_MISMATCH"
+
+
+def test_reconcile_with_venue_incomplete_execution_read_cannot_reconcile_and_never_edits_the_ledger():
+    L = open_pair()
+    before = (L.positions(), L.fills(), L.export_inputs())
+    r = L.reconcile_with_venue(**venue_read(executions=venue_read()["executions"][:1]), executions_complete=False)
+    assert r["venue_reconciled"] is False and "VENUE_EXECUTIONS_INCOMPLETE" in codes(r) and "EXEC_MISSING_IN_VENUE" not in codes(r)
+    assert (L.positions(), L.fills(), L.export_inputs()) == before
+
+
+def test_reconcile_with_venue_tolerances_are_stated_and_bounded():
+    L = open_pair()
+    ok = L.reconcile_with_venue(**venue_read(positions={"BTCUSDT": "-1.0000000001", "SPOT:BTCUSDT": "1"}))
+    assert ok["venue_reconciled"] is True and ok["checked"]["tolerances"]["qty"] == "1E-9"
+    bad = L.reconcile_with_venue(**venue_read(positions={"BTCUSDT": "-1.001", "SPOT:BTCUSDT": "1"}))
+    assert bad["venue_reconciled"] is False
+
+
+def test_reconcile_with_venue_ledger_integrity_flags_block_it():
+    L = open_pair()
+    L.record_fill(fill("a", "Sell", 2, 100, 0.1, leg="P"))                         # conflicting duplicate
+    r = L.reconcile_with_venue(**venue_read())
+    assert r["venue_reconciled"] is False and "LEDGER_INTEGRITY" in codes(r)
+
+
+def test_a_negative_slippage_amount_is_refused_because_it_would_book_a_gain():
+    L = A.Ledger() if hasattr(A, "Ledger") else None
+    for kind in ("taker", "adverse"):
+        with pytest.raises(A.LedgerError):
+            L.record_slippage(-0.01, kind, "BTCUSDT")
+    assert L.record_slippage(0.0, "taker", "BTCUSDT") is True and L.record_slippage(0.5, "adverse", "BTCUSDT") is True

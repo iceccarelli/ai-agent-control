@@ -44,9 +44,12 @@ NOT_GRANTED = TAM.NOT_GRANTED
 _GRANTED = TAM._GRANTED
 DEFAULT_CAPABILITY_PATH = os.path.join(os.path.expanduser("~"), ".ai-agent-control", "ms_testnet_capability.json")
 
+#: The variable names the owner session tool (``ms_testnet_session``) reads: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET (derived from the manifest defaults; names only, never values).
+SESSION_CREDENTIAL_ENV = dict(api_key=TAM.DEFAULT_KEY_ENV.replace("DEDICATED_", ""), api_secret=TAM.DEFAULT_SECRET_ENV.replace("DEDICATED_", ""))
+
 AGGREGATE_CEILING_USD = float(shadow.SHADOW_MAX_NOTIONAL_USD)       # across ALL symbols, hedged pair counted once; never a per-symbol allowance
 MAX_SYMBOLS = 5
-MAX_ACTIVE_GROUPS = 2
+MAX_ACTIVE_GROUPS = 1                                              # ONE active group (ceiling AND default); the session tool enforces it and refusals() rejects more
 MAX_ENTRIES_PER_UTC_DAY = 4
 MAX_LEVERAGE = 3.0
 MAX_MARKET_AGE_MS = 5000
@@ -113,7 +116,7 @@ def _ceilings() -> Dict[str, float]:
 
 
 def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], strategy: str = "multi_symbol_funding_carry",
-             lower: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
+             lower: Optional[Mapping[str, float]] = None, credential_env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """The manifest for ``symbols`` / one candidate. ``lower`` may LOWER bounds; it cannot raise them (a raised bound makes ``refusals`` non-empty). Authorisation: NOT_GRANTED."""
     bounds: Dict[str, Any] = dict(_ceilings())
     for k, v in (lower or {}).items():
@@ -122,7 +125,7 @@ def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], str
         bounds[k] = v
     m: Dict[str, Any] = {
         "schema": SCHEMA, "venue": "testnet", "category_scope": ["linear", "spot"], "mode": "multi_symbol_hedged_carry", "credential_class": RC.TESTNET_CREDENTIAL_CLASS,
-        "credential_env": {"api_key": TAM.DEFAULT_KEY_ENV, "api_secret": TAM.DEFAULT_SECRET_ENV},
+        "credential_env": dict(credential_env) if credential_env is not None else {"api_key": TAM.DEFAULT_KEY_ENV, "api_secret": TAM.DEFAULT_SECRET_ENV},
         "strategy_allowlist": [{"strategy": strategy, "candidate_id": candidate_id, "spec_digest": spec_digest}],
         "symbol_allowlist": list(symbols), "allowed_sides": {k: list(v) for k, v in SIDES.items()}, "allowed_order_types": list(ORDER_TYPES),
         "execution_styles": list(EXECUTION_STYLES), "bounds": bounds, "kill_switch": dict(KILL_SWITCH),
@@ -261,7 +264,7 @@ def policy_from_manifest(m: Mapping[str, Any], *, strategy_index: int = 0) -> Di
             "allowed_symbols": list(m["symbol_allowlist"]), "allowed_sides": {k: list(v) for k, v in m["allowed_sides"].items()},
             "allowed_order_types": list(m["allowed_order_types"]), "max_notional_per_symbol_usd": b["max_notional_per_symbol_usd"],
             "max_aggregate_notional_usd": b["aggregate_max_notional_usd"], "max_gross_exposure_usd": b["max_gross_exposure_usd"], "max_net_exposure_usd": b["max_net_exposure_usd"],
-            "max_active_groups": b["max_active_groups"], "max_unhedged_usd": b["max_unhedged_usd"], "max_leverage": float(b["max_leverage"]),
+            "max_active_groups": b["max_active_groups"], "max_unhedged_usd": b["max_unhedged_usd"], "max_daily_loss_usd": float(b["max_loss_usd"]), "max_leverage": float(b["max_leverage"]),
             "max_market_age_ms": b["max_market_age_ms"], "max_account_age_ms": b["max_account_age_ms"], "execution_styles": list(m["execution_styles"])}
 
 
@@ -346,12 +349,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     g.add_argument("--candidate-id", required=True)
     g.add_argument("--spec-digest", required=True)
     g.add_argument("--symbols", required=True)
+    g.add_argument("--session-credentials", action="store_true",
+                   help="name the dedicated variables the owner session tool reads: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET (the names are part of the digest)")
     v = sub.add_parser("validate")
     v.add_argument("file")
     sub.add_parser("status")
     a = ap.parse_args(argv)
     if a.cmd == "generate":
-        m = generate(candidate_id=a.candidate_id, spec_digest=a.spec_digest, symbols=[s for s in a.symbols.split(",") if s])
+        m = generate(candidate_id=a.candidate_id, spec_digest=a.spec_digest, symbols=[s for s in a.symbols.split(",") if s],
+                     credential_env=SESSION_CREDENTIAL_ENV if a.session_credentials else None)
         rep = validate(m, env={})
         print(json.dumps(m, indent=2, sort_keys=True))
         return 0 if rep["valid"] else 1

@@ -40,8 +40,18 @@ def loopback_only(monkeypatch):
 
 
 # ------------------------------------------------------------------ synthetic but schema-true artifacts
+IDENT = {"run_id": "run_0123456789abcdef0123", "mode": "REPLAY", "candidate_id": "carry_eth", "spec_digest": "a" * 64, "data_digest": "b" * 64, "code_revision": "c0ffee1", "generated_ms": NOW - 60_000}
+
+
 def art(schema, basis, **kw):
-    return {"schema": schema, "basis": basis, "generated_ms": NOW - 60_000, **kw}
+    """A schema-true artifact. It carries the run identity by default; ``identity=None`` makes it a legacy file, ``identity={...}`` overrides it."""
+    ident = kw.pop("identity", IDENT)
+    d = {"schema": schema, "generated_ms": NOW - 60_000, **kw}
+    if basis is not None:
+        d["basis"] = basis
+    if ident is not None:
+        d["identity"] = dict(ident)
+    return d
 
 
 def good_set(**over):
@@ -55,7 +65,7 @@ def good_set(**over):
                                                 "mark_price": 3010.0, "unrealised_pnl_usd": 1.25, "group_id": "g1"}]),
         "risk_state.json": art("risk_state/v1", "CALCULATED", halted=False, halt_reasons=[], limits=[{"name": "gross exposure", "unit": "USD", "limit": 1000.0, "value": 400.0, "status": "OK"}],
                                alerts=[{"severity": "WARN", "code": "STALE_BOOK", "detail": "book 12 s old"}]),
-        "ledger_pnl.json": art("ledger_pnl/v1", "SIMULATED", period_start_ms=None, period_end_ms=None, realised_gross_usd=18.5, fees_usd=7.0, funding_usd=2.0, realised_net_usd=11.5, unrealised_usd=1.25),
+        "ledger_pnl.json": art("ledger_pnl/v1", "SIMULATED", period_start_ms=None, period_end_ms=None, realised_gross_usd=15.25, fees_usd=7.0, funding_usd=2.0, realised_net_usd=10.25, unrealised_usd=1.25),
         "competition.json": art("competition/v1", "ESTIMATED", candidates=[
             {"candidate_id": "carry_eth", "kind": "SPOT_PERP_CARRY", "spot_hedge": "HEDGEABLE_ON_BYBIT", "status": "SUFFICIENT_EVIDENCE", "reason": None, "gross_bps_horizon": 30.0, "net_bps_horizon": 12.0, "n_observations": 40, "prov": "MODELLED"},
             {"candidate_id": "dir_pepe", "kind": "PERP_DIRECTIONAL_FUNDING", "spot_hedge": "PERP_ONLY", "status": "REJECTED", "reason": "net negative after costs in every fold", "gross_bps_horizon": 9.0, "net_bps_horizon": -2.0, "n_observations": 40, "prov": "MEASURED"}]),
@@ -64,6 +74,15 @@ def good_set(**over):
              "capacity_usd": 50_000.0, "prov": "MODELLED", "exclusions": []},
             {"candidate_id": "dir_pepe", "kind": "PERP_DIRECTIONAL_FUNDING", "symbols": ["PEPEUSDT"], "spot_hedge": "PERP_ONLY", "hold_days": 3.0, "gross_bps_horizon": 25.0, "net_bps_horizon": None,
              "capacity_usd": None, "prov": "ASSUMED", "exclusions": []}]),
+        "pipeline_summary.json": art("pipeline_summary/v1", None, outcome="SIMULATED_EXECUTION", reason=None, required_span={"days": 457, "holding_rows": 60}, data_digest_parts={"funding": "f" * 16, "mark": "m" * 16},
+                                     evidence_basis={"replay_report.json": "SIMULATED"}),
+        "reconcile_report.json": art("reconcile_report/v1", None, findings=[], halt_new_exposure=False, views_compared=["ledger", "portfolio"]),
+        "universe_scope.json": art("universe_scope/v1", None, scope_verdict="SURVIVORS_ONLY", eligible_perpetual_lifecycle_universe={"count": 120}, lifecycle_class_counts={"TRADING": 118, "DELISTED": 2}),
+        "funnel.json": art("funnel/v1", None, steps=[{"name": "universe rows", "count": 600}, {"name": "eligible", "count": 120}], exclusion_reasons={"prelaunch_no_history": 12}),
+        "testnet_session.json": art("testnet_session/v1", "NOT_RUN", identity={**IDENT, "mode": "TESTNET", "run_id": "run_testnet_0001"}, venue="Testnet", endpoint_host="api-testnet.bybit.com",
+                                    credential_state={"dedicated_key_present": True, "dedicated_secret_present": True, "generic_credentials_ignored": True},
+                                    preflight={"status": "NOT_RUN", "checked_ms": None, "checks": []}, plan=None, confirmation={"state": "NOT_REQUESTED", "plan_digest_confirmed": None},
+                                    orders=[], executions=[], final_position=None, flat_verified=None, net={"fees_usd": None, "funding_usd": None, "price_pnl_usd": None, "note": None}),
     }
     s.update(over)
     return s
@@ -78,6 +97,7 @@ def write_set(d, files):
 
 
 def build(tmp_path, files=None, *, env=None, data_root="mk", universe=None, **kw):
+    os.makedirs(tmp_path, exist_ok=True)
     ad = write_set(tmp_path / "artifacts", files) if files is not None else str(tmp_path / "no-artifacts")
     dr = None
     if data_root == "mk":
@@ -177,11 +197,11 @@ def test_populated_values_carry_the_right_basis_labels(full_state):
 def test_a_simulated_ledger_is_never_presented_as_realised(full_state, tmp_path):
     pnl = full_state["portfolio"]["pnl"]
     assert pnl["kind"] == "SIMULATED_NOT_REALISED"
-    assert pnl["simulated_net"]["v"] == 11.5 and pnl["simulated_net"]["basis"] == "SIMULATED"
+    assert pnl["simulated_net"]["v"] == 10.25 and pnl["simulated_net"]["basis"] == "SIMULATED"
     assert pnl["realised_net"]["v"] is None and pnl["realised_gross"]["v"] is None and pnl["realised_net"]["basis"] == "MISSING"
     files = good_set(**{"ledger_pnl.json": art("ledger_pnl/v1", "EXCHANGE_REPORTED", period_start_ms=None, period_end_ms=None, realised_gross_usd=20.0, fees_usd=5.0, funding_usd=1.0, realised_net_usd=16.0, unrealised_usd=None)})
     p2 = build(tmp_path, files)["portfolio"]["pnl"]
-    assert p2["kind"] == "ACCOUNT_REALISED" and p2["realised_net"]["basis"] == "EXCHANGE_REPORTED" and p2["simulated_net"]["v"] is None and p2["unrealised"]["basis"] == "MISSING"
+    assert p2["kind"] == "ACCOUNT_REPORTED_UNRECONCILED" and p2["realised_net"]["basis"] == "EXCHANGE_REPORTED" and p2["simulated_net"]["v"] is None and p2["unrealised"]["basis"] == "MISSING"
     files = good_set(**{"ledger_pnl.json": art("ledger_pnl/v1", "OWNER_SUPPLIED_UNVERIFIED", period_start_ms=None, period_end_ms=None, realised_gross_usd=20.0, fees_usd=None, funding_usd=None, realised_net_usd=None, unrealised_usd=None)})
     p3 = build(tmp_path, files)["portfolio"]["pnl"]
     assert p3["kind"] == "OWNER_IMPORT_UNVERIFIED" and p3["realised_gross"]["basis"] == "OWNER_SUPPLIED_UNVERIFIED"
@@ -281,7 +301,8 @@ BAD = {
     "directory": lambda d, n: (d / n).mkdir(),
     "not_an_object": lambda d, n: (d / n).write_text("[1, 2, 3]"),
     "wrong_schema": lambda d, n: (d / n).write_text(json.dumps({**good_set()[n], "schema": "other/v9"})),
-    "basis_not_allowed": lambda d, n: (d / n).write_text(json.dumps({**good_set()[n], "basis": "MEASURED" if n == "replay_report.json" else "NONSENSE"})),
+    "basis_not_allowed": lambda d, n: (d / n).write_text(json.dumps({**good_set()[n], "basis": "MEASURED" if n == "replay_report.json" else "NONSENSE"} if CC.ARTIFACTS[n][1] is not None
+                                                                    else {**good_set()[n], "identity": {**IDENT, "mode": "MAINNET"}})),     # a file with no basis field: an identity mode outside the vocabulary
     "future": lambda d, n: (d / n).write_text(json.dumps({**good_set()[n], "generated_ms": NOW + 10 * 86_400_000})),
     "invalid_utf8": lambda d, n: (d / n).write_bytes(b"\xff\xfe\x00{"),
     "deep_nesting": lambda d, n: (d / n).write_text("[" * 100_000 + "]" * 100_000),
@@ -364,7 +385,8 @@ def test_environment_findings_reach_the_attention_list_and_secrets_are_never_sho
     assert any(a["source"] == "environment" and "BYBIT_VENUE" in a["text"] for a in s["overview"]["attention"])
     text = json.dumps(s)
     assert "KEYVALUE12345" not in text and "SECRETVALUE6789" not in text
-    assert s["environment"]["secrets"]["BYBIT_API_KEY"] == "set"
+    flags = {f["name"]: f["presence"] for f in s["overview"]["environment"]["flags"]}
+    assert flags["BYBIT_API_KEY"] == "set" and flags["BYBIT_API_SECRET"] == "set" and flags["LIVE_TRADING_ACK"] == "unset"
 
 
 def test_a_halted_risk_state_and_critical_alerts_are_failures(tmp_path):
@@ -581,17 +603,20 @@ const base = process.argv[2], outDir = process.argv[3], exe = process.argv[4];
   for (const width of [1280, 390]) {
     const ctx = await browser.newContext({ viewport: { width, height: 900 } });
     const page = await ctx.newPage();
+    page.on('dialog', d => { dialogs++; d.dismiss(); });
     const errors = [], external = [];
+    let dialogs = 0;
     page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
     page.on('pageerror', e => errors.push(String(e)));
     page.on('request', r => { if (!r.url().startsWith(base)) external.push(r.url()); });
-    for (const view of ['overview', 'research', 'portfolio', 'execution', 'risk', 'evidence']) {
+    for (const view of ['overview', 'research', 'portfolio', 'execution', 'accounting', 'risk', 'testnet', 'evidence']) {
       await page.goto(base + '/#/' + view, { waitUntil: 'networkidle' });
       await page.waitForSelector('#view-h');
       const m = await page.evaluate(() => ({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, h: document.getElementById('view-h').textContent,
-        legend: document.querySelectorAll('#legend .badge').length, text: document.getElementById('view').innerText.length, current: document.querySelector('.rail a[aria-current]').textContent }));
+        legend: document.querySelectorAll('#legend .badge').length, text: document.getElementById('view').innerText.length, current: document.querySelector('.rail a[aria-current]').getAttribute('data-view'), xss: window.__xss === undefined ? null : window.__xss, imgs: document.querySelectorAll('#view img, #view script, #view iframe').length,
+        hostile: document.getElementById('view').innerText.includes('onerror=window.__xss=1') }));
       await page.screenshot({ path: outDir + '/' + process.argv[5] + '-' + view + '-' + width + '.png', fullPage: true });
-      results.push({ width, view, ...m, errors: errors.slice(), external: external.slice() });
+      results.push({ width, view, ...m, alerts: dialogs, errors: errors.slice(), external: external.slice() });
     }
     await ctx.close();
   }
@@ -603,28 +628,29 @@ CHROME = "/opt/pw-browsers/chromium-1243/chrome-linux64/chrome"
 NODE_MODULES = "/opt/node22/lib/node_modules"
 
 
-def _render(srv, tmp_path, tag):
+def _render(srv, tmp_path, tag, shots_dir=None):
     node = shutil.which("node")
     if not node or not os.path.exists(CHROME) or not os.path.isdir(os.path.join(NODE_MODULES, "playwright")):
         pytest.skip("render smoke needs node + node playwright + chromium at /opt/pw-browsers (python playwright.sync_api is not installed); not available here")
     script = tmp_path / "render_check.js"
     script.write_text(NODE_CHECK)
-    shots = tmp_path / "shots"
+    shots = tmp_path / "shots" if shots_dir is None else shots_dir
     shots.mkdir(exist_ok=True)
     env = {"PATH": os.environ.get("PATH", ""), "NODE_PATH": NODE_MODULES, "HOME": str(tmp_path), "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
     p = subprocess.run([node, str(script), f"http://127.0.0.1:{srv.server_address[1]}", str(shots), CHROME, tag], capture_output=True, text=True, timeout=180, env=env)
     assert p.returncode == 0, p.stderr[-2000:]
     res = json.loads(p.stdout.strip().splitlines()[-1])
-    assert len(res) == 12
+    assert len(res) == 16
     for r in res:
         assert r["errors"] == [] and r["external"] == [], r
         assert r["sw"] <= r["cw"], f"horizontal scroll at {r['width']}px on {r['view']}: {r['sw']} > {r['cw']}"
-        assert r["legend"] == 8 and r["text"] > 80 and r["current"].lower() == r["view"] and r["h"].lower() == r["view"]
-    assert len(list(shots.glob(f"{tag}-*.png"))) == 12
+        assert r["legend"] == 8 and r["text"] > 80 and r["current"] == r["view"] and r["h"].lower() == r["view"]
+        assert r["xss"] is None and r["imgs"] == 0 and r["alerts"] == 0, r
+    assert len(list(shots.glob(f"{tag}-*.png"))) == 16
     return res
 
 
-def test_render_smoke_with_data_six_views_two_widths_no_console_error_no_horizontal_scroll(server, tmp_path):
+def test_render_smoke_with_data_eight_views_two_widths_no_console_error_no_horizontal_scroll(server, tmp_path):
     _render(server, tmp_path, "data")
 
 
@@ -641,16 +667,632 @@ def test_render_smoke_with_no_data_shows_empty_states(tmp_path):
 
 
 def test_the_pnl_card_states_one_net_the_total_with_realised_and_unrealised_beside_it(tmp_path):
-    files = good_set(**{"ledger_pnl.json": art("ledger_pnl/v1", "SIMULATED", period_start_ms=None, period_end_ms=None, realised_gross_usd=18.5, fees_usd=7.0, funding_usd=2.0,
-                                                realised_net_usd=11.5, unrealised_usd=1.25, net_usd=12.75)})
-    st = build(tmp_path, files)
+    st = build(tmp_path, good_set())
     pnl = st["portfolio"]["pnl"]
-    assert pnl["total_net"]["v"] == 12.75 and pnl["total_net"]["basis"] == "SIMULATED"
-    assert pnl["simulated_net"]["v"] + pnl["unrealised"]["v"] == pnl["total_net"]["v"]
+    assert pnl["total_net"]["v"] == 11.5 and pnl["total_net"]["basis"] == "SIMULATED" and pnl["total_net"]["src"] == "replay_report.json:net_pnl_usd"
+    assert round(pnl["simulated_net"]["v"] + pnl["unrealised"]["v"], 2) == pnl["total_net"]["v"]
+    assert pnl["total_net"] == st["execution"]["net"] == st["figures"]["net"]                    # the same value in every view
     text = next(c for c in st["overview"]["cards"] if c["id"] == "pnl")["text"]
-    assert "$12.75" in text and "realised $11.50" in text and "unrealised $1.25" in text and "not realised cash" in text
-    files = good_set(**{"ledger_pnl.json": art("ledger_pnl/v1", "SIMULATED", period_start_ms=None, period_end_ms=None, realised_gross_usd=18.5, fees_usd=7.0, funding_usd=2.0,
-                                                realised_net_usd=11.5, unrealised_usd=1.25)})                      # no net_usd: the total is NOT derived here
-    st = build(tmp_path, files)
+    assert "$11.50" in text and "realised $10.25" in text and "unrealised $1.25" in text and "not realised cash" in text
+    files = good_set()
+    del files["replay_report.json"]                                                              # no replay: the total is only what the ledger states (net_usd), never derived
+    st = build(tmp_path / "b", files)
     assert st["portfolio"]["pnl"]["total_net"]["v"] is None and st["portfolio"]["pnl"]["total_net"]["basis"] == "MISSING"
     assert "not stated (MISSING)" in next(c for c in st["overview"]["cards"] if c["id"] == "pnl")["text"]
+    files["ledger_pnl.json"]["net_usd"] = 11.5
+    st = build(tmp_path / "c", files)
+    assert st["portfolio"]["pnl"]["total_net"]["v"] == 11.5 and st["figures"]["net"]["src"] == "ledger_pnl.json:net_usd"
+
+
+# ====================================================================== ROUND 9: one coherent state, run identity, the eight views, testnet, honesty
+import contextlib      # noqa: E402
+import copy           # noqa: E402
+
+MONEY_KEYS = ("net", "gross", "fees", "funding", "realised_net", "realised_gross", "unrealised", "simulated_net", "simulated_gross", "simulated_fees", "simulated_funding",
+              "realised_fees", "realised_funding", "total_net", "slippage", "hedge_cost", "adverse_selection")
+PER_ITEM = ("symbols[", "positions[", "candidates[", "items[", ".testnet", "limits[", ".exposure", "competition", "opportunities")     # per-symbol/per-position/per-candidate or a different universe
+
+
+def single_source_violations(state):
+    """Walk the whole state. Every displayed net/gross/realised/unrealised/fees/funding/slippage figure must be one of the ``figures`` (it carries ``concept`` and ``src``) and every
+    copy of a concept must be identical (same value, basis and source field)."""
+    by, bad = {}, []
+    for path, o in values(state):
+        key = path.rsplit(".", 1)[-1].split("[")[0]
+        if "concept" in o:
+            by.setdefault(o["concept"], []).append((path, o))
+        elif key in MONEY_KEYS and not any(c in path for c in PER_ITEM) and not (o["v"] is None and o["basis"] == "MISSING"):     # an empty slot cannot compete
+            bad.append(("NO_CONCEPT", path))
+    for concept, rows in by.items():
+        if len({json.dumps(o, sort_keys=True) for _p, o in rows}) > 1:
+            bad.append(("COMPETING", concept))
+    return bad, by
+
+
+def test_every_displayed_money_figure_is_read_from_one_source_field(full_state):
+    bad, by = single_source_violations(full_state)
+    assert bad == []                                                                                    # positive control
+    assert set(by) >= {"net", "gross", "fees", "funding", "closed_net", "closed_gross", "unrealised", "slippage", "hedge_cost", "adverse_selection"}
+    net_paths = {p for p, _ in by["net"]}
+    assert {".figures.net", ".execution.net", ".portfolio.pnl.total_net"} <= net_paths and any(".accounting.components" in p for p in net_paths)      # the same figure in four places
+    srcs = {c: {o["src"] for _p, o in rows} for c, rows in by.items()}
+    assert srcs["net"] == {"replay_report.json:net_pnl_usd"} and srcs["gross"] == {"replay_report.json:gross_pnl_usd"} and srcs["fees"] == {"replay_report.json:fees_usd"}
+    assert srcs["unrealised"] == {"ledger_pnl.json:unrealised_usd"} and srcs["closed_net"] == {"ledger_pnl.json:realised_net_usd"}
+    for c in ("net", "gross"):                                                                          # gross and net are never conflated: the source field says which it is
+        assert all(c in src.split(":")[1] for src in srcs[c])
+    F = full_state["figures"]
+    assert round(F["gross"]["v"] - F["fees"]["v"], 2) == F["net"]["v"]                                  # gross - fees = net
+    assert round(F["closed_net"]["v"] + F["unrealised"]["v"], 2) == F["net"]["v"]                     # realised + unrealised = the one net
+    assert round(F["closed_gross"]["v"] + F["funding"]["v"] - F["fees"]["v"], 2) == F["closed_net"]["v"]
+
+
+def test_a_second_competing_figure_is_detected_mutation_check(full_state):
+    st = copy.deepcopy(full_state)
+    st["execution"]["net"]["v"] = 99.0                                                                  # a card that computed its own net
+    assert ("COMPETING", "net") in single_source_violations(st)[0]
+    st = copy.deepcopy(full_state)
+    st["portfolio"]["pnl"]["unrealised"]["src"] = "portfolio_state.json:unrealised_pnl_usd"           # same number, another source field
+    assert ("COMPETING", "unrealised") in single_source_violations(st)[0]
+    st = copy.deepcopy(full_state)
+    st["execution"]["fees"] = CC.val(7.0, "SIMULATED", "USD")                                           # a figure that does not say where it came from
+    assert ("NO_CONCEPT", ".execution.fees") in single_source_violations(st)[0]
+
+
+def test_the_accounting_identities_are_checked_shown_and_a_failure_is_loud(tmp_path):
+    ok = build(tmp_path / "ok", good_set())["accounting"]
+    assert ok["integrity"] == "PASS" and all(c["state"] == "PASS" for c in ok["checks"]) and {c["id"] for c in ok["checks"]} == {
+        "gross_minus_fees", "symbols_sum", "ledger_components", "realised_plus_unrealised", "fees_match", "unrealised_matches_portfolio", "positions_sum"}
+    for name, mutate, failing in (
+            ("replay_report.json", lambda o: o.update(net_pnl_usd=12.5), "gross_minus_fees"),
+            ("replay_report.json", lambda o: o["symbols"][0].update(net_pnl_usd=9.5), "symbols_sum"),
+            ("ledger_pnl.json", lambda o: o.update(realised_net_usd=9.0), "ledger_components"),
+            ("ledger_pnl.json", lambda o: o.update(unrealised_usd=2.0), "realised_plus_unrealised"),
+            ("ledger_pnl.json", lambda o: o.update(fees_usd=8.0), "fees_match"),
+            ("portfolio_state.json", lambda o: o.update(unrealised_pnl_usd=3.0), "unrealised_matches_portfolio")):
+        files = good_set()
+        mutate(files[name])
+        st = build(tmp_path / (name + failing), files)
+        assert st["accounting"]["integrity"] == "FAIL" and {c["id"]: c["state"] for c in st["accounting"]["checks"]}[failing] == "FAIL", failing
+        assert any(a["source"] == "accounting" and a["severity"] == "FAIL" for a in st["overview"]["attention"]) and {c["id"]: c for c in st["overview"]["cards"]}["pnl"]["status"] == "FAIL"
+        assert st["accounting"]["complete"] is False
+    files = good_set()
+    files["ledger_pnl.json"].update(unrealised_usd=None)                                                # an unknown input is NOT_CHECKABLE, never PASS
+    st = build(tmp_path / "unk", files)["accounting"]
+    assert {c["id"]: c["state"] for c in st["checks"]}["realised_plus_unrealised"] == "NOT_CHECKABLE"
+
+
+def test_the_components_are_displayed_and_the_ones_no_backend_provides_are_missing(full_state):
+    comp = {c["key"]: c for c in full_state["accounting"]["components"]}
+    assert comp["hedge_cost"]["value"]["v"] is None and comp["hedge_cost"]["value"]["basis"] == "MISSING" and "no backend" in comp["hedge_cost"]["value"]["note"]
+    for k in ("slippage", "adverse_selection"):                                                # no artifact states them in THIS set: missing, never zero
+        assert comp[k]["value"]["v"] is None and comp[k]["value"]["basis"] == "MISSING"
+    assert comp["funding"]["value"]["v"] == 2.0 and comp["fees"]["value"]["v"] == 7.0
+    assert full_state["accounting"]["complete"] is False and full_state["accounting"]["why_incomplete"]
+
+
+# ---------------------------------------------------------------- run identity
+def ident_set(**per_file):
+    files = good_set()
+    for name, change in per_file.items():
+        files[name.replace("__", ".")]["identity"] = {**IDENT, **change}
+    return files
+
+
+def test_matching_identities_are_consistent_and_carry_through(full_state):
+    c = full_state["coherence"]
+    assert c["verdict"] == "CONSISTENT" and c["mismatches"] == [] and c["primary"]["run_id"] == IDENT["run_id"] and c["code_revisions"] == ["c0ffee1", "c0ffee1"][:1] + [] or c["code_revisions"]
+    assert c["combined_numbers_withheld"] is False and full_state["figures"]["net"]["v"] == 11.5
+    assert {r["file"] for r in c["runs"]} == set(CC.ARTIFACTS)
+
+
+@pytest.mark.parametrize("field,other", [("run_id", "run_other"), ("candidate_id", "dir_pepe"), ("data_digest", "d" * 64), ("mode", "PAPER")])
+@pytest.mark.parametrize("victim", ["ledger_pnl.json", "portfolio_state.json", "risk_state.json"])
+def test_a_run_candidate_digest_or_mode_mismatch_is_a_loud_inconsistent_run_and_no_figure_is_combined(tmp_path, field, other, victim):
+    files = good_set()
+    files[victim]["identity"] = {**IDENT, field: other}
+    st = build(tmp_path, files)
+    c = st["coherence"]
+    assert c["verdict"] == "INCONSISTENT_RUN" and c["combined_numbers_withheld"] is True and any(m["field"] == field for m in c["mismatches"])
+    assert st["overview"]["headline"]["status"] == "FAIL" and "INCONSISTENT_RUN" in st["overview"]["headline"]["text"]
+    assert any(a["source"] == "coherence" and a["severity"] == "FAIL" for a in st["overview"]["attention"])
+    for k, f in st["figures"].items():                                                                  # nothing that needs two files is combined
+        assert f["v"] is None and f["basis"] == "MISSING" and "withheld" in f["note"], k
+    assert st["accounting"]["withheld"] is True and st["accounting"]["integrity"] == "WITHHELD" and all(x["state"] == "NOT_CHECKABLE" for x in st["accounting"]["checks"])
+    assert st["execution"]["net"]["v"] is None and st["portfolio"]["pnl"]["total_net"]["v"] is None and st["portfolio"]["unrealised"]["v"] is None
+    cards = {x["id"]: x for x in st["overview"]["cards"]}
+    assert "Withheld" in cards["pnl"]["text"] and "Withheld" in cards["exposure"]["text"] and "$" not in cards["pnl"]["text"]
+    answers = " ".join(a["a"] for a in st["overview"]["answers"])
+    assert "INCONSISTENT_RUN" in answers and "$11.50" not in answers and "$400" not in answers
+    assert st["overview"]["next_steps"][0].startswith("Regenerate the artifacts from ONE run")
+    assert single_source_violations(st)[0] == []
+
+
+def test_identity_mismatch_positive_control_one_run_shows_the_figures(tmp_path):
+    st = build(tmp_path, good_set())                                                                    # the same fixture without the mutation
+    assert st["coherence"]["verdict"] == "CONSISTENT" and st["figures"]["net"]["v"] == 11.5 and st["accounting"]["withheld"] is False
+
+
+def test_legacy_files_without_identity_are_unverified_not_inconsistent_and_not_hidden(tmp_path):
+    files = good_set(**{n: art(CC.ARTIFACTS[n][0], good_set()[n].get("basis"), identity=None, **{k: v for k, v in good_set()[n].items() if k not in ("schema", "basis", "identity", "generated_ms")})
+                        for n in ("replay_report.json", "ledger_pnl.json")})
+    st = build(tmp_path, files)
+    c = st["coherence"]
+    assert c["verdict"] == "UNVERIFIED" and set(c["legacy_files"]) == {"replay_report.json", "ledger_pnl.json"} and c["mismatches"] == []
+    assert st["figures"]["net"]["v"] == 11.5 and any(a["source"] == "coherence" and "UNVERIFIED" in a["text"] for a in st["overview"]["attention"])
+    src = {x["file"]: x for x in st["evidence"]["sources"]}
+    assert src["replay_report.json"]["identity_status"] == "LEGACY_NO_IDENTITY" and src["risk_state.json"]["identity_status"] == "IDENTIFIED"
+    assert st["accounting"]["venue_reconciliation"]["status"] == "INTERNAL_CONSISTENCY_ONLY"
+
+
+def test_unknown_identity_fields_are_unverified_and_never_matches(tmp_path):
+    files = good_set()
+    files["ledger_pnl.json"]["identity"] = {**IDENT, "data_digest": "UNKNOWN"}
+    c = build(tmp_path, files)["coherence"]
+    assert c["verdict"] == "UNVERIFIED" and "ledger_pnl.json:data_digest" in c["unknown_fields"]
+
+
+def test_a_malformed_identity_refuses_the_file(tmp_path):
+    for bad in ({"run_id": "x"}, "not an object", {**IDENT, "mode": "MAINNET"}, {**IDENT, "generated_ms": -1}, None):
+        files = good_set()
+        files["ledger_pnl.json"]["identity"] = bad
+        assert CC.load_artifact(write_set(tmp_path / str(abs(hash(str(bad)))), files), "ledger_pnl.json", NOW)["state"] == "ERROR", bad
+
+
+def test_the_testnet_family_is_separate_but_its_mode_must_be_testnet(tmp_path):
+    st = build(tmp_path / "a", good_set())
+    assert st["coherence"]["verdict"] == "CONSISTENT"                                                   # a different run_id and mode TESTNET do not conflict with the simulated family
+    files = good_set()
+    files["testnet_session.json"]["identity"] = {**IDENT, "mode": "REPLAY"}
+    assert build(tmp_path / "b", files)["coherence"]["verdict"] == "INCONSISTENT_RUN"
+    files = good_set()
+    files["replay_report.json"]["identity"] = {**IDENT, "mode": "TESTNET"}
+    assert build(tmp_path / "c", files)["coherence"]["verdict"] == "INCONSISTENT_RUN"
+
+
+# ---------------------------------------------------------------- testnet
+def tn(**over):
+    return {**good_set()["testnet_session.json"], **over}
+
+
+def tn_executed(**over):
+    plan = {"digest": "p" * 16, "manifest_digest": "m" * 16, "notional_usd": 70.0,
+            "legs": [{"symbol": "BTCUSDT", "side": "Sell", "order_type": "Market", "qty": 0.001, "price": None, "notional_usd": 70.0}]}
+    base = dict(basis="EXCHANGE_REPORTED", preflight={"status": "PASS", "checked_ms": NOW - 5000, "checks": [{"name": "read_only_auth", "ok": True, "detail": "ok"}, {"name": "instrument", "ok": True, "detail": "Trading"}]},
+                plan=plan, confirmation={"state": "CONFIRMED", "plan_digest_confirmed": "p" * 16},
+                orders=[{"link_id": "g1-leg1", "order_id": "o1", "symbol": "BTCUSDT", "side": "Sell", "qty": 0.001, "status": "Filled", "filled_qty": 0.001, "avg_price": 70000.0},
+                        {"link_id": "g1-leg2", "order_id": None, "symbol": "BTCUSDT", "side": "Buy", "qty": 0.001, "status": "Rejected", "filled_qty": 0.0, "avg_price": None},
+                        {"link_id": "g1-leg3", "order_id": "o3", "symbol": "BTCUSDT", "side": "Buy", "qty": 0.001, "status": "PartiallyFilled", "filled_qty": 0.0004, "avg_price": 70010.0},
+                        {"link_id": "g1-leg4", "order_id": "o4", "symbol": "BTCUSDT", "side": "Buy", "qty": 0.001, "status": "Cancelled", "filled_qty": 0.0, "avg_price": None}],
+                executions=[{"exec_id": "e1", "link_id": "g1-leg1", "symbol": "BTCUSDT", "side": "Sell", "qty": 0.001, "price": 70000.0, "fee_usd": 0.04, "ts_ms": NOW - 4000}],
+                final_position={"BTCUSDT": 0.0}, flat_verified=True, net={"fees_usd": 0.04, "funding_usd": None, "price_pnl_usd": -0.1, "note": "testnet books are thin"})
+    base.update(over)
+    return tn(**base) | {"basis": base["basis"]}
+
+
+def tnv(tmp_path, session, name="t"):
+    return build(tmp_path / name, good_set(**{"testnet_session.json": session}))["testnet"]
+
+
+def test_testnet_not_run_is_an_explicit_empty_state_and_never_green(tmp_path, empty_state):
+    for st in (empty_state, build(tmp_path, good_set())):                                               # no file at all, and a file that says NOT_RUN
+        t = st["testnet"]
+        assert t["session_state"] == "NOT_RUN" and t["pill"] == "NO_DATA" and "not owner profit" in t["banner"]
+        card = next(c for c in st["overview"]["cards"] if c["id"] == "testnet")
+        assert card["status"] == "NO_DATA" and card["status"] != "OK" and "NOT_RUN" in card["text"]
+        assert any("testnet preflight" in step for step in st["overview"]["next_steps"])
+    assert "NOT_RUN" in empty_state["testnet"]["empty"] and "not a pass" in empty_state["testnet"]["empty"]
+    t = build(tmp_path / "f", good_set())["testnet"]
+    assert t["state"] == "OK" and t["preflight"]["status"] == "NOT_RUN" and t["plan"] is None and t["orders"] == [] and t["final_position"] is None and t["flat"]["verified_flat"] is False
+    assert t["fees"]["basis"] == "MISSING"
+
+
+def test_testnet_credentials_are_booleans_only_and_the_endpoint_must_be_the_registered_testnet_host(tmp_path):
+    t = tnv(tmp_path, tn(credential_state={"dedicated_key_present": True, "dedicated_secret_present": False, "generic_credentials_ignored": True}), "c")
+    assert t["credentials"]["dedicated_key_present"]["v"] is True and t["credentials"]["dedicated_secret_present"]["v"] is False and "no value" in t["credentials"]["note"]
+    assert t["endpoint_host"] == "api-testnet.bybit.com" and t["venue"]["v"] == "Testnet"
+    for host in ("api.bybit.com", "api-demo.bybit.com", "api.bybit.eu", "evil.example.com", "API-TESTNET.bybit.com.evil.com"):
+        bad = build(tmp_path / ("h" + host), good_set(**{"testnet_session.json": tn(endpoint_host=host)}))["testnet"]
+        assert bad["state"] == "ERROR" and "not the registered testnet host" in bad["error"], host
+    assert tnv(tmp_path, tn(endpoint_host="API-TESTNET.BYBIT.COM"), "up")["state"] == "OK"
+    assert CC.load_artifact(write_set(tmp_path / "nv", good_set(**{"testnet_session.json": tn(venue="Mainnet")})), "testnet_session.json", NOW)["state"] == "ERROR"
+    for non_bool in ("yes", 1, None):
+        assert CC.load_artifact(write_set(tmp_path / f"nb{non_bool}", good_set(**{"testnet_session.json": tn(credential_state={"dedicated_key_present": non_bool, "dedicated_secret_present": True, "generic_credentials_ignored": True})})),
+                                "testnet_session.json", NOW)["state"] == "ERROR"
+
+
+def test_testnet_not_run_cannot_carry_orders_a_confirmation_or_a_preflight_result(tmp_path):
+    for over in ({"orders": tn_executed()["orders"]}, {"final_position": {"BTCUSDT": 0.0}}, {"confirmation": {"state": "CONFIRMED", "plan_digest_confirmed": "x"}, "plan": tn_executed()["plan"]},
+                 {"preflight": {"status": "PASS", "checked_ms": NOW, "checks": []}}):
+        assert CC.load_artifact(write_set(tmp_path / str(abs(hash(str(over)))), good_set(**{"testnet_session.json": tn(**over)})), "testnet_session.json", NOW)["state"] == "ERROR", over
+
+
+def test_an_executed_testnet_session_is_shown_in_full_but_never_as_green_or_owner_profit(tmp_path):
+    st = build(tmp_path, good_set(**{"testnet_session.json": tn_executed()}))
+    t = st["testnet"]
+    assert t["session_state"] == "EXECUTED_FLAT_VERIFIED" and t["pill"] == "INFO" and t["flags"] == [] and t["run_basis"] == "EXCHANGE_REPORTED"
+    assert t["counts"] == {"orders": 4, "acked": 3, "filled": 1, "partial": 1, "cancelled": 1, "rejected": 1, "open": 0, "executions": 1}
+    assert t["plan"]["digest"]["v"] == "p" * 16 and t["confirmation"]["matches_plan"] is True and t["flat"]["verified_flat"] is True
+    assert t["orders"][0]["filled_qty"]["basis"] == "EXCHANGE_REPORTED" and t["executions"][0]["fee"]["v"] == 0.04 and t["final_position"]["BTCUSDT"]["v"] == 0.0
+    assert next(c for c in st["overview"]["cards"] if c["id"] == "testnet")["status"] == "INFO"
+    assert st["accounting"]["testnet"]["fees"]["v"] == 0.04 and st["accounting"]["testnet"]["price_pnl"]["v"] == -0.1
+    base = build(tmp_path / "base", good_set())
+    assert st["figures"] == base["figures"] and st["accounting"]["simulated"] == base["accounting"]["simulated"]      # testnet never moves a simulated number
+    assert st["accounting"]["mainnet_cash"]["status"] == "NOT_AVAILABLE" and st["accounting"]["mainnet_cash"]["realised"]["v"] is None
+    assert "not owner profit" in t["banner"]
+    assert single_source_violations(st)[0] == []
+
+
+@pytest.mark.parametrize("mutate,flag,pill", [
+    (lambda d: d.update(confirmation={"state": "NOT_REQUESTED", "plan_digest_confirmed": None}), "ORDERS_WITHOUT_CONFIRMATION", "FAIL"),
+    (lambda d: d["confirmation"].update(plan_digest_confirmed="z" * 16), "CONFIRMATION_DIGEST_MISMATCH", "FAIL"),
+    (lambda d: d["preflight"]["checks"].append({"name": "x", "ok": False, "detail": "bad"}), "PREFLIGHT_PASS_CONTRADICTS_CHECKS", "FAIL"),
+    (lambda d: d.update(final_position=None), "FLAT_CLAIM_NOT_SUPPORTED", "FAIL"),
+    (lambda d: d.update(final_position={"BTCUSDT": 0.001}), "FLAT_CLAIM_NOT_SUPPORTED", "FAIL"),
+    (lambda d: d["net"].update(fees_usd=5.0), "FEES_DO_NOT_MATCH_EXECUTIONS", "FAIL"),
+])
+def test_testnet_contradictions_are_flags_and_never_shown_as_flat_or_clean(tmp_path, mutate, flag, pill):
+    sess = tn_executed()
+    mutate(sess)
+    st = build(tmp_path, good_set(**{"testnet_session.json": sess}))
+    t = st["testnet"]
+    assert any(f.startswith(flag) for f in t["flags"]) and t["pill"] == pill
+    assert any(a["source"] == "testnet" and a["text"].startswith(flag) for a in st["overview"]["attention"])
+    if flag.startswith("FLAT"):
+        assert t["flat"]["verified_flat"] is False and t["session_state"] != "EXECUTED_FLAT_VERIFIED"
+
+
+def test_a_failed_testnet_preflight_is_a_failure_and_an_unverified_flat_is_not_flat(tmp_path):
+    t = tnv(tmp_path, tn_executed(preflight={"status": "FAIL", "checked_ms": NOW, "checks": [{"name": "read_only_auth", "ok": False, "detail": "401"}]}), "pf")
+    assert t["session_state"] == "PREFLIGHT_FAILED" and t["pill"] == "FAIL"
+    t = tnv(tmp_path, tn_executed(flat_verified=None), "fv")
+    assert t["session_state"] == "EXECUTED_FLAT_UNVERIFIED" and t["flat"]["verified_flat"] is False and t["pill"] == "ATTENTION"
+
+
+# ---------------------------------------------------------------- pipeline, scope, funnel, reconcile, environment, answers
+@pytest.mark.parametrize("code", CC.OUTCOME_CODES)
+def test_every_pipeline_outcome_code_is_shown_with_its_meaning_and_a_next_step(tmp_path, code):
+    files = good_set()
+    files["pipeline_summary.json"]["outcome"] = code
+    st = build(tmp_path, files)
+    p = st["research"]["pipeline"]
+    assert p["state"] == "OK" and p["outcome"] == code and p["meaning"] and p["next"] and p["required_span"] == {"days": 457, "holding_rows": 60}
+    assert p["data_digest_parts"]["funding"] == "f" * 16 and p["evidence_basis"] == {"replay_report.json": "SIMULATED"}
+    assert p["blocking"] is (code != "SIMULATED_EXECUTION")
+    steps = st["overview"]["next_steps"]
+    assert any(p["next"] in x for x in steps) is p["blocking"]                                           # the next step comes from the outcome
+    assert (next(c for c in st["overview"]["cards"] if c["id"] == "pipeline")["status"] == "ATTENTION") is p["blocking"]
+
+
+def test_an_unknown_pipeline_outcome_is_refused(tmp_path):
+    for bad in ("PROFIT", "OK", None, 7):
+        files = good_set()
+        files["pipeline_summary.json"]["outcome"] = bad
+        assert CC.load_artifact(write_set(tmp_path / str(bad), files), "pipeline_summary.json", NOW)["state"] == "ERROR", bad
+    files = good_set()
+    files["pipeline_summary.json"].pop("outcome")
+    files["pipeline_summary.json"]["outcome_code"] = "NO_FILL"                                          # the alternative spelling
+    assert CC.load_artifact(write_set(tmp_path / "alt", files), "pipeline_summary.json", NOW)["data"]["outcome"] == "NO_FILL"
+
+
+def test_universe_scope_and_funnel_counts_are_shown_and_a_survivorship_free_claim_needs_corroboration(tmp_path, monkeypatch):
+    st = build(tmp_path / "a", good_set())
+    u, f = st["research"]["universe_scope"], st["research"]["funnel"]
+    assert u["eligible"] == {"count": 120} and u["lifecycle_classes"] == {"TRADING": 118, "DELISTED": 2} and u["scope_verdict_shown"] == "SURVIVORS_ONLY"
+    assert [x["name"] for x in f["steps"]] == ["universe rows", "eligible"] and f["exclusion_reasons"] == {"prelaunch_no_history": 12}
+    files = good_set()
+    files["universe_scope.json"]["scope_verdict"] = "SURVIVORSHIP_FREE"
+    shown = build(tmp_path / "b", files)["research"]["universe_scope"]
+    assert shown["corroborated_here"] is False and shown["scope_verdict_shown"].startswith("SURVIVORS_ONLY") and "SURVIVORSHIP_FREE" not in shown["scope_verdict_shown"]
+    uni = tmp_path / "uni"
+    uni.mkdir()
+    monkeypatch.setattr(CC.UC, "verify_capture_dir", lambda p: {"ok": True, "problems": [], "coverage": {"dataset_status": "COMPLETE", "delisting_observability": "OBSERVED", "status_coverage": {"Closed": "OBSERVED_ROWS"}}})
+    assert build(tmp_path / "c", files, universe=str(uni))["research"]["universe_scope"]["scope_verdict_shown"] == "SURVIVORSHIP_FREE"      # positive control: corroborated
+
+
+def test_empty_research_extras_name_what_to_run(empty_state):
+    for k, word in (("pipeline", "pipeline"), ("universe_scope", "universe scope"), ("funnel", "funnel")):
+        sec = empty_state["research"][k]
+        assert sec["state"] == "NO_DATA" and word in sec["empty"].lower() and "Run" in sec["empty"]
+
+
+def test_reconcile_findings_become_incidents_attention_and_a_halt(tmp_path):
+    files = good_set()
+    files["reconcile_report.json"].update(findings=[{"code": "POSITION_MISMATCH", "detail": "venue 2 vs book 1", "severity": "CRITICAL"}, {"code": "NOTE", "detail": "fine", "severity": "INFO"}],
+                                          halt_new_exposure=True, views_compared=["book", "venue_positions"])
+    st = build(tmp_path, files)
+    assert [i["code"] for i in st["overview"]["incidents"]] == ["POSITION_MISMATCH"]                    # INFO is not an incident
+    assert any(a["source"] == "reconcile" and a["severity"] == "FAIL" and "POSITION_MISMATCH" in a["text"] for a in st["overview"]["attention"])
+    assert st["overview"]["headline"]["status"] == "FAIL" and "reconcile" in st["overview"]["headline"]["text"]
+    assert any(r["source"] == "reconcile_report.json" for r in st["overview"]["restrictions"]) and {x["source"]: x["halted"] for x in st["risk"]["halt_flags"]}["reconcile_report.json"] is True
+    assert st["risk"]["recovery"]["state"] == "RECOVERY_REQUIRED" and "Resolve the reconciliation findings" in st["overview"]["next_steps"][0]
+    assert st["execution"]["reconciliation"]["halt_new_exposure"] is True
+
+
+def test_reconcile_is_green_only_with_a_compared_venue_view_and_no_findings(tmp_path):
+    internal = build(tmp_path / "i", good_set())
+    assert next(c for c in internal["overview"]["cards"] if c["id"] == "reconcile")["status"] == "INFO"       # clean but internal-only: not green
+    files = good_set()
+    files["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+    assert next(c for c in build(tmp_path / "v", files)["overview"]["cards"] if c["id"] == "reconcile")["status"] == "OK"
+    none = build(tmp_path, None)
+    assert next(c for c in none["overview"]["cards"] if c["id"] == "reconcile")["status"] == "NO_DATA" and none["risk"]["recovery"]["state"] == "MISSING"
+
+
+def test_venue_reconciled_needs_an_exchange_reported_ledger_a_venue_view_one_run_and_passing_identities(tmp_path):
+    def venue_files(**kw):
+        files = good_set()
+        del files["replay_report.json"]
+        files["ledger_pnl.json"].update(basis="EXCHANGE_REPORTED", net_usd=11.5)
+        files["portfolio_state.json"]["basis"] = "EXCHANGE_REPORTED"
+        files["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+        for name, f in files.items():                                        # a venue-reconciled TESTNET run: every run-family artifact names the one TESTNET run
+            if name != "testnet_session.json" and "identity" in f:
+                f["identity"] = {**f["identity"], "mode": "TESTNET", "run_id": "run_testnet_0001"}
+        for k, v in kw.items():
+            files[k.replace("__", ".")].update(v)
+        return files
+    sim = build(tmp_path / "sim", good_set())["accounting"]["venue_reconciliation"]
+    assert sim["status"] == "INTERNAL_CONSISTENCY_ONLY" and any("SIMULATED" in w for w in sim["why_not"])            # a simulation is never venue reconciled
+    ok = build(tmp_path / "ok", venue_files())["accounting"]
+    assert ok["venue_reconciliation"]["status"] == "VENUE_RECONCILED" and ok["venue_reconciliation"]["why_not"] == []        # positive control
+    assert ok["mainnet_cash"]["status"] == "NOT_AVAILABLE" and ok["complete"] is False                                       # even then: not mainnet cash, gross is missing
+    for name, kw in (("noview", {"reconcile_report__json": {"views_compared": ["ledger", "portfolio"]}}), ("halt", {"reconcile_report__json": {"halt_new_exposure": True}}),
+                     ("finding", {"reconcile_report__json": {"findings": [{"code": "X", "detail": "d", "severity": "WARN"}]}}),
+                     ("fees", {"ledger_pnl__json": {"fees_usd": 9.0}}), ("owner", {"ledger_pnl__json": {"basis": "OWNER_SUPPLIED_UNVERIFIED"}})):
+        assert build(tmp_path / name, venue_files(**kw))["accounting"]["venue_reconciliation"]["status"] == "INTERNAL_CONSISTENCY_ONLY", name
+    files = venue_files()
+    del files["reconcile_report.json"]
+    assert build(tmp_path / "norec", files)["accounting"]["venue_reconciliation"]["status"] == "INTERNAL_CONSISTENCY_ONLY"
+
+
+def test_a_forged_venue_reconciliation_is_refused_when_the_artifacts_do_not_name_a_testnet_run(tmp_path):
+    """Red team: a REPLAY / PAPER run (or a SimVenue 'venue' view) that merely DECLARES basis EXCHANGE_REPORTED and a venue view must never count as venue reconciled. Both the ledger and the
+    reconcile report must carry identity.mode TESTNET."""
+    def forged(ledger_mode, rec_mode, same_run=True):
+        files = good_set()
+        del files["replay_report.json"]
+        files["ledger_pnl.json"].update(basis="EXCHANGE_REPORTED", net_usd=11.5)
+        files["portfolio_state.json"]["basis"] = "EXCHANGE_REPORTED"
+        files["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+        for name, f in files.items():
+            if name != "testnet_session.json" and "identity" in f:
+                f["identity"] = {**f["identity"], "mode": "TESTNET", "run_id": "run_testnet_0001"}
+        for name, mode in (("ledger_pnl.json", ledger_mode), ("reconcile_report.json", rec_mode)):
+            if mode is None:
+                files[name].pop("identity", None)
+            else:
+                files[name]["identity"] = {**files[name]["identity"], "mode": mode}
+        return files
+    ok = build(tmp_path / "ok", forged("TESTNET", "TESTNET"))["accounting"]["venue_reconciliation"]
+    assert ok["status"] == "VENUE_RECONCILED", ok                                                                   # positive control
+    for name, lm, rm in (("replay_ledger", "REPLAY", "TESTNET"), ("paper_rec", "TESTNET", "PAPER"), ("sim_both", "REPLAY", "REPLAY"), ("no_ident", None, None), ("no_rec_ident", "TESTNET", None)):
+        v = build(tmp_path / name, forged(lm, rm))["accounting"]["venue_reconciliation"]
+        assert v["status"] == "INTERNAL_CONSISTENCY_ONLY", (name, v)
+        assert v["why_not"], name
+    sim = good_set()                                                                                                 # a plain simulation that lies about its basis AND keeps its REPLAY identity
+    del sim["replay_report.json"]
+    sim["ledger_pnl.json"].update(basis="EXCHANGE_REPORTED")
+    sim["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+    v = build(tmp_path / "lie", sim)["accounting"]["venue_reconciliation"]
+    assert v["status"] == "INTERNAL_CONSISTENCY_ONLY" and any("TESTNET run identity" in w for w in v["why_not"])
+
+
+def test_environment_flags_are_presence_only_and_no_value_is_ever_in_the_state(tmp_path):
+    names = ("LIVE_TRADING_ACK", "USE_TESTNET", "PAPER_TRADING", "BYBIT_API_KEY", "BYBIT_API_SECRET", "OWNER_ATTESTATION_KEY")
+    vals = ("SUPER-" + "SECRET-ACK-VALUE", "0", "PAPER-VALUE-" + "zz", "KEY-VALUE-" + "1234", "SECRET-VALUE-" + "5678", "ATTEST-VALUE-" + "9")
+    env = dict(zip(names, vals))
+    st = build(tmp_path, None, env=env)
+    text = json.dumps(st)
+    for v in ("SUPER-SECRET-ACK-VALUE", "KEY-VALUE-1234", "SECRET-VALUE-5678", "ATTEST-VALUE-9", "PAPER-VALUE-zz"):
+        assert v not in text, v
+    flags = {f["name"]: f["presence"] for f in st["overview"]["environment"]["flags"]}
+    assert flags == {n: "set" for n in ("LIVE_TRADING_ACK", "USE_TESTNET", "PAPER_TRADING", "BYBIT_API_KEY", "BYBIT_API_SECRET", "OWNER_ATTESTATION_KEY")}
+    assert all(set(f) == {"name", "presence"} for f in st["overview"]["environment"]["flags"])
+    assert "values" not in st["environment"] and "secrets" not in st["environment"]
+    none = {f["name"]: f["presence"] for f in build(tmp_path / "n", None, env={})["overview"]["environment"]["flags"]}
+    assert set(none.values()) == {"unset"}
+    assert any("LIVE_TRADING_ACK" in a["text"] for a in st["overview"]["attention"])                      # the rule-breaking presence is a finding
+
+
+def test_the_plain_language_answers_are_computed_from_the_state_not_constants(tmp_path, empty_state, full_state):
+    qs = [a["q"] for a in full_state["overview"]["answers"]]
+    assert qs == ["What is the engine doing?", "What capital is at risk?", "Are there positions?", "Is P&L complete?", "What has executed?", "What is blocked?", "What must happen next?"]
+    ans = {a["q"]: a["a"] for a in full_state["overview"]["answers"]}
+    assert "SIMULATED_EXECUTION" in ans["What is the engine doing?"] and "No real money" in ans["What capital is at risk?"] and "$400.00" in ans["What capital is at risk?"]
+    assert "1 position(s)" in ans["Are there positions?"] and ans["Is P&L complete?"].startswith("No.") and "$11.50" in ans["Is P&L complete?"]
+    assert "Replay: 5 order group(s)" in ans["What has executed?"] and "No mainnet order" in ans["What has executed?"]
+    assert "Mainnet (real money)" in ans["What is blocked?"]
+    e = {a["q"]: a["a"] for a in empty_state["overview"]["answers"]}
+    assert "Unknown" in e["What capital is at risk?"] and "Unknown" in e["Are there positions?"] and "No pipeline_summary.json" in e["What is the engine doing?"]
+    assert "Capture market data" in e["What must happen next?"]
+    seen = set()
+    for name, mutate in (("halt", lambda f: f["risk_state.json"].update(halted=True, halt_reasons=["kill switch"])),
+                         ("hist", lambda f: f["pipeline_summary.json"].update(outcome="INADEQUATE_HISTORY")),
+                         ("rec", lambda f: f["reconcile_report.json"].update(halt_new_exposure=True, findings=[{"code": "DRIFT", "detail": "d", "severity": "WARN"}])),
+                         ("err", lambda f: f.update({"portfolio_state.json": "{broken"}))):
+        files = good_set()
+        mutate(files)
+        nxt = build(tmp_path / name, files)["overview"]["next_steps"]
+        assert nxt and nxt[-1].startswith("The promotion gate is REFUSE")                                  # the owner-only gate is always last, never 'all clear'
+        seen.add(nxt[0])
+    assert len(seen) == 4 and "halted" in sorted(seen)[0].lower() + " ".join(seen).lower()
+    for st in (empty_state, full_state):
+        assert all("all clear" not in x.lower() and x.strip() != "OK" for x in st["overview"]["next_steps"])
+
+
+def test_market_data_health_overview_block_comes_from_the_freshness_audit(tmp_path, monkeypatch):
+    report = {"axes": {"data_freshness": {"verdict": "STALE", "issues": [{"code": "OLD", "level": "STALE", "detail": "funding 9 days old"}]}, "research_readiness": {"verdict": "NOT_READY", "issues": []},
+                       "code_correctness": {"verdict": "NOT_ASSESSED"}}, "cycles": {"latest_complete_cycle": {"cycle": "c1", "age_ms": 5000}}, "status_partitions": {"present": [], "missing": []},
+              "backups": {}, "history": {}, "collector_health": {"status": "RUNNING", "consecutive_failures": 3, "interval_ms": 60000}}
+    monkeypatch.setattr(CC.DFA, "audit", lambda *a, **k: report)
+    st = build(tmp_path, good_set())
+    md = st["overview"]["market_data"]
+    assert md["verdict"] == "STALE" and md["collector"]["status"]["basis"] == "UNVERIFIED" and md["collector"]["consecutive_failures"]["v"] == 3
+    assert any(a["source"] == "data" and a["severity"] == "FAIL" for a in st["overview"]["attention"]) and st["overview"]["headline"]["status"] == "FAIL"
+    assert next(c for c in st["overview"]["cards"] if c["id"] == "data")["basis"] == "UNVERIFIED"
+
+
+def test_portfolio_shows_only_existing_fields_and_marks_the_rest_missing(full_state):
+    p = full_state["portfolio"]
+    for k in ("available_balance", "reserved_capital", "margin", "drawdown"):
+        assert p[k]["v"] is None and p[k]["basis"] == "MISSING" and "no such field" in p[k]["note"]
+    assert p["leverage"]["v"] == 0.4 and p["leverage"]["basis"] == "CALCULATED" and p["concentration"]["v"] == 50.0 and "ETHUSDT" in p["concentration"]["note"]
+    assert p["equity"]["v"] == 1000.0 and p["equity"]["basis"] == "SIMULATED"
+
+
+def test_opportunities_are_ranked_by_known_net_and_an_unknown_net_is_unranked(full_state):
+    items = full_state["research"]["opportunities"]["items"]
+    assert [(i["candidate_id"], i["rank"]) for i in items] == [("carry_eth", 1), ("dir_pepe", None)]
+
+
+def test_evidence_and_ops_carry_digests_revision_and_say_ci_is_not_available_offline(full_state, empty_state):
+    ev = full_state["evidence"]
+    assert ev["digests"]["run_data_digest"] == "b" * 64 and ev["digests"]["data_digest_parts"]["mark"] == "m" * 16 and ev["software"]["code_revisions"] == ["c0ffee1"]
+    assert ev["ci"]["state"] == "NOT_AVAILABLE_OFFLINE" and "not available offline" in ev["ci"]["text"]
+    assert empty_state["evidence"]["software"]["code_revisions"] == [] and empty_state["evidence"]["operations"] is None
+
+
+def test_risk_extras_are_missing_when_no_backend_has_them(full_state):
+    r = full_state["risk"]
+    assert r["kill_switch"]["basis"] == "MISSING" and r["stress"]["basis"] == "MISSING" and r["exposure"]["gross"]["v"] == 400.0
+    assert {h["source"] for h in r["halt_flags"]} == {"risk_state.json", "reconcile_report.json", "promotion gate"} and [h for h in r["halt_flags"] if h["source"] == "promotion gate"][0]["halted"] is True
+
+
+# ---------------------------------------------------------------- honesty
+def test_simulated_is_never_labelled_realised_and_testnet_is_never_owner_profit(full_state, tmp_path):
+    for c in full_state["accounting"]["components"]:
+        if c["value"]["basis"] == "SIMULATED":
+            assert "realised" not in c["label"].lower().replace("unrealised", ""), c
+    assert full_state["accounting"]["simulated"]["label"].endswith("never realised cash") and full_state["accounting"]["mainnet_cash"]["status"] == "NOT_AVAILABLE"
+    for p, o in walk(full_state):                                                                       # a simulated value never sits in a realised_* slot
+        if isinstance(o, dict) and o.get("basis") == "SIMULATED" and "concept" not in o:
+            assert not re.search(r"(?:^|\.)realised_[a-z]+$", p), p
+    st = build(tmp_path, good_set(**{"testnet_session.json": tn_executed()}))
+    text = json.dumps(st)
+    for m in re.finditer(r"(?i)owner profit", text):
+        assert re.search(r"(?i)not\s+$", text[max(0, m.start() - 6):m.start()]) or re.search(r"(?i)never\s+$", text[max(0, m.start() - 8):m.start()]), text[max(0, m.start() - 40):m.end()]
+    assert st["testnet"]["banner"] in json.dumps(st["testnet"]) and "TESTNET results are not owner profit" in st["testnet"]["banner"]
+    assert "t.banner" in _bundle()["app.js"]                                                            # the page renders it on the Testnet view
+
+
+def test_green_only_from_a_real_checker_every_ok_in_the_state(full_state, empty_state, tmp_path):
+    def oks(st):
+        return [(p, o) for p, o in walk(st) if isinstance(o, dict) and o.get("status") == "OK" and "id" in o and "title" in o]
+    assert oks(empty_state) == []
+    assert oks(full_state) == []                                                                        # the risk file carries a WARN alert, the data root is empty, the reconcile is internal only
+    clean = good_set()
+    clean["risk_state.json"]["alerts"] = []
+    assert {o["id"] for _p, o in oks(build(tmp_path, clean))} == {"operations"}                         # positive control: the one checker that returned OK from real data
+    for st in (empty_state, full_state):
+        assert st["overview"]["headline"]["status"] != "OK" and st["testnet"]["pill"] != "OK"
+        assert all(c["state"] != "OK" or c["id"] for c in st["accounting"]["checks"])
+
+
+def test_gross_net_fields_are_never_the_same_object_and_net_is_never_inferred_from_gross(tmp_path):
+    files = good_set()
+    files["replay_report.json"]["net_pnl_usd"] = None
+    st = build(tmp_path, files)
+    assert st["figures"]["gross"]["v"] == 18.5 and st["figures"]["net"]["v"] is None and st["figures"]["net"]["basis"] == "MISSING"
+    assert st["execution"]["net"]["v"] is None and "net_pnl_usd" not in json.dumps(st["figures"]["gross"])
+
+
+def test_stale_artifacts_and_old_state_are_visible(tmp_path):
+    files = good_set()
+    files["testnet_session.json"]["generated_ms"] = NOW - 4 * 86_400_000
+    st = build(tmp_path, files)
+    assert {x["file"]: x["stale"] for x in st["evidence"]["sources"]}["testnet_session.json"] is True
+    assert any(a["source"] == "artifacts" and "testnet_session.json" in a["text"] for a in st["overview"]["attention"])
+    js = _bundle()["app.js"]
+    assert "STALE_FETCH_MS" in js and "Stale source file" in js and 'id="updated"' in _bundle()["index.html"] and 'id="stale"' in _bundle()["index.html"]
+
+
+def test_the_page_has_the_eight_views_loading_and_error_states_and_a_poll(tmp_path):
+    b = _bundle()
+    for v in ("overview", "research", "portfolio", "execution", "accounting", "risk", "testnet", "evidence"):
+        assert f'data-view="{v}"' in b["index.html"] and f"{v}: {v}" in b["app.js"], v
+    assert "Loading state from the local backend" in b["app.js"] and "Could not load /api/state" in b["app.js"] and "setInterval(load" in b["app.js"] and "INCONSISTENT_RUN" in b["app.js"]
+    assert "createTextNode" in b["app.js"] and "@media (max-width: 700px)" in b["style.css"] and "overflow-x: hidden" in b["style.css"]
+
+
+# ---------------------------------------------------------------- hostile strings (backend accepts them as data; the page must render them as text)
+HOSTILE = '<img src=x onerror=window.__xss=1>"\''
+ENUM_KEYS = {"schema", "basis", "kind", "spot_hedge", "status", "side", "severity", "prov", "universe_scope", "mode", "venue", "endpoint_host", "outcome", "state", "order_type"}
+KEYED_MAPS = {"required_span", "data_digest_parts", "evidence_basis", "eligible_perpetual_lifecycle_universe", "lifecycle_class_counts", "exclusion_reasons", "final_position"}
+
+
+def hostile(o, key=None):
+    if isinstance(o, dict):
+        return {(f"{HOSTILE}{i}" if key in KEYED_MAPS else k): hostile(v, k) for i, (k, v) in enumerate(o.items())}
+    if isinstance(o, list):
+        return [hostile(x, key) for x in o]
+    if isinstance(o, str) and key not in ENUM_KEYS and key is not None:
+        return HOSTILE + o
+    return o
+
+
+def hostile_set():
+    files = {n: hostile(o) for n, o in good_set(**{"testnet_session.json": tn_executed()}).items()}
+    files["reconcile_report.json"]["findings"] = [{"code": HOSTILE, "detail": HOSTILE, "severity": "WARN"}]
+    files["risk_state.json"]["halted"] = True
+    files["risk_state.json"]["halt_reasons"] = [HOSTILE]
+    return files
+
+
+def test_hostile_strings_in_every_artifact_field_are_accepted_as_data_and_reach_the_state_verbatim(tmp_path):
+    files = hostile_set()
+    st = build(tmp_path, files)
+    assert [x["file"] for x in st["evidence"]["sources"] if x["state"] != "OK"] == []                    # the test is only meaningful if every file loaded
+    text = json.dumps(st)
+    assert text.count("onerror=window.__xss=1") > 60
+    assert st["testnet"]["orders"][0]["link_id"].startswith(HOSTILE) and st["research"]["funnel"]["steps"][0]["name"].startswith(HOSTILE)
+    assert st["coherence"]["verdict"] == "CONSISTENT"                                                   # identical mapping everywhere: still one run
+
+
+def test_the_page_renders_hostile_strings_as_text_in_all_eight_views_at_both_widths(tmp_path):
+    ad = write_set(tmp_path / "artifacts", hostile_set())
+    cfg = CC._Config(None, None, ad, False, False, clock=lambda: NOW, ttl_ms=10 ** 12, env={})
+    with _serving(cfg) as srv:
+        res = _render(srv, tmp_path, "hostile")
+    assert sum(1 for r in res if r["hostile"]) >= 10                                                    # the strings are on the page as visible text, not interpreted
+
+
+@contextlib.contextmanager
+def _serving(cfg):
+    srv = CC.make_server(cfg, "127.0.0.1", 0)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        t.join(5)
+
+
+def test_render_smoke_inconsistent_run_and_executed_testnet_and_legacy(tmp_path):
+    inc = good_set(**{"testnet_session.json": tn_executed()})
+    inc["ledger_pnl.json"]["identity"] = {**IDENT, "run_id": "run_other"}
+    for tag, files in (("inconsistent", inc), ("testnet", good_set(**{"testnet_session.json": tn_executed()}))):
+        ad = write_set(tmp_path / tag / "artifacts", files)
+        with _serving(CC._Config(None, None, ad, False, False, clock=lambda: NOW, ttl_ms=10 ** 12, env={})) as srv:
+            _render(srv, tmp_path / tag, tag)
+
+
+def test_slippage_and_adverse_selection_are_shown_with_their_source_when_the_ledger_states_them(tmp_path):
+    files = good_set()
+    files["ledger_pnl.json"].update(taker_slippage_usd=1.5, adverse_selection_usd=0.75)
+    comp = {c["key"]: c["value"] for c in build(tmp_path, files)["accounting"]["components"]}
+    assert comp["slippage"]["v"] == 1.5 and comp["slippage"]["src"] == "ledger_pnl.json:taker_slippage_usd" and comp["slippage"]["basis"] == "SIMULATED"
+    assert comp["adverse_selection"]["v"] == 0.75 and comp["adverse_selection"]["src"] == "ledger_pnl.json:adverse_selection_usd"
+    files["ledger_pnl.json"].update(taker_slippage_usd=None, adverse_selection_usd=None)
+    comp = {c["key"]: c["value"] for c in build(tmp_path / "unk", files)["accounting"]["components"]}
+    assert comp["slippage"]["v"] is None and comp["slippage"]["basis"] == "MISSING"             # unknown stays unknown
+
+
+def test_the_testnet_credential_names_are_scrubbed_like_the_others(tmp_path):
+    k1, k2 = "TESTNET" + "KEYCANARY123", "TESTNET" + "SECRETCANARY456"
+    env = dict(zip(("BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_SECRET"), (k1, k2)))
+    files = good_set()
+    files["risk_state.json"]["alerts"] = [{"severity": "WARN", "code": "X", "detail": "leaked TESTNETKEYCANARY123 and TESTNETSECRETCANARY456"}]
+    text = json.dumps(build(tmp_path, files, env=env))
+    assert "TESTNETKEYCANARY123" not in text and "TESTNETSECRETCANARY456" not in text and "[value hidden]" in text

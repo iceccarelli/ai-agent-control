@@ -177,7 +177,7 @@ def test_authorisation_syntax():
 def test_implied_policy_is_a_valid_closed_ms_risk_policy():
     m = fresh(symbols=["BTCUSDT"])
     pol = AD.policy_from_manifest(m)
-    assert set(pol) == set(ms_risk.POLICY_KEYS) and not ms_risk.policy_refusals(pol) and pol["venue"] == "testnet" and pol["allowed_symbols"] == ["BTCUSDT"]
+    assert set(pol) == set(ms_risk.POLICY_KEYS) | {"max_daily_loss_usd"} and not ms_risk.policy_refusals(pol) and pol["venue"] == "testnet" and pol["allowed_symbols"] == ["BTCUSDT"]
     with pytest.raises(AD.ManifestError):
         AD.policy_from_manifest({**m, "venue": "mainnet"})
 
@@ -348,3 +348,48 @@ def test_lowering_the_aggregate_alone_leaves_net_unhedged_and_gross_above_it_whi
     r2 = AD.refusals(fresh(lower={"aggregate_max_notional_usd": 20.0, "max_net_exposure_usd": 20.0, "max_unhedged_usd": 20.0}))
     assert any("max_gross_exposure_usd" in x for x in r2)
     assert not AD.refusals(fresh(lower={"aggregate_max_notional_usd": 20.0, "max_net_exposure_usd": 20.0, "max_unhedged_usd": 20.0, "max_gross_exposure_usd": 40.0}))
+
+
+# ---- session credential names (testnet execution path) --------------------------------------------------------------------------------------------------------
+def test_generate_can_name_the_session_tools_dedicated_variables_and_the_names_are_in_the_digest():
+    ce = AD.SESSION_CREDENTIAL_ENV
+    assert list(ce.values()) == ["BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_" + "SECRET"]
+    default = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"])
+    named = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"], credential_env=ce)
+    assert AD.refusals(named) == [] and named["credential_env"] == ce and named["authorisation"] == "NOT_GRANTED"
+    assert named["plan_sha256"] != default["plan_sha256"] and default["credential_env"]["api_key"] == "BYBIT_TESTNET_DEDICATED_API_KEY"      # default unchanged
+
+
+def _pair(k, v):
+    return dict(zip(("api_key", "api_secret"), (k, v)))
+
+
+@pytest.mark.parametrize("ce", [_pair("BYBIT_API_KEY", "BYBIT_API_" + "SECRET"), _pair("BYBIT_MAINNET_API_KEY", "BYBIT_TESTNET_API_" + "SECRET"),
+                                _pair("BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_KEY")])
+def test_a_generic_or_mainnet_named_or_duplicate_credential_variable_is_still_refused(ce):
+    m = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"], credential_env=ce)
+    assert AD.refusals(m)
+
+
+def test_the_cli_flag_names_the_session_variables_and_the_module_still_sends_nothing(capsys):
+    assert AD.main(["generate", "--candidate-id", "cand_1", "--spec-digest", "a" * 64, "--symbols", "BTCUSDT", "--session-credentials"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["credential_env"] == AD.SESSION_CREDENTIAL_ENV and out["authorisation"] == "NOT_GRANTED"
+
+
+# ---- one active group (red team): the default manifest and the ceiling are 1
+def test_the_default_manifest_allows_one_active_group_and_more_is_refused():
+    m = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"])
+    assert m["bounds"]["max_active_groups"] == 1 and AD.refusals(m) == []
+    assert AD.policy_from_manifest(m)["max_active_groups"] == 1
+    for n in (2, 3):
+        bad = dict(m, bounds=dict(m["bounds"], max_active_groups=n))
+        bad["plan_sha256"] = AD.plan_digest(bad)
+        assert any("max_active_groups" in r for r in AD.refusals(bad)), n
+    assert AD.refusals(AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"], lower={"max_active_groups": 2}))
+
+
+def test_the_policy_carries_the_manifest_loss_limit_as_a_hard_risk_limit():
+    m = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"])
+    pol = AD.policy_from_manifest(m)
+    assert pol["max_daily_loss_usd"] == m["bounds"]["max_loss_usd"] and ms_risk.policy_refusals(pol) == []

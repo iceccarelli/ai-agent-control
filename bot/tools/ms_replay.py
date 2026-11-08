@@ -105,6 +105,7 @@ class ReplayConfig:
     regime_low_bps_day: float = 1.0
     regime_high_bps_day: float = 5.0
     stale_book_age_ms: int = 600_000
+    exit_book_max_age_ms: int = 3_600_000                  # EXPLICIT wider book-age cap for REDUCE-ONLY taker exits (an entry never gets it: it uses fill.stale_quote_ms); every exit that needed it is counted
 
 
 # ------------------------------------------------------------------ the local P&L ledger (contract-compatible; swap for ms_accounting via ledger_factory)
@@ -340,6 +341,15 @@ class ReplayTransport:
         if self.fault_next and self.fault_next[0] == "STALE_BOOK_ONCE":
             age = self.cfg.fill.stale_quote_ms + 1
             self.fault_next.pop(0)
+        if leg.order_type != "Limit":                                  # a taker walks the book it SEES: a book of any age is not a quote
+            cap = max(self.cfg.exit_book_max_age_ms, self.cfg.fill.stale_quote_ms) if leg.reduce_only else self.cfg.fill.stale_quote_ms
+            if age is None or age > cap:
+                self.stats["refused"]["STALE_QUOTE"] = self.stats["refused"].get("STALE_QUOTE", 0) + 1
+                if leg.reduce_only:
+                    self.stats["exits_refused_stale_quote"] = self.stats.get("exits_refused_stale_quote", 0) + 1
+                return EX.Ack(link, "REJECTED", None, "STALE_QUOTE")
+            if leg.reduce_only and age > self.cfg.fill.stale_quote_ms:
+                self.stats["exits_on_wider_book_cap"] = self.stats.get("exits_on_wider_book_cap", 0) + 1
         self.stats["orders_placed"] += 1
         fault = self.fault_next.pop(0) if self.fault_next and self.fault_next[0] in ("LOST_ACK", "LOST_REQUEST") else None
         if leg.order_type == "Limit":
@@ -485,6 +495,7 @@ class WorldProbe:
     snapshots: Callable[[], Dict[str, T.MarketSnapshot]]
     risk_state: Callable[[], Dict[str, Any]]
     engine: Callable[[], Any]
+    portfolio_state: Optional[Callable[[], Any]] = None          # the PortfolioState at the present step (reconciliation compares it with the venue book)
 
 
 def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Callable[[int, Mapping[str, T.MarketSnapshot], Mapping[str, T.Instrument]], List[T.Opportunity]],
@@ -531,6 +542,7 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
                              "orders_unfilled": 0, "orders_partial": 0, "settlements": 0, "opportunities_withheld_by_halt": 0, "groups_submitted": 0, "groups_refused_at_approval": 0,
                              "groups_refused_at_submit": 0, "groups_refused_at_submit_by_halt": 0}
     peak = cfg.equity0
+    day = {"ix": cfg.start_ms // 86_400_000, "eq": cfg.equity0}                 # UTC day and the equity at its first step: the state's ``day_start_equity_usd`` (hard daily-loss input)
     pending_faults = sorted(cfg.faults, key=lambda f: (f.ts_ms, f.kind))
     active_stale_book_until = -1
     stale_account_until = -1
@@ -615,13 +627,13 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
             positions[pk] = PF.Position(pk, cat, n, snaps[sym].next_funding_ms if cat == "linear" else None, instruments[sym].base_coin or sym, instruments[sym].quote_coin)
             cap += abs(n) if cat == "spot" else abs(n) / lev
             margin += abs(n) / lev if cat == "linear" else 0.0
-        return PF.PortfolioState(equity, equity - cap, max(peak, equity), positions, eng.open_groups(), margin, t, account_ts)
+        return PF.PortfolioState(equity, equity - cap, max(peak, equity), positions, eng.open_groups(), margin, t, account_ts, day_start_equity_usd=day["eq"])
 
     now = cfg.start_ms
     if gates is not None:
         gates.bind(WorldProbe(now=lambda: now, snapshots=lambda: snapshots(now),
                               risk_state=lambda: portfolio_state(now, snapshots(now), (now - cfg.exec_policy.max_account_age_ms - 1) if now <= stale_account_until else now).to_risk_state(),
-                              engine=lambda: eng))
+                              engine=lambda: eng, portfolio_state=lambda: portfolio_state(now, snapshots(now), now)))
     t = cfg.start_ms
     next_decision = cfg.start_ms
     while t <= cfg.end_ms:
@@ -760,6 +772,8 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
         pnl = led.pnl()
         equity = cfg.equity0 + pnl["net"]
         peak = max(peak, equity)
+        if now // 86_400_000 != day["ix"]:
+            day["ix"], day["eq"] = now // 86_400_000, equity
         equity_curve.append((now, equity))
         gross = sum(abs(float(q)) * (snaps[k.split(":", 1)[1]].mark if k.startswith("linear") else (snaps[k.split(":", 1)[1]].spot_mark or snaps[k.split(":", 1)[1]].mark))
                     for k, q in eng.positions_exp.items() if k.split(":", 1)[1] in snaps)
