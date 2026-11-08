@@ -793,3 +793,37 @@ def test_no_history_at_all_is_a_total_shortfall(tmp_path):
     uni = make_universe(tmp_path)
     s = do_plan(uni)["history_shortfall"]
     assert s["short_by_days_max"] == NEED_DAYS and s["datasets"]["funding"]["cause"] == "DATASET_ABSENT"
+
+
+def test_a_symbol_launched_inside_the_window_ends_on_an_empty_page_and_is_never_refetched(tmp_path):
+    uni = make_universe(tmp_path, [inst("AAAUSDT"), inst("MIDUSDT", launch=W0 + 2 * DAY)])
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    assert _run(pf, out, uni, _venue_for_plan(uni, doc))["status"] == "DONE"
+    ledger = (out / "funding" / "MIDUSDT" / "pages.jsonl").read_text()
+    assert '"reason":"exhausted"' in ledger                                        # it stopped on an empty page, not at the window start
+    v = _venue_for_plan(uni, doc)
+    assert _run(pf, out, uni, v)["status"] == "DONE" and v.urls == []
+
+
+def test_a_dataset_directory_this_plans_progress_file_does_not_own_is_refused_even_beside_its_own(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    _run(pf, out, uni, _venue_for_plan(uni, doc))
+    os.mkdir(out / "kline-240", 0o700)
+    with pytest.raises(MH.HistoryError, match="does not own"):
+        _run(pf, out, uni, Venue({}))
+
+
+def test_resume_does_not_re_ask_a_symbol_that_already_ended_on_an_empty_page(tmp_path):
+    uni = make_universe(tmp_path, [inst("AMIDUSDT", launch=W0 + 2 * DAY), inst("BBBUSDT")])
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    v1 = _venue_for_plan(uni, doc)
+    with pytest.raises(KeyboardInterrupt):
+        _run(pf, out, uni, v1, stop_after_requests=3)                               # AMID finished (a data page + the empty page), BBB interrupted after one request
+    assert '"reason":"exhausted"' in (out / "funding" / "AMIDUSDT" / "pages.jsonl").read_text()
+    v2 = _venue_for_plan(uni, doc)
+    assert _run(pf, out, uni, v2)["status"] == "DONE"
+    assert not any("symbol=AMIDUSDT" in u for u in v2.urls if MH.DATASETS[MH.FUNDING]["path"] in u) and not (set(v1.urls) & set(v2.urls))

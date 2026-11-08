@@ -212,6 +212,10 @@ def test_positive_history_evidence_turns_unresolved_into_cancelled_before_openin
     assert ev == {"CANCELUSDT": {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}}            # UNRESUSDT has no kline-type dataset: no evidence
     views[MH.MARK]["rd"]["verified"] = False
     assert BP.history_evidence_from_datasets(views) == {}                                                   # unverified datasets are never evidence
+    views[MH.MARK]["rd"]["verified"] = True
+    views[MH.FUNDING]["rd"]["verified"] = False
+    assert BP.history_evidence_from_datasets(views) == {}
+    views[MH.FUNDING]["rd"]["verified"] = True
     monkeypatch.setattr(BP, "history_evidence_from_datasets", lambda _v: {"CANCELUSDT": {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}})
     f = BP.funnel(str(uni), None, window=(W0, T)).report()
     assert f["excluded_lifecycle"]["CANCELUSDT"] == "CONFIRMED_CANCELLED_BEFORE_OPENING" and f["excluded_lifecycle"]["UNRESUSDT"] == "TERMINAL_UNRESOLVED_PENDINGOPEN"
