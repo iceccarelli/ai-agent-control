@@ -465,6 +465,17 @@ def _all_cost_inputs_assumed(spec: Mapping[str, Any]) -> bool:
     return bool(labels) and all(x == "assumed" for x in labels)
 
 
+def _funding_type(spec: Mapping[str, Any]) -> bool:
+    """A candidate whose edge is (or is priced in) funding: it names funding in its data, family / id / hypothesis, or models a per-settlement funding rate.
+    Such evidence must STATE ``universe_funding_normalisation_known is True`` (absence is not knowledge)."""
+    if not isinstance(spec, Mapping):
+        return True                                                      # unknown shape: the stricter rule
+    text = " ".join(str(spec.get(k, "")) for k in ("candidate_id", "family", "hypothesis")).lower()
+    names = " ".join(str(d.get("name", "")) for d in (spec.get("required_data") or []) if isinstance(d, Mapping)).lower()
+    fm = spec.get("funding_model")
+    return "funding" in text or "funding" in names or (isinstance(fm, Mapping) and "expected_bps_per_settlement" in fm)
+
+
 def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapping[str, Any]] = None, *, now_ms: Optional[int] = None,
             key_provider: Optional[Callable[[], Any]] = None) -> Tuple[bool, Optional[str]]:
     """Does this item count as a PASS/FAIL at its stage? (ok, why_not). A FAIL always counts (killing is easy); a PASS must earn it: it must be about THIS candidate and THIS spec,
@@ -516,8 +527,8 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapp
             return False, "UNIVERSE_NOT_POINT_IN_TIME"
         if m.get("universe_pit_basis") != "RAW_RESPONSES_VERIFIED":
             return False, "UNIVERSE_PIT_NOT_RAW_VERIFIED"           # a boolean is a claim: point in time must rest on raw captures the harness re-verified
-        if m.get("universe_funding_normalisation_known") is False:
-            return False, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"   # per-symbol fundingInterval not recorded: per-print funding is not comparable
+        if _funding_type(spec) and m.get("universe_funding_normalisation_known") is not True:
+            return False, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"   # per-symbol fundingInterval not recorded (or the flag ABSENT / None / truthy-but-not-True): per-print funding is not comparable
     if s == "cost_model":
         unk = m.get("unknown_cost_inputs")
         if type(unk) is not int or unk != 0:                           # exactly the integer 0: not False, not 0.0, not None

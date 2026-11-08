@@ -1074,3 +1074,68 @@ def test_ticker_vs_instrument_reconciliation_reports_orphans_and_missing_tickers
     assert UC.verify_capture_dir(str(tmp_path / "v2"))["coverage"]["ticker_reconciliation"] == r
     clean = run2(tmp_path, V2Venue({("linear", "PreLaunch"): chain([pre])}, tickers=[tick("BTCUSDT"), tick("ETHUSDT"), tick("OPENAIUSDT"), tick("BPUSDT")]), name="clean")
     assert clean["ticker_reconciliation"]["orphan_count"] == 0 and clean["ticker_reconciliation"]["instruments_without_ticker"] == []
+
+
+# ---------------------------------------------------------------- renames are lineage, not conflicts (F2)
+def _rename_venue(old_status="Closed", old_over=None, new_over=None, new_status="Trading"):
+    old = inst("OLDUSDT", **{"status": old_status, "symbolId": "sid-r", "launchTime": "1600000000000", "deliveryTime": "1700000000000", **(old_over or {})})
+    new = inst("NEWUSDT", **{"status": new_status, "symbolId": "sid-r", "launchTime": "1700000000000", **(new_over or {})})
+    btc = inst("BTCUSDT")
+    parts = {("linear", None): chain([[old, new, btc]]), ("linear", "Trading"): chain([[r for r in (new, btc) if r["status"] == "Trading"]]),
+             ("linear", "Closed"): chain([[old]] if old_status == "Closed" else [[]]), ("linear", "Delivering"): chain([[old]] if old_status == "Delivering" else [[]])}
+    return V2Venue(parts, tickers=[tick("NEWUSDT"), tick("BTCUSDT")])
+
+
+def test_a_closed_old_symbol_and_a_trading_new_one_sharing_a_symbolid_are_a_rename_not_a_conflict(tmp_path):
+    m = run2(tmp_path, _rename_venue())
+    d = str(tmp_path / "v2")
+    assert m["conflicts"] == [] and m["dataset_status"] == "COMPLETE"
+    assert m["renames"] == [{"category": "linear", "symbolId": "sid-r", "from": "OLDUSDT", "to": "NEWUSDT"}]
+    v = UC.verify_capture_dir(d)
+    assert v["ok"] is True, v["problems"]                                                   # verify re-derives the same renames
+    assert v["coverage"]["renames"] == m["renames"] and v["coverage"]["dataset_status"] == "COMPLETE"
+
+
+def test_a_delivering_old_symbol_is_a_rename_too(tmp_path):
+    m = run2(tmp_path, _rename_venue(old_status="Delivering"), name="deliv")
+    assert m["conflicts"] == [] and [r["from"] for r in m["renames"]] == ["OLDUSDT"]
+
+
+def test_two_trading_rows_sharing_a_symbolid_stay_conflicted(tmp_path):
+    m = run2(tmp_path, _rename_venue(old_status="Trading", old_over={"deliveryTime": "0"}), name="twot")
+    assert m["dataset_status"] == "CONFLICTED" and m["renames"] == []
+    assert any(c["kind"] == "symbolId_multiple_symbols" for c in m["conflicts"])
+
+
+def test_two_closed_rows_with_one_symbolid_and_no_launch_after_delivery_stay_conflicted(tmp_path):
+    m = run2(tmp_path, _rename_venue(new_status="Closed", new_over={"launchTime": "1650000000000", "deliveryTime": "1710000000000"}), name="twoc")
+    assert m["dataset_status"] == "CONFLICTED" and m["renames"] == []                      # same status, and the new one launched BEFORE the old one was delivered
+
+
+def test_a_tampered_renames_claim_fails_verification(tmp_path):
+    run2(tmp_path, _rename_venue())
+    d = str(tmp_path / "v2")
+    mp = os.path.join(d, "manifest.json")
+    man = json.load(open(mp))
+    man["renames"] = []
+    os.chmod(mp, 0o600)
+    open(mp, "w").write(json.dumps(man, indent=2, sort_keys=True) + "\n")
+    v = UC.verify_capture_dir(d)
+    assert v["ok"] is False and any("renames" in p for p in v["problems"])
+
+
+def test_mutation_without_the_rename_rule_a_closed_plus_trading_pair_is_a_conflict(tmp_path, monkeypatch):
+    monkeypatch.setattr(UC, "_rename_chain", lambda by_sym: None)
+    m = run2(tmp_path, _rename_venue(), name="mut")
+    assert m["dataset_status"] == "CONFLICTED"                                             # the pre-fix behaviour: the control that proves the test above discriminates
+
+
+# ---------------------------------------------------------------- survivors-only is stated, not implied (F2)
+def test_a_refused_closed_partition_is_complete_at_capture_level_but_survivors_only_in_words(tmp_path):
+    v = V2Venue({("linear", "Closed"): {"": env([], retCode=10001, retMsg="params error")}})
+    m = run2(tmp_path, v, name="refused")
+    assert m["dataset_status"] == "COMPLETE" and m["delisting_observability"] == "NOT_OBSERVED"       # capture-level semantics unchanged: two separate facts
+    txt = UC.describe_delisting_observability(m["delisting_observability"], m["status_coverage"]["Closed"])
+    assert "survivors only" in txt and "NOT observed" in txt
+    assert "no Closed rows served" in UC.describe_delisting_observability("OBSERVED", "OBSERVED_EMPTY") and "does not prove" in UC.describe_delisting_observability("OBSERVED", "OBSERVED_EMPTY")
+    assert "survivors only" not in UC.describe_delisting_observability("OBSERVED", "OBSERVED_ROWS")

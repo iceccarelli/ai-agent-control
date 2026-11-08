@@ -48,7 +48,8 @@ GAPS = (
     "AsOfView makes the future unreachable through its API; Python cannot stop deliberate reflection into the caller's own full arrays",
     "detect_lookahead catches leaks visible as a difference between full-history and truncated-history features; a leak through a label is for audit_split",
     "point in time is established ONLY by PointInTimeUniverse.from_capture_dirs: raw universe_capture responses re-hashed and re-parsed here AND passed through universe_capture.verify_capture_dir (absent or failed = refused). "
-    "A hash shows what was read, not who produced it: the bytes are not authenticated against the exchange (universe_pit_verified_against_exchange stays False). A membership source name, includes_delisted, an observed window or a "
+    "RAW_RESPONSES_VERIFIED means SELF-CONSISTENT BYTES AS CAPTURED BY THE OWNER (hashes, cursor chains and re-derived coverage agree); it is NOT authenticated as produced by the exchange "
+    "(a hash shows what was read, not who produced it; universe_pit_verified_against_exchange stays False). A membership source name, includes_delisted, an observed window or a "
     "no-delistings attestation is a claim and is IGNORED for the point-in-time verdict",
     "a verified capture vouches for the universe only from its own snapshot time (for at most max_snapshot_gap_ms, default 7 days): study time before the first genuine capture, after the last one, or across a larger gap is "
     "NOT_POINT_IN_TIME_VERIFIED and a study that needs it is INSUFFICIENT_DATA. No such capture is committed to this repository: every committed corpus is NOT point in time (hand-picked survivors)",
@@ -60,6 +61,9 @@ GAPS = (
     "snapshots, are not recoverable by this method (SYMBOL_VANISHED_WITHOUT_RECORD flags the second only when a later snapshot omits a symbol that was seen)",
     "committed corpora carry venue event time only, not the local RECEIVE time: decision_time <= receive_time can be audited (audit_receive_times, PITSeries(recv_ms=)) only for data collected with receive stamps; "
     "the committed funding/price corpora are bound to event time alone (receive_time_bound=False)",
+    "spot_listed / hedgeability come from ONE current spot snapshot (CURRENT_SNAPSHOT_ONLY): a label for today's hedge availability, never a historical fact and never an input to a historical ranking or selection",
+    "membership ends at the first non-Trading sighting at the latest (deliveryTime is used when present and sane); a Closed/Delivering row WITHOUT a deliveryTime is CLOSED_WITHOUT_DELIVERY and makes the universe not point in time; "
+    "a PreLaunch / PendingOpen symbol is not a tradable member until it is first seen Trading",
     "the selection log is verified by recomputing a best-train-mean selector; a different (documented) selection rule needs its own selector= and is only as honest as that function",
 )
 
@@ -104,11 +108,13 @@ NON_PIT_SOURCES = ("hand_picked", "hand_picked_survivors", "current_listing", "c
 PIT_SOURCE_KINDS = ("exchange_instruments_info_snapshots_with_status_history", "recorded_universe_snapshots")
 UNIVERSE_CAPTURE_SCHEMA = "universe_capture/v2"
 #: Bybit V5 instruments-info statuses. ``Closed`` is how a delisted contract stays visible: a capture without that partition cannot see a delisting.
+ENDED_STATUSES = ("Closed", "Delivering")       # a contract in either can no longer be opened: membership ends at the first such sighting at the latest
+NEVER_MEMBER = 2 ** 53                          # listing time of a symbol that was never seen Trading (PreLaunch / PendingOpen only)
 DEFAULT_REQUIRED_STATUSES = ("PreLaunch", "Trading", "Delivering", "Closed")
 #: A snapshot vouches for the universe until the next one, but never for longer than this: a symbol listed and delisted unseen between two far-apart snapshots
 #: is invisible, so a longer stretch is NOT point-in-time verified.
 DEFAULT_MAX_SNAPSHOT_GAP_MS = 7 * 86_400_000
-PIT_RAW = "RAW_RESPONSES_VERIFIED"
+PIT_RAW = "RAW_RESPONSES_VERIFIED"       # = self-consistent bytes as captured by the owner; NOT authenticated as produced by the exchange
 PIT_PARTIAL = "PARTIALLY_VERIFIED"
 PIT_ASSERTED = "ASSERTED"
 NOT_VERIFIED = "NOT_POINT_IN_TIME_VERIFIED"
@@ -352,7 +358,9 @@ def _load_capture(path: str, verify: Callable[[str], Any], required: Sequence[st
 
 
 class PointInTimeUniverse:
-    """Membership as of timestamps. Active on [launch, delivery).
+    """Membership as of timestamps. Active on [listing, end): listing = launchTime, or the first sighting as Trading for a symbol first seen PreLaunch / PendingOpen;
+    end = the earlier of deliveryTime and the first Closed/Delivering sighting (a Closed row with no deliveryTime is CLOSED_WITHOUT_DELIVERY: a problem, never an
+    immortal member). Symbols sharing a symbolId across captures (old name pruned, new name appearing) are renames: lineage, not a vanishing.
 
     Built from verified raw captures (``from_capture_dirs``) it can be point in time. Built from ``members`` it is a DESCRIPTION: ``point_in_time`` is False
     whatever ``membership_source``, ``includes_delisted``, the observed window or ``no_delistings_attestation`` say; they are kept as ignored assertions."""
@@ -447,6 +455,10 @@ class PointInTimeUniverse:
         first_seen: Dict[str, int] = {}
         lineage: Dict[str, str] = {}
         intervals: Dict[str, List[Tuple[int, Optional[int]]]] = {}
+        lineage_members: Dict[str, List[str]] = {}
+        for sym, seq in obs.items():
+            for lin in {o.lineage for o in seq if o.lineage}:
+                lineage_members.setdefault(lin, []).append(sym)
         for sym in sorted(obs):
             seq = obs[sym]
             if len({o.launch_ms for o in seq}) > 1:
@@ -461,18 +473,35 @@ class PointInTimeUniverse:
                 elif seen_delivery:
                     probs.append(f"DELIVERYTIME_RESCINDED:{sym}")
                     break
+            if any(o.status in ENDED_STATUSES and not o.delivery_ms for o in seq):
+                probs.append(f"CLOSED_WITHOUT_DELIVERY:{sym}")          # a Closed/Delivering row that states no deliveryTime: when it ended is unknown, so the universe is not point in time
             lins = {o.lineage for o in seq if o.lineage}
             if len(lins) > 1:
                 probs.append(f"LINEAGE_CONTRADICTION:{sym}")
             if needs_funding_interval and any(o.interval_min is None for o in seq):
                 probs.append(f"FUNDING_INTERVAL_UNKNOWN:{sym}")        # no stated fundingInterval: per-print funding cannot be normalised, so a funding study cannot pass
-            members[sym] = (seq[0].launch_ms, max(deliveries) if deliveries else None)
+            launch = seq[0].launch_ms
+            first_trading = next((o.snap_ms for o in seq if o.status == "Trading"), None)
+            if seq[0].status != "Trading" and seq[0].status not in ENDED_STATUSES:
+                lo_m = max(launch, first_trading) if first_trading is not None else NEVER_MEMBER     # PreLaunch / PendingOpen: tradable only from the first sighting as Trading
+            else:
+                lo_m = launch
+            ends = [d for d in deliveries]
+            first_ended = next((o.snap_ms for o in seq if o.status in ENDED_STATUSES), None)
+            if first_ended is not None:
+                ends.append(first_ended)                                  # membership ends at the first non-Trading (Closed/Delivering) sighting at the latest
+            members[sym] = (lo_m, min(ends) if ends else None)
             intervals[sym] = [(o.snap_ms, o.interval_min) for o in seq]
             first_seen[sym] = seq[0].snap_ms
             lineage[sym] = sorted(lins)[0] if lins else sym
             for c in uniq:                                                # vanished: seen, then absent from a later complete capture, with no delisting recorded
                 if c.snapshot_ms > first_seen[sym] and sym not in c.rows and not any(o.delivery_ms for o in seq if o.snap_ms < c.snapshot_ms):
-                    probs.append(f"SYMBOL_VANISHED_WITHOUT_RECORD:{sym}")
+                    successors = [t for lin in lins for t in lineage_members.get(lin, []) if t != sym and t in c.rows and obs[t][0].snap_ms > first_seen[sym]]
+                    if successors:                                        # same symbolId now under another name: a rename whose old row was pruned, not a vanishing
+                        cut = min(obs[t][0].snap_ms for t in successors)
+                        members[sym] = (members[sym][0], cut if members[sym][1] is None else min(members[sym][1], cut))
+                    else:
+                        probs.append(f"SYMBOL_VANISHED_WITHOUT_RECORD:{sym}")
                     break
             if deliveries and max(deliveries) <= seq[0].launch_ms:
                 probs.append(f"DELIVERYTIME_NOT_AFTER_LAUNCH:{sym}")

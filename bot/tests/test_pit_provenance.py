@@ -155,18 +155,81 @@ def test_new_listing_is_not_a_member_before_launch_even_if_recorded_later(tmp_pa
     pre = PF.row("PREUSDT", "PreLaunch", 8_000)
     caps = [PF.write_capture(root, "c0", 0, {"PreLaunch": [pre]})]
     u = build(caps, lo=0, hi=9_000)
-    assert u.active_at(7_999) == [] and u.active_at(8_000) == ["PREUSDT"]
+    # a symbol seen only as PreLaunch is never a tradable member, even after its scheduled launchTime (the launch is a plan, not a sighting of Trading)
+    assert u.active_at(7_999) == [] and u.active_at(8_000) == []
+    live = PF.row("PREUSDT", "Trading", 8_000)
+    u2 = build([caps[0], PF.write_capture(root, "c1", 8_500, {"Trading": [live]})], lo=0, hi=9_000)
+    assert u2.active_at(8_400) == [] and u2.active_at(8_500) == ["PREUSDT"]                       # a member from the first sighting as Trading
 
 
 def test_closed_instrument_partition_is_what_makes_delisting_visible(tmp_path):
     root = str(tmp_path)
     closed = PF.row("OLDUSDT", "Closed", 0, 4_000)
-    caps = [PF.write_capture(root, "c0", 0, {"Closed": [closed], "Trading": [PF.row("BBBUSDT", "Trading", 0)]})]
+    # (changed: the Closed row used to be first sighted at t=0 with a deliveryTime of 4000, i.e. a contract 'Closed' before it was delivered. A Closed sighting proves the contract
+    # had ended by then, so membership now ends at the sighting at the latest; the realistic shape is Trading first, Closed after its delivery.)
+    caps = [PF.write_capture(root, "c0", 0, {"Trading": [PF.row("OLDUSDT", "Trading", 0), PF.row("BBBUSDT", "Trading", 0)]}),
+            PF.write_capture(root, "c1a", 5_000, {"Closed": [closed], "Trading": [PF.row("BBBUSDT", "Trading", 0)]})]
     u = build(caps, lo=0, hi=9_000)
     assert u.point_in_time and u.active_at(3_999) == ["BBBUSDT", "OLDUSDT"] and u.active_at(4_000) == ["BBBUSDT"]
+    first_sight = build([PF.write_capture(root, "c2", 0, {"Closed": [closed], "Trading": [PF.row("BBBUSDT", "Trading", 0)]})], lo=0, hi=9_000)
+    assert first_sight.active_at(0) == ["BBBUSDT"]                                                   # a Closed row cannot be a member at the instant it is seen Closed
     only_trading = [PF.write_capture(root, "c1", 0, {"Trading": [PF.row("BBBUSDT", "Trading", 0)]}, statuses=("PreLaunch", "Trading", "Delivering"))]
     miss = build(only_trading, lo=0, hi=9_000)
     assert not miss.point_in_time and "MISSING_STATUS_PARTITION:Closed" in miss.survivorship_problems()
+
+
+def test_a_closed_row_without_a_delivery_time_is_a_problem_not_an_immortal_member(tmp_path):
+    root = str(tmp_path)
+    a_open, b = PF.row("AAAUSDT", "Trading", 0), PF.row("BBBUSDT", "Trading", 0)
+    ok_closed = PF.row("AAAUSDT", "Closed", 0, 5_000)
+    good = [PF.write_capture(root, "g0", 0, {"Trading": [a_open, b]}), PF.write_capture(root, "g1", 6_000, {"Trading": [b], "Closed": [ok_closed]})]
+    assert build(good, lo=0, hi=9_000).point_in_time                                                   # positive control: the same shape WITH a deliveryTime is fine
+    bad_closed = PF.row("AAAUSDT", "Closed", 0, 0)
+    bad = [PF.write_capture(root, "b0", 0, {"Trading": [a_open, b]}), PF.write_capture(root, "b1", 6_000, {"Trading": [b], "Closed": [bad_closed]})]
+    u = build(bad, lo=0, hi=9_000)
+    assert not u.point_in_time and "CLOSED_WITHOUT_DELIVERY:AAAUSDT" in u.survivorship_problems()
+    # and even if someone looks past the problem, the symbol does not stay active forever: membership ends at the first non-Trading sighting at the latest
+    assert u._m["AAAUSDT"][1] == 6_000
+    delivering = PF.row("AAAUSDT", "Delivering", 0, 0)
+    d = build([PF.write_capture(root, "d0", 0, {"Trading": [a_open, b]}), PF.write_capture(root, "d1", 6_000, {"Trading": [b], "Delivering": [delivering]})], lo=0, hi=9_000)
+    assert "CLOSED_WITHOUT_DELIVERY:AAAUSDT" in d.survivorship_problems()
+
+
+def test_membership_ends_at_the_first_non_trading_sighting_when_the_delivery_time_is_later(tmp_path):
+    root = str(tmp_path)
+    a_open, b = PF.row("AAAUSDT", "Trading", 0), PF.row("BBBUSDT", "Trading", 0)
+    late = PF.row("AAAUSDT", "Closed", 0, 99_000)                                                     # a deliveryTime far after the sighting that already shows it Closed
+    u = build([PF.write_capture(root, "c0", 0, {"Trading": [a_open, b]}), PF.write_capture(root, "c1", 6_000, {"Trading": [b], "Closed": [late]})], lo=0, hi=9_000)
+    assert u.active_at(5_999) == ["AAAUSDT", "BBBUSDT"] and u.active_at(6_000) == ["BBBUSDT"]
+    early = PF.row("AAAUSDT", "Closed", 0, 5_000)
+    e = build([PF.write_capture(root, "e0", 0, {"Trading": [a_open, b]}), PF.write_capture(root, "e1", 6_000, {"Trading": [b], "Closed": [early]})], lo=0, hi=9_000)
+    assert e.active_at(4_999) == ["AAAUSDT", "BBBUSDT"] and e.active_at(5_000) == ["BBBUSDT"]         # a sane deliveryTime before the sighting is what is used
+
+
+def test_a_pre_launch_symbol_with_a_past_launch_time_is_not_a_member_until_seen_trading(tmp_path):
+    root = str(tmp_path)
+    b = PF.row("BBBUSDT", "Trading", 0)
+    pend = PF.row("PENUSDT", "PendingOpen", 1_000)
+    caps = [PF.write_capture(root, "c0", 0, {"Trading": [b], "PendingOpen": [pend]}), PF.write_capture(root, "c1", 4_000, {"Trading": [b], "PendingOpen": [pend]}),
+            PF.write_capture(root, "c2", 8_000, {"Trading": [b, PF.row("PENUSDT", "Trading", 1_000)]})]
+    u = build(caps, lo=0, hi=9_000, required_statuses=("PreLaunch", "PendingOpen", "Trading", "Delivering", "Closed"))
+    assert u.point_in_time, u.survivorship_problems()
+    assert u.active_at(2_000) == ["BBBUSDT"] and u.active_at(7_999) == ["BBBUSDT"] and u.active_at(8_000) == ["BBBUSDT", "PENUSDT"]
+
+
+def test_a_renamed_symbol_whose_old_name_was_pruned_is_lineage_not_a_vanishing(tmp_path):
+    root = str(tmp_path)
+    b = PF.row("BBBUSDT", "Trading", 0, symbol_id="lin-2")
+    old = PF.row("OLDUSDT", "Trading", 0, symbol_id="lin-7")
+    new = PF.row("NEWUSDT", "Trading", 4_000, symbol_id="lin-7")
+    u = build([PF.write_capture(root, "c0", 0, {"Trading": [old, b]}), PF.write_capture(root, "c1", 5_000, {"Trading": [new, b]})], lo=0, hi=9_000)
+    assert u.point_in_time, u.survivorship_problems()
+    assert u.renames() == [("OLDUSDT", "NEWUSDT")] and u.delisted_between(0, 9_000) == []
+    assert u.active_at(4_999) == ["BBBUSDT", "OLDUSDT"] and u.active_at(5_000) == ["BBBUSDT", "NEWUSDT"]       # one lineage active at a time
+    assert u.active_lineages_at(6_000) == ["lin-2", "lin-7"]
+    other = PF.row("NEWUSDT", "Trading", 4_000, symbol_id="lin-9")
+    v = build([PF.write_capture(root, "d0", 0, {"Trading": [old, b]}), PF.write_capture(root, "d1", 5_000, {"Trading": [other, b]})], lo=0, hi=9_000)
+    assert not v.point_in_time and "SYMBOL_VANISHED_WITHOUT_RECORD:OLDUSDT" in v.survivorship_problems()      # a different symbolId is not a rename
 
 
 def test_non_perpetual_or_non_usdt_rows_are_not_universe_members(tmp_path):

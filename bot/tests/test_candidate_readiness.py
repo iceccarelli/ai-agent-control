@@ -227,17 +227,19 @@ def offline(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", boom)
 
 
-def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT")):
+def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT"), funding_override=None, universe_kw=None):
     """A real dataset root: universe capture (BTC/ETH 8h, FAST 240m, OLD Closed with a deliveryTime), funding + mark-kline-240 written by the real writer with a scripted
     fetch / clock / sleep, and (optionally) a spot-instruments snapshot. Returns (root, universe_dir, spot_dir)."""
     delivery = TMH.BASE - 60 * TMH.H8
     root = tmp_path / "hist"
     os.mkdir(root, 0o700)
-    uni = TMH._universe_dir(tmp_path, syms=syms, intervals={"FASTUSDT": 240}, bases={"FASTUSDT": "1000FAST"}, statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": delivery})
+    uni = TMH._universe_dir(tmp_path, syms=syms, intervals={"FASTUSDT": 240}, bases={"FASTUSDT": "1000FAST"}, statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": delivery}, **(universe_kw or {}))
     recs, info = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
     fdata = {("funding", "BTCUSDT"): TMH.grid(TMH.FIRST, TMH.N, TMH.H8), ("funding", "ETHUSDT"): TMH.grid(TMH.FIRST, TMH.N, TMH.H8),
              ("funding", "FASTUSDT"): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4), ("funding", "OLDUSDT"): TMH.grid(TMH.FIRST, TMH.N - 60, TMH.H8)}
     fdata = {k: v for k, v in fdata.items() if k[1] in syms}
+    for sym, ts_list in (funding_override or {}).items():
+        fdata[("funding", sym)] = ts_list
     fspecs = MH.build_specs("funding", None, sorted(recs), TMH.START, TMH.END, recs)
     fv = TMH.HV(fdata)
     TMH.run(root, fspecs, fv, universe=info)
@@ -265,7 +267,7 @@ def test_round_trip_real_writer_to_ranked_funding_plumbing(tmp_path, offline):
     assert by["FASTUSDT"].interval_min == 240 and by["BTCUSDT"].interval_min == 480
     assert by["OLDUSDT"].delivery_ms == TMH.BASE - 60 * TMH.H8
     assert by["BTCUSDT"].delivery_ms is None and by["BTCUSDT"].launch_ms == TMH.FIRST - 1
-    assert by["BTCUSDT"].funding[0] == (TMH.FIRST, pytest.approx(1.0)) and by["BTCUSDT"].mark[0] == (TMH.FIRST, pytest.approx(100.5))      # 0.0001 fraction = 1 bp; mark = close
+    assert by["BTCUSDT"].funding[0] == (TMH.FIRST, pytest.approx(1.0)) and by["BTCUSDT"].mark[0] == (TMH.FIRST + H4, pytest.approx(100.5))      # 0.0001 fraction = 1 bp; mark = close, KEYED BY WHEN IT IS KNOWABLE (the candle starting at FIRST closes at FIRST+4h; it was keyed FIRST before: look-ahead)
     assert len(by["FASTUSDT"].funding) == 2 * TMH.N - 1 and by["OLDUSDT"].funding[-1][0] <= by["OLDUSDT"].delivery_ms
     assert [by[s].spot_listed for s in ("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT")] == [True, False, None, False]       # SPOT_TRADING / NO_SPOT_PAIR / UNRESOLVED_MULTIPLIER / SPOT_NOT_TRADING
     assert info["datasets"]["funding"]["dataset_status"] == "COMPLETE" and info["datasets"][f"mark-kline-{MARK_IV}"]["verified"] is True
@@ -403,7 +405,7 @@ def test_mutation_flipping_cross_venue_to_executable_is_caught():
 
 
 def test_mutation_a_formation_window_that_reaches_forward_is_caught():
-    m = _mutant("if t - formation_ms < ts <= t]", "if t - formation_ms < ts <= t + formation_ms]")
+    m = _mutant("if t - formation_ms < ts <= t:", "if t - formation_ms < ts <= t + formation_ms:")
     leaky = mk("L", 480, [0.1] * 60 + [500.0] * 60)
     assert m.formation_score(leaky, 18 * DAY, 5 * DAY) > 100 and CR.formation_score(leaky, 18 * DAY, 5 * DAY) == pytest.approx(0.3)
 
@@ -416,7 +418,7 @@ def test_mutation_without_the_delivery_cap_a_closed_contract_keeps_earning():
 
 
 def test_mutation_without_interval_normalisation_per_print_rates_would_be_compared():
-    m = _mutant("return statistics.fmean(vals) * 1440.0 / s.interval_min", "return statistics.fmean(vals)")
+    m = _mutant("per_day.append(v * 1440.0 / iv)", "per_day.append(v)")
     c = mk("C", 240, [1.2] * 60)
     assert m.formation_score(c, 5 * DAY, 3 * DAY) == pytest.approx(1.2) and CR.formation_score(c, 5 * DAY, 3 * DAY) == pytest.approx(7.2)
 
@@ -426,3 +428,143 @@ def test_mutation_a_perp_only_symbol_labelled_hedgeable_would_be_reported_as_car
     p = mk("P", 480, [3.0] * 120, spot=False)
     leg = m.run_variant([p], formation_days=3, hold_days=7, top_k=1, round_trip_bps=11.0, t_start=10 * DAY, t_end=30 * DAY)["rows"][0]["legs"][0]
     assert "hedged_carry_funding_net_of_cost_bps" in leg
+
+
+# ------------------------------------------------------------------ red-team fixes (F2): look-ahead in the price leg, per-print funding intervals, survivorship, labels, family count
+def test_marks_are_keyed_by_observation_time_and_a_close_is_unknowable_at_its_candle_start(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, _info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    s = next(x for x in series if x.symbol == "BTCUSDT")
+    rows = [json.loads(line) for line in open(os.path.join(root, f"mark-kline-{MARK_IV}", "BTCUSDT", "rows.jsonl"), "rb").read().splitlines()]
+    assert [t for t, _ in s.mark] == [r["observation_time"] for r in rows] and all(r["observation_time"] == r["ts"] + H4 for r in rows)
+    assert CR.price_at(s.mark, TMH.FIRST) is None                                   # the candle STARTING at FIRST has not closed: nothing is known at FIRST
+    assert CR.price_at(s.mark, TMH.FIRST + H4 - 1) is None
+    assert CR.price_at(s.mark, TMH.FIRST + H4) == pytest.approx(100.5)             # positive control: usable from its close
+
+
+def test_a_candle_that_closes_at_150_is_not_the_entry_price_at_its_start():
+    t = 3 * DAY
+    H = 3600_000
+    fund = [(i * 8 * H, 5.0) for i in range(1, 200)]
+    mark = [(i * 4 * H + 4 * H, 100.0) for i in range(0, 400)]                       # obs-keyed: the candle starting at i*4h closes at (i+1)*4h
+    mark = [(ts, 150.0 if ts == t + 4 * H else p) for ts, p in mark]                 # the candle STARTING at t closes at 150 (a spike unknowable at t)
+    s = CR.SymbolSeries("AAAUSDT", 480, fund, mark, 0, None, True)
+    leg = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=t, t_end=t + 8 * DAY)["rows"][0]["legs"][0]
+    assert leg["price_leg_bps"] == pytest.approx(0.0)                                # entry 100 (known at t), exit 100: the 150 close is not used
+    later = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=t + 4 * H, t_end=t + 4 * H + 8 * DAY)["rows"][0]["legs"][0]
+    assert later["price_leg_bps"] == pytest.approx(-(100.0 / 150.0 - 1) * 1e4)      # positive control: decided AT the close, it is used
+
+
+def test_the_loader_refuses_mark_rows_that_claim_a_close_before_the_candle_ended(tmp_path, offline, monkeypatch):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    assert CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[0]       # positive control
+    real = CR._rows
+
+    def early(ddir, sym):
+        out = real(ddir, sym)
+        return [dict(r, observation_time=r["ts"]) for r in out] if f"mark-kline-{MARK_IV}" in ddir else out
+    monkeypatch.setattr(CR, "_rows", early)
+    with pytest.raises(RH.LookAheadError):
+        CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+
+
+def test_a_row_used_before_its_observation_time_raises_lookahead():
+    with pytest.raises(RH.LookAheadError):
+        CR.assert_usable_at(200, 199)
+    CR.assert_usable_at(200, 200)
+    m = _mutant("if seq[mid][0] <= t:", "if seq[mid][0] <= t + 14_400_000:")           # a lookup that reaches one candle ahead
+    with pytest.raises(RH.LookAheadError):
+        m.price_at([(100, 1.0), (200, 2.0)], 150)
+    assert CR.price_at([(100, 1.0), (200, 2.0)], 150) == 1.0
+
+
+def test_funding_is_normalised_with_the_interval_of_the_segment_containing_each_print():
+    p8 = 8 * 3_600_000
+    f = [(i * p8, 1.0) for i in range(1, 31)] + [(30 * p8 + j * (p8 // 2), 0.5) for j in range(1, 61)]      # 480m then 240m; 3.0 bps/day throughout
+    s = CR.SymbolSeries("X", 240, f, [], 0, None, None, funding_intervals=[(1 * p8, 30 * p8, 480), (30 * p8, 30 * p8 + 60 * (p8 // 2), 240)])
+    assert CR.formation_score(s, 20 * p8, 5 * DAY) == pytest.approx(3.0)             # all in the 480 segment (the current-interval formula gave 6.0)
+    assert CR.formation_score(s, 30 * p8 + 40 * (p8 // 2), 5 * DAY) == pytest.approx(3.0)
+    mixed = CR.formation_score(s, 30 * p8 + 6 * (p8 // 2), 3 * DAY)
+    assert mixed == pytest.approx(3.0)
+    flat = CR.SymbolSeries("Y", 240, f, [], 0, None, None)                          # no segments: the single interval is applied to every print (hand-built series only)
+    assert CR.formation_score(flat, 20 * p8, 5 * DAY) == pytest.approx(6.0)
+
+
+def test_round_trip_a_480_to_240_history_is_normalised_per_segment(tmp_path, offline):
+    last8 = TMH.FIRST + 59 * TMH.H8
+    ts = TMH.grid(TMH.FIRST, 60, TMH.H8) + [last8 + k * H4 for k in range(1, (TMH.BASE - last8) // H4 + 1)]
+    root, uni, _ = _hist(tmp_path, spot=False, funding_override={"FASTUSDT": ts})
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    s = next(x for x in series if x.symbol == "FASTUSDT")
+    assert s.interval_min == 240 and [iv for _a, _b, iv in s.funding_intervals] == [480, 240]
+    assert s.funding_intervals[0][:2] == (TMH.FIRST, last8) and "FASTUSDT" not in [x["symbol"] for x in info["excluded"]]
+    assert CR.formation_score(s, TMH.FIRST + 40 * TMH.H8, 5 * DAY) == pytest.approx(3.0)       # 1 bp per 8h print = 3 bps/day; "current interval" scaling gave 6.0
+    assert CR.formation_score(s, TMH.BASE, 5 * DAY) == pytest.approx(6.0)                      # 1 bp per 4h print = 6 bps/day
+    out = CR.evaluate_ranked_funding(series)
+    assert out["intervals_min_counts"]["240"] == 1
+
+
+def test_a_symbol_whose_prints_have_no_known_interval_is_excluded_and_listed():
+    man = {"segments": [{"first_ts": 100, "last_ts": 500, "interval_ms": 28_800_000, "fundingInterval_min": 480}, {"first_ts": 900, "last_ts": 1500, "interval_ms": 57_600_000, "fundingInterval_min": 960}],
+           "reasons": ["interval_disagrees_with_record"]}
+    segs, why = CR.funding_interval_segments(man, [100, 300, 500, 700, 900, 1500])             # print 700 sits between two segments: its interval is unknown
+    assert segs is None and why.startswith("funding_interval_unknown_for_1_prints")
+    segs, why = CR.funding_interval_segments(man, [100, 300, 500, 900, 1200, 1500])
+    assert why is None and [(a, b, iv) for a, b, iv in segs] == [(100, 500, 480), (900, 1500, 960)]
+    assert CR.funding_interval_segments({"reasons": []}, [1, 2])[0] is None                    # no segments in the manifest: unknown, never the current interval
+
+
+def test_survivors_only_is_stated_when_the_closed_partition_was_refused(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT"), universe_kw={"refuse_closed": True})
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert info["universe"]["delisting_observability"] == "NOT_OBSERVED" and info["survivorship"] == "SURVIVORS_ONLY" and info["point_in_time_claim"] is False
+    assert "SURVIVORS" in info["warning"].upper() and "survivorship" in info["warning"].lower()
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert out["survivorship"] == "SURVIVORS_ONLY" and any("SURVIVORS_ONLY" in w for w in out["warnings"])
+    assert CR.evaluate_ranked_funding(series)["survivorship"] == "SURVIVORS_ONLY"               # no information given: fail closed
+
+
+def test_an_empty_closed_partition_is_no_closed_rows_served_not_proof_of_no_delistings(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT"))
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert info["universe"]["delisting_observability"] == "OBSERVED" and info["survivorship"] == "SURVIVORS_ONLY"
+    assert "no Closed rows served" in info["universe"]["delisting_note"] and "does not prove" in info["universe"]["delisting_note"]
+
+
+def test_observed_closed_rows_give_delistings_observed(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path)
+    series, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    assert info["survivorship"] == "DELISTINGS_OBSERVED" and info["point_in_time_claim"] is False        # observed delistings are necessary, not sufficient
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert out["survivorship"] == "DELISTINGS_OBSERVED" and "warnings" in out
+
+
+def test_spot_listing_is_a_current_snapshot_only_label(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path)
+    series, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    assert info["hedge"]["basis"] == "CURRENT_SNAPSHOT_ONLY"
+    s = [x for x in series if x.symbol == "BTCUSDT"]
+    leg = CR.run_variant(s, formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=TMH.FIRST + 10 * DAY, t_end=TMH.FIRST + 30 * DAY)["rows"][0]["legs"][0]
+    assert leg["hedgeability"] == "HEDGEABLE_ON_BYBIT" and leg["hedgeability_basis"] == "CURRENT_SNAPSHOT_ONLY"
+
+
+def test_raw_responses_verified_is_described_as_self_consistent_not_authenticated():
+    assert "NOT authenticated as produced by the exchange" in " ".join(RH.GAPS)
+    assert "NOT authenticated as produced by the exchange" in CR.PIT_LABEL_NOTE and "RAW_RESPONSES_VERIFIED" in CR.PIT_LABEL_NOTE
+
+
+def test_every_variant_tried_in_the_call_is_counted_and_recorded():
+    fam = "t_" + uuid.uuid4().hex
+    out = CR.evaluate_ranked_funding(_long_capture(1, 2.0), spec=spec(fam), formation_days_grid=(3, 7), hold_days=7, hold_days_grid=(7, 14), top_k_grid=(1, 2),
+                                     cost_scenarios={"base": 11.0, "stress": 22.0})
+    assert out["n_variants_counted"] == 2 * 2 * 2 * 2 == len(out["variants_tried"]) and out["multiple_testing_scope"] == "PER_PROCESS"
+    assert out["hold_days_grid"] == [7, 14] and out["top_k_grid"] == [1, 2] and sorted(out["cost_scenarios_bps"]) == ["base", "stress"]
+    assert out["status"] == "WALK_FORWARD_DONE" and all("|H14|" not in n for n in out["selected_per_fold"])           # different hold = different time grid: counted, never selectable
+    plain = CR.evaluate_ranked_funding(_long_capture(1, 2.0), spec=spec("t_" + uuid.uuid4().hex), formation_days_grid=(3, 7), hold_days=7)
+    assert plain["n_variants_counted"] == 2 and plain["multiple_testing_scope"] == "PER_PROCESS"
+
+
+def test_a_ledger_path_changes_the_scope_statement(tmp_path):
+    fam = "t_" + uuid.uuid4().hex
+    out = CR.evaluate_ranked_funding(_long_capture(1, 2.0), spec=spec(fam), formation_days_grid=(3,), hold_days=7, ledger_path=str(tmp_path / "ledger.jsonl"))
+    assert out["multiple_testing_scope"] == "PERSISTENT_LEDGER_FILE" and out["n_variants_counted"] == 1

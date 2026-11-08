@@ -24,6 +24,12 @@ Schema v2 (``capture_universe``, the ``capture`` CLI). Same guarantees, plus: ev
 answers is RECORDED (never assumed): ``OBSERVED_ROWS`` / ``OBSERVED_EMPTY`` / ``REFUSED_BY_VENUE:<code>/<msg>`` / ``TRANSPORT_ERROR:<class>`` / ``PARTIAL``.
 A venue that does not serve ``status=Closed`` is a recorded answer, not a crash. ``verify_capture_dir`` re-derives every claim from the raw bytes. The legacy
 single-partition ``capture`` function and its schema-1 manifest are unchanged for ``market_collector``.
+
+Two things this tool states plainly rather than implies. (1) ``dataset_status`` and ``delisting_observability`` are separate facts: a capture whose ``status=Closed``
+partition the venue refused (or served EMPTY) is still COMPLETE at capture level, and its universe is SURVIVORS ONLY; an empty Closed partition means 'no Closed rows
+served', not 'no delistings happened' (``describe_delisting_observability``). (2) One symbolId on successive names where the earlier one has ENDED (Closed/Delivering, or
+delivered before the next launched) is a RENAME, recorded in the manifest's ``renames`` as lineage and re-derived by ``verify_capture_dir``; one symbolId on two Trading
+rows (or any pair with no ended predecessor) remains a CONFLICT. A manifest written before ``renames`` existed verifies only if the capture contains no rename.
 """
 from __future__ import annotations
 
@@ -735,10 +741,34 @@ def _ckey(rec: Dict[str, Any]) -> str:
     return json.dumps(rec, sort_keys=True, allow_nan=False, separators=(",", ":"))
 
 
+_ENDED_STATUSES = ("Closed", "Delivering")
+
+
+def _rename_chain(by_sym: Dict[str, List[Dict[str, Any]]]) -> Optional[List[Tuple[str, str]]]:
+    """The (old, new) pairs when the symbols sharing ONE symbolId are successive names of one instrument, else None (a conflict). Ordered by launchTime, every earlier name
+    must have ENDED (every record Closed/Delivering, or a deliveryTime at or before the next name's launchTime) and the two names must not carry the same set of statuses
+    unless the later one launched at or after the earlier one's delivery. Two Trading rows with one symbolId never qualify."""
+    info = []
+    for sym, recs in by_sym.items():
+        launches = [r.get("launchTime") or 0 for r in recs]
+        deliveries = [r.get("deliveryTime") or 0 for r in recs]
+        info.append((min(launches), sym, frozenset(r.get("status") for r in recs), max(deliveries)))
+    info.sort(key=lambda x: (x[0], x[1]))
+    pairs: List[Tuple[str, str]] = []
+    for (la, sa, sta, da), (lb, sb, stb, _db) in zip(info, info[1:]):
+        launched_after_delivery = da > 0 and lb >= da
+        ended = bool(sta) and all(x in _ENDED_STATUSES for x in sta)
+        if not (ended or launched_after_delivery) or (sta == stb and not launched_after_delivery):
+            return None
+        pairs.append((sa, sb))
+    return pairs
+
+
 def build_universe(parts: Sequence[Dict[str, Any]], tickers: Dict[str, Dict[str, Any]], snapshot_ms: int) -> Dict[str, Any]:
     """Pure. Normalise every usable row of every partition, reconcile across partitions, write nothing. Identical records seen in several partitions are one
-    line with every partition in ``seen_in``. Two DIFFERENT records for one (category, symbol), or one symbolId on two symbols, are never merged: every
-    variant stays a line flagged ``conflict`` and the keys are returned in ``conflicts``."""
+    line with every partition in ``seen_in``. Two DIFFERENT records for one (category, symbol), or one symbolId on two Trading (or otherwise un-ended)
+    symbols, are never merged: every variant stays a line flagged ``conflict`` and the keys are returned in ``conflicts``. One symbolId on successive names where the earlier
+    one has ENDED (Closed/Delivering, or delivered before the next launched) is a RENAME: recorded in ``renames`` as lineage, not a conflict."""
     acc: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
     rej: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for p in parts:
@@ -754,7 +784,7 @@ def build_universe(parts: Sequence[Dict[str, Any]], tickers: Dict[str, Dict[str,
             if label not in v["seen"]:
                 v["seen"].append(label)
     conflicts: List[Dict[str, Any]] = []
-    ids: Dict[Tuple[str, str], set] = {}
+    ids: Dict[Tuple[str, str], Dict[str, List[Dict[str, Any]]]] = {}
     lines: List[bytes] = []
     for key in sorted(acc):
         variants = acc[key]
@@ -768,12 +798,17 @@ def build_universe(parts: Sequence[Dict[str, Any]], tickers: Dict[str, Dict[str,
         for ck in sorted(variants):
             rec = variants[ck]["rec"]
             if rec.get("symbolId"):
-                ids.setdefault((key[0], rec["symbolId"]), set()).add(key[1])
+                ids.setdefault((key[0], rec["symbolId"]), {}).setdefault(key[1], []).append(rec)
             row = dict(rec, seen_in=sorted(variants[ck]["seen"]), snapshot_ms=snapshot_ms, conflict=multi, ticker=tickers.get(key[1]) if key[0] == "linear" else None)
             lines.append((json.dumps(row, sort_keys=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8"))
-    for (cat, sid), syms in sorted(ids.items()):
-        if len(syms) > 1:
-            conflicts.append({"kind": "symbolId_multiple_symbols", "category": cat, "symbolId": sid, "symbols": sorted(syms)})
+    renames: List[Dict[str, Any]] = []
+    for (cat, sid), by_sym in sorted(ids.items()):
+        if len(by_sym) > 1:
+            pairs = _rename_chain(by_sym)
+            if pairs is None:
+                conflicts.append({"kind": "symbolId_multiple_symbols", "category": cat, "symbolId": sid, "symbols": sorted(by_sym)})
+            else:
+                renames.extend({"category": cat, "symbolId": sid, "from": a, "to": b} for a, b in pairs)       # one instrument under successive names: lineage, not a conflict
     for e in rej.values():
         e["partitions"].sort()
     rejected = sorted(rej.values(), key=lambda e: (e["category"], e["symbol"], e["row_sha256"]))
@@ -783,7 +818,7 @@ def build_universe(parts: Sequence[Dict[str, Any]], tickers: Dict[str, Dict[str,
             k = f"{e['category']}:{e['reason'].split(':', 1)[1]}"
             excl[k] = excl.get(k, 0) + 1
     all_syms = sorted({(r.get("symbol")) for p in parts for r in p["usable_rows"] if isinstance(r, dict) and isinstance(r.get("symbol"), str)})
-    return {"jsonl": b"".join(lines), "rows": len(lines), "rejected": summarize_rejects(rejected), "conflicts": conflicts,
+    return {"jsonl": b"".join(lines), "rows": len(lines), "rejected": summarize_rejects(rejected), "conflicts": conflicts, "renames": renames,
             "instruments": sum(1 for _ in acc), "excluded_contract_types": dict(sorted(excl.items())), "instrument_symbols": all_syms,
             "linear_accepted_symbols": sorted(k[1] for k in acc if k[0] == "linear")}
 
@@ -810,6 +845,19 @@ def _coverage(parts: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str
     closed = by_cat.get("linear", {}).get("Closed", "")
     deli = "OBSERVED" if closed in ("OBSERVED_ROWS", "OBSERVED_EMPTY") else "NOT_OBSERVED"
     return dict(by_cat.get("linear", {})), by_cat, deli
+
+
+def describe_delisting_observability(observability: Any, closed_outcome: Any) -> str:
+    """Plain words for what the Closed partition did and did NOT show. ``dataset_status`` and ``delisting_observability`` are separate facts: a capture whose Closed
+    partition was refused is still COMPLETE at capture level, and its universe is survivors only. An EMPTY Closed partition means 'no Closed rows served'; it does not
+    prove that no delistings happened."""
+    if observability == "OBSERVED" and closed_outcome == "OBSERVED_ROWS":
+        return ("Closed rows were served: delisted contracts the venue still serves are visible. The venue may not serve old delistings, so an absent symbol is still not proof "
+                "it was never delisted")
+    if observability == "OBSERVED" and closed_outcome == "OBSERVED_EMPTY":
+        return "no Closed rows served (the Closed partition answered but was empty); this does not prove no delistings happened, so the universe is survivors only"
+    return (f"delistings NOT observed (Closed partition outcome {closed_outcome!r}, delisting_observability {observability!r}): delisted contracts are invisible, "
+            "the universe is survivors only")
 
 
 def _dataset_status(parts: Sequence[Dict[str, Any]], conflicts: Sequence[Any], timing: Sequence[Tuple[Optional[int], Optional[int]]]) -> str:
@@ -993,7 +1041,7 @@ def capture_universe(out_dir: str, *, fetch: Callable[[str], bytes] = http_fetch
         "schema": SCHEMA_V2, "schema_version": 2, "capture_id": f"uc2-{started}", "started_ms": started, "finished_ms": int(clock_ms()),
         "source_host": venues.host_of(_base()), "categories": cats, "partitions": partitions, "tickers": tickers_claim,
         "universe_file": {"file": ufile, "sha256": _sha(uni["jsonl"]), "rows": uni["rows"]},
-        "rejected_instruments": uni["rejected"], "rejected_tickers": tk["rejected"] if tk else None, "conflicts": uni["conflicts"],
+        "rejected_instruments": uni["rejected"], "rejected_tickers": tk["rejected"] if tk else None, "conflicts": uni["conflicts"], "renames": uni["renames"],
         "excluded_contract_types": uni["excluded_contract_types"], "ticker_reconciliation": derived["reconciliation"],
         "status_coverage": derived["status_coverage"], "status_coverage_by_category": derived["status_coverage_by_category"],
         "delisting_observability": derived["delisting_observability"], "coverage_note": COVERAGE_NOTE,
@@ -1184,6 +1232,8 @@ def _verify(path: str, problems: List[str], out: Dict[str, Any]) -> None:
         problems.append("excluded_contract_types differs from the re-derivation of the raw pages")
     if m["conflicts"] != uni["conflicts"]:
         problems.append("conflicts differ from the re-derivation of the raw pages")
+    if m.get("renames", []) != uni["renames"]:
+        problems.append("renames differ from the re-derivation of the raw pages")
     cov, cov_cat, deli = _coverage(derived_parts)
     for key, val in (("status_coverage", cov), ("status_coverage_by_category", cov_cat), ("delisting_observability", deli)):
         if m[key] != val:
@@ -1202,7 +1252,7 @@ def _verify(path: str, problems: List[str], out: Dict[str, Any]) -> None:
         "partitions": [{"category": p["category"], "status": p["status"], "outcome": p["outcome"], "rows_total": p["rows_total"], "complete": p["complete"],
                         "pages": len(p["pages"]), "by_contract_type": p["by_contract_type"]} for p in derived_parts],
         "universe_rows": uni["rows"], "rejected_instruments_count": uni["rejected"]["count"],
-        "rejected_tickers_count": tick["rejected"]["count"] if tick else None, "conflicts": uni["conflicts"], "ticker_reconciliation": rec,
+        "rejected_tickers_count": tick["rejected"]["count"] if tick else None, "conflicts": uni["conflicts"], "renames": uni["renames"], "ticker_reconciliation": rec,
         "excluded_contract_types": uni["excluded_contract_types"], "manifest_sha256": out["manifest_sha256"],
     }
 
