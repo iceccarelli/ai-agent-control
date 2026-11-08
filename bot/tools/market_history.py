@@ -29,7 +29,7 @@ dataset_status (per symbol and for the dataset = the worst symbol; precedence CO
               newest row is within two intervals of the window end.
   STALE       as COMPLETE but the newest row is older than two intervals before the window end (the feed stopped, or the window end was in the future of the data).
   PARTIAL     a known hole or an incomplete run: a gap, an off-grid step (an interval change), a rejected row/page, a rate-limit exhaustion, a stalled cursor, the page
-              cap, an HTTP error, a clock-skew flag, a head that cannot be proved (no launch time and the venue ran out of rows), or no rows at all.
+              cap, an HTTP error, a clock-skew flag, an unclosed candle (ts + interval beyond the server's own time: dropped, listed as unclosed_candles), regime flapping (an interval that comes back non-adjacently), a head that cannot be proved (no launch time and the venue ran out of rows), or no rows at all.
   CONFLICTED  one timestamp carries two different rows (identical repeats are counted and dropped; conflicting ones are never merged).
   UNVERIFIED  the evidence cannot be trusted or the grid cannot be judged: a page failed its hash, the ledger is damaged, the resume parameters differ, or the interval
               is UNKNOWN (funding without a universe record: the grid check is REFUSED and reported, never defaulted to 480).
@@ -287,9 +287,11 @@ def _bump(r: Dict[str, int], k: str, n: int = 1) -> None:
     r[k] = r.get(k, 0) + n
 
 
-def parse_page(dataset: str, symbol: str, body: bytes, win_start: int, cursor_end: int) -> Dict[str, Any]:
-    """Strict parse of one raw page. ``rows`` are validated rows (dicts with ``ts``); ``raw_ts`` every parseable timestamp (drives the cursor); counted rejects, never silent."""
-    out: Dict[str, Any] = {"ok": False, "rows": [], "raw_count": 0, "raw_ts": [], "rejects": {}, "server_time": None, "descending": True}
+def parse_page(dataset: str, symbol: str, body: bytes, win_start: int, cursor_end: int, interval_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Strict parse of one raw page. ``rows`` are validated rows (dicts with ``ts``); ``raw_ts`` every parseable timestamp (drives the cursor); counted rejects, never silent.
+    ``unclosed`` lists the timestamps of kline/mark/index/open-interest rows whose interval had NOT ended at the server's own time (ts + interval > server time): they are not final rows
+    and are not returned in ``rows`` (they still move the cursor)."""
+    out: Dict[str, Any] = {"ok": False, "rows": [], "raw_count": 0, "raw_ts": [], "rejects": {}, "server_time": None, "descending": True, "unclosed": []}
     rej = out["rejects"]
     try:
         doc = json.loads(body.decode("utf-8", "strict"))
@@ -374,6 +376,9 @@ def parse_page(dataset: str, symbol: str, body: bytes, win_start: int, cursor_en
             continue
         if stime is not None and row["ts"] > stime + SKEW_WARN_MS:
             _bump(rej, "row_in_future_of_server_time")
+            continue
+        if stime is not None and interval_ms and dataset != FUNDING and row["ts"] + interval_ms > stime:
+            out["unclosed"].append(row["ts"])
             continue
         seen.append(row["ts"])
         out["rows"].append(row)
@@ -542,10 +547,17 @@ def _accepted_regime_runs(runs: Sequence[Sequence[int]], declared_ms: Optional[i
     Rejected runs are judged as gaps / off-grid steps by the caller."""
     acc: List[int] = []
     prev: Optional[int] = None
-    for k, (v, cnt, _i0) in enumerate(runs):
-        if cnt < MIN_REGIME_RUN or v <= 0 or _DAY_MS % v:
-            continue
-        if prev is not None and v > prev and v % prev == 0 and v != declared_ms:
+    cands = [k for k, (v, cnt, _i0) in enumerate(runs) if cnt >= MIN_REGIME_RUN and v > 0 and not _DAY_MS % v]
+    for pos, k in enumerate(cands):
+        v = runs[k][0]
+        if prev is None:
+            # The HEAD run has nothing before it to compare with. A head run that is a whole multiple (> 1) of the declared interval and is followed directly by a run AT the declared
+            # interval is missing prints (3 x 24h, then the 8h grid), not a regime. Only a NON-power-of-two multiple counts: real funding intervals (480/240/120/60) change by powers of two,
+            # so a genuine direct 480 -> 240 or 240 -> 60 change is kept. (480 -> 240 -> 60 declared 60 is unaffected: the head's successor is not the declared interval.)
+            nxt = runs[cands[pos + 1]][0] if pos + 1 < len(cands) else None
+            if declared_ms and v > declared_ms and v % declared_ms == 0 and nxt == declared_ms and (v // declared_ms) & (v // declared_ms - 1):
+                continue
+        elif v > prev and v % prev == 0 and v != declared_ms:
             continue
         acc.append(k)
         prev = v
@@ -583,7 +595,10 @@ def funding_regimes(ts_sorted: Sequence[int], declared_ms: Optional[int]) -> Dic
         sg["prints"] = sum(1 for t in ts_sorted if sg["first_ts"] <= t <= sg["last_ts"])
         sg["source"] = "inferred_from_print_spacing" if inferred else "declared_instrument_record"
     changes = [{"at_ts": b["first_ts"], "from_interval_ms": a["interval_ms"], "to_interval_ms": b["interval_ms"]} for a, b in zip(segs, segs[1:])]
+    ivs = [sg["interval_ms"] for sg in segs]
     base = {"segments": segs, "regime_changes": changes, "observed_interval_ms": segs[-1]["interval_ms"] if segs else None,
+            "regime_flapping": len(set(ivs)) != len(ivs),          # an interval that comes back non-adjacently (240/480/240/480): prints are hidden between the runs
+
             "interval_mismatch": bool(declared_ms and inferred and segs[-1]["interval_ms"] != declared_ms)}
     if declared_ms is None:
         return {**base, "grid_check": "REFUSED_UNKNOWN_INTERVAL", "expected": None, "missing": None, "gaps": [], "gap_count": None, "off_grid": [], "off_grid_count": 0}
@@ -628,6 +643,7 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
     problems += bad
     reasons: List[str] = []
     rejects: Dict[str, int] = {}
+    unclosed: set = set()
     unique: Dict[int, Tuple[Dict[str, Any], int]] = {}
     dup_ident = conflicts = pages_ok = pages_failed = skew = 0
     first_recv: Optional[int] = None
@@ -636,12 +652,19 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
     interval_ms = spec.get("interval_ms")
     if ledger and ledger[0].get("type") != "begin":
         problems.append("LEDGER_NO_BEGIN")
+    chain_end: Optional[int] = spec["end_ms"]            # the endTime the NEXT page must have asked for (backward paging: previous page's next_end)
     for r in ledger[:good]:
         if r["type"] == "stop":
             stop_reason = r.get("reason")
             continue
         if r["type"] != "page":
             continue
+        asked = r.get("request", {}).get("params", {}).get(DATASETS[dataset]["end"])
+        if chain_end is not None and (not isinstance(asked, str) or not _UINT.fullmatch(asked) or int(asked) != chain_end):
+            if not any(p.startswith("LEDGER_CHAIN_BROKEN") for p in problems):
+                problems.append(f"LEDGER_CHAIN_BROKEN: page {r.get('n')} asked endTime {asked!r}, the previous page's next_end was {chain_end}")
+        if isinstance(r.get("next_end"), int) and not isinstance(r.get("next_end"), bool):
+            chain_end = r["next_end"]
         page_digest.update(f"{r['n']}:{r['sha256']}:{int(bool(r.get('ok')))}\n".encode())
         if not r.get("ok"):                                 # an envelope error / stalled-cursor page: kept as evidence, its rows are not counted
             pages_failed += 1
@@ -650,7 +673,8 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
             body = fh.read()
         req = r.get("request", {}).get("params", {})
         cur_end = int(req.get(DATASETS[dataset]["end"], spec["end_ms"]))
-        pr = parse_page(dataset, symbol, body, spec["start_ms"], cur_end)
+        pr = parse_page(dataset, symbol, body, spec["start_ms"], cur_end, spec.get("interval_ms"))
+        unclosed.update(pr["unclosed"])
         for k, v in pr["rejects"].items():
             _bump(rejects, k, v)
         pages_ok += 1
@@ -704,12 +728,16 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
             reasons_p.append("rejects")
         if skew:
             reasons_p.append("clock_skew")
+        if unclosed:
+            reasons_p.append("unclosed_candle")
         if grid["gap_count"]:
             reasons_p.append("gaps")
         if grid["off_grid_count"]:
             reasons_p.append("off_grid_step")
         if grid["interval_mismatch"]:
             reasons_p.append("interval_disagrees_with_record")
+        if grid.get("regime_flapping"):
+            reasons_p.append("regime_flapping")
         if head_missing:
             reasons_p.append("head_gap")
         if not head_verified:
@@ -739,7 +767,7 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
     summary = {"status": status, "reasons": reasons, "coverage": cov, "gaps": grid["gaps"], "gap_count": grid["gap_count"], "grid_check": grid["grid_check"],
                "off_grid": grid["off_grid"], "off_grid_count": grid["off_grid_count"], "segments": grid["segments"],
                "regime_changes": grid["regime_changes"], "pages": pages_ok, "pages_failed": pages_failed, "rejects": dict(sorted(rejects.items())),
-               "duplicates_identical": dup_ident, "conflicts": conflicts, "skew_flags": skew, "stop_reason": stop_reason, "problems": problems,
+               "duplicates_identical": dup_ident, "conflicts": conflicts, "unclosed_candles": sorted(unclosed), "skew_flags": skew, "stop_reason": stop_reason, "problems": problems,
                "ledger_sha256": _sha(ledger_raw), "pages_digest": page_digest.hexdigest(), "rows_sha256": _sha(rows_bytes), "normalized_ms": normalization_ms,
                "spec": dict(spec)}
     return summary, rows_bytes
@@ -851,7 +879,7 @@ def collect_symbol(spec: Mapping[str, Any], sdir: str, fetch: Callable[[str], by
         fname = _page_name(n)
         UC._create_exclusive(os.path.join(sdir, fname), body)          # raw, unedited, before anything is concluded about it
         coll = int(clock())
-        pr = parse_page(dataset, symbol, body, spec["start_ms"], cursor_end)
+        pr = parse_page(dataset, symbol, body, spec["start_ms"], cursor_end, spec.get("interval_ms"))
         params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
         row: Dict[str, Any] = {"type": "page", "n": n, "file": fname, "sha256": _sha(body), "bytes": len(body), "ok": pr["ok"], "request": {"path": urllib.parse.urlsplit(url).path,
                                "params": params, "url": url}, "server_time": pr["server_time"], "recv_ms": recv, "collection_ms": coll, "raw_rows": pr["raw_count"],

@@ -271,6 +271,19 @@ def test_a_history_window_that_ended_too_long_ago_is_stale_on_request(tmp_path):
     assert verdicts(rep)["data_freshness"] == "STALE"
 
 
+def test_data_newer_than_the_audit_clock_is_flagged_and_never_healthy(tmp_path):
+    root, ctx = build(tmp_path)
+    ok = A(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
+    assert verdicts(ok)["data_freshness"] == "HEALTHY" and "DATA_FROM_THE_FUTURE" not in codes(ok)             # positive control
+    rep = A(str(root), now_ms=ctx["now"] - 20 * 86_400_000, backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
+    assert "DATA_FROM_THE_FUTURE" in codes(rep) and verdicts(rep)["data_freshness"] in ("PARTIAL", "STALE")
+    assert verdicts(rep)["data_freshness"] != "HEALTHY"
+    details = " ".join(i["detail"] for i in rep["axes"]["data_freshness"]["issues"] if i["code"] == "DATA_FROM_THE_FUTURE")
+    assert "cycle" in details and "funding" in details                                                         # cycles and the history dataset are both named
+    just = A(str(root), now_ms=TH.BASE - DA.FUTURE_SKEW_MS, history_max_age_ms=LONG_AGO_OK, universe_file=None)  # inside the tolerance: no flag
+    assert not any("BTCUSDT last_ts" in i["detail"] for i in just["axes"]["data_freshness"]["issues"] if i["code"] == "DATA_FROM_THE_FUTURE")
+
+
 # ---------------------------------------------------------------- research readiness and coverage versus the declared universe
 
 def _universe_file(tmp_path, syms):

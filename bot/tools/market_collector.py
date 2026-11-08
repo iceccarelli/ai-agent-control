@@ -958,8 +958,8 @@ def _seal_locked(root: str, manifest: str, now: int, accept_problems: bool) -> D
     already: Set[str] = set()
     if os.path.isfile(manifest):
         for r in EC.rows_of(EC.read_lines(manifest)[0]):
-            if isinstance(r, dict):
-                already |= {c["cycle"] for c in r.get("cycles", [])}
+            if isinstance(r, dict) and isinstance(r.get("cycles"), list):
+                already |= {c["cycle"] for c in r["cycles"] if _cycle_entry_problem(c) is None}
     names = cycle_dirs(root)
     bad = [n for n in names if n not in already and verify_cycle_dir(os.path.join(root, n))]
     if bad and not accept_problems:
@@ -972,6 +972,31 @@ def _seal_locked(root: str, manifest: str, now: int, accept_problems: bool) -> D
     return {"manifest_rows": n, "head": head, "sealed_new": len(new), "cycles_total": len(names)}
 
 
+def _cycle_entry_problem(c: Any) -> Optional[str]:
+    """Why a sealed-cycle entry is malformed (a hash-chained row can still carry a hand-made body), else None."""
+    if not isinstance(c, dict):
+        return "a cycles entry is not an object"
+    name = c.get("cycle")
+    if not isinstance(name, str) or not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
+        return f"a cycles entry has a bad cycle name {str(name)[:40]!r}"
+    if not isinstance(c.get("manifest_sha256"), str):
+        return f"{name}: no manifest_sha256"
+    files = c.get("files")
+    if not isinstance(files, dict):
+        return f"{name}: files is not an object"
+    for rel, f in files.items():
+        if not isinstance(rel, str) or not isinstance(f, dict) or not isinstance(f.get("sha256"), str) or not isinstance(f.get("bytes"), int) or isinstance(f.get("bytes"), bool):
+            return f"{name}: file entry {str(rel)[:60]!r} lacks bytes/sha256"
+    return None
+
+
+def _row_log_cycles(row: Mapping[str, Any]) -> Optional[Set[str]]:
+    lc = row.get("log_cycles", [])
+    if not isinstance(lc, list) or not all(isinstance(x, str) for x in lc):
+        return None
+    return set(lc)
+
+
 def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
     """Compare the directory with EVERY sealed row: MISSING (a cycle or a file gone), TRUNCATED (a file shorter / a log row lost), ALTERED (a hash changed)."""
     problems: List[str] = []
@@ -982,9 +1007,21 @@ def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
         problems.append(f"the seal manifest's own chain does not verify: {ver.get('problems') or ver.get('state') or ver}")
     rows = [r for r in EC.rows_of(EC.read_lines(manifest)[0]) if isinstance(r, dict)]
     sealed_log: Set[str] = set()
-    for row in rows:
-        sealed_log |= set(row.get("log_cycles", []))
-        for c in row.get("cycles", []):
+    for idx, row in enumerate(rows):
+        lc = _row_log_cycles(row)
+        if lc is None:
+            problems.append(f"MALFORMED_SEAL_ROW: row {idx} log_cycles is not a list of strings")
+        else:
+            sealed_log |= lc
+        cyc = row.get("cycles", [])
+        if not isinstance(cyc, list):
+            problems.append(f"MALFORMED_SEAL_ROW: row {idx} cycles is not a list")
+            continue
+        for c in cyc:
+            bad = _cycle_entry_problem(c)
+            if bad:
+                problems.append(f"MALFORMED_SEAL_ROW: row {idx}: {bad}")
+                continue
             name, path = c["cycle"], os.path.join(root, c["cycle"])
             if not os.path.isdir(path):
                 problems.append(f"{name}: MISSING (it was sealed with {len(c['files'])} files)")
@@ -1044,9 +1081,9 @@ def _sealed_cycles(manifest: str) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     if os.path.isfile(manifest):
         for r in EC.rows_of(EC.read_lines(manifest)[0]):
-            if isinstance(r, dict):
-                for c in r.get("cycles", []):
-                    if isinstance(c, dict) and isinstance(c.get("cycle"), str):
+            if isinstance(r, dict) and isinstance(r.get("cycles"), list):
+                for c in r["cycles"]:
+                    if _cycle_entry_problem(c) is None:
                         out.setdefault(c["cycle"], c)
     return out
 
@@ -1461,6 +1498,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             res = restore_check(a.backup, a.receipts, a.manifest)
     except (CollectorError, UC.CaptureError, UC.AR.RecordError, OSError, EC.ChainDesync) as exc:
         print(f"market_collector: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # a hand-made or damaged input must end as a clean refusal, never a traceback
+        print(f"market_collector: unexpected {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
         return 2
     print(json.dumps(res, indent=2, sort_keys=True, default=str))
     return 0 if res.get("ok", True) else 1

@@ -99,7 +99,10 @@ class HV:
     """Serves backward-paged history: ``data[(dataset, symbol)]`` = ascending timestamps. ``script[(dataset, symbol)]`` = items consumed first (bytes or an exception)."""
     PATHS = {MH.DATASETS[d]["path"]: d for d in MH.DATASETS}
 
-    def __init__(self, data, server=SERVER0):
+    def __init__(self, data, server=None):
+        if server is None:      # a candle is final only once it has closed at the server's own clock: serve a time after the newest non-funding candle's close
+            tail = [max(v) for (d, _s), v in data.items() if d != MH.FUNDING and v]
+            server = max([SERVER0] + [t + 86_400_000 for t in tail])
         self.data, self.server, self.script, self.urls = data, server, {}, []
         self.lock = threading.Lock()
 
@@ -138,7 +141,7 @@ def funding_specs(syms=("BTCUSDT",), interval_min=480, launch=FIRST - 1, **kw):
 
 def run(root, specs, venue, dataset=MH.FUNDING, interval=None, **kw):
     t = kw.pop("time", None) or Time()
-    kw.setdefault("clock", Clock())
+    kw.setdefault("clock", Clock(max(SERVER0, getattr(venue, "server", 0)) + 50))        # the local clock follows the scripted server's
     kw.setdefault("free_bytes_fn", lambda _p: 1 << 40)
     kw.setdefault("reserve_bytes", 1)
     return MH.run_dataset(str(root), dataset, interval, specs, fetch=venue, sleep=t.sleep, mono=t.mono, **kw)
@@ -232,9 +235,10 @@ def test_a_captured_page_is_never_overwritten(root):
 @pytest.mark.parametrize("dataset,interval,step", [("kline", "60", 3_600_000), ("mark-kline", "15", 900_000), ("index-kline", "D", 86_400_000), ("open-interest", "1h", 3_600_000)])
 def test_every_dataset_pages_backward_to_complete_and_verifies(root, dataset, interval, step):
     first, n = (BASE // step) * step - 1499 * step, 1500
-    v = HV({(dataset, "BTCUSDT"): grid(first, n, step)})
+    server = first + n * step + 1000                                  # every candle is closed at the server's own time
+    v = HV({(dataset, "BTCUSDT"): grid(first, n, step)}, server=server)
     spec = MH.build_specs(dataset, interval, ["BTCUSDT"], first - 10 * step, first + (n - 1) * step + 10, {"BTCUSDT": {"launchTime": first - 1}})
-    man = run(root, spec, v, dataset, interval)
+    man = run(root, spec, v, dataset, interval, clock=Clock(server + 50))
     s = sym_of(man)
     assert s["status"] == "COMPLETE", s
     assert s["coverage"]["rows"] == n and s["coverage"]["missing"] == 0 and s["coverage"]["interval_ms"] == step
@@ -305,6 +309,26 @@ def test_the_stored_times_of_every_row_satisfy_the_ordering_invariants(root):
              "normalization_time": s["normalized_ms"], "observation_time": r["observation_time"]}
         assert MH.check_time_invariants(t) == [], (t, r)
         assert r["observation_time"] == r["ts"] + step                                                  # a candle is final only at its close
+
+
+@pytest.mark.parametrize("dataset,interval,step", [("kline", "60", 3_600_000), ("mark-kline", "240", 4 * 3_600_000), ("index-kline", "15", 900_000), ("open-interest", "1h", 3_600_000)])
+def test_a_candle_not_closed_at_the_servers_time_is_not_a_final_row(root, dataset, interval, step):
+    first, n = (BASE // step) * step - 19 * step, 20
+    ts = grid(first, n, step)
+    spec = MH.build_specs(dataset, interval, ["BTCUSDT"], first - 3 * step, ts[-1] + 10, {"BTCUSDT": {"launchTime": first - 1}})
+    server = ts[-1] + step // 4                                       # the last candle is still forming at the server's clock
+    man = run(root, spec, HV({(dataset, "BTCUSDT"): ts}, server=server), dataset, interval, clock=Clock(server + 50))
+    s = sym_of(man)
+    assert s["unclosed_candles"] == [ts[-1]] and "unclosed_candle" in s["reasons"] and s["status"] == "PARTIAL"
+    assert s["coverage"]["last_ts"] == ts[-2] and s["coverage"]["rows"] == n - 1
+    rows = [json.loads(x) for x in open(os.path.join(ddir(root, dataset, interval), "BTCUSDT", "rows.jsonl"))]
+    assert ts[-1] not in [r["ts"] for r in rows] and all(r["observation_time"] <= server for r in rows)
+    assert MH.verify_dataset(ddir(root, dataset, interval))["ok"]
+    r2 = os.path.join(os.path.dirname(str(root)), "data_closed")                 # positive control: the same candle, server clock after its close
+    os.mkdir(r2, 0o700)
+    server2 = ts[-1] + step + 1000
+    s2 = sym_of(run(r2, spec, HV({(dataset, "BTCUSDT"): ts}, server=server2), dataset, interval, clock=Clock(server2 + 50)))
+    assert s2["unclosed_candles"] == [] and s2["coverage"]["rows"] == n and s2["status"] == "COMPLETE"
 
 
 def test_a_row_stamped_after_the_servers_own_clock_is_rejected_not_kept(root):
@@ -433,6 +457,33 @@ def test_a_regime_interval_must_divide_a_day_and_may_not_be_a_multiple_of_the_de
         ts.append(ts[-1] + D)                                                           # divides a day but is 3x the declared interval
     r = MH.funding_regimes(ts, H8)
     assert r["regime_changes"] == [] and r["missing"] >= 8 and r["gap_count"] == 4
+
+
+def _regime_series(*runs, first=FIRST):
+    """runs = (step_ms, count) pairs, laid end to end."""
+    ts = [first]
+    for step, cnt in runs:
+        for _ in range(cnt):
+            ts.append(ts[-1] + step)
+    return ts
+
+
+def test_a_head_run_of_whole_multiple_spacings_is_a_gap_run_not_a_regime():
+    D = 24 * 3_600_000
+    r = MH.funding_regimes(_regime_series((D, 3), (H8, 40)), H8)                         # 3 x 24h at the head, then the declared 8h grid: 6 prints are missing
+    assert r["missing"] == 6 and r["gap_count"] == 3 and r["regime_changes"] == [] and [g["interval_ms"] for g in r["segments"]] == [H8]
+    assert r["regime_flapping"] is False
+    ok = MH.funding_regimes(_regime_series((H8, 4), (H4, 20), (H1, 20)), H1)             # positive control: 480 -> 240 -> 60 is genuine
+    assert ok["missing"] == 0 and ok["gap_count"] == 0 and len(ok["segments"]) == 3 and ok["regime_flapping"] is False
+
+
+def test_flapping_between_two_intervals_is_never_complete(root):
+    ts = _regime_series((H4, 12), (H8, 3), (H4, 12), (H8, 6))                            # 240 / 480 / 240 / 480 with 480 declared
+    r = MH.funding_regimes(ts, H8)
+    assert r["regime_flapping"] is True
+    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 480, "snapshot_ms": 1}})
+    s = sym_of(run(root, specs, HV({("funding", "BTCUSDT"): ts})))
+    assert s["status"] == "PARTIAL" and "regime_flapping" in s["reasons"]
 
 
 def test_a_lone_off_grid_step_is_not_a_regime_and_is_never_filled(root):
@@ -727,6 +778,21 @@ def test_verify_detects_a_tampered_manifest_rows_file_ledger_and_strays(root):
     assert MH.verify_dataset(d)["ok"]
     os.remove(mp)
     assert not MH.verify_dataset(d)["ok"]
+
+
+def test_a_broken_backward_chain_in_the_ledger_is_named_by_verify(root):
+    run(root, funding_specs(), funding_venue(n=450))                     # > 200 rows: several pages
+    d = ddir(root)
+    assert MH.verify_dataset(d)["ok"]                                    # positive control: an intact chain verifies
+    lp = os.path.join(d, "BTCUSDT", "pages.jsonl")
+    keep = open(lp, "rb").read()
+    rows = [json.loads(x) for x in keep.splitlines()]
+    pages = [r for r in rows if r["type"] == "page"]
+    assert len(pages) >= 3
+    pages[1]["request"]["params"]["endTime"] = str(int(pages[1]["request"]["params"]["endTime"]) - H8)      # page 2 asked for an older window than page 1 pointed at
+    open(lp, "wb").write(b"".join(MH._canon(r) for r in rows))
+    r = MH.verify_dataset(d)
+    assert not r["ok"] and any("LEDGER_CHAIN_BROKEN" in x for x in r["problems"]), r["problems"]
 
 
 # ---------------------------------------------------------------- rate limits, backoff, bucket, concurrency, skew

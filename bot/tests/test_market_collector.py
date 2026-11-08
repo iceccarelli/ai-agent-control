@@ -780,6 +780,39 @@ def test_cli_seal_check_backup_restore(tmp_path, root, capsys):
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("body", [
+    {"cycles": [{"cycle": "cycle-1"}]},                     # no manifest_sha256 / files
+    {"cycles": [5]},                                        # an entry that is not an object
+    {"cycles": "x"},                                        # cycles is not a list
+    {"cycles": [], "log_cycles": 7},                        # log_cycles is not a list
+    {"cycles": [{"cycle": "../x", "manifest_sha256": "a", "files": {}}]},   # path-shaped name
+])
+def test_a_hand_made_seal_row_is_a_named_problem_not_a_crash(tmp_path, root, capsys, body):
+    filled(root, 2)
+    man = str(tmp_path / "seal.jsonl")
+    MC.seal_cycles(str(root), man)
+    assert MC.check_cycles(str(root), man)["ok"]                                              # positive control: a real row is fine
+    EC.append(man, {"at_ms": 1, **body})                                                      # chained, so only the body is hostile
+    r = MC.check_cycles(str(root), man)
+    assert r["ok"] is False and any("MALFORMED_SEAL_ROW" in x for x in r["problems"])
+    with pytest.raises(MC.SealError):                                                         # sealing over it refuses cleanly, no TypeError/KeyError
+        MC.seal_cycles(str(root), man)
+    assert MC.main(["check", "--root", str(root), "--manifest", man]) == 1
+    capsys.readouterr()
+
+
+def test_the_check_cli_never_prints_a_traceback(tmp_path, root, capsys, monkeypatch):
+    filled(root, 1)
+    man = str(tmp_path / "seal.jsonl")
+    MC.seal_cycles(str(root), man)
+    def boom(*a, **k):
+        raise RuntimeError("surprise")
+    monkeypatch.setattr(MC, "check_cycles", boom)
+    assert MC.main(["check", "--root", str(root), "--manifest", man]) == 2
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "Traceback" not in err
+
+
 # ---------------------------------------------------------------- red-team hardening: patterns, now_ms, turnover, and the real network primitive
 
 @pytest.mark.parametrize("name,sample", [("_SYMBOL", "BTCUSDT"), ("_DEC", "1.5"), ("_SDEC", "-1.5"), ("_UINT", "123"), ("_CYCLE", "cycle-123"), ("_HEX", "a" * 64)])

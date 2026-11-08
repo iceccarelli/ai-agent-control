@@ -50,7 +50,7 @@ DAY_MS = 86_400_000
 DEFAULT_HISTORY_MAX_AGE_MS = 3 * DAY_MS               # a history window that ended longer ago than this is STALE unless the owner passes --history-max-age-ms
 DEFAULT_OPS_MAX_AGE_MS = 3 * DAY_MS                   # newest seal / backup (receipt) / restore-check older than this is STALE; the collector's recorded cadence x OPS_CADENCE_FACTOR can only TIGHTEN it
 OPS_CADENCE_FACTOR = 3
-FUTURE_SKEW_MS = 5 * 60_000
+FUTURE_SKEW_MS = 5 * 60_000                           # data stamped later than now + this is DATA_FROM_THE_FUTURE (a wrong audit clock, a skewed host or a forged row): PARTIAL at best, never HEALTHY
 EXIT = {"HEALTHY": 0, "PARTIAL": 1, "STALE": 3, "NO_DATA": 4}
 
 
@@ -78,6 +78,14 @@ def load_research_universe(path: str) -> List[str]:
     return out
 
 
+def _future(issues: List[Dict[str, Any]], now: int, what: str, t: Any) -> bool:
+    """Record DATA_FROM_THE_FUTURE (PARTIAL) when ``t`` is later than ``now`` + FUTURE_SKEW_MS. A negative age is not freshness: it is evidence the clock or the data is wrong."""
+    if isinstance(t, int) and not isinstance(t, bool) and t > now + FUTURE_SKEW_MS:
+        issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": "DATA_FROM_THE_FUTURE", "detail": f"{what} is {(t - now) // 1000}s after the audit clock (tolerance {FUTURE_SKEW_MS // 1000}s)"})
+        return True
+    return False
+
+
 def _cycle_section(root: str, now: int, health: Optional[Mapping[str, Any]], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
     log = os.path.join(root, MC.LOG_NAME)
     sec: Dict[str, Any] = {"present": os.path.isfile(log), "latest_complete_cycle": None, "cycles": 0, "fields": {}, "gaps": [], "expected_interval_ms": None, "stale": False}
@@ -94,6 +102,7 @@ def _cycle_section(root: str, now: int, health: Optional[Mapping[str, Any]], iss
     complete.sort(key=lambda r: r["cycle_ms"])
     last = complete[-1]
     sec["latest_complete_cycle"] = {"cycle": last["cycle"], "cycle_ms": last["cycle_ms"], "status": last.get("status"), "age_ms": now - last["cycle_ms"]}
+    _future(issues, now, f"cycle {last['cycle']} cycle_ms", last["cycle_ms"])
     interval = (health or {}).get("interval_ms")
     if not isinstance(interval, int) or interval <= 0:
         spacing = sorted(b["cycle_ms"] - a["cycle_ms"] for a, b in zip(complete, complete[1:]))
@@ -119,6 +128,9 @@ def _cycle_section(root: str, now: int, health: Optional[Mapping[str, Any]], iss
                 k = f"{a['kind']}:{a.get('symbol', '*')}"
                 newest[k] = max(newest.get(k, 0), a["recv_ms"])
     sec["fields"] = {k: {"latest_ms": v, "age_ms": now - v} for k, v in sorted(newest.items())}
+    fut = sorted(k for k, v in newest.items() if v > now + FUTURE_SKEW_MS)
+    if fut:
+        _future(issues, now, f"cycle field(s) {fut[:5]}", max(newest[k] for k in fut))
     # a symbol/field that the newest cycle no longer has is stale relative to the stream
     if interval:
         stale_fields = sorted(k for k, v in newest.items() if now - v > STALE_FACTOR * interval)
@@ -147,6 +159,8 @@ def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, 
             entry = {"status": rec.get("status"), "latest_observed_ts": last, "expected_cadence_ms": iv, "rows": cov.get("rows"), "gap_count": rec.get("gap_count"),
                      "age_ms": (now - last) if isinstance(last, int) else None}
             sec["symbols"][sym] = entry
+            if _future(issues, now, f"{name}/{sym} last_ts", last):
+                entry["from_the_future"] = True
             if rec.get("status") != "COMPLETE":
                 sec["incomplete_symbols"].append(sym)
             if isinstance(last, int) and iv and not delivery and now - last > MH.STALE_INTERVALS * iv + (now - (man.get("request") or {}).get("end_ms", now)):
@@ -155,6 +169,7 @@ def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, 
         # long ago is STALE, never HEALTHY. A continuing feed is judged by the cycle section.
         wend = (man.get("request") or {}).get("end_ms")
         max_age = DEFAULT_HISTORY_MAX_AGE_MS if history_max_age_ms is None else history_max_age_ms
+        _future(issues, now, f"{name} window end", wend)
         if not isinstance(wend, int):
             sec["stale_symbols"] = sorted(man["symbols"])                      # a dataset that does not say when its window ended cannot be shown fresh
         elif now - wend > max_age:
