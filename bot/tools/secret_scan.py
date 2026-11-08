@@ -62,6 +62,14 @@ RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("password-literal", re.compile(r"""(?ix)(?<![a-z0-9])(?:[a-z0-9_]{0,24}(?:password|passwd|passphrase)|pwd|pw)["']?\s*[:=]\s*["']([^"'\n]{6,})["']""")),
     # an UNQUOTED ``pw=`` / ``pwd=`` / ``password=`` / ``passphrase=`` value (libpq DSN, query string, env file)
     ("password-assignment", re.compile(r"""(?ix)(?<![a-z0-9])(?:[a-z0-9_]{0,24}(?:password|passwd|passphrase)|pwd|pw)\s*=\s*([^\s"'&;,()]{6,})(?![\w(.\[])""")),
+    # ---- red-team round 4 additions (appended). An assignment of a literal to an attestation / signing / HMAC / private / encryption KEY name, in any form: shell ``export X=v``, an
+    # env line, ``os.environ["X"] = "v"``, a Python / JS assignment, YAML ``signing_key: v``, JSON ``"signing_key": "v"``, ``fly secrets set X=v``. Bounded repeats (no unbounded
+    # lazy scan): a pathological line stays linear.
+    # the owner attestation key BY NAME (OWNER_ATTESTATION_KEY, owner_attest_key, ...): any non-placeholder literal, letters-only included
+    ("owner-attestation-key", re.compile(
+        r"""(?ix)owner[_-]?attest[a-z0-9_]{0,16}?[_-]?key[a-z0-9_]{0,16}["']?\]?["']?[ \t]*[:=][ \t]*["']?([A-Za-z0-9/+_=-]{16,})(?![\w(.\[])""")),
+    ("key-material-assignment", re.compile(
+        r"""(?ix)(?:attestation|signing|hmac|private|encryption)[_-]?key[a-z0-9_]{0,16}["']?\]?["']?[ \t]*[:=][ \t]*["']?([A-Za-z0-9/+_=-]{16,})(?![\w(.\[])""")),
 )
 
 #: Words a placeholder value may be made of. A value is a placeholder only when EVERY ``_ - / + =``-separated
@@ -88,10 +96,10 @@ def _is_placeholder(value: str) -> bool:
 
 #: Rules whose group 1 must additionally look like a literal secret: not a placeholder, and mixed letters and
 #: digits (an identifier such as ``build_authorization_header`` is code, not a credential).
-_STRICT_VALUE_RULES = frozenset(("secret-literal", "secret-assignment", "password-assignment"))
-_ASSIGNMENT_RULES = frozenset(("credential-assignment", "secret-literal", "secret-assignment", "password-literal", "password-assignment"))
+_STRICT_VALUE_RULES = frozenset(("secret-literal", "secret-assignment", "password-assignment", "key-material-assignment"))
+_ASSIGNMENT_RULES = frozenset(("credential-assignment", "secret-literal", "secret-assignment", "password-literal", "password-assignment", "key-material-assignment", "owner-attestation-key"))
 #: rules whose group 1 is judged by ``_credential_value`` (not a placeholder / template / code expression)
-_CREDVALUE_RULES = frozenset(("credentialed-url", "bearer-token", "password-literal"))
+_CREDVALUE_RULES = frozenset(("credentialed-url", "bearer-token", "password-literal", "owner-attestation-key"))
 _TEMPLATE = re.compile(r"^(?:\$\{?\w*\}?|<[^>]*>|\{\{.*\}\}|\{\w*\}|%\(?\w*\)?[sd]|\.\.\.|\*+|\w*\(\))$")
 
 
@@ -104,6 +112,8 @@ def _credential_value(rule: str, value: str) -> bool:
     words = [t for t in re.split(r"[^A-Za-z0-9]+", v.lower()) if t]
     if not words or all(w in _PLACEHOLDER_WORDS or w in ("user", "pass", "postgres", "localhost", "host", "pw", "pwd", "passwd", "secret", "passphrase", "pass", "phrase") or re.fullmatch(r"x+|0+|\d{1,3}|\*+", w) for w in words):
         return False
+    if rule == "owner-attestation-key" and re.fullmatch(r"[A-Za-z]+(?:_[A-Za-z]+)+", v):
+        return False                                    # an env-var / identifier NAME (OWNER_ATTESTATION_KEY_ENV = "OWNER_ATTESTATION_KEY"), not a key
     if rule == "bearer-token":
         return (any(c.isdigit() for c in v) and any(c.isalpha() for c in v)) or (any(c.isupper() for c in v) and any(c.islower() for c in v))
     return True

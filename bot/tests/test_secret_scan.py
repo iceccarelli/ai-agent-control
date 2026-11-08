@@ -265,3 +265,71 @@ def test_rt3_7_new_rules_scan_pathological_lines_in_bounded_time():
     lines = [("pass" + "word='") * 20000, ("p" + "w=") * 30000, "a://b:" * 30000, "a://:" * 30000 + "@", "bearer " + "a" * 300000, "x_" * 100000 + "p" + "w="]
     SS.scan_text("\n".join(lines))
     assert time.time() - t < 5
+
+
+# ---- red-team round 4 (rt4-5): attestation / signing / HMAC / private / encryption key assignments and OWNER_ATTESTATION_KEY by name. Literals are assembled at run time.
+
+def _rt4_cases():
+    v = "Zk3Jd9QpL2m" + "N8xVb7YcR4tWe6H"
+    hexv = "c0ffee12" + "34567890abcdef12"
+    k = "OWNER_ATTEST" + "ATION_KEY"
+    return {
+        "shell_export": ("export " + k + "='" + hexv + "'", "owner-attestation-key"),
+        "env_line": (k + "=" + hexv, "owner-attestation-key"),
+        "env_letters_only": (k + "=" + "abcdefghijklmnopqrstuvwxyz", "owner-attestation-key"),
+        "python_environ": ('os.environ["' + k + '"] = "' + v + '"', "owner-attestation-key"),
+        "python_assign": ("owner_attest" + "_key = '" + v + "'", "owner-attestation-key"),
+        "hmac_python": ("hmac_" + "key = \"" + v + "\"", "key-material-assignment"),
+        "signing_yaml": ("signing_" + "key: " + v, "key-material-assignment"),
+        "signing_json": ('{"signing_' + 'key": "' + v + '"}', "key-material-assignment"),
+        "private_assign": ("private_" + "key = '" + v + "'", "key-material-assignment"),
+        "encryption_env": ("encryption_" + "key=" + v, "key-material-assignment"),
+        "attestation_env": ("ATTESTATION_" + "KEY=" + v, "key-material-assignment"),
+        "camel": ("const signing" + "Key = '" + v + "'", "key-material-assignment"),
+        "prefixed_name": ("MY_APP_HMAC_" + "KEY=" + v, "key-material-assignment"),
+        "fly_secrets": ("fly secrets set " + k + "=" + hexv, "owner-attestation-key"),
+    }
+
+
+def test_rt4_5_each_key_assignment_shape_is_found_by_a_named_rule():
+    for name, (text, rule) in _rt4_cases().items():
+        assert rule in [r for _, r in SS.scan_text(text)], name
+
+
+def test_rt4_5_the_report_never_prints_the_value(tmp_path, capsys):
+    f = tmp_path / "x.env"
+    f.write_text("\n".join(t for t, _ in _rt4_cases().values()) + "\n")
+    rc = SS.main([str(f)])
+    out = capsys.readouterr().out
+    assert rc == 1 and "key-material-assignment" in out and "owner-attestation-key" in out
+    for frag in ("Zk3Jd9QpL2m", "c0ffee12", "abcdefghijklmnopqrstuvwxyz"):
+        assert frag not in out
+
+
+def test_rt4_5_positive_controls_names_code_templates_and_placeholders_are_not_findings():
+    k = "OWNER_ATTEST" + "ATION_KEY"
+    for text in ('key = os.environ.get("' + k + '")', "signing_" + "key = load_signing_key()", "hmac_" + "key = None", k + "=<your key>", "signing_" + "key: ${SIGNING_KEY}",
+                 'export ' + k + '="$KEY"', k + "=your_key_here", "private_" + "key = self._derive_private_key_bytes", "def hmac_" + "key(self):", "# rotate the " + k + " per the runbook",
+                 "encryption_" + "key = 'changeme'", "signing_" + "key_path = '/etc/x'", "hmac_" + "key = b''"):
+        assert SS.scan_text(text) == [], text
+
+
+def test_rt4_5_mutation_each_new_rule_is_load_bearing():
+    import re as _re
+    for rule in ("key-material-assignment", "owner-attestation-key"):
+        probes = [t for t, r in _rt4_cases().values() if r == rule]
+        assert probes and all(rule in [r for _, r in SS.scan_text(t)] for t in probes), rule
+        saved = SS.RULES
+        try:
+            SS.RULES = tuple((n, (_re.compile(r"(?!x)x") if n == rule else rx)) for n, rx in saved)
+            assert not any(rule in [r for _, r in SS.scan_text(t)] for t in probes), rule
+        finally:
+            SS.RULES = saved
+    assert SS.RULES[1][0] == "aws-access-key-id"
+
+
+def test_rt4_5_new_rules_scan_pathological_lines_in_bounded_time():
+    import time
+    t = time.time()
+    SS.scan_text("\n".join(["hmac_key" * 40000, "owner_attest" * 40000, "signing_key=" * 40000, "private_" * 100000 + "key", "a" * 300000 + "_key=" + "b" * 300000]))
+    assert time.time() - t < 5

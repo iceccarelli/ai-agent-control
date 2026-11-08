@@ -244,8 +244,9 @@ NATURAL_KEY: Dict[str, Tuple[str, ...]] = {
     "incident_events": (), "system_health": ("component", "observed_utc"), "backup_receipts": ("backup_id",), "restore_receipts": ("restore_id",),
 }
 #: Parents first (foreign keys). Evidence before abandonment/supersession (the DB refuses NEW evidence on an abandoned trial).
-TABLE_ORDER = ("strategy_hypotheses", "experiment_registrations", "experiment_evidence", "experiment_amendments", "experiment_abandonments", "experiment_supersessions",
-               "instrument_universe_snapshots", "data_batches", "md_seal_receipts", "collector_status", "owner_account_imports", "owner_account_import_status_events",
+#: owner_account_imports BEFORE experiment_evidence: owner-level evidence is refused by the database unless the import row it cites already exists.
+TABLE_ORDER = ("strategy_hypotheses", "experiment_registrations", "owner_account_imports", "experiment_evidence", "experiment_amendments", "experiment_abandonments", "experiment_supersessions",
+               "instrument_universe_snapshots", "data_batches", "md_seal_receipts", "collector_status", "owner_account_import_status_events",
                "risk_policy_versions", "approval_records", "incidents", "incident_events", "system_health", "backup_receipts", "restore_receipts")
 #: How content_sha256 is formed. row: over the whole row except owner_id/content_sha256. import: also except import_id, which EQUALS the hash (SQL check).
 #: policy: the policy document. registry: the registry's entry_digest (cannot be recomputed from the row; checked against the entry at build time).
@@ -272,10 +273,20 @@ EVIDENCE_METRICS = ("capacity_usd", "complete", "fees_measured", "fills_measured
 #: the owner holds; an evidence row can only name that report by its sha256 (``import_report_sha256``) or an execution log by its sha256 (``execution_log_sha256``).
 EVIDENCE_BINDING_HASHES = ("import_report_sha256", "execution_log_sha256")
 #: Evidence levels that make a claim about real money / a real venue: they are refused unless the row names the hashed artifact it is bound to.
-LEVEL_REQUIRES_HASH = {"OWNER_ACCOUNT_VERIFIED": "import_report_sha256", "TESTNET_MECHANICS": "execution_log_sha256"}
+LEVEL_REQUIRES_HASH = {"OWNER_ACCOUNT_VERIFIED": "import_report_sha256"}
+#: A hash-shaped string is not a binding: OWNER_ACCOUNT_VERIFIED evidence must also be backed, IN THE SAME PLAN, by an owner_account_imports row whose report_sha256 is the cited
+#: hash and whose status is VERIFIED or RECONCILED (``cross_problems``; the database checks the same with a trigger). A TESTNET_MECHANICS claim would have to point at an execution
+#: session row, and NOTHING in this repository writes execution_sessions (the table is write-closed), so no claim at that level can be backed: it is refused entirely, and a
+#: registry that holds such evidence skips it WITH A REASON.
+REFUSED_LEVELS = {"TESTNET_MECHANICS": "TESTNET_MECHANICS evidence is refused: no writer exists for execution_sessions, so the claim cannot be bound to a session row"}
+#: A free-text provenance / source is a short code, never prose: this charset cannot carry an e-mail, a phone number, an assignment, a quoted value or accented personal data.
+#: The same pattern is a SQL CHECK (``PROVENANCE_SQL_REGEX``); a test asserts they are identical.
+PROVENANCE_SQL_REGEX = r"^[A-Za-z0-9_.:/# -]{1,120}$"
+PROVENANCE_RE = re.compile(r"^[A-Za-z0-9_.:/# -]{1,120}\Z")
 #: Keys of a strategy_verdict / registry evidence ``details`` that are deliberately NOT synced (mapped away, and reported): the owner report attachment (privacy), the candidate
-#: binding words, and the owner's figure and its labels (no second financial truth).
-EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest")
+#: binding words, the owner's figure and its labels (no second financial truth), and the two HMAC attestations ``strategy_verdict.record_evidence`` writes (``attestation``,
+#: ``report_attestation``): they are keyed MACs over the evidence, verified where the registry lives, and a MAC is hash-shaped material that must never reach a database.
+EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest", "attestation", "report_attestation", "recorded_ms")
 EVIDENCE_DROPPED_METRICS = ("net_usd_after_all_costs", "owner_figure_basis", "import_status", "candidate_id", "spec_digest")
 OBJ_SCHEMAS: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("experiment_evidence", "details"): {**{m: "metric" for m in EVIDENCE_METRICS}, "metrics": {**{m: "metric" for m in EVIDENCE_METRICS}, **{h: "hex64" for h in EVIDENCE_BINDING_HASHES}},
@@ -500,6 +511,8 @@ def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
         bad = _check_kind(c, row[c.name])
         if bad:
             out.append(bad)
+        elif (c.name == "source" or (table, c.name) == ("experiment_evidence", "provenance")) and not PROVENANCE_RE.match(str(row[c.name])):
+            out.append(f"{c.name}:not_a_safe_short_code")
         elif (table, c.name) in OBJ_SCHEMAS:
             out += _schema_problems(OBJ_SCHEMAS[(table, c.name)], row[c.name], c.name)
     if out:
@@ -526,6 +539,8 @@ def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
         out.append("superseded_by:self")
     if table == "incident_events" and r["state"] in ("MITIGATED", "RESOLVED") and not _nb(r.get("note")):
         out.append("note:required_for_MITIGATED_RESOLVED")
+    if table == "experiment_evidence" and r["level"] in REFUSED_LEVELS:
+        out.append(f"level:{REFUSED_LEVELS[r['level']]}")
     if table == "experiment_evidence" and r["level"] in LEVEL_REQUIRES_HASH:
         need = LEVEL_REQUIRES_HASH[r["level"]]
         if not _bound_hash(r.get("details"), need):
@@ -540,8 +555,9 @@ def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
 # ------------------------------------------------------------------ SECRET GUARD
 
 _KEY_EXACT = frozenset("""apikey secret secretkey apisecret uid accountid userid memberid email emailaddress ip ipaddress password passwd token accesstoken refreshtoken
-sessiontoken authorization privatekey servicerolekey anonkey publishablekey clientsecret bearer jwt pw pwd passphrase mnemonic seedphrase recoveryphrase""".split())
-_KEY_PARTS = ("secret", "apikey", "password", "privatekey", "authorization", "servicerole", "publishablekey", "anonkey", "accesstoken")
+sessiontoken authorization privatekey servicerolekey anonkey publishablekey clientsecret bearer jwt pw pwd passphrase mnemonic seedphrase recoveryphrase attestation reportattestation hmac""".split())
+_KEY_PARTS = ("secret", "apikey", "password", "privatekey", "authorization", "servicerole", "publishablekey", "anonkey", "accesstoken", "attestationkey", "signingkey", "hmackey",
+              "encryptionkey", "ownerattest")
 #: a key whose WORDS (snake_case, kebab-case, camelCase, spaces) include one of these names an account / balance / identity field: none exists in this app's schemas.
 _KEY_TOKENS = frozenset("""acct account accounts balance balances wallet wallets equity position positions pnl address iban phone mobile name ssn passport dob birthday
 holder beneficiary""".split())
@@ -560,6 +576,12 @@ _VALUE_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("internal_hostname", re.compile(r"(?i)(?<![A-Za-z0-9-])(?:[a-z0-9-]+\.)+(?:internal|intranet|corp|lan|local|localdomain|private|vpc|flycast)(?:\.[a-z0-9-]+)*(?![A-Za-z0-9-])")),
     ("assigned_pw", re.compile(r"""(?i)(?<![a-z0-9])(?:pw|pwd|passphrase|mnemonic)\s*[:=]\s*["']?[^\s"',;]{4,}""")),
     ("plain_english_secret", re.compile(r"(?i)\b(?:password|passwd|passphrase|pwd)\b\s*(?:is|was|=|:|equals|set to|changed to)\s+[\"']?(?P<w>[^\s\"',;]{4,})")),
+    ("stripe_key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|\bwhsec_[A-Za-z0-9]{16,}")),
+    ("assigned_key_material", re.compile(r"""(?i)(?:(?:attestation|signing|hmac|private|encryption)[_-]?key|owner[_-]?attest\w*?[_-]?key)\w*["']?\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{12,}""")),
+    ("seed_or_passphrase_wording", re.compile(r"(?i)\b(?:seed|recovery|wallet|backup)\s+(?:phrase|words?)\b|\bmnemonic\b|\bpassphrase\b")),
+    ("holder_or_name_wording", re.compile(r"(?i)\b(?:account\s+holder|holder\s+name|full\s+name|first\s+name|last\s+name|surname|date\s+of\s+birth)\b")),
+    ("spaced_phone_like", re.compile(r"(?<![\w+])\+\d{1,3}[ .-]?\(?\d{1,4}\)?(?:[ .-]?\d{2,4}){2,}(?!\d)|(?<!\d)\(\d{3}\)\s?\d{3}[ -]\d{4}(?!\d)|(?<!\d)\d{3}[ .-]\d{3}[ .-]\d{4}(?!\d)")),
+    ("spaced_iban_like", re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b")),
     ("ipv4_address", re.compile(r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])")),
     ("long_hex_token", re.compile(r"(?<![0-9A-Za-z])(?:0[xX])?[0-9a-fA-F]{24,}(?![0-9A-Za-z])")),
     ("base32_token", re.compile(r"(?<![A-Za-z0-9])[A-Z2-7]{26,}=*(?![A-Za-z0-9])")),
@@ -953,6 +975,9 @@ def registry_puts(owner_id: str, registry: Mapping[str, Any], *, source: Optiona
         puts += _registration_puts(owner_id, t, source=src)
         tid = t["trial_id"]
         for i, ev in enumerate(t.get("evidence", []) or []):
+            if ev.get("level") in REFUSED_LEVELS:
+                skipped.append(f"{tid}: evidence[{i}] not synced: {REFUSED_LEVELS[ev['level']]}")
+                continue
             det, dropped = registry_evidence_details(ev.get("details"))
             if dropped:
                 skipped.append(f"{tid}: evidence[{i}] not synced by design: {', '.join(dropped)}")
@@ -1291,15 +1316,20 @@ def restore_receipt_put(owner_id: str, restore_id: str, backup_id: str, outcome:
 
 
 def cross_problems(puts: Iterable[Put]) -> List[str]:
-    """Rules that span rows of ONE plan. A VERIFIED/RECONCILED status event needs the import row it names (same import_id) in the same plan, carrying the same status:
-    an event can never promote an import the plan does not itself contain."""
+    """Rules that span rows of ONE plan. A VERIFIED/RECONCILED status event needs the import row it names (same import_id) in the same plan, carrying the same status: an event
+    can never promote an import the plan does not itself contain. OWNER_ACCOUNT_VERIFIED evidence needs an owner_account_imports row in the same plan whose report_sha256 is the hash
+    the evidence cites and whose status is VERIFIED or RECONCILED: the cited hash is bound to an import this plan writes, not merely hash-shaped."""
     flat = list(puts)
-    imports = {p.row.get("import_id"): p.row.get("status") for p in flat if p.table == "owner_account_imports"}
+    imports = {p.row.get("import_id"): p.row for p in flat if p.table == "owner_account_imports"}
     out: List[str] = []
     for i, p in enumerate(flat):
         if p.table == "owner_account_import_status_events" and p.row.get("status") in ("VERIFIED", "RECONCILED"):
-            if imports.get(p.row.get("import_id")) != p.row.get("status"):
+            if (imports.get(p.row.get("import_id")) or {}).get("status") != p.row.get("status"):
                 out.append(f"{p.table}[{i}]: {p.row.get('status')} event has no matching import row with that hash and status in the plan")
+        if p.table == "experiment_evidence" and p.row.get("level") in LEVEL_REQUIRES_HASH:
+            h = _bound_hash(p.row.get("details"), LEVEL_REQUIRES_HASH[p.row["level"]])
+            if not any(i.get("report_sha256") == h and i.get("status") in ("VERIFIED", "RECONCILED") for i in imports.values()):
+                out.append(f"{p.table}[{i}]: {p.row['level']} evidence cites a report hash that no owner_account_imports row with status VERIFIED or RECONCILED in the plan carries")
     return out
 
 

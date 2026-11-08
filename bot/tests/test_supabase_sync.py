@@ -1046,7 +1046,7 @@ def test_rt3_mutation_evidence_and_cross_row_rules():
     ev = SS.import_status_event_put(A, imp, "RECONCILED", 1762387400000, evidence_ref=imp)
     with pytest.raises(SS.SyncError):
         SS.plan(A, [ev])
-    m3 = _mutant('if imports.get(p.row.get("import_id")) != p.row.get("status"):', "if False:")
+    m3 = _mutant('if (imports.get(p.row.get("import_id")) or {}).get("status") != p.row.get("status"):', "if False:")
     assert m3.plan(A, [m3.Put(ev.table, ev.row)]).puts
 
 
@@ -1635,15 +1635,15 @@ def test_rt4_1_the_importer_output_is_unaffected_through_the_sync_path():
 
 # ---- rt4-2: evidence is bound to the hashed artifact it speaks about
 
-IMP_HASH, LOG_HASH = "3c9a1f5e7b2d4086" * 4, "7f1e2d3c4b5a6988" * 4
+IMP_HASH, LOG_HASH = import_report()["report_sha256"], "7f1e2d3c4b5a6988" * 4          # IMP_HASH is a REAL sealed report hash: owner evidence is bound to the import row built from it
 
 
 def _evp(level, details, **kw):
     return SS.evidence_put(A, "T1", level, result=kw.pop("result", "r:PASS"), provenance=kw.pop("provenance", "run-1"), details=details, recorded_utc=1762300800000)
 
 
-def test_rt4_2_owner_and_testnet_evidence_without_the_bound_hash_is_refused():
-    for level, field in (("OWNER_ACCOUNT_VERIFIED", "import_report_sha256"), ("TESTNET_MECHANICS", "execution_log_sha256")):
+def test_rt4_2_owner_evidence_without_the_bound_hash_is_refused():
+    for level, field in (("OWNER_ACCOUNT_VERIFIED", "import_report_sha256"),):
         for det in ({}, {"status": "RECONCILED"}, {"metrics": {"venue": "testnet"}}, {field: "z" * 64}, {field: "a" * 64}, {field: H("1")[:63]},
                     {"metrics": {field: IMP_HASH}, field: LOG_HASH}):               # a hash of 64 'a' is not a hash; two different hashes are not one binding
             with pytest.raises(SS.SyncError) as ei:
@@ -1675,7 +1675,8 @@ def test_rt4_2_a_hand_built_unbound_row_never_reaches_the_client():
     row["content_sha256"] = SS.row_hash("experiment_evidence", row)
     with pytest.raises(SS.SyncError):
         SS.plan(A, [SS.Put("experiment_evidence", row)])
-    forged = dataclasses.replace(SS.plan(A, [good]), puts=(SS.Put("experiment_evidence", row),))
+    imp = SS.owner_import_puts(A, import_report(), imported_utc=1762387300000, storage_ref="private://owner/imports/rt4")
+    forged = dataclasses.replace(SS.plan(A, imp, [good]), puts=(SS.Put("experiment_evidence", row),))
     client = MemClient()
     with pytest.raises(SS.SyncError):
         SS.write(forged, client)
@@ -1788,17 +1789,20 @@ def _verdict_items():
 
 
 def test_rt4_4_every_verdict_stage_syncs_with_typed_hashes_and_no_owner_report_figure_or_free_text():
+    imp = SS.owner_import_puts(A, import_report(), imported_utc=1762387300000, storage_ref="private://owner/imports/rt4")
     for item in _verdict_items():
+        if item.stage == "execution_validation":                      # rt5: no writer exists for the execution session such a claim must point at
+            with pytest.raises(SS.SyncError, match="no writer"):
+                SS.verdict_evidence_put(A, "cand1", item)
+            continue
         put = SS.verdict_evidence_put(A, "cand1", item)
         d = put.row["details"]
         blob = json.dumps(put.row)
         assert "attachment" not in blob and "net_usd_after_all_costs" not in blob and "1476" not in blob and "spec_digest" not in blob and "candidate_id" not in d
-        assert SS.scan_row(put.table, put.row) == [] and SS.plan(A, [put]).puts
+        assert SS.scan_row(put.table, put.row) == [] and SS.plan(A, [put], imp).puts
         if put.row["level"] == "OWNER_ACCOUNT_VERIFIED":
             assert d["metrics"]["import_report_sha256"] == IMP_HASH and "imp_ref" in put.row["provenance"] and "0123456789abcdef" not in put.row["provenance"]
             assert d["status"] == "RECONCILED"
-        if put.row["level"] == "TESTNET_MECHANICS":
-            assert d["metrics"]["execution_log_sha256"] == LOG_HASH
         if put.row["level"] == "PROSPECTIVE":
             assert d["metrics"]["observation_started_ms"] == 1762000000000 and d["metrics"]["coverage"] == "1"
 
@@ -1817,8 +1821,10 @@ def test_rt4_4_a_registry_holding_all_verdict_evidence_syncs_and_reports_what_it
     hr.seal(reg)
     puts, skipped = SS.registry_puts(A, reg)
     ev = [p for p in puts if p.table == "experiment_evidence"]
-    assert {p.row["level"] for p in ev} == {"PROSPECTIVE", "TESTNET_MECHANICS", "OWNER_ACCOUNT_VERIFIED"}
-    assert SS.plan(A, puts).puts
+    assert {p.row["level"] for p in ev} == {"PROSPECTIVE", "OWNER_ACCOUNT_VERIFIED"}          # TESTNET_MECHANICS is skipped WITH A REASON (rt5), below
+    assert any("TESTNET_MECHANICS" in s and "no writer" in s for s in skipped)
+    imp = SS.owner_import_puts(A, import_report(), imported_utc=1762387300000, storage_ref="private://owner/imports/rt4")
+    assert SS.plan(A, puts, imp).puts
     blob = json.dumps([p.row for p in ev])
     assert "net_usd_after_all_costs" not in blob and "import_report" not in blob.replace("import_report_sha256", "") and "attachment" not in blob
     assert any("attachment" in s and "not synced by design" in s for s in skipped) and any("metrics.net_usd_after_all_costs" in s for s in skipped)
@@ -1847,13 +1853,17 @@ def test_rt4_4_poc3_stage_table_every_stage_now_maps():
     stages = {it.stage for it in _verdict_items()}
     assert stages == {"prospective_observation", "execution_validation", "reconciled_owner_result"}
     for it in _verdict_items():
-        SS.verdict_evidence_put(A, "cand1", it)                  # none of them refuses (they refused on the previous tree)
+        if it.stage == "execution_validation":
+            with pytest.raises(SS.SyncError, match="no writer"):
+                SS.verdict_evidence_put(A, "cand1", it)          # refused on purpose (rt5): nothing writes the execution session it would be bound to
+            continue
+        SS.verdict_evidence_put(A, "cand1", it)
     assert set(sv.STAGE_TO_REGISTRY_LEVEL) >= stages
 
 
 def test_rt4_4_mutation_dropping_the_attachment_and_figure_is_load_bearing():
     item = _verdict_items()[2]
-    m = _mutant('EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest")', "EVIDENCE_DROPPED_DETAILS = ()")
+    m = _mutant('EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest", "attestation", "report_attestation", "recorded_ms")', "EVIDENCE_DROPPED_DETAILS = ()")
     det = {"metrics": dict(item.metrics), "attachment": item.attachment}
     out, dropped = m.registry_evidence_details(det)
     assert "attachment" in out and "attachment" not in dropped                   # mutant would carry the owner report onward (and the whitelist would then refuse the whole row)
@@ -1920,7 +1930,7 @@ def test_rt4_executed_verdict_evidence_and_a_bound_import_land_in_real_postgres_
     rep = SS.write(SS.plan(owner, puts), SqlClient(pg))
     assert rep.ok, rep.results
     stored = pg.scalar(f"select count(*) from carry.experiment_evidence where owner_id='{owner}';")
-    assert stored == "3"
+    assert stored == "2"                                                              # PROSPECTIVE + the import-backed owner row; TESTNET_MECHANICS is skipped (rt5)
     assert pg.scalar(f"select count(*) from carry.experiment_evidence where owner_id='{owner}' and (details::text like '%net_usd%' or details::text like '%attachment%');") == "0"
     assert pg.scalar(f"select report_sha256 from carry.owner_account_imports where owner_id='{owner}';") == import_report()["report_sha256"]
     # the database refuses what the writer would also refuse: a RECONCILED import with no report hash and an owner-level evidence row with no bound hash
@@ -1932,3 +1942,221 @@ def test_rt4_executed_verdict_evidence_and_a_bound_import_land_in_real_postgres_
         SS.plan(owner, [SS.Put("owner_account_imports", unbound)])
     with pytest.raises(AssertionError):
         SqlClient(pg).put_row("owner_account_imports", unbound)
+
+
+# =========================================================================== round-5 (red-team round 4) sync findings
+
+def _real_verdict_registry(stages=("prospective_observation",), attest=True):
+    """A registry built the way production builds it: ``strategy_verdict.register_candidate`` + ``record_evidence`` (which writes details.attestation / report_attestation)."""
+    from unittest import mock
+    import hypothesis_registry as hr
+    import test_strategy_verdict as T
+    reg = {"trials": []}
+    with mock.patch.object(hr, "_now", lambda: T.REG_UTC):
+        T.SV.register_candidate(reg, T.spec(), code_sha="a" * 40, input_data_sha256={"funding": T.H})
+    for st in stages:
+        T.SV.record_evidence(reg, "cand1", T.ev(st, attest=attest))
+    hr.seal(reg)
+    return reg
+
+
+def test_rt5_1_a_registry_written_by_the_real_record_evidence_syncs_without_the_attestations():
+    reg = _real_verdict_registry(("historical_test", "prospective_observation"))
+    details = [e["details"] for e in reg["trials"][0]["evidence"]]
+    assert any(d.get("attestation") for d in details)                                # precondition: the real writer put an HMAC hex there (observed stages are attested)
+    secret_hexes = {d["attestation"] for d in details if d.get("attestation")} | {d["report_attestation"] for d in details if d.get("report_attestation")}
+    puts, skipped = SS.registry_puts(A, reg)
+    ev = [p for p in puts if p.table == "experiment_evidence"]
+    assert len(ev) == 2
+    blob = json.dumps([p.row for p in ev])
+    assert "attestation" not in blob and not any(h in blob for h in secret_hexes)
+    assert any("attestation" in s and "not synced by design" in s for s in skipped)  # reported as dropped, never silent
+    assert SS.plan(A, puts).puts
+
+
+def test_rt5_1_positive_control_unattested_items_sync_too_and_a_planted_hmac_elsewhere_is_still_refused():
+    reg = _real_verdict_registry(("historical_test",), attest=False)
+    assert SS.registry_puts(A, reg)[0]
+    det, dropped = SS.registry_evidence_details({"metrics": {"sharpe": "1"}, "attestation": "ab" * 32, "report_attestation": "cd" * 32})
+    assert det == {"metrics": {"sharpe": "1"}} and {"attestation", "report_attestation"} <= set(dropped)
+    with pytest.raises(SS.SyncError):                                                # a hex digest under any non-listed name is refused, not stripped
+        SS.evidence_put(A, "T1", "BACKTEST", result="r", provenance="run-1", details={"metrics": {"note_hmac": "ab" * 32}}, recorded_utc=1762300800000)
+
+
+def test_rt5_1_mutation_the_dropped_attestation_names_are_load_bearing():
+    reg = _real_verdict_registry(("prospective_observation",))
+    m = _mutant('EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest", "attestation", "report_attestation", "recorded_ms")', 'EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest")')
+    with pytest.raises(m.SyncError):
+        m.registry_puts(A, reg)
+
+
+# ---- rt5-2: owner-level evidence is bound to an import row in the SAME plan, not merely to a hash-shaped string
+
+def _owner_ev(h, **kw):
+    return SS.evidence_put(A, "T1", "OWNER_ACCOUNT_VERIFIED", result="reconciled_owner_result:PASS", provenance="owner import", details={"metrics": {"import_report_sha256": h}},
+                           recorded_utc=1762300800000, **kw)
+
+
+def test_rt5_2_owner_evidence_citing_a_hash_with_no_import_row_in_the_plan_is_refused():
+    import hashlib
+    fake = hashlib.sha256(b"nothing").hexdigest()
+    with pytest.raises(SS.SyncError, match="owner_account_imports"):
+        SS.plan(A, [_owner_ev(fake)])
+    rep = import_report()
+    imp = SS.owner_import_puts(A, rep, imported_utc=1762387300000, storage_ref="private://owner/imports/rt5")
+    with pytest.raises(SS.SyncError, match="owner_account_imports"):
+        SS.plan(A, imp, [_owner_ev(fake)])                                           # an import exists, but not the one cited
+    assert len(SS.plan(A, imp, [_owner_ev(rep["report_sha256"])]).puts) == 2          # positive control: the cited, VERIFIED/RECONCILED import is in the plan
+    assert SS.plan(A, [_owner_ev(rep["report_sha256"])], imp).puts[0].table == "owner_account_imports"      # order of the groups does not matter; the import is written first
+
+
+def test_rt5_2_an_import_with_a_weaker_status_does_not_back_owner_evidence():
+    for weak in ("ESTIMATED", "PROVISIONAL"):
+        rep = resealed(weak)
+        imp = SS.owner_import_puts(A, rep, imported_utc=1762387300000, storage_ref="private://owner/imports/rt5-" + weak.lower())
+        with pytest.raises(SS.SyncError, match="VERIFIED"):
+            SS.plan(A, imp, [_owner_ev(rep["report_sha256"])])
+    for ok in ("VERIFIED", "RECONCILED"):
+        rep = resealed(ok)
+        imp = SS.owner_import_puts(A, rep, imported_utc=1762387300000, storage_ref="private://owner/imports/rt5-" + ok.lower())
+        assert SS.plan(A, imp, [_owner_ev(rep["report_sha256"])]).puts
+
+
+def test_rt5_2_write_rechecks_the_binding_so_a_forged_plan_never_reaches_the_client():
+    rep = import_report()
+    imp = SS.owner_import_puts(A, rep, imported_utc=1762387300000, storage_ref="private://owner/imports/rt5")
+    good = SS.plan(A, imp, [_owner_ev(rep["report_sha256"])])
+    forged = dataclasses.replace(good, puts=tuple(p for p in good.puts if p.table != "owner_account_imports"))
+    client = MemClient()
+    with pytest.raises(SS.SyncError):
+        SS.write(forged, client)
+    assert client.calls == 0
+
+
+def test_rt5_2_evidence_is_written_after_the_import_it_cites():
+    order = SS.TABLE_ORDER
+    assert order.index("owner_account_imports") < order.index("experiment_evidence")
+
+
+def test_rt5_2_testnet_mechanics_is_refused_entirely_because_no_execution_session_writer_exists():
+    for det in ({"execution_log_sha256": LOG_HASH}, {"metrics": {"execution_log_sha256": LOG_HASH}}, {}):
+        with pytest.raises(SS.SyncError, match="no writer"):
+            _evp("TESTNET_MECHANICS", det)
+    assert "execution_sessions" not in SS.TABLE_ORDER                               # the premise: nothing here writes the table such a claim would need to point at
+    reg = _real_verdict_registry(("prospective_observation", "execution_validation"))
+    puts, skipped = SS.registry_puts(A, reg)                                         # a real registry holding that evidence still syncs: the claim is skipped and REPORTED
+    assert {p.row["level"] for p in puts if p.table == "experiment_evidence"} == {"PROSPECTIVE"}
+    assert any("TESTNET_MECHANICS" in s and "no writer" in s for s in skipped)
+    with pytest.raises(SS.SyncError, match="no writer"):
+        SS.verdict_evidence_put(A, "cand1", _verdict_items()[1])
+
+
+def test_rt5_2_mutation_the_cross_row_binding_is_load_bearing():
+    import hashlib
+    fake = hashlib.sha256(b"nothing").hexdigest()
+    m = _mutant('            if not any(i.get("report_sha256") == h and i.get("status") in ("VERIFIED", "RECONCILED") for i in imports.values()):', "            if False:")
+    assert m.plan(A, [m.evidence_put(A, "T1", "OWNER_ACCOUNT_VERIFIED", result="r:PASS", provenance="owner import", details={"metrics": {"import_report_sha256": fake}},
+                                     recorded_utc=1762300800000)]).puts
+
+
+# ---- rt5-3: the whitelist is mirrored in SQL
+
+NEWEST = FILES[-1]
+
+
+def _sql_key_arrays():
+    code = _strip(NEWEST.read_text())
+    m = re.search(r"evidence_details_keys_ok.*?array\[(.*?)\]::text\[\].*?array\[(.*?)\]::text\[\]", code, re.S)
+    assert m, "the whitelist function must carry the two key arrays"
+    return [tuple(re.findall(r"'([^']+)'", g)) for g in m.groups()]
+
+
+def test_rt5_3_the_sql_key_whitelists_are_exactly_the_python_ones():
+    top, metrics = _sql_key_arrays()
+    schema = SS.OBJ_SCHEMAS[("experiment_evidence", "details")]
+    assert sorted(top) == sorted(schema) and len(set(top)) == len(top)
+    assert sorted(metrics) == sorted(schema["metrics"]) and len(set(metrics)) == len(metrics)
+    assert "net_usd_after_all_costs" not in top and "net_usd_after_all_costs" not in metrics and "attestation" not in top
+
+
+# ---- rt5-4: free-text columns
+
+SK = "sk" + "_live_" + "abcdefghijklmnop1234"
+
+
+@pytest.mark.parametrize("text", [SK, "rk" + "_live_" + "abcdefghijklmnop1234", "wh" + "sec_" + "abcdefghijklmnopqrstuvwx", "sk" + "_test_" + "abcdefghijklmnop1234",
+                                  "pass" + "phrase hunter22hunter22", "seed " + "phrase abandon abandon abandon", "recovery " + "phrase is on the note", "mnemo" + "nic abandon ability",
+                                  "owner phone +34 612 345 678", "call (415) 555-2671 for the owner", "IB" + "AN DE89 3704 0044 0532 0130 00", "account " + "holder is on file",
+                                  "full " + "name on the statement"])
+def test_rt5_4_new_free_text_shapes_are_refused_in_every_free_text_column(text):
+    assert SS._shape_rules(text), text
+    with pytest.raises(SS.SecretGuardError):
+        SS.incident_event_put(A, "I", "OPENED", 1762300800000, note=text)
+
+
+def test_rt5_4_positive_controls_ordinary_notes_still_pass():
+    for text in ("restarted, lag back to 1s", "sk_live is the stripe prefix name only", "rotate the key per RUNBOOKS section 4", "ran 3 of 5 checks on 2026-11-08 at 12:30",
+                 "see ticket 1234 5678 for details", "limit 2.5 bps over 120 observations"):
+        assert SS._shape_rules(text) == [], text
+        assert SS.incident_event_put(A, "I", "OPENED", 1762300800000, note=text)
+
+
+@pytest.mark.parametrize("prov", ["run by alice@example.org", "owner phone +34 612 345 678", "balance=12345.67", "run, by, alice", "x" * 121, "", "run\nnext", "café run", "run;drop",
+                                  "Zk3Jd9QpL2mN8xVb7YcR4tWe6H", "wallet 0x71C7656EC7ab88b098defB751B7401B5f6d8976F", "run (1)"])
+def test_rt5_4_provenance_and_source_are_a_restricted_charset_or_short_code(prov):
+    with pytest.raises(SS.SyncError):
+        SS.evidence_put(A, "T1", "BACKTEST", result="r:PASS", provenance=prov, details={}, recorded_utc=1762300800000)
+    with pytest.raises(SS.SyncError):
+        SS.incident_put(A, "I", "WARN", "title", 1762300800000, source=prov)
+
+
+def test_rt5_4_the_repos_own_writers_values_are_accepted_and_the_charset_is_the_same_in_sql():
+    for prov in ("run#1 offline harness", "run-1", "testnet drill 7", "prospective run 1", "owner statement", "imp_ref", "tools/strategy_verdict.py", "p", "run-" * 30, "carry:tools/md_seal.py v1.2"):
+        assert SS.evidence_put(A, "T1", "BACKTEST", result="r:PASS", provenance=prov, details={}, recorded_utc=1762300800000, source=prov)
+    m = re.search(r"~ '(\^\[[^']*\{1,120\}\$)'", _strip(NEWEST.read_text()))
+    assert m and m.group(1) == SS.PROVENANCE_SQL_REGEX, "SQL and Python must hold the same pattern"
+    assert SS.PROVENANCE_RE.pattern.replace("\\Z", "$") == SS.PROVENANCE_SQL_REGEX
+
+
+def test_rt5_4_mutation_the_charset_check_is_load_bearing():
+    kw = dict(result="r:PASS", provenance="run, by, alice", details={}, recorded_utc=1762300800000)
+    with pytest.raises(SS.SyncError):
+        SS.evidence_put(A, "T1", "BACKTEST", **kw)
+    m = _mutant('        elif (c.name == "source" or (table, c.name) == ("experiment_evidence", "provenance")) and not PROVENANCE_RE.match(str(row[c.name])):',
+                "        elif False:")
+    assert m.evidence_put(A, "T1", "BACKTEST", **kw)                               # without the rule the free-form provenance goes through
+    m2 = _mutant('"(?:seed|recovery|wallet|backup)', '"(?:seed|recovery|wallet|backup)') if False else None
+    assert m2 is None
+
+
+# ---- rt5-5: key-name rules in the SecretGuard
+
+@pytest.mark.parametrize("key", ["attestation_key", "signing_key", "hmac_key", "private_key", "encryption_key", "owner_attestation_key", "OWNER_ATTEST_KEY", "ownerAttestKey", "signingKey",
+                                 "hmacKey", "attestation", "report_attestation"])
+def test_rt5_5_attestation_and_signing_key_names_are_refused_as_keys(key):
+    assert SS.key_rule(key), key
+    with pytest.raises(SS.SecretGuardError):
+        _regp(A, reg_entry(costs={key: 1}))
+
+
+@pytest.mark.parametrize("text", ["OWNER_ATTES" + "TATION_KEY=c0ffee1234567890abcdef12", "export OWNER_ATTES" + "TATION_KEY='c0ffee1234567890abcdef12'", "hmac_" + "key = \"Zk3Jd9QpL2mN8xVb7YcR4tWe6H\"",
+                                  "signing_" + "key: Zk3Jd9QpL2mN8xVb7YcR4tWe6H", "encryption_" + "key=Zk3Jd9QpL2mN8xVb7YcR4tWe6H"])
+def test_rt5_5_key_assignments_in_free_text_are_refused(text):
+    assert SS._shape_rules(text), text
+
+
+def test_rt5_5_positive_controls_names_without_a_value_and_ordinary_words_pass():
+    for key in ("keyboard", "monkey", "turkey_count", "sign", "private_note_count"):
+        assert SS.key_rule(key) is None, key
+    assert SS._shape_rules("rotate the signing key and the hmac key per the runbook") == []
+
+
+def test_rt5_1_verdict4_keys_recorded_ms_spec_digest_and_spec_declarations_are_deliberately_not_synced():
+    reg = _real_verdict_registry(("prospective_observation",))
+    entry = reg["trials"][0]
+    assert entry.get("spec_digest") and entry.get("spec_declarations") and "recorded_ms" in entry["evidence"][0]["details"]          # precondition: the real writers store them
+    puts, skipped = SS.registry_puts(A, reg)
+    blob = json.dumps([p.row for p in puts])
+    assert "spec_declarations" not in blob and "recorded_ms" not in blob and entry["spec_digest"] not in blob
+    assert any("recorded_ms" in s for s in skipped)                                     # the evidence time is the evidence row's recorded_utc; the ms copy is reported as dropped
+    assert SS.plan(A, puts).puts

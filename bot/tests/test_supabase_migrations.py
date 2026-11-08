@@ -205,7 +205,13 @@ def pg(server):
 @pytest.fixture(scope="module")
 def pg_pre(server):
     """The schema as of 20261107000900 (before the rt4 migration closed the no-writer tables): the tests of that migration's CHECKs insert into tables the later one write-closes."""
-    return _fresh(server, "mig_pre", [f for f in FILES if f != RT4])
+    return _fresh(server, "mig_pre", [f for f in FILES if f not in (RT4, RT5)])
+
+
+@pytest.fixture(scope="module")
+def pg_rt4(server):
+    """The schema as of the rt4 migration (before rt5 refused TESTNET_MECHANICS and bound owner evidence to an import row)."""
+    return _fresh(server, "mig_rt4", [f for f in FILES if f != RT5])
 
 
 A, B = str(uuid.uuid4()), str(uuid.uuid4())
@@ -371,10 +377,11 @@ def test_manifest_constraints(pg):
 
 HARDENING = MIG_DIR / "20261107000900_carry_write_path_hardening.sql"
 RT4 = MIG_DIR / "20261108000100_carry_rt4_sync_hardening.sql"
+RT5 = MIG_DIR / "20261108000200_carry_rt5_sync_hardening.sql"
 
 
 def test_hardening_migration_is_last_additive_and_documents_what_it_cannot_close():
-    assert FILES[-2] == HARDENING and FILES[-1] == RT4          # the rt4 migration is the newest; nothing numbered was edited to make room for it
+    assert FILES[-3] == HARDENING and FILES[-2] == RT4 and FILES[-1] == RT5          # the rt5 migration is the newest; nothing numbered was edited to make room for it
     raw = HARDENING.read_text()
     code = strip_comments(raw).lower()
     assert not re.search(r"\bcreate table\b|\bdrop\b|\bgrant\b[^;]*\b(insert|update|delete|truncate|all)\b|disable row level|security definer", code)
@@ -622,7 +629,8 @@ def _evrow(owner, level, details, n):
             "source": "t", "content_sha256": sha(f"rt4-ev{n}")}
 
 
-def test_rt4_financial_evidence_is_bound_to_a_hash_and_carries_no_owner_figure(pg):
+def test_rt4_financial_evidence_is_bound_to_a_hash_and_carries_no_owner_figure(pg_rt4):
+    pg = pg_rt4
     owner = str(uuid.uuid4())
     assert put(pg, "strategy_hypotheses", hyp(owner)) == "t"
     assert put(pg, "experiment_registrations", reg(owner)) == "t"
@@ -670,3 +678,149 @@ def test_rt4_mutation_the_write_closing_trigger_and_revoke_are_load_bearing(serv
     h.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(row), "permission denied", role="service_role")
     h.run("drop trigger carry_no_insert on carry.execution_sessions; grant insert on carry.execution_sessions to service_role;")
     assert put(h, "execution_sessions", row) == "t"
+
+
+# =========================================================================== rt5 (red-team round 4)
+
+def _ins(pg, row, table="experiment_evidence", **kw):
+    return pg.run("select carry.put_row('%s', $j$%s$j$::jsonb);" % (table, json.dumps(row)), role="service_role", **kw)
+
+
+def _refused(pg, row, match="violates|must cite|refused", table="experiment_evidence"):
+    return pg.fails("select carry.put_row('%s', $j$%s$j$::jsonb);" % (table, json.dumps(row)), match, role="service_role")
+
+
+_N = [1000]
+
+
+def _ev5(owner, level, details, **over):
+    _N[0] += 1
+    r = _evrow(owner, level, details, _N[0])
+    r["content_sha256"] = sha(f"rt5-ev{_N[0]}")
+    r.update(over)
+    return r
+
+
+def _seed_reg(pg, owner):
+    assert put(pg, "strategy_hypotheses", hyp(owner)) == "t"
+    assert put(pg, "experiment_registrations", reg(owner)) == "t"
+
+
+def _sql_arrays():
+    code = strip_comments(RT5.read_text())
+    m = re.search(r"evidence_details_keys_ok.*?array\[(.*?)\]::text\[\].*?array\[(.*?)\]::text\[\]", code, re.S)
+    return [re.findall(r"'([^']+)'", g) for g in m.groups()]
+
+
+def test_rt5_the_migration_is_additive_and_says_exactly_what_is_and_is_not_bound():
+    raw = RT5.read_text()
+    code = strip_comments(raw).lower()
+    assert not re.search(r"\bcreate table\b|\bdrop\b|\bgrant\b[^;]*\b(insert|update|delete|truncate|all)\b|disable row level|security definer", code)
+    assert code.count("not valid") >= 3
+    for phrase in ("NOT bound", "FORMAT check only", "client-supplied", "TESTNET_MECHANICS evidence: REFUSED", "NOT closable"):
+        assert phrase in raw, phrase
+
+
+def test_rt5_the_sql_whitelists_are_the_python_whitelists():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import supabase_sync as SS
+    top, met = _sql_arrays()
+    schema = SS.OBJ_SCHEMAS[("experiment_evidence", "details")]
+    assert sorted(top) == sorted(schema) and sorted(met) == sorted(schema["metrics"])
+    assert re.search(r"~ '%s'" % re.escape(SS.PROVENANCE_SQL_REGEX), strip_comments(RT5.read_text()))
+
+
+def test_rt5_renamed_or_nested_financial_keys_are_refused_by_the_whitelist_and_every_listed_key_is_accepted(pg):
+    owner = str(uuid.uuid4())
+    _seed_reg(pg, owner)
+    top, met = _sql_arrays()
+    for bad in ({"net_pnl_usd": "1234.5"}, {"pnl": "5"}, {"metrics": {"net_pnl": "5"}}, {"metrics": {"balance": "9"}}, {"owner": {"net": 1}}, {"metrics": {"nested": {"net_usd_after_all_costs": 1}}},
+                {"attestation": "ab" * 32}, {"metrics": "scalar"}, {"Sharpe": 1}, {"metrics": {"SHARPE": 1}}, {"net_usd_after_all_costs": "1"}):
+        _refused(pg, _ev5(owner, "BACKTEST", bad))
+    _refused(pg, _ev5(owner, "BACKTEST", [1, 2]))                                      # not an object
+    for k in top:
+        if k in ("metrics",):
+            continue
+        assert _ins(pg, _ev5(owner, "BACKTEST", {k: "1"})).returncode == 0, k              # positive control: every whitelisted top-level key is accepted
+    for k in met:
+        assert _ins(pg, _ev5(owner, "BACKTEST", {"metrics": {k: "1"}})).returncode == 0, k
+    assert _ins(pg, _ev5(owner, "BACKTEST", {})).returncode == 0
+
+
+def _imp5(owner, status, rsha, tag):
+    r = _imp(owner, status, report_sha256=rsha, source_sha256=sha("src5" + tag))
+    r["import_id"] = r["content_sha256"] = sha("imp5" + tag)
+    return r
+
+
+def test_rt5_owner_evidence_must_cite_an_existing_verified_or_reconciled_import_row_of_the_same_owner(pg):
+    owner, other = str(uuid.uuid4()), str(uuid.uuid4())
+    _seed_reg(pg, owner)
+    fake = sha("no import has this")
+    for det in ({"import_report_sha256": fake}, {"metrics": {"import_report_sha256": fake}}):
+        _refused(pg, _ev5(owner, "OWNER_ACCOUNT_VERIFIED", det), "must cite")                 # the PoC: a random sha256 with no import row
+    weak = sha("weak report")
+    assert put(pg, "owner_account_imports", _imp5(owner, "ESTIMATED", weak, "w")) == "t"
+    _refused(pg, _ev5(owner, "OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": weak}), "must cite")     # an import with a weaker status backs nothing
+    theirs = sha("someone elses report")
+    assert put(pg, "owner_account_imports", _imp5(other, "RECONCILED", theirs, "o")) == "t"
+    _refused(pg, _ev5(owner, "OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": theirs}), "must cite")  # another owner's import backs nothing
+    for status in ("VERIFIED", "RECONCILED"):                                                   # positive controls, hash at top level and in metrics
+        good = sha("good " + status)
+        assert put(pg, "owner_account_imports", _imp5(owner, status, good, status)) == "t"
+        assert _ins(pg, _ev5(owner, "OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": good})).returncode == 0
+        row = _ev5(owner, "OWNER_ACCOUNT_VERIFIED", {"metrics": {"import_report_sha256": good}})
+        assert put(pg, "experiment_evidence", row) == "t" and put(pg, "experiment_evidence", row) == "f"      # an identical re-send stays idempotent
+        _refused(pg, _ev5(owner, "OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": good, "metrics": {"import_report_sha256": fake}}), "two different|must cite")
+
+
+def test_rt5_testnet_mechanics_evidence_is_refused_outright(pg):
+    owner = str(uuid.uuid4())
+    _seed_reg(pg, owner)
+    for det in ({"execution_log_sha256": sha("log")}, {"metrics": {"execution_log_sha256": sha("log")}}):
+        _refused(pg, _ev5(owner, "TESTNET_MECHANICS", det), "no writer exists")
+    assert _ins(pg, _ev5(owner, "SIMULATED_EXECUTION", {})).returncode == 0
+
+
+@pytest.mark.parametrize("bad", ["run by alice@example.org", "+34 612 345 678", "balance=12345.67", "a, b", "x" * 121, "", "run\n", "café", "run;drop", "run (1)", "k'v"])
+def test_rt5_provenance_and_source_are_restricted_to_a_safe_short_code(pg, bad):
+    owner = str(uuid.uuid4())
+    _seed_reg(pg, owner)
+    _refused(pg, _ev5(owner, "BACKTEST", {}, provenance=bad), "violates|check")
+    _refused(pg, hyp(owner, "Hbad") | {"source": bad}, "violates|check", table="strategy_hypotheses")
+
+
+def test_rt5_provenance_and_source_quote_newline_and_the_writers_own_values(pg):
+    owner = str(uuid.uuid4())
+    _seed_reg(pg, owner)
+    for bad in ("run\n", "run\nnext", "a​b"):
+        r = _ev5(owner, "BACKTEST", {}, provenance=bad)
+        p = pg.run("select carry.put_row('experiment_evidence', %s::jsonb);" % ("'" + json.dumps(r).replace("'", "''") + "'"), role="service_role", check=False)
+        assert p.returncode != 0 and re.search("violates", p.stderr), bad
+    for good in ("run#1 offline harness", "run-1", "testnet drill 7", "imp_ref", "tools/strategy_verdict.py", "carry:tools/md_seal.py v1.2", "r" * 120):
+        assert _ins(pg, _ev5(owner, "BACKTEST", {}, provenance=good, source=good)).returncode == 0, good
+
+
+def test_rt5_reapplying_the_migration_changes_nothing(pg):
+    before = pg.scalar("select count(*) from pg_constraint where connamespace='carry'::regnamespace;")
+    pg.run(RT5.read_text())
+    assert pg.scalar("select count(*) from pg_constraint where connamespace='carry'::regnamespace;") == before
+    assert pg.scalar("select count(*) from pg_trigger where tgname='carry_evidence_binding' and not tgisinternal;") == "1"
+
+
+def test_rt5_mutation_the_trigger_the_whitelist_and_the_charset_are_each_load_bearing(server):
+    h = _fresh(server, "mig_mut5", FILES)
+    owner = str(uuid.uuid4())
+    _seed_reg(h, owner)
+    fake = _ev5(owner, "OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": sha("nothing")})
+    renamed = _ev5(owner, "BACKTEST", {"metrics": {"net_pnl": "5"}})
+    prov = _ev5(owner, "BACKTEST", {}, provenance="run, by, alice")
+    for r in (fake, renamed, prov):
+        _refused(h, r)
+    h.run("drop trigger carry_evidence_binding on carry.experiment_evidence;")
+    assert put(h, "experiment_evidence", fake) == "t"
+    h.run("alter table carry.experiment_evidence drop constraint experiment_evidence_details_key_whitelist;")
+    assert put(h, "experiment_evidence", renamed) == "t"
+    h.run("alter table carry.experiment_evidence drop constraint experiment_evidence_provenance_short_code;")
+    assert put(h, "experiment_evidence", prov) == "t"
