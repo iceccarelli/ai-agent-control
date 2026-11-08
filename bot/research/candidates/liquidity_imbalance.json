@@ -53,7 +53,7 @@
   "prospective_protocol": {
     "description": "forward shadow signal log with measured latency before any order",
     "min_coverage": 0.9,
-    "min_duration_ms": 1209600000,
+    "min_duration_ms": 2592000000,
     "min_settlements": 30,
     "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
     "start_ms": null

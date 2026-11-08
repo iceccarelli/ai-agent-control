@@ -31,6 +31,7 @@ H = 3_600_000
 INPUT_SHA = hashlib.sha256(b"economic fixture input data").hexdigest()
 with open(os.path.join(BOT, "research", "candidates", "cross_sectional_funding.json"), encoding="utf-8") as _f:
     SPEC = json.load(_f)
+SPEC["fee_model"]["taker_bps"]["provenance"] = "measured"         # the verdict layer refuses a cost PASS when EVERY spec cost input is assumed
 SPEC["capacity_model"]["min_viable_capacity_usd"] = 100.0           # a real, valid candidate spec (candidate_id + digest are stamped on evidence)
 
 
@@ -240,7 +241,7 @@ def test_capacity_evidence():
     base = dict(impact_bps=q("0"), basis_cost_bps=q("0"), opportunity_cost_apr=q("0", "measured"))
     cap = EM.capacity_usd(overlay(**base), "12.5")
     sha = INPUT_SHA
-    ok = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=1000, spec=SPEC, data_sha256=sha)
+    ok = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=100, spec=SPEC, data_sha256=sha)
     assert ok.result == SV.PASS and ok.metrics["capacity_usd"] == 66699.99 and SV.counted(ok, SPEC) == (True, None)
     low = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=70000, spec=SPEC, data_sha256=sha)
     assert low.result == SV.FAIL
