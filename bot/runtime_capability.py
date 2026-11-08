@@ -36,10 +36,12 @@ ROLES: Tuple[str, ...] = (PUBLIC_COLLECTOR, READ_ONLY_MONITOR, EVIDENCE_BACKUP, 
 
 TESTNET_CREDENTIAL_CLASS = "testnet_dedicated"
 
-#: Public market data (unsigned GET).
+#: Public market data (unsigned GET). ``mark-price-kline``, ``index-price-kline`` and ``open-interest`` are the history endpoints ``tools/market_history.py`` pages
+#: (read-only, unsigned, exact paths: a prefix or sibling is still ENDPOINT_NOT_ALLOWED). Every role that may read public data may read them; none gains a write.
 PUBLIC_MARKET_PATHS: FrozenSet[str] = frozenset({
     "/v5/market/time", "/v5/market/tickers", "/v5/market/orderbook", "/v5/market/kline",
     "/v5/market/instruments-info", "/v5/market/funding/history", "/v5/market/recent-trade",
+    "/v5/market/mark-price-kline", "/v5/market/index-price-kline", "/v5/market/open-interest",
 })
 
 #: Account READ paths (signed GET). Nothing here can move money or change state.

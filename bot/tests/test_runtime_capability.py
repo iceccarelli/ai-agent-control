@@ -56,7 +56,7 @@ BAD_FORMS = [
     "/v5/market/tickers?category=linear", "/v5/market/Tickers", "/v5/market/tickers/", "/v5/", "/v5", "/", "", "/v6/order/create",
     "/v5/order/create-", "/v5/-order/create", "/v5/order/creatе", "/v5/market/time/..",
 ]
-UNKNOWN = ["/v5/market/insurance", "/v5/market/open-interest", "/v5/account/unknown", "/v5/order/unknown", "/v5/position/switch-isolated", "/other/path",
+UNKNOWN = ["/v5/market/insurance", "/v5/market/account-ratio", "/v5/market/risk-limit", "/v5/market/delivery-price", "/v5/account/unknown", "/v5/order/unknown", "/v5/position/switch-isolated", "/other/path",
            "/v5/position/confirm-pending-mmr", "/v5/account/borrow"]
 ROLE_CAPS = [COLLECTOR, MONITOR, BACKUP, EXECUTOR]
 
@@ -171,3 +171,32 @@ def test_public_collector_positive_control_accept_and_user_agent_pass_any_case()
     t.request("GET", _TIME_URL, headers={})
     t.request("GET", _TIME_URL, headers=None)
     assert len(inner.sent) == 3
+
+
+# ---- history endpoints (market_history): exact paths, collector reads only -----------------------------------------------------------------------------------
+HISTORY_PATHS = ("/v5/market/mark-price-kline", "/v5/market/index-price-kline", "/v5/market/open-interest")
+
+
+@pytest.mark.parametrize("path", HISTORY_PATHS)
+def test_history_paths_are_public_unsigned_get_for_the_collector(path):
+    assert path in RC.PUBLIC_MARKET_PATHS
+    assert COLLECTOR.check("GET", path, False, TN) is None
+    assert cap(RC.PUBLIC_COLLECTOR, "mainnet").check("GET", path, False, MN) is None
+    # the collector still cannot sign, POST or use another host on them
+    assert COLLECTOR.check("GET", path, True, TN) == "COLLECTOR_UNSIGNED_ONLY"
+    assert COLLECTOR.check("POST", path, True, TN) == "COLLECTOR_GET_ONLY"
+    assert COLLECTOR.check("POST", path, False, TN) == "COLLECTOR_GET_ONLY"
+    assert COLLECTOR.check("GET", path, False, MN) == "HOST_REFUSED"
+    assert EXECUTOR.check("POST", path, True, TN) == "ENDPOINT_NOT_ALLOWED"
+    assert BACKUP.check("GET", path, False, TN).startswith("NO_VENUE_ACCESS")
+
+
+@pytest.mark.parametrize("path", [p + s for p in HISTORY_PATHS for s in ("/", "-x", "/x", "s")] + ["/v5/market/mark-price", "/v5/market/index-price", "/v5/market/open", "/v5/market/premium-index-price-kline"])
+def test_only_the_exact_history_paths_are_allowed_never_a_prefix_or_sibling(path):
+    assert COLLECTOR.check("GET", path, False, TN) in ("ENDPOINT_NOT_ALLOWED", "ENDPOINT_NOT_CANONICAL")
+
+
+def test_the_public_market_allow_list_is_exactly_these_ten_paths():
+    assert RC.PUBLIC_MARKET_PATHS == frozenset({"/v5/market/time", "/v5/market/tickers", "/v5/market/orderbook", "/v5/market/kline", "/v5/market/instruments-info",
+                                                "/v5/market/funding/history", "/v5/market/recent-trade", *HISTORY_PATHS})
+    assert all(p.startswith("/v5/market/") for p in RC.PUBLIC_MARKET_PATHS)

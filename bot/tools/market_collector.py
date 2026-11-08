@@ -174,17 +174,23 @@ def _transport() -> "RC.CapabilityTransport":
     return RC.CapabilityTransport(_UrllibTransport(), RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="mainnet"))
 
 
-def http_request(method: Any, url: Any, *, headers: Any = None, body: Any = None) -> bytes:
-    """The only network primitive. The role refuses (BEFORE a connection is opened) any POST, signed/credential-carrying or unparseable header, body,
-    credential-looking query parameter, control character, other host or non-allow-listed path; the pinned-path check below is a second, stricter fence."""
+def http_request_to(method: Any, url: Any, allowed_paths: Sequence[str], *, headers: Any = None, body: Any = None) -> bytes:
+    """The only network primitive, for a caller (``market_history``) that pages other PUBLIC paths. ``allowed_paths`` is the caller's pinned set; the ``public_collector``
+    role independently refuses (BEFORE a connection is opened) any POST, signed/credential-carrying or unparseable header, body, credential-looking query parameter,
+    control character, other host or path outside ``runtime_capability.PUBLIC_MARKET_PATHS``; the pinned-path check below is a second, stricter fence."""
     base = _base()
-    if not isinstance(url, str) or not any(url.startswith(base + p + "?") for p in PUBLIC_PATHS):
+    if not isinstance(url, str) or not any(url.startswith(base + p + "?") for p in allowed_paths):
         raise CollectorError("refusing a URL that is not the registry host and a pinned public market path")
     hdrs = {"Accept": "application/json", "User-Agent": "market-collector/1"} if headers is None else headers
     try:
         return _transport().request(method, url, headers=hdrs, body=body, timeout=TIMEOUT_S)
     except RC.CapabilityRefused as exc:
         raise CollectorError(f"refused by the public_collector role: {exc.code}") from exc
+
+
+def http_request(method: Any, url: Any, *, headers: Any = None, body: Any = None) -> bytes:
+    """The collector's own pinned paths (instruments, tickers, order book, recent trades) through ``http_request_to``."""
+    return http_request_to(method, url, PUBLIC_PATHS, headers=headers, body=body)
 
 
 def http_fetch(url: str) -> bytes:
@@ -1184,6 +1190,180 @@ def _repair_locked(root: str) -> Dict[str, Any]:
     return {"ok": bool(res.get("appendable")) and bool(after.get("ok")), **res, "resealed_indices": after.get("resealed_indices", []), "verify_ok": bool(after.get("ok"))}
 
 
+# ---------------------------------------------------------------- data-root guard (shared with market_history)
+
+def _in_git_tree(path: str) -> bool:
+    """True when ``path`` (or its nearest existing ancestor, symlinks resolved) is inside a git work tree: a ``.git`` entry in it or any parent."""
+    d = os.path.realpath(path)
+    while not os.path.exists(d) and os.path.dirname(d) != d:
+        d = os.path.dirname(d)
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def root_guard(root: str, reserve_bytes: int, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free) -> List[str]:
+    """Reasons a data root may NOT be written (empty = fine): inside a git work tree (data would be committable), a link, group/world accessible, or free space under
+    the reserve. Checked before every cycle / dataset so a filling disk stops the run instead of corrupting a cycle."""
+    problems: List[str] = []
+    r = os.path.abspath(root)
+    if _in_git_tree(r):
+        problems.append("the data root is inside a git work tree: market data must live outside Git")
+    if os.path.islink(r):
+        problems.append("the data root is a symbolic link")
+    if os.path.isdir(r) and os.stat(r).st_mode & 0o077:
+        problems.append(f"the data root mode is {oct(os.stat(r).st_mode & 0o777)}: it must be 0700")
+    probe = r
+    while not os.path.exists(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    try:
+        free = int(free_bytes_fn(probe))
+    except OSError as exc:
+        problems.append(f"free space cannot be read ({exc.strerror})")
+    else:
+        if free < reserve_bytes:
+            problems.append(f"free space {free} bytes is below the reserve {reserve_bytes}")
+    return problems
+
+
+# ---------------------------------------------------------------- continuous collection (run-continuous) and its health report
+
+HEALTH_NAME = "health.json"
+HEALTH_SCHEMA = "market_collector_health/v1"
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
+STOP_SLICE_S = 5.0
+
+
+def _write_health(path: str, doc: Mapping[str, Any]) -> None:
+    """Atomic replace, 0600. The health file is overwritten by design (a status, not evidence); it never lists a secret."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.write(fd, (json.dumps(doc, indent=2, sort_keys=True, default=str, allow_nan=False) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, duration_ms: Optional[int] = None, until_ms: Optional[int] = None, stop_file: Optional[str] = None,
+                   max_cycles: Optional[int] = None, fetch: Callable[[str], bytes] = http_fetch, clock: Callable[[], int] = lambda: int(time.time() * 1000),
+                   sleep: Callable[[float], None] = time.sleep, max_symbols: int = DEFAULT_MAX_SYMBOLS, depth: int = DEFAULT_DEPTH, trades_limit: int = DEFAULT_TRADES,
+                   reserve_bytes: int = DEFAULT_RESERVE_BYTES, max_bytes: int = DEFAULT_MAX_BYTES, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free,
+                   seal_manifest: Optional[str] = None, backup_to: Optional[str] = None, receipts: Optional[str] = None, seal_every: int = 60, backup_every: int = 60,
+                   restore_check_every: int = 0, max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES, health_path: Optional[str] = None,
+                   max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S) -> Dict[str, Any]:
+    """Repeat ``run_once`` every ``interval_ms`` until a duration/``until_ms``/``max_cycles`` limit, an explicit ``stop_file``, the disk guard, a refusal that needs the owner
+    (broken log, held lock, storage budget) or ``max_consecutive_failures``. Restart-safe: every cycle is a new directory and ``run_once`` itself sets aside an interrupted one and
+    adopts a COMPLETE-but-unrecorded one, so killing and restarting this loop loses at most the cycle in flight. Seal / backup / restore-check hooks run every N cycles when
+    configured (through ``seal_cycles`` / ``backup_cycles`` / ``restore_check``); a failing hook is RECORDED in the health report, never swallowed and never fatal to collection.
+    The health report (``health.json``, rewritten after every step) is machine readable; ``tools/data_freshness_audit.py`` reads it."""
+    _check_ms("interval_ms", interval_ms)
+    if not (duration_ms is None or _check_ms("duration_ms", duration_ms)) or not (until_ms is None or _check_ms("until_ms", until_ms)):
+        raise CollectorError("bad duration/until")
+    if max_cycles is not None and (isinstance(max_cycles, bool) or not isinstance(max_cycles, int) or max_cycles < 1):
+        raise CollectorError("max_cycles must be a positive whole number")
+    if duration_ms is None and until_ms is None and max_cycles is None and not stop_file:
+        raise CollectorError("an unbounded run needs --stop-file (an explicit way to stop), or a duration/until/max-cycles")
+    if (backup_to is None) != (receipts is None) or (backup_to is not None and seal_manifest is None):
+        raise CollectorError("backup needs --backup-to, --receipts and --seal-manifest together")
+    if restore_check_every and backup_to is None:
+        raise CollectorError("restore-check needs the backup configured")
+    root = os.path.abspath(out_root)
+    hp = health_path or os.path.join(root, HEALTH_NAME)
+    t0 = int(clock())
+    end_ms = min(x for x in (until_ms, t0 + duration_ms if duration_ms else None) if x is not None) if (until_ms or duration_ms) else None
+    h: Dict[str, Any] = {"schema": HEALTH_SCHEMA, "root": root, "interval_ms": interval_ms, "started_ms": t0, "status": "RUNNING", "stop_reason": None, "cycles_run": 0,
+                         "cycles_ok": 0, "cycles_partial": 0, "last_cycle": None, "gaps": {"missed_expected_cycles_total": 0, "last": None}, "consecutive_failures": 0,
+                         "max_consecutive_failures": max_consecutive_failures, "rate_limit_events_total": 0, "disk": None, "last_seal": None, "last_backup": None,
+                         "last_restore_check": None, "refusal": None}
+
+    def _flush() -> None:
+        h["written_ms"] = int(clock())
+        if os.path.isdir(root):
+            _write_health(hp, h)
+
+    def _disk() -> List[str]:
+        probs = root_guard(root, reserve_bytes, free_bytes_fn)
+        h["disk"] = {"free_bytes": int(free_bytes_fn(root if os.path.isdir(root) else os.path.dirname(root))), "reserve_bytes": reserve_bytes,
+                     "root_bytes": _tree_bytes(root) if os.path.isdir(root) else 0, "max_bytes": max_bytes, "in_git_tree": _in_git_tree(root), "problems": probs}
+        return probs
+
+    def _hook(name: str, fn: Callable[[], Dict[str, Any]]) -> None:
+        try:
+            res = fn()
+            h[name] = {"at_ms": int(clock()), "ok": bool(res.get("ok", True)), "detail": {k: res[k] for k in res if k in ("ok", "problems", "sealed_new", "cycles_total", "backed_up",
+                                                                                                                     "failed", "rejected", "checked")}}
+        except (CollectorError, UC.CaptureError, OSError, EC.ChainDesync) as exc:
+            h[name] = {"at_ms": int(clock()), "ok": False, "detail": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
+
+    def _stop(reason: str, status: str = "STOPPED") -> Dict[str, Any]:
+        h["status"], h["stop_reason"] = status, reason
+        _flush()
+        return h
+
+    cycles = 0
+    while True:
+        if stop_file and os.path.lexists(stop_file):
+            return _stop("stop_file")
+        if max_cycles is not None and cycles >= max_cycles:
+            return _stop("max_cycles")
+        now = int(clock())
+        if end_ms is not None and now >= end_ms:
+            return _stop("duration")
+        probs = _disk()
+        if probs:
+            h["refusal"] = {"code": "DISK_GUARD", "problems": probs}
+            return _stop("disk_guard", "REFUSED")
+        t_cycle = now
+        try:
+            res = run_once(root, t_cycle, fetch, clock, sleep=sleep, max_symbols=max_symbols, depth=depth, trades_limit=trades_limit, interval_ms=interval_ms,
+                           reserve_bytes=reserve_bytes, max_bytes=max_bytes, free_bytes_fn=free_bytes_fn, max_retries=max_retries, backoff_s=backoff_s)
+        except CollectorError as exc:
+            res = {"status": "ABORTED", "reason": f"{type(exc).__name__}: {exc}"}
+        cycles += 1
+        h["cycles_run"] = cycles
+        st = res.get("status")
+        if st in ("REFUSED_STORAGE", "REFUSED_LOG", "REFUSED_LOCKED"):
+            h["refusal"] = {"code": st, "reason": res.get("reason"), "detail": res.get("detail")}
+            return _stop(st.lower(), "REFUSED")
+        if st in ("OK", "PARTIAL"):
+            h["cycles_ok" if st == "OK" else "cycles_partial"] += 1
+            h["last_cycle"] = {"cycle": res["cycle"], "cycle_ms": t_cycle, "status": st, "counts": res["counts"], "partial_reasons": res["partial_reasons"],
+                               "finished_ms": int(clock())}
+            h["rate_limit_events_total"] += int(res["counts"].get("rate_limit_events", 0))
+            if res["gaps"]:
+                h["gaps"]["missed_expected_cycles_total"] += sum(int(g.get("missed_expected_cycles", 0)) for g in res["gaps"])
+                h["gaps"]["last"] = res["gaps"][-1]
+            h["consecutive_failures"] = 0 if st == "OK" else h["consecutive_failures"] + 1
+        else:                                            # ABORTED / REFUSED_CLOCK: nothing was recorded for this slot
+            h["consecutive_failures"] += 1
+            h["last_cycle"] = {"cycle": res.get("cycle"), "cycle_ms": t_cycle, "status": st, "reason": res.get("reason"), "finished_ms": int(clock())}
+        if h["consecutive_failures"] >= max_consecutive_failures:
+            h["refusal"] = {"code": "CONSECUTIVE_FAILURES", "count": h["consecutive_failures"]}
+            return _stop("consecutive_failures", "REFUSED")
+        if seal_manifest and seal_every > 0 and cycles % seal_every == 0:
+            _hook("last_seal", lambda: seal_cycles(root, seal_manifest))
+        if backup_to and backup_every > 0 and cycles % backup_every == 0:
+            _hook("last_backup", lambda: backup_cycles(root, backup_to, receipts, manifest=seal_manifest))
+        if backup_to and restore_check_every > 0 and cycles % restore_check_every == 0:
+            _hook("last_restore_check", lambda: restore_check(backup_to, receipts, seal_manifest))
+        _flush()
+        # wait for the next slot (rate-limit-aware: a throttled cycle waits longer, capped), checking the stop file between short sleeps
+        extra = min(BACKOFF_CAP_S, backoff_s * (2 ** min(h["consecutive_failures"], 5))) if (h["consecutive_failures"] or res.get("counts", {}).get("rate_limit_events")) else 0.0
+        due = t_cycle + interval_ms + int(extra * 1000)
+        while int(clock()) < due:
+            if stop_file and os.path.lexists(stop_file):
+                break
+            if end_ms is not None and int(clock()) >= end_ms:
+                break
+            sleep(min(STOP_SLICE_S, max(0.0, (due - int(clock())) / 1000.0)) or 0.001)
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1197,6 +1377,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     r.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
     r.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES)
     r.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    cn = sub.add_parser("run-continuous", help="repeat run-once on an interval until a limit or an explicit stop file; health.json is rewritten every step")
+    cn.add_argument("--out-root", required=True, help="data root OUTSIDE the git work tree (created 0700)")
+    cn.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
+    cn.add_argument("--duration-s", type=int, help="stop after this many seconds")
+    cn.add_argument("--until-ms", type=int, help="stop at this epoch ms")
+    cn.add_argument("--stop-file", help="the run stops cleanly when this path exists (touch it)")
+    cn.add_argument("--max-cycles", type=int)
+    cn.add_argument("--max-symbols", type=int, default=DEFAULT_MAX_SYMBOLS)
+    cn.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
+    cn.add_argument("--trades-limit", type=int, default=DEFAULT_TRADES)
+    cn.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES)
+    cn.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    cn.add_argument("--seal-manifest"); cn.add_argument("--seal-every", type=int, default=60)
+    cn.add_argument("--backup-to"); cn.add_argument("--receipts"); cn.add_argument("--backup-every", type=int, default=60)
+    cn.add_argument("--restore-check-every", type=int, default=0)
+    cn.add_argument("--max-consecutive-failures", type=int, default=DEFAULT_MAX_CONSECUTIVE_FAILURES)
+    cn.add_argument("--health", help="health report path (default <out-root>/health.json)")
     s = sub.add_parser("seal"); s.add_argument("--root", required=True); s.add_argument("--manifest", required=True)
     s.add_argument("--accept-problems", action="store_true")
     c = sub.add_parser("check"); c.add_argument("--root", required=True); c.add_argument("--manifest", required=True)
@@ -1213,6 +1410,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                            interval_ms=a.interval_ms, reserve_bytes=a.reserve_bytes, max_bytes=a.max_bytes)
             ok = res["status"] in ("OK", "PARTIAL")
             res = {**res, "ok": ok}
+        elif a.cmd == "run-continuous":
+            res = run_continuous(a.out_root, interval_ms=a.interval_ms, duration_ms=a.duration_s * 1000 if a.duration_s else None, until_ms=a.until_ms, stop_file=a.stop_file,
+                                 max_cycles=a.max_cycles, max_symbols=a.max_symbols, depth=a.depth, trades_limit=a.trades_limit, reserve_bytes=a.reserve_bytes,
+                                 max_bytes=a.max_bytes, seal_manifest=a.seal_manifest, seal_every=a.seal_every, backup_to=a.backup_to, receipts=a.receipts,
+                                 backup_every=a.backup_every, restore_check_every=a.restore_check_every, max_consecutive_failures=a.max_consecutive_failures,
+                                 health_path=a.health)
+            res = {**res, "ok": res["status"] == "STOPPED"}
         elif a.cmd == "seal":
             res = seal_cycles(a.root, a.manifest, accept_problems=a.accept_problems)
         elif a.cmd == "check":
