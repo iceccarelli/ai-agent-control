@@ -161,6 +161,7 @@ jobs:
           tests/test_fee_rate_freshness.py
           tests/test_live_authority_needs_a_live_venue.py
           tests/test_owner_console.py
+          tests/test_control_centre.py
           tests/test_drill_stops.py
           tests/test_hypothesis_registry_integrity.py
           tests/test_md_seal.py

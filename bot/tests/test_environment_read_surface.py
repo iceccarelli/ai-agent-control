@@ -25,6 +25,7 @@ ALLOWED = {
     "tools/testnet_certificate.py": 1,    # offline certificate: hands os.environ to config.is_live_authorized (main only)
     "tools/strategy_verdict.py": 1,      # default key provider: reads ONE named variable (the owner's attestation key) at verification time; never logged, stored or serialised
     "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
+    "tools/control_centre.py": 1,        # read-only localhost UI: hands os.environ to owner_console.build (config.is_live_authorized); secrets reported as set/unset only, no value logged or served
     "tools/runner_alerts.py": 1,         # alert transport settings
     "tools/runner_monitor.py": 4,        # credential presence, alert settings
     "tools/unattended_drill.py": 3,      # credential presence, testnet env
