@@ -23,11 +23,13 @@ Honesty rules enforced here (each has a test and a mutation):
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import hashlib
 import json
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -41,6 +43,7 @@ import entry_authority as EA  # noqa: E402
 import ms_accounting as MACC  # noqa: E402
 import ms_authority as MAUTH  # noqa: E402
 import ms_execution as EX  # noqa: E402
+from ms_fillmodel import Tick as FM_Tick  # noqa: E402
 import ms_portfolio as PF  # noqa: E402
 import ms_replay as RP  # noqa: E402
 import ms_risk as MR  # noqa: E402
@@ -50,7 +53,14 @@ import ms_types as T  # noqa: E402
 SCHEMA = "ms_pipeline/v1"
 DATA_INJECTED = "INJECTED_TEST_DATA"
 DATA_HISTORY = "VERIFIED_HISTORY_ROOT"
-MODES = ("REPLAY", "PAPER")
+MODES = ("REPLAY", "PAPER")                   # what this pipeline (and its CLI) runs; TESTNET is a separate, owner-invoked session tool and is refused here; there is NO mainnet mode anywhere
+STATUS_CODES = ("REJECTED_CANDIDATE", "INADEQUATE_HISTORY", "NO_OPPORTUNITY", "NO_ALLOCATION", "RISK_REFUSAL", "NO_FILL", "UNKNOWN_OR_UNRECONCILED", "INADEQUATE_SAMPLE", "SIMULATED_EXECUTION")
+#: the competition readiness levels at which candidate_competition itself ranks a candidate in its top tier (candidate_competition._tier == PROMISING); nothing below may allocate
+PROMOTED_READINESS = ("PROMISING", "PROSPECTIVE", "EXECUTION_READY", "OWNER_PROFIT_EVIDENCED")
+BLOCKING_VERDICTS = ("REJECTED", "UNTESTED", "INSUFFICIENT_DATA")
+#: which scanner kind each registered candidate family runs as. A family not listed (microstructure, cross-venue, regime conditioning) is NOT runnable by this pipeline.
+CANDIDATE_KIND = {"cash_and_carry": "SPOT_PERP_CARRY", "spot_perp_basis": "SPOT_PERP_CARRY", "hedgeable_majors_basis_convergence": "SPOT_PERP_CARRY",
+                  "cross_sectional_funding": "PERP_FUNDING_SPREAD", "cross_interval_funding_dispersion": "PERP_FUNDING_SPREAD", "market_neutral_relative_value": "PERP_FUNDING_SPREAD"}
 POLICY_VENUE = "testnet"                      # the policy's registered SANDBOX classification; this pipeline never connects anywhere
 AUTHORITY_STRATEGY = "multi_symbol_funding_carry_replay"
 ARTIFACT_FILES = ("replay_report.json", "portfolio_state.json", "risk_state.json", "ledger_pnl.json", "competition.json", "opportunities.json")
@@ -63,6 +73,146 @@ _CC_BASIS_BY_PROV = {"MEASURED": "CALCULATED", "VENUE_STATED": "CALCULATED", "DE
 
 class PipelineRefused(ValueError):
     """The pipeline refuses to run: a malformed spec / policy, an unverified history root, a venue that is not a sandbox, a missing injected clock. Nothing ran."""
+
+
+# ======================================================================== identity, data digest, revision, allocation gate, history requirement (pure helpers)
+
+def git_revision(cwd: Optional[str] = None, reader: Optional[Callable[..., Any]] = None) -> str:
+    """``git rev-parse HEAD`` of the checkout this code lives in (through ``provenance.git_commit``, the repo's one git reader; this module spawns nothing itself), or the string
+    'UNKNOWN'. Never invented: any failure, a sentinel, or anything that is not a 40-hex lower-case object name is 'UNKNOWN'."""
+    try:
+        if reader is None:
+            import provenance as _prov
+            reader = _prov.git_commit
+        out = str(reader(cwd or BOT, mark_dirty=False)).strip()
+        return out if re.fullmatch(r"[0-9a-f]{40}", out) else "UNKNOWN"
+    except Exception:                                                       # noqa: BLE001 - a revision is never worth failing a run for; the answer is then 'UNKNOWN'
+        return "UNKNOWN"
+
+
+def data_digest_of(parts: Mapping[str, str]) -> str:
+    """The run's ``data_digest``: sha256 over the canonical JSON of the verified inputs' manifest digests (an absent part is the explicit string 'ABSENT', which is part of the hash, so a
+    run with and without a collector never share a digest). 'UNKNOWN' when nothing is known (injected data, no parts)."""
+    if not parts or all(v == "UNKNOWN" for v in parts.values()):
+        return "UNKNOWN"
+    return hashlib.sha256(json.dumps({str(k): str(v) for k, v in sorted(parts.items())}, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def stamp_identity(arts: Dict[str, Dict[str, Any]], ident: T.RunIdentity) -> Dict[str, Dict[str, Any]]:
+    """EVERY artifact carries the run's identity so a consumer can prove the files belong together."""
+    for a in arts.values():
+        a["identity"] = ident.as_dict()
+    return arts
+
+
+@dataclass(frozen=True)
+class AllocationGate:
+    """May this candidate allocate capital (even simulated)? Decided from the candidate_competition row ONLY; closed: anything not positively promoted is a refusal."""
+    allowed: bool
+    reason: str
+    verdict: str
+    readiness_level: str
+    candidate_id: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"allowed": self.allowed, "reason": self.reason, "verdict": self.verdict, "readiness_level": self.readiness_level, "candidate_id": self.candidate_id}
+
+
+def evaluate_gate(row: Optional[Mapping[str, Any]], *, candidate_id: str) -> AllocationGate:
+    """REJECTED / UNTESTED / INSUFFICIENT_DATA never allocate unless the competition's own ranking put the candidate in its top tier (readiness PROMISING or above). A missing row, a row of
+    another candidate or an unknown verdict is a refusal, never a pass."""
+    if not isinstance(row, Mapping) or not row:
+        return AllocationGate(False, "COMPETITION_ROW_MISSING: no candidate_competition verdict for this candidate; nothing may allocate on an unknown verdict", "UNKNOWN", "UNKNOWN", candidate_id)
+    verdict, level = str(row.get("verdict", "UNKNOWN")), str(row.get("readiness_level", "UNKNOWN"))
+    why = "; ".join(_short(x, 160) for x in list(row.get("rejection_reasons") or [])[:2])
+    if row.get("candidate") != candidate_id:
+        return AllocationGate(False, f"COMPETITION_ROW_IS_FOR_ANOTHER_CANDIDATE: {_short(row.get('candidate'), 80)}", verdict, level, candidate_id)
+    if verdict not in BLOCKING_VERDICTS:
+        return AllocationGate(False, f"COMPETITION_VERDICT_UNRECOGNISED: {_short(verdict, 40)}", verdict, level, candidate_id)
+    if verdict == "REJECTED":
+        return AllocationGate(False, "COMPETITION_VERDICT_REJECTED" + (": " + why if why else ""), verdict, level, candidate_id)
+    if level not in PROMOTED_READINESS:
+        return AllocationGate(False, f"COMPETITION_VERDICT_{verdict}_AT_READINESS_{_short(level, 40)}: below PROMISING a candidate does not allocate" + (": " + why if why else ""), verdict, level, candidate_id)
+    return AllocationGate(True, f"competition readiness {level} (verdict {verdict}); simulated allocation only", verdict, level, candidate_id)
+
+
+def history_requirement(*, formation_days: float, hold_days: float, min_rows: int, first_ms: Optional[int], last_ms: Optional[int], end_ms: int) -> Dict[str, Any]:
+    """The span backfill_plan.required_window says ``min_rows`` independent holding rows need (warmup + formation + rows x hold) against the history the window can actually use."""
+    import backfill_plan as BP
+    w = BP.required_window(None, 1, max(1, int(math.ceil(formation_days))), max(1, int(math.ceil(hold_days))), int(min_rows), 7)
+    avail = None if (first_ms is None or last_ms is None) else max(0.0, (min(int(end_ms), int(last_ms)) - int(first_ms)) / DAY_MS)
+    need = float(w["needed_days"])
+    return {"required_days": need, "available_days": avail, "shortfall_days": None if avail is None else max(0.0, need - avail), "adequate": avail is not None and avail >= need,
+            "components": w["components"], "min_holding_rows": int(min_rows), "formula": w["formula"], "source": "backfill_plan.required_window"}
+
+
+def competition_row_for(candidate_id: str, *, history_root: str, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], ledger_dir: str) -> Optional[Dict[str, Any]]:
+    """The candidate's row of the REAL candidate_competition over the same verified inputs (its persistent multiple-testing ledger lives in ``ledger_dir``). None when the competition has
+    no row for this candidate id."""
+    import candidate_competition as CCMP
+    rep = CCMP.run_competition(data_root=history_root, history_root=history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_dir=ledger_dir)
+    for r in rep["results"]:
+        if r.get("candidate") == candidate_id:
+            return dict(r)
+    return None
+
+
+class StepClock:
+    """PAPER mode's injected clock for the CLI: simulated time that advances one step per call from the window start. Never the wall clock."""
+
+    def __init__(self, start_ms: int, step_ms: int) -> None:
+        self.start_ms, self.step_ms, self.n = int(start_ms), int(step_ms), 0
+
+    def __call__(self) -> int:
+        t = self.start_ms + self.n * self.step_ms
+        self.n += 1
+        return t
+
+
+@dataclass(frozen=True)
+class LoadedHistory:
+    """A history root that went through the VERIFIED loader (``verify_inputs``): the series, the loader's info and the manifest digests of every input part."""
+    series: Sequence[Any]
+    info: Mapping[str, Any]
+    parts: Mapping[str, str]
+
+
+def _manifest_digest(path: str) -> Optional[str]:
+    try:
+        with open(os.path.join(path, "manifest.json"), "rb") as fh:
+            d = json.loads(fh.read().decode("utf-8")).get("manifest_digest")
+        return d if isinstance(d, str) and d else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def input_parts(info: Mapping[str, Any], spot_dir: Optional[str], collector_digest: Optional[str]) -> Dict[str, str]:
+    """Manifest digests of the VERIFIED input parts (from the loader's own info, which only exists after verification). A part that is genuinely absent is 'ABSENT'; a present part whose
+    digest cannot be read is 'UNKNOWN' (and the data_digest then says so for that part)."""
+    ds = info.get("datasets") or {}
+    fund = (ds.get("funding") or {}).get("manifest_digest")
+    marks = sorted(k for k in ds if k != "funding")
+    mark = (ds[marks[0]] or {}).get("manifest_digest") if marks else None
+    uni = (info.get("universe") or {}).get("manifest_sha256")
+    return {"history_funding": fund or "UNKNOWN", "history_mark": mark or "UNKNOWN", "universe": uni or "UNKNOWN",
+            "spot": "ABSENT" if spot_dir is None else (_manifest_digest(spot_dir) or "UNKNOWN"), "collector": collector_digest or "ABSENT"}
+
+
+def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str]) -> LoadedHistory:
+    """The ONLY way a history root enters the pipeline: ``candidate_readiness.load_history_root`` (re-verifies every dataset, the universe capture and the spot snapshot)."""
+    series, label, info = load_series(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+    assert label == DATA_HISTORY
+    return LoadedHistory(tuple(series), info, input_parts(info, spot_dir, None))
+
+
+def _series_span(series: Sequence[Any]) -> Tuple[Optional[int], Optional[int]]:
+    firsts, lasts = [], []
+    for x in series:
+        for seq in (getattr(x, "mark", None), getattr(x, "funding", None)):
+            if seq:
+                firsts.append(seq[0][0])
+                lasts.append(seq[-1][0])
+    return (min(firsts), max(lasts)) if firsts else (None, None)
 
 
 # ======================================================================== ledger adapter (ms_replay's ledger contract over ms_accounting.Ledger)
@@ -387,6 +537,7 @@ class ScanRecorder:
         self.spec, self.candidate_id, self.spec_digest, self.params = dict(spec), candidate_id, spec_digest, dict(params or {})
         self.scans: List[Tuple[int, List[T.Opportunity]]] = []
         self.by_group: Dict[str, T.Opportunity] = {}
+        self.suppress = False                                              # True: the scan is recorded (and shown) but NOTHING is handed to the allocator (the allocation gate said no)
 
     @staticmethod
     def instrument_at(inst: T.Instrument, t_ms: int) -> T.Instrument:
@@ -402,6 +553,8 @@ class ScanRecorder:
         insts = {s: self.instrument_at(i, now) for s, i in instruments.items()}
         opps = SC.scan(insts, snaps, spec=self.spec, candidate_id=self.candidate_id, spec_digest=self.spec_digest, decision_ms=now, params=self.params)
         self.scans.append((now, list(opps)))
+        if self.suppress:
+            return []
         for o in opps:
             if o.legs and not o.exclusions:
                 gid = PF.derive_group_id(o.candidate_id, o.spec_digest, o.decision_ms, [s for s, _ in o.legs])
@@ -427,6 +580,12 @@ def _instrument_for(x: RP.ReplaySeries, cfg: RP.ReplayConfig) -> T.Instrument:
 
 def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[str], mark_interval: Optional[str]) -> Tuple[List[Any], str, Dict[str, Any]]:
     """(series, data_label, info). A string is a market_history root and goes through the VERIFIED loader; anything else is a sequence of injected series (INJECTED_TEST_DATA)."""
+    if isinstance(source, LoadedHistory):
+        info = dict(source.info)
+        ds = info.get("datasets") or {}
+        if not ds or not all(isinstance(v, Mapping) and v.get("verified") is True for v in ds.values()) or not source.series:
+            raise PipelineRefused("LOADED_HISTORY_IS_NOT_A_VERIFIED_LOAD")
+        return list(source.series), DATA_HISTORY, info
     if isinstance(source, str):
         if not universe_dir:
             raise PipelineRefused("UNIVERSE_DIR_REQUIRED_FOR_A_HISTORY_ROOT")
@@ -534,7 +693,8 @@ def _group_kinds(res: RP.ReplayResult, rec: ScanRecorder) -> Dict[str, str]:
 
 
 def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder, series: Sequence[RP.ReplaySeries], policy: Mapping[str, Any], gates: AuthorityGates,
-                     report: Mapping[str, Any], *, label: str, generated_ms: int, spec: Mapping[str, Any], candidate_id: str, universe_scope: str) -> Dict[str, Dict[str, Any]]:
+                     report: Mapping[str, Any], *, label: str, generated_ms: int, spec: Mapping[str, Any], candidate_id: str, universe_scope: str,
+                     gate: Optional[AllocationGate] = None, evidence_basis: Optional[Mapping[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     cfg = res.cfg
     p = led.pnl()
     L = p["ledger"]
@@ -542,7 +702,7 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     hedge_of = {s.symbol: (s.instrument.spot_hedge if s.instrument else "HEDGE_UNKNOWN") for s in series}
     kinds = _group_kinds(res, rec)
     kind_default = str(spec.get("kind", "SPOT_PERP_CARRY"))
-    common = {"generated_ms": int(generated_ms), "data_label": label}
+    common = {"generated_ms": int(generated_ms), "data_label": label, "evidence_basis": dict(evidence_basis or {"data": label, "execution": "MODELLED"})}
 
     # ---- replay_report
     gross = p["price_leg"] + p["funding"] if complete else None             # AT MID: net = gross - fees - slippage (taker walk + adverse selection)
@@ -681,7 +841,11 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     traded = sorted({s for g in res.groups.values() for s in g.symbols})
     indep = int(report["observations"]["independent"]) if isinstance(report.get("observations"), Mapping) else 0
     rprov = _prov_cap(str(report["provenance"]["weakest"]) if isinstance(report.get("provenance"), Mapping) else "ASSUMED", label)
-    if not scans:
+    if gate is not None and not gate.allowed:                                # the competition's own verdict stands: this run did not (and could not) change it
+        top = _short(gate.reason, 260)
+        status, reason = {"REJECTED": ("REJECTED", f"candidate_competition verdict REJECTED: {top}"),
+                          "INSUFFICIENT_DATA": ("INSUFFICIENT_EVIDENCE", f"candidate_competition verdict INSUFFICIENT_DATA, not promoted: {top}")}.get(gate.verdict, ("RESEARCHING", None))
+    elif not scans:
         status, reason = "RESEARCHING", None
     elif n_pos_any == 0:
         status, reason = "REJECTED", f"NO_EDGE_IN_WINDOW: none of {len(scans)} scan(s) had an eligible opportunity with positive net after costs (this window only; not a general rejection)"
@@ -700,12 +864,56 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
 
 # ======================================================================== the run
 
+def classify_status(*, gate: AllocationGate, res: RP.ReplayResult, rec: ScanRecorder, report: Mapping[str, Any], ledger_pnl: Mapping[str, Any], authority: Mapping[str, Any],
+                    history: Mapping[str, Any], min_rows: int, decision_reasons: Mapping[str, int]) -> Dict[str, Any]:
+    """The explicit, machine-readable reason a run produced what it produced. An empty result is a VALID result with one of these codes, never a failure. ``codes`` lists every code that
+    applies (in STATUS_CODES order); ``primary`` is the first, the most fundamental one."""
+    codes: Dict[str, str] = {}
+    n_scans = len(rec.scans)
+    n_pos = sum(1 for _ms, ops in rec.scans for o in ops if not o.exclusions and o.net_bps_horizon is not None and o.net_bps_horizon > 0)
+    if gate.verdict == "REJECTED":
+        codes["REJECTED_CANDIDATE"] = f"candidate_competition rejected {gate.candidate_id}: {gate.reason}"
+    if not history["adequate"]:
+        av = history["available_days"]
+        codes["INADEQUATE_HISTORY"] = (f"{history['min_holding_rows']} independent holding rows need {history['required_days']:.0f} days of history ({history['formula']}); "
+                                       f"{'unknown' if av is None else f'{av:.1f}'} available to this window")
+    if n_pos == 0:
+        codes["NO_OPPORTUNITY"] = f"none of {n_scans} scan(s) had an eligible opportunity with positive net after costs (this window only)"
+    n_groups = len(res.groups)
+    fills = [f for f in res.fills if not f.fill_id.startswith("FORCED")]
+    if not gate.allowed:
+        codes["NO_ALLOCATION"] = gate.reason
+    elif n_pos > 0 and n_groups == 0:
+        top = ", ".join(f"{k}x{v}" for k, v in sorted(decision_reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:3]) or "no allocator decision recorded"
+        codes["NO_ALLOCATION"] = f"the allocator allocated nothing although {n_pos} positive opportunity(ies) were scanned: {top}"
+    refused = int(authority.get("orders_refused", 0)) + int(authority.get("groups_refused_at_registration", 0)) + int(decision_reasons.get("RISK_REJECTED", 0))
+    if gate.allowed and not fills and refused > 0:
+        codes["RISK_REFUSAL"] = f"risk / authority refused: orders={authority.get('order_refusal_codes')} groups={authority.get('registration_refusal_codes')} allocator risk rejections={decision_reasons.get('RISK_REJECTED', 0)}"
+    if gate.allowed and n_groups > 0 and not fills:
+        codes["NO_FILL"] = f"{n_groups} group(s) were submitted and none filled (no maker fill without a strict trade-through; bars never fill by default)"
+    bad = [g for g, st in res.states.items() if (st.value if hasattr(st, "value") else st) in ("UNHEDGED", "UNKNOWN_OUTCOME")]
+    if fills and (not ledger_pnl["net_complete"] or bad):
+        codes["UNKNOWN_OR_UNRECONCILED"] = ("a ledger component is unknown: net is not stated" if not ledger_pnl["net_complete"] else f"{len(bad)} group(s) UNHEDGED or UNKNOWN_OUTCOME at the end of the window")
+    indep = int(report["observations"]["independent"]) if isinstance(report.get("observations"), Mapping) else 0
+    if fills and indep < min_rows:
+        codes["INADEQUATE_SAMPLE"] = f"{indep} independent closed round trip(s) < {min_rows} required (min_holding_rows)"
+    if fills:
+        codes["SIMULATED_EXECUTION"] = "fills exist, every one MODELLED against a simulated venue: not execution evidence"
+    ordered = [c for c in STATUS_CODES if c in codes]
+    return {"primary": ordered[0] if ordered else "NO_OPPORTUNITY", "codes": ordered, "reasons": {c: codes[c] for c in ordered},
+            "independent_observations": indep, "positive_opportunity_scans": n_pos, "n_scans": n_scans, "n_groups": n_groups, "n_fills": len(fills)}
+
+
 def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, spec: Mapping[str, Any], candidate_id: str,
         spec_digest: str, risk_policy: Optional[Mapping[str, Any]] = None, replay_cfg: RP.ReplayConfig, artifacts_dir: str, mode: str = "REPLAY",
         scan_params: Optional[Mapping[str, Any]] = None, generated_ms: Optional[int] = None, clock: Optional[Callable[[], int]] = None, state_dir: Optional[str] = None,
-        aggregate_notional_usd: Optional[float] = None, venue: Optional[EX.SimVenue] = None, store: Optional[Any] = None) -> PipelineResult:
-    """Run the whole stack on SIMULATED transport and write the control-centre artifacts. ``source`` is a history-root path (verified loader) or a list of injected series.
-    ``generated_ms`` (default: the end of the window) and the PAPER ``clock`` are injected: the same inputs give the same artifact bytes."""
+        aggregate_notional_usd: Optional[float] = None, venue: Optional[EX.SimVenue] = None, store: Optional[Any] = None,
+        competition_row: Optional[Mapping[str, Any]] = None, code_revision: str = "UNKNOWN", min_holding_rows: int = 60, trial_ledger: Optional[str] = None,
+        data_parts: Optional[Mapping[str, str]] = None, micro: Any = None) -> PipelineResult:
+    """Run the whole stack on SIMULATED transport and write the control-centre artifacts + ``pipeline_summary.json``. ``source`` is a history-root path or a ``LoadedHistory`` (both go
+    through the VERIFIED loader) or a list of injected series. ``competition_row`` is the candidate's candidate_competition row: a candidate that is REJECTED / UNTESTED / INSUFFICIENT_DATA
+    there (or has no row) allocates NOTHING (the scan is still run and shown). ``generated_ms`` (default: the end of the window) and the PAPER ``clock`` are injected: the same inputs give
+    the same artifact bytes. Every file carries ONE ``identity`` (ms_types.RunIdentity)."""
     if mode not in MODES:
         raise PipelineRefused(f"MODE_MUST_BE_ONE_OF:{MODES}")
     if mode == "PAPER" and clock is None:
@@ -722,9 +930,25 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
         raise PipelineRefused("REPLAY_CFG_SPEC_DIGEST_MISMATCH")
     if not isinstance(artifacts_dir, str) or not artifacts_dir:
         raise PipelineRefused("ARTIFACTS_DIR_REQUIRED")
+    if not (isinstance(code_revision, str) and code_revision.strip()):
+        raise PipelineRefused("CODE_REVISION_REQUIRED_USE_UNKNOWN_WHEN_NOT_KNOWN")
+    if not (isinstance(min_holding_rows, int) and not isinstance(min_holding_rows, bool) and min_holding_rows > 0):
+        raise PipelineRefused("MIN_HOLDING_ROWS_MUST_BE_A_POSITIVE_INTEGER")
 
     raw_series, label, info = load_series(source, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+    if data_parts is not None:
+        parts = dict(data_parts)
+    elif isinstance(source, LoadedHistory):
+        parts = dict(source.parts)
+    elif label == DATA_HISTORY:
+        parts = input_parts(info, spot_dir, None)
+    else:
+        parts = {"injected": "UNKNOWN"}
     series = _to_replay_series(raw_series, replay_cfg)
+    micro_info: Optional[Dict[str, Any]] = None
+    if micro is not None:
+        series, micro_info = apply_micro(series, micro)
+        parts = {**parts, "collector": micro.data_digest()}
     symbols = [s.symbol for s in series]
     scope = str(info.get("survivorship", "SURVIVORS_ONLY"))
     universe_scope = scope if scope in ("SURVIVORS_ONLY", "DELISTINGS_OBSERVED") else "SURVIVORS_ONLY"
@@ -739,6 +963,12 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     if missing_syms:
         raise PipelineRefused("RISK_POLICY_ALLOW_LIST_LACKS:" + ",".join(missing_syms))
 
+    gate = evaluate_gate(competition_row, candidate_id=candidate_id)
+    gen = int(generated_ms if generated_ms is not None else replay_cfg.end_ms)
+    ddig = data_digest_of(parts)
+    ident = T.RunIdentity(run_id=T.derive_run_id(mode=mode, candidate_id=candidate_id, spec_digest=spec_digest, data_digest=ddig, generated_ms=gen), mode=mode, candidate_id=candidate_id,
+                          spec_digest=spec_digest, data_digest=ddig, code_revision=code_revision, generated_ms=gen)
+
     os.makedirs(artifacts_dir, exist_ok=True)
     auth_dir = state_dir or os.path.join(artifacts_dir, "_ms_authority_state")
     if mode == "REPLAY":                                                   # a replay is a fresh world: its authority ledgers start empty (PAPER keeps them)
@@ -752,6 +982,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     params = dict(scan_params or {})
     params.setdefault("hold_days", replay_cfg.hold_ms / DAY_MS)
     recorder = ScanRecorder(spec, candidate_id, spec_digest, params)
+    recorder.suppress = not gate.allowed
     holder: List[LedgerAdapter] = []
     mark_prov = "ASSUMED" if label == DATA_INJECTED else "MEASURED"
 
@@ -765,11 +996,24 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     res = RP.run_replay(series, replay_cfg, scan_fn=recorder, risk_assess=risk_assess, risk_policy=policy, ledger_factory=ledger_factory, store=store, venue=sim_venue,
                         clock=clock, gates=gates)
     led = holder[0]
-    report = RP.build_report([res])
+    trials_total = None
+    if trial_ledger is not None:                                           # the persistent multiple-testing count: this configuration is ONE trial; an identical re-run is the same trial
+        vid = hashlib.sha256(json.dumps([replay_cfg.start_ms, replay_cfg.end_ms, replay_cfg.hold_ms, replay_cfg.decision_every_ms, replay_cfg.portfolio.style, sorted(params.items())],
+                                        sort_keys=True, default=str).encode()).hexdigest()[:16]
+        trials_total = RP.record_trials(trial_ledger, [RP.variant_key(vid, spec_digest)])
+    report = RP.build_report([res], trials_total=trials_total, trials_this_run=1, persistent_trials=trials_total is not None)
     if label == DATA_INJECTED:
         report["provenance"]["weakest"] = T.weakest(str(report["provenance"]["weakest"]), "ASSUMED")
-    gen = int(generated_ms if generated_ms is not None else replay_cfg.end_ms)
-    arts = _build_artifacts(res, led, recorder, series, policy, gates, report, label=label, generated_ms=gen, spec=spec, candidate_id=candidate_id, universe_scope=universe_scope)
+    first_ms, last_ms = _series_span(series)
+    history = history_requirement(formation_days=float(params.get("formation_days", SC.DEFAULT_PARAMS["formation_days"])), hold_days=replay_cfg.hold_ms / DAY_MS,
+                                  min_rows=min_holding_rows, first_ms=first_ms, last_ms=last_ms, end_ms=replay_cfg.end_ms)
+    evidence = {"data": label, "data_parts": dict(sorted(parts.items())), "execution": "MODELLED",
+                "books": "SYNTHETIC_ASSUMED_BOOK_FROM_MARKS (no collector: no measured depth or trades)" if micro_info is None else "MEASURED_BOOK_TAPE_AT_DECISION_TIME (fills still MODELLED)",
+                "microstructure": micro_info,
+                "fills": f"bar_policy={replay_cfg.fill.bar_policy}: a touch is never a fill; maker fills need a strict trade-through", "claim": "SIMULATED; never MEASURED execution"}
+    arts = _build_artifacts(res, led, recorder, series, policy, gates, report, label=label, generated_ms=gen, spec=spec, candidate_id=candidate_id, universe_scope=universe_scope,
+                            gate=gate, evidence_basis=evidence)
+    arts = stamp_identity(arts, ident)
     files: Dict[str, str] = {}
     for name in ARTIFACT_FILES:
         files[name] = os.path.join(artifacts_dir, name)
@@ -780,9 +1024,14 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
             k = str(r).split(":", 1)[0]
             reasons[k] = reasons.get(k, 0) + 1
     assumed = sorted(set(res.assumed) | ({"INSTRUMENT_FILTERS_DEFAULTED"} if label == DATA_HISTORY else set()))
-    summary = {"schema": SCHEMA, "mode": mode, "data_label": label, "generated_ms": gen, "symbols": symbols, "spec": dict(spec), "candidate_id": candidate_id, "spec_digest": spec_digest,
-               "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
-               "ledger": {"net": led.pnl()["net"], "net_complete": led.pnl()["net_complete"], "flags": led.pnl()["flags"][:20], "status": led.pnl()["status"]},
+    pnl = led.pnl()
+    status = classify_status(gate=gate, res=res, rec=recorder, report=report, ledger_pnl=pnl, authority=gates.stats(), history=history, min_rows=min_holding_rows, decision_reasons=reasons)
+    summary = {"schema": SCHEMA, "mode": mode, "data_label": label, "generated_ms": gen, "identity": ident.as_dict(), "data_parts": dict(sorted(parts.items())), "evidence_basis": evidence, "symbols": symbols, "spec": dict(spec),
+               "candidate_id": candidate_id, "spec_digest": spec_digest, "status": status, "gate": gate.as_dict(), "history": history,
+               "sample": {"independent": status["independent_observations"], "min_holding_rows": min_holding_rows, "closed_groups": sum(1 for g in res.groups.values() if g.closed)},
+               "execution": {"evidence": "MODELLED", "books": evidence["books"], "fills": evidence["fills"], "bar_policy": replay_cfg.fill.bar_policy},
+               "trials_total": trials_total, "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
+               "ledger": {"net": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
                "journal_head": res.journal_head, "promotion_eligible": False, "report": report,
                "note": "REPLAY/PAPER on a simulated transport. ONE net everywhere (artifacts, equity curve, observations, this summary): net = gross (price leg AT MID + funding) - fees - "
                        "taker slippage - adverse selection. The taker walk is inside the fill prices (added back to reach mid, then charged once); adverse selection is a modelled "
@@ -793,9 +1042,346 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
 
 
 def file_digests(artifacts_dir: str) -> Dict[str, str]:
-    """sha256 of the six artifacts (for the determinism check)."""
+    """sha256 of the six artifacts and the summary (for the determinism check)."""
     out = {}
-    for name in ARTIFACT_FILES:
+    for name in ARTIFACT_FILES + (SUMMARY_FILE,):
         with open(os.path.join(artifacts_dir, name), "rb") as fh:
             out[name] = hashlib.sha256(fh.read()).hexdigest()
     return out
+
+
+# ======================================================================== the command line: validate every input, then run
+
+class CliRefused(Exception):
+    """A refusal with a machine-readable code. The CLI prints ``{"ok": false, "error": {"code", "message"}}`` and exits 2; nothing ran and nothing was written."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code, self.message = code, message
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> Any:                                    # argparse would print usage to stderr and exit 2: same exit code, but machine readable
+        raise CliRefused("ARGUMENT_ERROR", message)
+
+
+MS_MIN, MS_MAX = 10 ** 12, 10 ** 13                                          # epoch milliseconds (2001 .. 2286): seconds and microseconds are refused, not guessed
+REGISTRY_DIR = os.path.join(BOT, "research", "candidates")
+
+
+@dataclass
+class Validated:
+    history_root: str
+    universe_dir: str
+    spot_dir: str
+    collector_root: Optional[str]
+    artifacts_dir: str
+    ledger_dir: str
+    start_ms: int
+    end_ms: int
+    mark_interval: Optional[str]
+    min_holding_rows: int
+    hold_days: int
+    decision_every_hours: int
+    execution_policy: str
+    risk_policy: Optional[Dict[str, Any]]
+    mode: str
+    clock_ms: int
+    code_revision: str
+    candidate_path: str
+    candidate_spec: Dict[str, Any]
+    candidate_id: str
+    spec_digest: str
+    kind: str
+    loaded: LoadedHistory
+    micro: Any
+    collector_digest: Optional[str]
+    data_digest: str
+    data_parts: Dict[str, str]
+
+
+def _int_arg(v: Any, code: str, what: str, lo: int, hi: Optional[int] = None) -> int:
+    try:
+        n = int(str(v), 10)
+    except (TypeError, ValueError):
+        raise CliRefused(code, f"{what} must be an integer, got {_short(v, 40)!r}") from None
+    if n < lo or (hi is not None and n > hi):
+        raise CliRefused(code, f"{what} out of range [{lo}, {hi if hi is not None else 'inf'}]: {n}")
+    return n
+
+
+def _real(path: str) -> str:
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _is_inside(child: str, parent: str) -> bool:
+    c, p = _real(child), _real(parent)
+    return c == p or c.startswith(p.rstrip(os.sep) + os.sep)
+
+
+def _inside_git(path: str) -> bool:
+    """True when the path, or the nearest existing ancestor of it, is in a git work tree (a ``.git`` directory or file on the way up)."""
+    p = _real(path)
+    while not os.path.exists(p):
+        q = os.path.dirname(p)
+        if q == p:
+            break
+        p = q
+    while True:
+        if os.path.exists(os.path.join(p, ".git")):
+            return True
+        q = os.path.dirname(p)
+        if q == p:
+            return False
+        p = q
+
+
+def _require_dir(path: Any, code: str, what: str) -> str:
+    if not isinstance(path, str) or not path or not os.path.isdir(path) or os.path.islink(path):
+        raise CliRefused(code, f"{what} must be an existing directory (not a symlink): {_short(path, 120)}")
+    return os.path.abspath(path)
+
+
+def _load_candidate(path: str, claimed_digest: Optional[str]) -> Tuple[Dict[str, Any], str, str, str]:
+    import strategy_verdict as SV
+    if not isinstance(path, str) or not os.path.isfile(path):
+        raise CliRefused("CANDIDATE_MISSING", f"candidate spec file not found: {_short(path, 120)}")
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise ValueError("candidate spec larger than 2 MB")
+        spec = json.loads(raw.decode("utf-8"), parse_constant=lambda c: (_ for _ in ()).throw(ValueError("NaN/Infinity")))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise CliRefused("CANDIDATE_UNREADABLE", f"candidate spec is not valid JSON: {_short(exc, 120)}") from None
+    if not isinstance(spec, dict) or not isinstance(spec.get("candidate_id"), str) or not spec["candidate_id"].strip():
+        raise CliRefused("CANDIDATE_UNREADABLE", "candidate spec has no candidate_id")
+    digest = SV.spec_digest(spec)                                            # the SAME digest the competition / harness binds a candidate to
+    in_registry = _is_inside(path, REGISTRY_DIR)
+    if claimed_digest is None and not in_registry:
+        raise CliRefused("CANDIDATE_DIGEST_REQUIRED", "a candidate spec outside research/candidates must come with --candidate-digest (its sha256 spec digest)")
+    if claimed_digest is not None and claimed_digest != digest:
+        raise CliRefused("CANDIDATE_DIGEST_MISMATCH", "the spec file does not match --candidate-digest: it was edited or is another file")
+    kind = CANDIDATE_KIND.get(str(spec.get("family")))
+    if kind is None:
+        raise CliRefused("CANDIDATE_NOT_RUNNABLE", f"family {_short(spec.get('family'), 60)!r} is not runnable by this pipeline (runnable: {sorted(CANDIDATE_KIND)})")
+    return spec, spec["candidate_id"], digest, kind
+
+
+def _load_risk_policy(path: str) -> Dict[str, Any]:
+    try:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > 65_536:
+            raise ValueError("not a regular file of at most 64 KB")
+        with open(path, "rb") as fh:
+            pol = json.loads(fh.read().decode("utf-8"), parse_constant=lambda c: (_ for _ in ()).throw(ValueError("NaN/Infinity")))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise CliRefused("RISK_POLICY_UNREADABLE", f"risk policy file unreadable: {_short(exc, 120)}") from None
+    bad = MR.policy_refusals(pol)
+    if bad:
+        raise CliRefused("RISK_POLICY_REFUSED", "ms_risk's closed schema refuses the policy: " + ",".join(bad)[:300])
+    return dict(pol)
+
+
+def load_collector(root: str) -> Any:
+    """The verified microstructure dataset (``ms_microstructure.load_cycles``: every cycle re-verified). Refused, never degraded, when the module is absent, the cycles do not verify, the
+    dataset is empty, or its cohort was selected with a rule that reads funding (a funding edge may not be evaluated on a funding-selected cohort)."""
+    import importlib
+    try:
+        mm = importlib.import_module("ms_microstructure")
+    except ImportError:
+        raise CliRefused("COLLECTOR_PATH_UNAVAILABLE", "--collector-root needs the ms_microstructure module, which is not in this tree") from None
+    try:
+        ds = mm.load_cycles(root, verify=True)
+    except (ValueError, OSError) as exc:
+        raise CliRefused("COLLECTOR_NOT_VERIFIED", _short(exc, 200)) from None
+    if not ds.verified or ds.problems or any(c.problems for c in ds.cycles):
+        raise CliRefused("COLLECTOR_NOT_VERIFIED", "the collector cycles do not verify: " + "; ".join(list(ds.problems)[:3])[:200])
+    if not ds.symbols():
+        raise CliRefused("COLLECTOR_EMPTY", "the collector root holds no symbol with a recorded book")
+    if not mm.evaluates_funding_edge_ok(ds):
+        raise CliRefused("COLLECTOR_COHORT_FUNDING_SELECTED", f"cohort {_short(ds.cohort_id, 40)} was selected by a rule that reads funding (cohort_v2) or an unknown rule: it must not be used to evaluate a funding edge; "
+                         "use the funding-independent broad history cohort")
+    return ds
+
+
+MICRO_LIMITS = ("NO_SPOT_ORDERBOOK_RECORDED: the spot / hedge leg is REJECTED (NO_RECORDED_BOOK_FOR_CATEGORY), never borrowed from the perp book",
+                "RECENT_TRADE_TAPE_IS_THE_LAST_TRADES_LIMIT_ROWS_PER_CYCLE: busy symbols at 60 s cadence often have TAPE_GAP, which gives no maker fills (raise --trades-limit / shorten the cadence)",
+                "QUEUE_POSITION_ESTIMATED_FROM_VISIBLE_SIZE_ONLY")
+
+
+def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any) -> Tuple[List[RP.ReplaySeries], Dict[str, Any]]:
+    """Give each symbol the collector's MEASURED books (keyed by the collector's local receive time) and tape (only windows whose coverage the tape proves). Symbols without a recorded
+    book are EXCLUDED from a collector run (never traded on a synthetic book beside measured ones) and listed."""
+    import ms_microstructure as MM
+    if not MM.evaluates_funding_edge_ok(micro):
+        raise PipelineRefused("COLLECTOR_COHORT_FUNDING_SELECTED: a funding-selected cohort must not evaluate a funding edge")
+    out: List[RP.ReplaySeries] = []
+    without: List[str] = []
+    for x in series:
+        snaps = sorted((v for v in micro.snapshots(x.symbol) if v.valid), key=lambda v: (v.local_receive_ms, v.cycle))
+        if not snaps:
+            without.append(x.symbol)
+            continue
+        books = tuple((v.local_receive_ms, v.bids, v.asks) for v in snaps)
+        ticks = tuple(sorted({(t[0], t[1], t[2]) for v in snaps if v.tape_complete for t in v.trades}))
+        out.append(dataclasses.replace(x, books=books, ticks=tuple(FM_Tick(a, b, c) for a, b, c in ticks)))
+    if not out:
+        raise PipelineRefused("COLLECTOR_HAS_NO_BOOK_FOR_ANY_HISTORY_SYMBOL")
+    return out, {"symbols_with_micro": [x.symbol for x in out], "symbols_without_micro_excluded": sorted(without), "limits": list(MICRO_LIMITS), "cohort_id": micro.cohort_id}
+
+
+def validate_inputs(ns: argparse.Namespace) -> Validated:
+    """EVERY input is checked before anything runs (existence, the real verifiers, mode, window). Any failure is a ``CliRefused`` with a code. Writes nothing."""
+    if ns.mode not in MODES:
+        extra = (" TESTNET sessions are owned by the separate, owner-invoked ms_testnet_* session tool; this CLI does not accept TESTNET (and there is no mainnet mode)." if ns.mode == "TESTNET" else "")
+        raise CliRefused("MODE_NOT_ACCEPTED", f"mode {_short(ns.mode, 40)!r} is not accepted: this CLI runs {' or '.join(MODES)} only (simulated transport)." + extra)
+    if ns.execution_policy not in ("MAKER_FIRST", "TAKER"):
+        raise CliRefused("EXECUTION_POLICY_INVALID", "--execution-policy must be MAKER_FIRST or TAKER")
+    start = _int_arg(ns.start_ms, "WINDOW_INVALID", "--start-ms", MS_MIN, MS_MAX)
+    end = _int_arg(ns.end_ms, "WINDOW_INVALID", "--end-ms", MS_MIN, MS_MAX)
+    if start >= end:
+        raise CliRefused("WINDOW_INVALID", f"--start-ms {start} must be before --end-ms {end}")
+    rows = _int_arg(ns.min_holding_rows, "MIN_HOLDING_ROWS_INVALID", "--min-holding-rows", 1, 100_000)
+    hold = _int_arg(ns.hold_days, "HOLD_DAYS_INVALID", "--hold-days", 1, 400)
+    every = _int_arg(ns.decision_every_hours, "DECISION_EVERY_INVALID", "--decision-every-hours", 1, 24 * 30)
+    if end - start < hold * DAY_MS:
+        raise CliRefused("WINDOW_INVALID", f"the window ({(end - start) / DAY_MS:.2f} days) is shorter than one hold ({hold} days): nothing could complete")
+    clock = _int_arg(ns.clock_ms if ns.clock_ms is not None else end, "CLOCK_MS_INVALID", "--clock-ms", MS_MIN, MS_MAX)
+    rev = ns.code_revision if ns.code_revision is not None else git_revision()
+    if not (rev == "UNKNOWN" or re.fullmatch(r"[0-9a-f]{40}", str(rev))):
+        raise CliRefused("CODE_REVISION_INVALID", "--code-revision must be a 40-hex git object name or UNKNOWN")
+    if ns.risk_policy is not None and ns.derive_risk_policy:
+        raise CliRefused("RISK_POLICY_CONFLICT", "give EITHER --risk-policy FILE OR --derive-risk-policy, not both")
+    if ns.risk_policy is None and not ns.derive_risk_policy:
+        raise CliRefused("RISK_POLICY_REQUIRED", "a risk policy is required: --risk-policy FILE (ms_risk closed schema) or an explicit --derive-risk-policy")
+    hist = _require_dir(ns.history_root, "HISTORY_ROOT_MISSING", "--history-root")
+    uni = _require_dir(ns.universe_dir, "UNIVERSE_DIR_MISSING", "--universe-dir")
+    spot = _require_dir(ns.spot_dir, "SPOT_DIR_MISSING", "--spot-dir")
+    col = _require_dir(ns.collector_root, "COLLECTOR_ROOT_MISSING", "--collector-root") if ns.collector_root is not None else None
+    inputs = [d for d in (hist, uni, spot, col) if d]
+    # ---- output directories
+    art = os.path.abspath(ns.artifacts_dir)
+    if os.path.islink(art):
+        raise CliRefused("ARTIFACTS_DIR_IS_SYMLINK", "--artifacts-dir may not be a symlink")
+    if not os.path.isdir(os.path.dirname(art)):
+        raise CliRefused("ARTIFACTS_DIR_PARENT_MISSING", f"the parent of --artifacts-dir does not exist: {_short(os.path.dirname(art), 120)}")
+    if any(_is_inside(art, d) or _is_inside(d, art) for d in inputs):
+        raise CliRefused("ARTIFACTS_DIR_IS_AN_INPUT", "--artifacts-dir is, contains or sits inside an input dataset: an existing dataset is never an output directory")
+    if _inside_git(art):
+        raise CliRefused("ARTIFACTS_DIR_INSIDE_GIT", "--artifacts-dir is inside a git work tree: run output is never committed")
+    if os.path.exists(art) and (not os.path.isdir(art) or os.listdir(art)):
+        raise CliRefused("ARTIFACTS_DIR_NOT_EMPTY", "--artifacts-dir must be a NEW or EMPTY directory")
+    led = os.path.abspath(ns.ledger_dir)
+    if _is_inside(led, art) or _is_inside(art, led):
+        raise CliRefused("LEDGER_DIR_INSIDE_ARTIFACTS_DIR", "--ledger-dir and --artifacts-dir may not contain one another (the ledger is persistent, the artifacts are per run)")
+    if _is_inside(led, os.path.join(BOT, "state")) or _inside_git(led) or any(_is_inside(led, d) for d in inputs):
+        raise CliRefused("LEDGER_DIR_REFUSED", "--ledger-dir may not be under bot/state, inside a git work tree or inside an input dataset")
+    if os.path.islink(led) or (os.path.exists(led) and not os.path.isdir(led)) or not os.path.isdir(os.path.dirname(led)):
+        raise CliRefused("LEDGER_DIR_REFUSED", "--ledger-dir must be a directory (or a new one in an existing parent), not a symlink")
+    # ---- candidate, policy file
+    spec, cid, digest, kind = _load_candidate(ns.candidate, ns.candidate_digest)
+    policy = None
+    if ns.risk_policy is not None:
+        policy = _load_risk_policy(ns.risk_policy)
+        if policy["candidate_id"] != cid or policy["spec_digest"] != digest:
+            raise CliRefused("RISK_POLICY_CANDIDATE_MISMATCH", "the risk policy names another candidate or spec digest than --candidate")
+    micro = load_collector(col) if col else None
+    coll_digest = micro.data_digest() if micro is not None else None
+    # ---- the real verifiers
+    try:
+        loaded = verify_inputs(hist, universe_dir=uni, spot_dir=spot, mark_interval=ns.mark_interval)
+    except PipelineRefused as exc:
+        raise CliRefused("INPUT_NOT_VERIFIED", _short(exc, 400)) from None
+    parts = dict(loaded.parts)
+    if coll_digest:
+        parts["collector"] = coll_digest
+    first, last = _series_span(loaded.series)
+    if first is None or end < first or start > last:
+        raise CliRefused("WINDOW_OUTSIDE_DATA", f"the window [{start}, {end}] does not overlap the verified history [{first}, {last}]: nothing could be tested")
+    if policy is not None:
+        lacks = sorted({s.symbol for s in loaded.series} - set(policy["allowed_symbols"]))
+        if lacks:
+            raise CliRefused("RISK_POLICY_ALLOW_LIST_LACKS", "the risk policy allow-list lacks verified symbols (it is never widened): " + ",".join(lacks)[:200])
+    return Validated(hist, uni, spot, col, art, led, start, end, ns.mark_interval, rows, hold, every, ns.execution_policy, policy, ns.mode, clock, rev, os.path.abspath(ns.candidate), spec, cid,
+                     digest, kind, loaded, micro, coll_digest, data_digest_of(parts), parts)
+
+
+def build_replay_config(v: Validated) -> RP.ReplayConfig:
+    style = v.execution_policy
+    portfolio = PF.PortfolioPolicy(style=style, max_wait_ms=3 * RP.MS_H) if style == "MAKER_FIRST" else PF.PortfolioPolicy(style=style)
+    # the conservative fill policy: bar_policy NO_FILL (a bar never fills an order; no measured trades => no maker fill)
+    return RP.ReplayConfig(start_ms=v.start_ms, end_ms=v.end_ms, hold_ms=v.hold_days * DAY_MS, decision_every_ms=v.decision_every_hours * RP.MS_H, spec_digest=v.spec_digest, portfolio=portfolio)
+
+
+def _emit(doc: Mapping[str, Any]) -> None:
+    sys.stdout.write(json.dumps(doc, sort_keys=True, allow_nan=False, default=str) + "\n")
+    sys.stdout.flush()
+
+
+def _add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--history-root", required=True, help="market_history root (funding/, mark-kline-<interval>/); re-verified before anything runs")
+    p.add_argument("--universe-dir", required=True, help="verified universe_capture directory")
+    p.add_argument("--spot-dir", required=True, help="verified spot-instruments snapshot directory (hedgeability)")
+    p.add_argument("--collector-root", default=None, help="optional microstructure collector root: decision-time books and trades (needs ms_microstructure; refused when unavailable)")
+    p.add_argument("--artifacts-dir", required=True, help="a NEW or EMPTY directory outside git (never an existing dataset)")
+    p.add_argument("--ledger-dir", required=True, help="persistent directory for the multiple-testing trial ledgers (candidate_competition + this pipeline's trials)")
+    p.add_argument("--start-ms", required=True, help="window start, epoch ms")
+    p.add_argument("--end-ms", required=True, help="window end, epoch ms")
+    p.add_argument("--candidate", required=True, help="candidate spec JSON: a file under research/candidates, or any file together with --candidate-digest")
+    p.add_argument("--candidate-digest", default=None, help="sha256 spec digest the --candidate file must have (required outside research/candidates)")
+    p.add_argument("--mark-interval", default=None, help="mark-kline interval of the history root (default: the loader's own single-dataset rule)")
+    p.add_argument("--min-holding-rows", default="60", help="independent holding rows a claim needs (sets the required history span and the sample check)")
+    p.add_argument("--hold-days", default="7", help="holding period in whole days")
+    p.add_argument("--decision-every-hours", default="8", help="hours between allocation decisions")
+    p.add_argument("--execution-policy", required=True, help="MAKER_FIRST or TAKER")
+    p.add_argument("--risk-policy", default=None, help="risk policy JSON, validated by ms_risk's closed schema")
+    p.add_argument("--derive-risk-policy", action="store_true", help="derive a conservative policy from the verified symbol allow-list (explicit opt-in)")
+    p.add_argument("--mode", default="REPLAY", help="REPLAY or PAPER (simulated transport both; TESTNET is not accepted here)")
+    p.add_argument("--clock-ms", default=None, help="the run's fixed timestamp for determinism (default: --end-ms; the wall clock is never read)")
+    p.add_argument("--code-revision", default=None, help="40-hex git revision stamped on the artifacts (default: git rev-parse HEAD, else UNKNOWN)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = _Parser(prog="ms_pipeline", description="Multi-symbol carry pipeline: REPLAY / PAPER on a SIMULATED transport only (no network, no credential, no order). "
+                 "Exit 0 = ran (an empty result is a valid result with an explicit status code), exit 2 = refused (machine-readable error on stdout).")
+    sub = ap.add_subparsers(dest="command", required=True)
+    _add_common(sub.add_parser("validate", help="verify every input and print the identity parts; write nothing"))
+    _add_common(sub.add_parser("run", help="validate, run the pipeline and write the six control-centre artifacts + pipeline_summary.json"))
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        ns = build_parser().parse_args(argv)
+        v = validate_inputs(ns)
+        base = {"ok": True, "command": ns.command, "candidate": {"candidate_id": v.candidate_id, "spec_digest": v.spec_digest, "kind": v.kind}, "data_parts": dict(sorted(v.data_parts.items())),
+                "data_digest": v.data_digest, "mode": v.mode, "window": {"start_ms": v.start_ms, "end_ms": v.end_ms}, "code_revision": v.code_revision}
+        if ns.command == "validate":
+            _emit(base)
+            return 0
+        os.makedirs(v.ledger_dir, exist_ok=True)
+        warnings: List[str] = []
+        try:
+            row = competition_row_for(v.candidate_id, history_root=v.history_root, universe_dir=v.universe_dir, spot_dir=v.spot_dir, mark_interval=v.mark_interval, ledger_dir=v.ledger_dir)
+        except (ValueError, OSError, KeyError) as exc:                       # the competition could not run: its verdict is unknown, and an unknown verdict allocates nothing
+            row = None
+            warnings.append("COMPETITION_FAILED:" + _short(exc, 160))
+        cfg = build_replay_config(v)
+        pr = run(v.loaded, spec={"kind": v.kind, "style": v.execution_policy}, candidate_id=v.candidate_id, spec_digest=v.spec_digest, risk_policy=v.risk_policy, replay_cfg=cfg,
+                 artifacts_dir=v.artifacts_dir, mode=v.mode, generated_ms=v.clock_ms, clock=StepClock(v.start_ms, cfg.step_ms) if v.mode == "PAPER" else None, competition_row=row, micro=v.micro,
+                 code_revision=v.code_revision, min_holding_rows=v.min_holding_rows, trial_ledger=os.path.join(v.ledger_dir, "ms_pipeline_trials.jsonl"), data_parts=v.data_parts)
+        _emit({**base, "artifacts_dir": v.artifacts_dir, "identity": pr.summary["identity"], "status": {"primary": pr.summary["status"]["primary"], "codes": pr.summary["status"]["codes"]},
+               "files": {n: os.path.basename(p) for n, p in sorted(pr.files.items())}, "digests": file_digests(v.artifacts_dir), "warnings": warnings})
+        return 0
+    except CliRefused as exc:
+        _emit({"ok": False, "error": {"code": exc.code, "message": exc.message}})
+        return 2
+    except PipelineRefused as exc:
+        _emit({"ok": False, "error": {"code": "PIPELINE_REFUSED", "message": _short(exc, 400)}})
+        return 2
+
+
+if __name__ == "__main__":
+    # run as ``python3 tools/ms_pipeline.py`` this module is ``__main__``, and ms_authority only accepts the whitelisted ``ms_pipeline.SimulatedTransport``: hand over to the real module
+    import ms_pipeline as _self
+    sys.exit(_self.main())

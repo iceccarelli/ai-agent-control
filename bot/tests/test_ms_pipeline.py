@@ -40,6 +40,7 @@ CAND, DIGEST = "cand_carry_v1", "d" * 64
 SPEC = {"kind": "SPOT_PERP_CARRY", "style": "MAKER_FIRST"}
 FILL = FM.FillParams(bar_policy="ASSUME_THROUGH_MULT", bar_through_mult=1.0, markout_mean_bps=1.0)
 GROUP_STATES = {s.value for s in T.GroupState}
+PROMOTED_ROW = {"candidate": CAND, "name": "cash_and_carry", "verdict": "INSUFFICIENT_DATA", "readiness_level": "PROMISING", "rejection_reasons": []}
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +87,7 @@ def go(tmp_path, series=None, c=None, name="art", spec=SPEC, **kw):
     if "persistence" in MP.SC.DEFAULT_PARAMS:                    # the scanner's modelled funding-persistence haircut is a separate knob: these proofs plant EXACT funding and check the arithmetic, so it is off (1.0)
         params.setdefault("persistence", 1.0)
     kw["scan_params"] = params
+    kw.setdefault("competition_row", PROMOTED_ROW)                  # these proofs are about the stack, not the gate: the candidate is promoted (test_ms_pipeline_cli covers the gate)
     return MP.run(series if series is not None else world(), spec=spec, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c or cfg(), artifacts_dir=str(tmp_path / name), **kw)
 
 
@@ -741,7 +743,8 @@ def test_same_inputs_give_identical_artifact_bytes(tmp_path):
     assert d1 != d3 and art(c, "ledger_pnl.json")["generated_ms"] == T0 + 20 * D          # only the injected generated_ms differs ...
     for n in MP.ARTIFACT_FILES:
         x, y = art(a, n), art(c, n)
-        x.pop("generated_ms"), y.pop("generated_ms")
+        for z in (x, y):
+            z.pop("generated_ms"), z.pop("identity")                                       # the stamp (and the run id derived from it) is the only thing that moves
         assert x == y                                                                       # ... and nothing else
 
 
@@ -750,7 +753,11 @@ def test_paper_mode_is_the_same_code_with_an_injected_clock_and_simulated_transp
     p = go(tmp_path, world(), cfg(end_ms=T0 + 6 * D), name="paper", mode="PAPER", clock=lambda: next(ticks))
     r = go(tmp_path, world(), cfg(end_ms=T0 + 6 * D), name="replay")
     assert p.mode == "PAPER" and r.mode == "REPLAY" and p.summary["mode"] == "PAPER"
-    assert MP.file_digests(str(tmp_path / "paper")) == MP.file_digests(str(tmp_path / "replay"))
+    for n in MP.ARTIFACT_FILES:                                                             # identical but for the identity block (its mode and run id differ by design)
+        x, y = art(p, n), art(r, n)
+        assert x["identity"]["mode"] == "PAPER" and y["identity"]["mode"] == "REPLAY"
+        x.pop("identity"), y.pop("identity")
+        assert x == y
     assert p.gates.authority.mode == "SIMULATED" and all(f.prov in ("SIMULATED", "MODELLED") for f in p.result.fills)
     check_consistent(p)
 
@@ -1020,7 +1027,7 @@ def test_a_verified_history_root_goes_through_the_loader_and_is_labelled_not_inj
     root, uni, spot = TCR._hist(tmp_path)
     c = RP.ReplayConfig(start_ms=TMH.FIRST + 20 * TMH.H8, end_ms=TMH.FIRST + 40 * TMH.H8, fill=FILL, hold_ms=2 * D, decision_every_ms=8 * H, spec_digest=DIGEST,
                         portfolio=PF.PortfolioPolicy(max_wait_ms=3 * H, style="MAKER_FIRST"))
-    pr = MP.run(root, universe_dir=uni, spot_dir=spot, mark_interval=TCR.MARK_IV, spec=SPEC, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c, artifacts_dir=str(tmp_path / "hist_art"))
+    pr = MP.run(root, universe_dir=uni, spot_dir=spot, mark_interval=TCR.MARK_IV, spec=SPEC, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c, artifacts_dir=str(tmp_path / "hist_art"), competition_row=PROMOTED_ROW)
     assert pr.data_label == "VERIFIED_HISTORY_ROOT" and art(pr, "replay_report.json")["data_label"] == "VERIFIED_HISTORY_ROOT"
     assert art(pr, "replay_report.json")["universe_scope"] == "DELISTINGS_OBSERVED"          # what the loader reported (its Closed partition served rows) ...
     assert cc_state(pr)["execution"]["survivorship"]["survivorship_free"] is False           # ... is still not believed without a verified universe capture beside it in the control centre
