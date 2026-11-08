@@ -154,3 +154,28 @@ def lay_out(tmp, trip, *, execs=None, txlog=None, w0=None, w1=None, with_wallets
     if trip.spot and spot_exec:
         pairs.append(("spot_execution", write_jsonl(tmp / "exec_spot.jsonl", trip.spot_executions())))
     return pairs
+
+
+def interest_row(n, ts, amount, bal, currency="USDT"):
+    """A USDT INTEREST statement line (negative = interest paid): change = cashFlow + funding - fee with only ``change`` non-zero is not allowed, so it is a cashFlow."""
+    return {"id": f"{n}_INTEREST_{ts}", "tradeId": "", "transactionTime": str(ts), "type": "INTEREST", "category": "", "symbol": "", "side": "", "size": "0",
+            "currency": currency, "feeRate": "", "funding": "0", "fee": "0", "cashFlow": repr(amount), "change": repr(amount), "cashBalance": repr(bal)}
+
+
+def with_interest(rows, ts, amount, n=900):
+    """``rows`` (a Trip.txlog()) plus one interest line at ``ts``; every later USDT running balance moves by ``amount``. -> (rows, closing_usdt_delta)."""
+    out, before = [], 0.0
+    for r in sorted(rows, key=lambda r: int(r["transactionTime"])):
+        if r["currency"] == "USDT" and int(r["transactionTime"]) <= ts:
+            before = float(r["cashBalance"])
+    placed = False
+    for r in sorted(rows, key=lambda r: int(r["transactionTime"])):
+        if not placed and int(r["transactionTime"]) > ts:
+            out.append(interest_row(n, ts, amount, before + amount))
+            placed = True
+        if placed and r["currency"] == "USDT":
+            r = dict(r, cashBalance=repr(float(r["cashBalance"]) + amount))
+        out.append(r)
+    if not placed:
+        out.append(interest_row(n, ts, amount, before + amount))
+    return out

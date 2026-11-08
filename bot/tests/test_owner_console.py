@@ -54,7 +54,7 @@ def test_an_armed_environment_is_flagged_secrets_are_never_printed_and_capital_s
     text = json.dumps(rep)
     assert rep["environment"]["live_authorized"] is True and any("REAL MONEY IS ARMED" in f for f in rep["environment"]["findings"])
     assert "KEYVALUE12345" not in text and "SECRETVALUE6789" not in text and "I_UNDERSTAND" not in text
-    assert rep["environment"]["secrets"] == {"BYBIT_API_KEY": "set", "BYBIT_API_SECRET": "set", "LIVE_TRADING_ACK": "set"}
+    assert rep["environment"]["secrets"] == {"BYBIT_API_KEY": "set", "BYBIT_API_SECRET": "set", "LIVE_TRADING_ACK": "set", "OWNER_ATTESTATION_KEY": "unset"}
     assert rep["capital"]["capital_usd"] == 0.0
     assert rep["eligibility"]["owner_authorised"]["met"] is False               # armed flags alone are not the signed gate
     for k, v in LIVE.items():
@@ -122,3 +122,29 @@ def test_the_console_shows_the_risk_policy_as_proposed_and_not_active():
     assert r["status"] == OC.ESTIMATED and r["policy_active"] is False and r["evaluation_without_an_approved_policy"] == ("NO_APPROVED_POLICY",)
     assert "OWNER DECISION REQUIRED" in r["decision"] and "per_trade_loss_usd" in r["unmeasured_limits"]
     assert 0.0 <= r["share_of_history_below_hurdle_requirement"] <= 1.0
+
+
+def test_the_console_lists_every_candidate_with_a_verdict_and_none_is_promoted():
+    s = OC.build({}, now_ms=LATER)["strategies"]
+    assert s["status"] in OC.STATUSES and len(s["candidates"]) >= 9                       # the frozen BTC description + the 8 mechanism templates
+    assert "btcusdt_funding_carry_overlay@prospective-1" in s["candidates"]
+    assert set(s["verdict_counts"]) == {"UNTESTED"} and s["candidates"]["btcusdt_funding_carry_overlay@prospective-1"]["spec_problems"] == 2 and all(c["spec_problems"] > 0 for k, c in s["candidates"].items() if not k.startswith("btcusdt_"))   # the BTC description truthfully declares depth and basis/margin missing (2 problems); templates lack the data they name; none is registrable
+
+
+def test_the_console_never_reports_a_verdict_above_untested_without_evidence():
+    """No registry, key or anchor is read by the console: it cannot display PROMISING or above for anything."""
+    s = OC.section_strategies()
+    assert set(s["verdict_counts"]) == {"UNTESTED"}
+
+
+def test_rt4_the_owner_attestation_key_is_reported_by_presence_and_flagged_on_an_app_host():
+    key = "ownerkeyVALUE-0123456789-abcdefghijklmnop"
+    on_own_machine = OC.build({"OWNER_ATTESTATION_KEY": key}, now_ms=LATER)["environment"]
+    assert on_own_machine["secrets"]["OWNER_ATTESTATION_KEY"] == "set" and on_own_machine["findings"] == []        # positive control: no BYBIT_* here
+    assert OC.build({}, now_ms=LATER)["environment"]["secrets"]["OWNER_ATTESTATION_KEY"] == "unset"
+    for host in ({"BYBIT_API_KEY": "KEYVALUE12345"}, {"BYBIT_VENUE": "testnet"}, {"BYBIT_API_SECRET": "SECRETVALUE6789"}):
+        rep = OC.build(dict(host, OWNER_ATTESTATION_KEY=key), now_ms=LATER)
+        env = rep["environment"]
+        assert any("OWNER_ATTESTATION_KEY" in f and "app host" in f for f in env["findings"]), host
+        assert key not in json.dumps(rep) and env["status"] == OC.PROVISIONAL                                         # presence only, never the value
+    assert not any("OWNER_ATTESTATION_KEY" in f for f in OC.build({"BYBIT_API_KEY": "KEYVALUE12345"}, now_ms=LATER)["environment"]["findings"])

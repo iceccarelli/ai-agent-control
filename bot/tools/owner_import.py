@@ -48,6 +48,11 @@ STATUSES = ("VERIFIED", "RECONCILED", "ESTIMATED", "PROVISIONAL", "STALE", "DISP
 _RANK = ("DISPUTED", "UNAVAILABLE", "INCOMPLETE", "STALE", "PROVISIONAL", "ESTIMATED", "RECONCILED", "VERIFIED")
 #: statuses that may carry a headline profit number
 _PROFIT_OK = ("RECONCILED", "PROVISIONAL", "ESTIMATED")
+#: What the headline number IS. It is the perp-side realised cash only (fills, fees, funding, interest, statement lines). It EXCLUDES the value change of the owned BTC and the
+#: perp's unrealised P&L, so it can be positive while the economic total is negative. It is not "profit"; the economic total is layers.economic_total.net_economic_pnl_usd.
+HEADLINE_BASIS = "realised_cash_only"
+HEADLINE_CAVEAT = ("realised perp cash only: excludes the value change of the owned BTC and perp unrealised P&L. It is NOT total profit and can be positive while the economic total "
+                   "(layers.economic_total.net_economic_pnl_usd) is negative.")
 
 ROLES = ("linear_execution", "spot_execution", "transaction_log", "wallet_opening", "wallet_closing")
 ROLE_TYPE = {"linear_execution": "execution", "spot_execution": "execution", "transaction_log": "transaction_log",
@@ -239,6 +244,8 @@ def _check_execution_rows(rows: List[Dict[str, Any]], role: str, label: str, fla
             else:
                 raise ImportRefused("SCHEMA", f"{w}: spot feeCurrency {cur!r} is not USDT or BTC")
         else:
+            if cur not in ("", "USDT", "USDC"):
+                raise ImportRefused("UNIT", f"{w}: a linear-perpetual execFee in feeCurrency {cur!r}: only a USDT/USDC fee is a USD amount (a fee in another coin is not summed as dollars)")
             if "isMaker" in r and not isinstance(r["isMaker"], bool) and str(r["isMaker"]).lower() not in ("true", "false"):
                 raise ImportRefused("SCHEMA", f"{w}: isMaker must be a boolean")
             if fee == 0 and fr in (None, ""):
@@ -386,6 +393,7 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
     by_role: Dict[str, List[Tuple[str, List[Dict[str, Any]]]]] = {}
     wallets: Dict[str, Dict[str, Any]] = {}
     lineage: List[Dict[str, Any]] = []
+    ent_of: Dict[int, Dict[str, Any]] = {}
     seen_real = set()
     for role, path in inputs:
         if role not in ROLES:
@@ -405,6 +413,7 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
                 raise ImportRefused("SCHEMA", f"{role} given twice")
             wallets[role] = _wallet(content, label)
             wallets[role]["label"] = label
+            wallets[role]["sha256"], wallets[role]["file"] = sha, os.path.basename(real)
             ent["rows"] = 1
             ent["first_ts_ms"] = ent["last_ts_ms"] = wallets[role]["ts_ms"]
         else:
@@ -414,6 +423,7 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
             ent["rows"] = len(content)
             ent["first_ts_ms"], ent["last_ts_ms"] = min(tss), max(tss)
             by_role.setdefault(role, []).append((label, content))
+            ent_of[id(content)] = ent
         ent["first_ts_utc"], ent["last_ts_utc"] = AR._iso(ent["first_ts_ms"]), AR._iso(ent["last_ts_ms"])
         lineage.append(ent)
     lineage.sort(key=lambda e: (e["role"], e["sha256"]))
@@ -438,11 +448,16 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
         dup_dropped += n
         disputes += d
     duplicates = {"identical_dropped": dup_dropped, "conflicting": disputes}
+    reg, in_file_dups = _registry(by_role, ent_of)
+    if in_file_dups:
+        _flag(flags, "DUPLICATE_PAGE_IN_FILE", "GAP", f"{len(in_file_dups)} identical record(s) repeated inside ONE file (a page exported twice): dropped and counted, but a file that repeats itself "
+              "is not a clean export, so the account is not reconciled until it is re-exported", [d["record_id"] for d in in_file_dups[:5]])
+    stages = _stages(lineage, wallets, reg, dup_dropped, in_file_dups, disputes)
     base = {"schema": IMPORTER_VERSION, "import_id": import_id, "provenance": PROVENANCE, "authorizes_trading": False, "changes_any_status": False,
-            "lineage": {"files": lineage, "marks": mk, "formats_refused_by_name": list(UNVERIFIED_FORMAT)},
+            "lineage": {"files": lineage, "marks": mk, "formats_refused_by_name": list(UNVERIFIED_FORMAT), "chain": list(CHAIN), "stages": stages},
             "duplicates": duplicates, "parameters": {k: v for k, v in params.items() if k != "marks"}}
     if disputes:
-        return _seal(dict(base, status="DISPUTED", headline_profit_usd=None, layers={}, flags=[{"code": "CONFLICTING_DUPLICATE", "severity": "HARD", "detail":
+        return _seal(dict(base, status="DISPUTED", headline_realised_cash_usd=None, headline_basis=HEADLINE_BASIS, headline_caveat=HEADLINE_CAVEAT, layers={}, flags=[{"code": "CONFLICTING_DUPLICATE", "severity": "HARD", "detail":
                      f"{len(disputes)} record id(s) appear twice with different content: which is the record is not decidable; nothing is computed",
                      "examples": [d["id"] for d in disputes[:5]]}], reading="records contradict each other; no result is stated"))
 
@@ -577,15 +592,29 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
             net = float(opening_perp_qty) + math.fsum(f.signed_qty for f in fills)
             if abs(last_size - net) > AR.POSITION_ABS_TOL + 1e-3 * abs(net):
                 _flag(flags, "POSITION_MISMATCH", "HARD", f"the executions imply a position of {net} but the transaction log's last TRADE row leaves {last_size}")
-    return _seal(_assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, bool(w0 and w1), mk, lineage))
+    prov = {"reg": reg, "w0": w0, "w1": w1, "opening_perp_qty": float(opening_perp_qty),
+            "grid": {f.exec_id: f.grid_ms for f in funding}}
+    return _seal(_assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, bool(w0 and w1), mk, lineage, prov=prov))
 
 
 def _rep_flag_codes(rep: Mapping[str, Any], sev: str) -> List[str]:
     return sorted({f["code"] for f in rep["flags"] if f["severity"] == sev})
 
 
-def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, anchored, mk, lineage) -> Dict[str, Any]:
+def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, anchored, mk, lineage, prov=None) -> Dict[str, Any]:
     """Map the ledger's verdict and the importer's own flags to the status vocabulary. The mapping is the whole decision; it adds no arithmetic."""
+    b = rep["equity_bridge"]
+    if b is not None:
+        fig = {"perp_realised_usd": b["perp_realised_usd"], "perp_fees_usd": b["perp_fees_usd"], "funding_net_usd": b["funding_net_usd"], "interest_usd": b["interest_usd"],
+               "other_cash_lines_usd": b["other_cash_lines_usd"]}
+    else:
+        pr = OL.perp_average_entry(fills) if fills else None
+        fig = {"perp_realised_usd": pr["realised_usd"] if pr else 0.0, "perp_fees_usd": -math.fsum(f.fee_usd for f in fills),
+               "funding_net_usd": math.fsum(f.payment_usd for f in funding), "interest_usd": None, "other_cash_lines_usd": None}
+    lin_figs: Dict[str, Any] = {}
+    if prov is not None:
+        lin_figs, lin_flags = _figure_sources(fig, b, prov, anchored)
+        flags.extend(lin_flags)
     my_hard = [f for f in flags if f["severity"] == "HARD"]
     my_gap = [f for f in flags if f["severity"] == "GAP" and f["code"] not in ("INVENTORY_UNVALUED", "MARK_STALE", "NO_BALANCE_ANCHOR")]
     verdict = rep["verdict"]
@@ -602,14 +631,6 @@ def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, an
     else:
         realised_status = "PROVISIONAL"        # consistent, but not anchored to two balance snapshots (or the inventory is unvalued)
     perp = rep.get("perp_position")
-    b = rep["equity_bridge"]
-    if b is not None:
-        fig = {"perp_realised_usd": b["perp_realised_usd"], "perp_fees_usd": b["perp_fees_usd"], "funding_net_usd": b["funding_net_usd"], "interest_usd": b["interest_usd"],
-               "other_cash_lines_usd": b["other_cash_lines_usd"]}
-    else:
-        pr = OL.perp_average_entry(fills) if fills else None
-        fig = {"perp_realised_usd": pr["realised_usd"] if pr else 0.0, "perp_fees_usd": -math.fsum(f.fee_usd for f in fills),
-               "funding_net_usd": math.fsum(f.payment_usd for f in funding), "interest_usd": None, "other_cash_lines_usd": None}
     settlements = (rep.get("perp_review") or {}).get("settlements") or {}
     missing_settle = settlements.get("missing", 0) or 0
     net = None
@@ -642,11 +663,13 @@ def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, an
         econ_net = net + b["btc_economic_pnl_usd"] + b["change_in_perp_unrealised_usd"]
     if econ_net is None and econ_status in ("RECONCILED", "ESTIMATED", "PROVISIONAL"):
         econ_status = "UNAVAILABLE"
-    economic = {"status": econ_status, "net_economic_pnl_usd": econ_net,
+    economic = {"status": econ_status, "net_economic_pnl_usd": econ_net, "basis": "economic_total: the figure a strategy verdict binds to (not headline_realised_cash_usd)",
                 "reading": "withheld (null) while a mark is stale or missing. realised cash P&L + BTC economic P&L at the supplied marks + change in perpetual unrealised P&L; withheld while any part is not computable"}
     status = realised_status
     unchecked = list(ledger_unrun) + ["no exchange authentication: files are the owner's, a digest proves bytes, not origin"]
-    return dict(base, status=status, headline_profit_usd=(net if status in _PROFIT_OK else None),
+    if prov is not None:
+        base = _complete_lineage(base, lin_figs, prov, realised_status, inv, b, flags, rep, unvalued, stale, unchecked, economic)
+    return dict(base, status=status, headline_realised_cash_usd=(net if status in _PROFIT_OK else None), headline_basis=HEADLINE_BASIS, headline_caveat=HEADLINE_CAVEAT,
                 partial_figures=(fig if status not in _PROFIT_OK else None), layers={"realised_cash": realised, "inventory_valuation": inv, "economic_total": economic},
                 ledger={"verdict": rep["verdict"], "residuals": rep["residuals"], "window": rep["window"], "records": rep["records"]},
                 flags=sorted(flags + [dict(f) for f in rep["flags"] if f["severity"] != "INFO"], key=lambda f: (f["severity"], f["code"])),
@@ -654,12 +677,284 @@ def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, an
                 reading="RECONCILED means the owner's files agree with each other and with the two balances; it is not exchange-authenticated.")
 
 
+
+# ---------------------------------------------------------------- evidence lineage: raw row -> normalized record -> validation -> dedup -> reconciliation -> uncertainty -> ledger -> owner P&L
+CHAIN = ("raw record", "normalized record", "validation", "dedup", "reconciliation", "uncertainty", "ledger", "owner P&L")
+BASES = ("realized", "unrealized", "estimated", "provisional", "reconciled", "incomplete")
+#: numeric leaves under these roots are FIGURES: each needs a lineage entry (or an explicit null with its reason). Counts / timestamps / the marks themselves are inputs, not figures
+_FIGURE_ROOTS = ("headline_realised_cash_usd", "partial_figures", "layers", "ledger.residuals")
+_NOT_FIGURES = ("layers.realised_cash.settlements", "layers.inventory_valuation.marks_used")
+_LIN_TOL = dict(rel_tol=1e-9, abs_tol=1e-6)
+
+
+def _rec_id(role: str, r: Mapping[str, Any]) -> str:
+    if ROLE_TYPE[role] == "execution":
+        return "exec:" + str(r["execId"]).strip()
+    return "txlog:" + f"{str(r['id']).strip()}|{str(r.get('tradeId') or '').strip()}|{r.get('transactionTime')}|{str(r['currency']).strip().upper()}"
+
+
+def _registry(by_role, ent_of) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]]]:
+    """The KEPT normalized records in file order, each with its raw-row source (file sha256 + 1-based row index among the file's records) and a digest of
+    the raw row; plus identical repeats found inside ONE file. Replays ``_dedupe_rows`` exactly (first occurrence wins)."""
+    reg: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    in_file: List[Dict[str, Any]] = []
+    for role, parts in by_role.items():
+        kind = ROLE_TYPE[role]
+        seen: Dict[str, Tuple[Dict[str, Any], int]] = {}
+        for _label, rows in parts:
+            ent = ent_of[id(rows)]
+            for i, r in enumerate(rows):
+                rec = {"role": role, "file": ent["file"], "sha256": ent["sha256"], "row": i + 1, "record_id": _rec_id(role, r), "row_sha256": _sha_text(_canon(r))}
+                k = _row_key(kind, r)
+                if k in seen:
+                    if seen[k][0]["row_sha256"] == rec["row_sha256"] and seen[k][1] == id(rows):
+                        in_file.append(rec)
+                    continue
+                seen[k] = (rec, id(rows))
+                reg.append((rec, r))
+    return reg, in_file
+
+
+def _stages(files, wallets, reg, dup_dropped, in_file, disputes) -> Dict[str, Any]:
+    read: Dict[str, int] = {}
+    for e in files:
+        read[e["role"]] = read.get(e["role"], 0) + e["rows"]
+    norm = dict(read)
+    kept: Dict[str, int] = {}
+    for rec, _r in reg:
+        kept[rec["role"]] = kept.get(rec["role"], 0) + 1
+    return {"read": dict(read, total=sum(read.values())), "normalized": dict(norm, total=sum(norm.values())),
+            "rejected": {"count": 0, "reasons": [], "note": "a row that fails validation refuses its whole file (ImportRefused with a named code); a refused import produces no report"},
+            "duplicate_dropped": {"count": dup_dropped, "identical_within_one_file": len(in_file)},
+            "conflicting": {"count": len(disputes), "ids": [d["id"] for d in disputes[:20]]},
+            "kept_records": dict(kept, total=sum(kept.values())),
+            "records_digest": _sha_text(_canon([[rec["role"], rec["sha256"], rec["row"], rec["record_id"], rec["row_sha256"]] for rec, _ in reg])),
+            "reconciled": {"count": 0}, "unreconciled": {"count": sum(kept.values()), "why": "not evaluated"},
+            "uncertainty": {}}
+
+
+def _wallet_src(role: str, w: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"role": role, "file": w["file"], "sha256": w["sha256"], "row": None, "record_id": f"wallet:{w['ts_ms']}",
+            "row_sha256": _sha_text(_canon({"ts_ms": w["ts_ms"], "balances": w["balances"], "borrow": w["borrow"]}))}
+
+
+def _mark_src(m: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"role": "mark", "file": None, "sha256": None, "row": None, "record_id": f"mark:{m['instrument']}@{m['ts_ms']}", "row_sha256": _sha_text(_canon(m))}
+
+
+def _figure_sources(fig, b, prov, anchored) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Lineage entries for the realised-cash components and their derived totals: which kept records each one is the sum of, recomputed from the RAW rows
+    (not from the ledger) so the figure can be checked against its own sources."""
+    reg, w0, w1, windowed = prov["reg"], prov["w0"], prov["w1"], b is not None
+
+    def inwin(ts: int) -> bool:
+        return (w0["ts_ms"] < ts <= w1["ts_ms"]) if (windowed and w0 and w1) else True
+
+    def pick(role, pred, tsf):
+        return [(rec, r) for rec, r in reg if rec["role"] == role and pred(r) and inwin(tsf(rec, r))]
+
+    ex_ts = lambda rec, r: int(r["execTime"])          # noqa: E731
+    tx_ts = lambda rec, r: int(r["transactionTime"])   # noqa: E731
+    typ = lambda r: str(r["type"]).upper()             # noqa: E731
+    exec_rows = pick("linear_execution", lambda r: True, ex_ts)
+    fund_rows = pick("transaction_log", lambda r: typ(r) == "SETTLEMENT",
+                     lambda rec, r: prov["grid"].get(rec["record_id"][len("txlog:"):], int(r["transactionTime"])))
+    int_rows = pick("transaction_log", lambda r: typ(r) == "INTEREST" and str(r["currency"]).upper() in ("USDT", "USDC"), tx_ts)
+    qty = lambda r: float(r["execQty"]) * (1 if r["side"] == "Buy" else -1)   # noqa: E731
+    net_qty = math.fsum(qty(r) for _, r in exec_rows)
+    flat = abs(float(prov["opening_perp_qty"])) <= AR.DUST_QTY and abs(net_qty) <= AR.DUST_QTY
+    spec = {
+        "perp_realised_usd": ("realized", "sum over the listed executions of (sell notional - buy notional); exact for a book that starts and ends flat, else average-entry accounting that is not a plain row sum",
+                              exec_rows, (math.fsum(float(r["execQty"]) * float(r["execPrice"]) * (1 if r["side"] == "Sell" else -1) for _, r in exec_rows) if flat else None)),
+        "perp_fees_usd": ("realized", "minus the sum of execFee over the listed linear executions", exec_rows, -math.fsum(float(r["execFee"]) for _, r in exec_rows)),
+        "funding_net_usd": ("realized", "sum of funding over the listed SETTLEMENT rows of the transaction log", fund_rows, math.fsum(float(r["funding"]) for _, r in fund_rows)),
+        "interest_usd": ("realized", "sum of change over the listed INTEREST rows (USD coins) of the transaction log", int_rows, math.fsum(float(r["change"]) for _, r in int_rows)),
+        "other_cash_lines_usd": ("realized", "sum of statement lines categorised OTHER (the adapter maps none: unmapped types are flagged, never silently summed)", [], 0.0),
+    }
+    out: Dict[str, Any] = {}
+    flags: List[Dict[str, Any]] = []
+    for name, (nature, formula, rows, ssum) in spec.items():
+        val = fig[name]
+        base = {"nature": nature, "basis": "@conf", "formula": formula, "sources": [rec for rec, _ in rows], "empty_set": not rows}
+        if val is None:
+            base.update(why="UNKNOWN, not zero: " + ("no statement window / balance anchor was available to total it" if name in ("interest_usd", "other_cash_lines_usd") else "not computable"),
+                        source_sum=None, source_check="WITHHELD", sources=[], empty_set=False)
+        elif ssum is None:
+            base.update(source_sum=None, source_check="NOT_A_ROW_SUM")
+        else:
+            ok = math.isclose(val, ssum, **_LIN_TOL)
+            base.update(source_sum=ssum, source_check="MATCH" if ok else "MISMATCH")
+            if not ok:
+                flags.append({"code": "LINEAGE_SUM_MISMATCH", "severity": "HARD", "detail": f"{name} is {val} but the raw rows it is attributed to sum to {ssum}: the figure is not explained by its sources",
+                              "examples": [name]})
+        for root in ("layers.realised_cash.figures.", "partial_figures."):
+            out[root + name] = dict(base, sources=list(base["sources"]))
+    comps = ["layers.realised_cash.figures." + k for k in fig]
+    out["layers.realised_cash.net_realised_cash_usd"] = {"nature": "realized", "basis": "@conf", "formula": "sum of the five realised-cash components", "derived_from": comps}
+    out["layers.realised_cash.partial_net_of_known_components_usd"] = {"nature": "realized", "basis": "incomplete", "formula": "sum of the components that ARE known (a labelled partial, never the net)",
+                                                                       "derived_from": [c for c, k in zip(comps, fig) if fig[k] is not None]}
+    out["headline_realised_cash_usd"] = {"nature": "realized", "basis": "@conf", "formula": "REALISED CASH ONLY (not total profit; see layers.economic_total). Equals net_realised_cash_usd, and only under RECONCILED / PROVISIONAL / ESTIMATED",
+                                  "derived_from": ["layers.realised_cash.net_realised_cash_usd"]}
+    return out, flags
+
+
+def _complete_lineage(base, lin_figs, prov, realised_status, inv, b, flags, rep, unvalued, stale, unchecked, economic) -> Dict[str, Any]:
+    """Add the valuation / economic / residual entries, resolve the basis labels, and fill in the per-stage counts that depend on the verdict."""
+    conf = {"RECONCILED": "reconciled", "PROVISIONAL": "provisional"}.get(realised_status, "incomplete")
+    figs = {k: dict(v) for k, v in lin_figs.items()}
+    for v in figs.values():
+        if v.get("basis") == "@conf":
+            v["basis"] = conf
+    w0, w1 = prov["w0"], prov["w1"]
+    walls = [_wallet_src(r, w) for r, w in (("wallet_opening", w0), ("wallet_closing", w1)) if w]
+    marks_used = [_mark_src(m) for m in inv.get("marks_used", [])] if isinstance(inv, dict) else []
+    inv_basis = "estimated" if inv.get("status") == "ESTIMATED" else "incomplete"
+    inv_pref = "layers.inventory_valuation."
+    if inv.get("btc_value_usd") is not None and w1:
+        sp = [m for m in inv["marks_used"] if m["instrument"] == "BTC_SPOT"]
+        ssum = w1["balances"].get("BTC", 0.0) * sp[0]["price"] if sp else None
+        figs[inv_pref + "btc_qty"] = {"nature": "realized", "basis": conf, "formula": "BTC walletBalance of the closing wallet file", "sources": [_wallet_src("wallet_closing", w1)],
+                                      "source_sum": w1["balances"].get("BTC", 0.0), "source_check": "MATCH" if math.isclose(inv["btc_qty"], w1["balances"].get("BTC", 0.0), **_LIN_TOL) else "MISMATCH"}
+        figs[inv_pref + "btc_value_usd"] = {"nature": "estimated", "basis": inv_basis, "formula": "closing BTC walletBalance x the supplied BTC_SPOT mark", "sources": [_wallet_src("wallet_closing", w1)] + [_mark_src(m) for m in sp],
+                                            "source_sum": ssum, "source_check": ("MATCH" if ssum is not None and math.isclose(inv["btc_value_usd"], ssum, **_LIN_TOL) else "MISMATCH")}
+    everything = {"nature": "estimated", "basis": inv_basis, "plus_all_records": True, "sources": walls + marks_used, "source_sum": None, "source_check": "NOT_A_ROW_SUM"}
+    figs[inv_pref + "perp_qty"] = dict(everything, nature="realized", basis=conf, formula="opening perpetual quantity + signed sum of the listed linear executions", sources=walls)
+    figs[inv_pref + "perp_unrealised_usd"] = dict(everything, nature="unrealized", basis=("unrealized" if inv.get("status") == "ESTIMATED" else "incomplete"),
+                                                  formula="perp quantity x (supplied BTCUSDT_PERP mark - average entry of the executions)")
+    figs[inv_pref + "btc_economic_pnl_usd"] = dict(everything, formula="closing BTC value - opening BTC value - net cost of trading it (marks supplied; spot executions and BTC flows)")
+    figs[inv_pref + "change_in_perp_unrealised_usd"] = dict(everything, nature="unrealized", basis=("unrealized" if inv.get("status") == "ESTIMATED" else "incomplete"),
+                                                            formula="closing minus opening perpetual unrealised P&L at the supplied marks")
+    figs["layers.economic_total.net_economic_pnl_usd"] = {"nature": "estimated", "basis": "estimated" if economic.get("status") == "ESTIMATED" else "incomplete",
+                                                         "formula": "net realised cash + BTC economic P&L + change in perpetual unrealised P&L",
+                                                         "derived_from": ["layers.realised_cash.net_realised_cash_usd", inv_pref + "btc_economic_pnl_usd", inv_pref + "change_in_perp_unrealised_usd"]}
+    for k in (rep.get("residuals") or {}):
+        figs["ledger.residuals." + k] = dict(everything, nature="realized", basis=conf, formula=f"ledger residual '{k}': what the closing balance shows minus what the records explain",
+                                             sources=walls)
+    for v in figs.values():
+        if v.get("plus_all_records"):
+            v["all_records_digest"] = base["lineage"]["stages"]["records_digest"]
+    allf = list(flags) + [f for f in rep["flags"] if f["severity"] != "INFO"]
+    stages = json.loads(_canon(base["lineage"]["stages"]))
+    total = stages["kept_records"]["total"]
+    stages["reconciled"] = {"count": total if realised_status == "RECONCILED" else 0}
+    stages["unreconciled"] = {"count": 0 if realised_status == "RECONCILED" else total,
+                              "why": ("every record family agrees within tolerance" if realised_status == "RECONCILED" else f"the account is {realised_status}: reconciliation is all-or-nothing per report")}
+    stages["uncertainty"] = {"hard_flags": sorted({f["code"] for f in allf if f["severity"] == "HARD"}), "gap_flags": sorted({f["code"] for f in allf if f["severity"] == "GAP"}),
+                             "unvalued": list(unvalued), "stale": list(stale), "unchecked": list(unchecked)}
+    return dict(base, lineage=dict(base["lineage"], figures=figs, stages=stages))
+
+
+def _path_get(rep: Mapping[str, Any], path: str) -> Any:
+    cur: Any = rep
+    for part in path.split("."):
+        if not isinstance(cur, Mapping) or part not in cur:
+            raise KeyError(path)
+        cur = cur[part]
+    return cur
+
+
+def _leaves(node: Any, path: str):
+    if isinstance(node, Mapping):
+        for k, v in node.items():
+            yield from _leaves(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            yield from _leaves(v, path + "[]")
+    elif node is None or (isinstance(node, (int, float)) and not isinstance(node, bool)):
+        yield path, node
+
+
+def _finalize_lineage(rep: Dict[str, Any]) -> None:
+    """The lineage invariant, run by ``_seal`` on EVERY report: each numeric figure carries provenance (sources, or the figures it is derived from, plus a
+    basis label and a recomputed-from-sources check), or is an explicit null with its reason. Raises AssertionError otherwise."""
+    lin = rep.setdefault("lineage", {})
+    figs = lin.setdefault("figures", {})
+    status = rep["status"]
+    for path in list(figs):
+        try:
+            _path_get(rep, path)
+        except KeyError:
+            del figs[path]
+    roots = []
+    for r in _FIGURE_ROOTS:
+        try:
+            roots.append((r, _path_get(rep, r)))
+        except KeyError:
+            pass
+    for root, node in roots:
+        for path, val in _leaves(node, root):
+            if any(path == ex or path.startswith(ex + ".") or path.startswith(ex + "[") for ex in _NOT_FIGURES):
+                continue
+            if "[]" in path:
+                raise AssertionError(f"figure {path} sits inside a list: it cannot be given a lineage entry")
+            if path not in figs:
+                if val is not None:
+                    raise AssertionError(f"figure without lineage: {path} = {val!r}")
+                layer = rep.get("layers", {}).get(path.split(".")[1], {}) if path.startswith("layers.") else {}
+                figs[path] = {"nature": "realized", "basis": "incomplete", "formula": None, "sources": [],
+                              "why": f"not computable ({layer.get('reason') or 'status ' + status})"}
+    for path, e in figs.items():
+        v = _path_get(rep, path)
+        e["value"] = v
+        if v is None:
+            if not e.get("why"):
+                e["why"] = f"withheld: report status {status}"
+            e["source_sum"], e["source_check"] = None, "WITHHELD"
+            e["basis"] = "incomplete" if e.get("basis") in ("reconciled", "provisional") else e.get("basis", "incomplete")
+        else:
+            e.pop("why", None)
+        assert e.get("basis") in BASES, (path, e.get("basis"))
+    memo: Dict[str, Dict[str, Any]] = {}
+
+    def resolve(path: str) -> Dict[str, Any]:
+        if path in memo:
+            return memo[path]
+        e = figs[path]
+        if e.get("derived_from") is not None:
+            assert e["value"] is None or all(d in figs for d in e["derived_from"]), (path, "derived from a figure that is not in the report")
+            deps = [resolve(d) for d in e["derived_from"] if d in figs]
+            srcs: List[Dict[str, Any]] = []
+            seen = set()
+            for d in deps:
+                for s in d["sources"]:
+                    key = (s["role"], s["sha256"], s["row"], s["record_id"])
+                    if key not in seen:
+                        seen.add(key)
+                        srcs.append(s)
+            e["sources"] = srcs
+            e["derived_digests"] = [d["provenance_digest"] for d in deps]
+            if e["value"] is None:
+                e["source_sum"], e["source_check"] = None, "WITHHELD"
+            else:
+                vals = [d["value"] for d in deps]
+                assert vals and all(x is not None for x in vals), (path, "a non-null total over a null component")
+                e["source_sum"] = math.fsum(vals)
+                e["source_check"] = "MATCH" if math.isclose(e["value"], e["source_sum"], **_LIN_TOL) else "MISMATCH"
+        e["source_ids"] = [s["record_id"] for s in e.get("sources", [])]
+        e["provenance_digest"] = _sha_text(_canon({k: e.get(k) for k in ("value", "formula", "sources", "derived_digests", "all_records_digest", "empty_set")}))
+        memo[path] = e
+        return e
+
+    for path in figs:
+        e = resolve(path)
+        if e["value"] is not None:
+            assert e["sources"] or e.get("empty_set"), f"{path}: a number with no source row, no source figure and no explicit empty set"
+            assert e["source_check"] != "MISMATCH" or "LINEAGE_SUM_MISMATCH" in {f["code"] for f in rep.get("flags", [])}, f"{path}: unexplained sum mismatch"
+        else:
+            assert e.get("why"), f"{path}: null without a reason"
+    fhash = {p: [e["value"], e["provenance_digest"]] for p, e in sorted(figs.items())}
+    st = lin.get("stages", {})
+    st["figures"] = {"total": len(figs), "numeric": sum(1 for e in figs.values() if e["value"] is not None), "null_with_reason": sum(1 for e in figs.values() if e["value"] is None)}
+    lin["stages"] = st
+    lin["digest"] = _sha_text(_canon({"files": [[e["role"], e["sha256"]] for e in lin.get("files", [])], "marks": lin.get("marks"), "stages": st, "figures": fhash}))
+
+
 def _seal(rep: Dict[str, Any]) -> Dict[str, Any]:
     """Invariants that hold for every report: status words from the vocabulary; no profit under a non-profit status; every layer is no better than the
     account's own status when the account is incomplete or disputed; a content digest of the body."""
     assert rep["status"] in STATUSES, rep["status"]
     if rep["status"] not in _PROFIT_OK:
-        rep["headline_profit_usd"] = None
+        rep["headline_realised_cash_usd"] = None
         for layer in rep.get("layers", {}).values():
             if layer.get("status") in ("VERIFIED", "RECONCILED"):
                 layer["status"] = rep["status"]
@@ -668,6 +963,7 @@ def _seal(rep: Dict[str, Any]) -> Dict[str, Any]:
                     layer[k] = None
     for layer in rep.get("layers", {}).values():
         assert layer["status"] in STATUSES
+    _finalize_lineage(rep)
     body = _canon({k: v for k, v in rep.items() if k != "report_sha256"})
     rep["report_sha256"] = _sha_text(body)
     return json.loads(_canon(rep))            # normalise: plain JSON types only, sorted keys

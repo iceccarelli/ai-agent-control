@@ -17,7 +17,12 @@ What the authority checks (all must pass; the first refusal wins and every reaso
     restart and refuses until a reasoned clear;
   * the order's own notional against a hard cap;
   * a durable, cross-process RESERVATION per ``orderLinkId``: a resend of the identical order is allowed (that is how a lost acknowledgement is resolved), the same id with
-    different symbol/side/qty/category is refused as a conflict, and the number of distinct unresolved entries is bounded.
+    different canonical body (symbol/side/qty/category/orderType/price/reduceOnly/timeInForce) is refused as a conflict, and the number of distinct unresolved entries is bounded.
+  * the instrument: only the carry's own legs, ``{perp symbol: (linear, Sell), spot symbol: (spot, Buy)}``; any other (category, symbol, side) is ``UNKNOWN_INSTRUMENT`` /
+    ``WRONG_DIRECTION`` (a DOGEUSDT limit, an option, a perp long, a spot sell of the hedge are all refused);
+  * the order TYPE: only exact ``Market`` / ``Limit``; a Market order carries no price (a price on a Market order was sized as notional = price*qty: reproduced), and is sized
+    at the mark (max with a price if one is ever stated) on BOTH sides;
+  * the orderLinkId: ``[A-Za-z0-9_-]{1,36}`` fullmatch, no whitespace (``' A1'`` collided with ``'A1'`` in the ledger but not on the wire).
 The authority never approves anything by itself: with no approved policy the correct outcome is refusal, and nothing here sets ``approved_by_owner``.
 
 NOT claimed: that the checks' INPUTS are measured by the running book today (risk_policy lists limits nothing measures yet: those refuse with ``MISSING_INPUT``, which is the
@@ -30,6 +35,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -45,6 +51,12 @@ NOTIONAL_TOLERANCE = 1.02
 #: pruned: an old id still conflicts with a different order that reuses it.
 RESERVATION_WINDOW_MS = 15 * 60 * 1000
 MAX_UNRESOLVED_ENTRIES = 2        # one carry pair is two legs; a third distinct unresolved entry is not a retry of either
+#: An orderLinkId is exactly this (Bybit: 1-36 of A-Za-z0-9_-). ``fullmatch`` (not ``$``, which accepts a trailing newline); never stripped or normalised.
+LINK_ID = re.compile(r"[A-Za-z0-9_-]{1,36}")
+ORDER_TYPES = ("Market", "Limit")
+#: A spot SELL is an exit only if the spot left after it still covers the short perp to within this fraction (the spot leg is net of the buy fee in base coin, and a
+#: proportional partial close floors to a lot). Beyond it the sell strips the hedge off a short perp and is refused.
+HEDGE_SLACK = 0.02
 
 
 class EntryRefused(Exception):
@@ -64,23 +76,70 @@ class OrderIntent:
     reduce_only: bool
     order_link_id: str
     price: Optional[str] = None
+    order_type: str = ""
+    time_in_force: Optional[str] = None
+    #: Every key of the wire body except ``orderLinkId`` (its own ledger key). The reservation identifies an order by ALL of it: a resend that differs in any field is a conflict.
+    body: Optional[Mapping[str, Any]] = None
+
+
+#: The CLOSED allow-list of ``/v5/order/create`` body keys this bot sends (``place_order``/``_category_order_fields``/``CarryBroker``). Anything else is refused as
+#: ``UNKNOWN_BODY_FIELD``: a venue silently honours fields nothing here reasons about (``isLeverage`` margin borrow, ``triggerPrice``/``orderFilter`` conditional orders,
+#: ``takeProfit``/``stopLoss``, ``closeOnTrigger``, ``tpslMode``, ``positionIdx`` hedge slots, ``marketUnit`` quote sizing, ...). A new key needs a reviewed change here.
+ORDER_BODY_KEYS = frozenset({"category", "symbol", "side", "orderType", "qty", "price", "timeInForce", "orderLinkId", "reduceOnly", "positionIdx", "isLeverage", "marketUnit"})
+#: A spot SELL exit may additionally be the spot protective stop (``place_stop_order``: a conditional ``StopOrder``).
+SPOT_STOP_KEYS = frozenset({"orderFilter", "triggerPrice", "triggerDirection"})
+TIME_IN_FORCE = ("GTC", "IOC", "FOK", "PostOnly")
+_PLAIN_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
 
 
 def _truthy(v: Any) -> bool:
-    """Only the boolean True or the exact string "true" is reduce-only. 1, "TRUE ", "yes" are NOT: how the venue reads a non-boolean is unverified, so it is treated as an entry."""
-    return v is True or v == "true"
+    """ONLY the boolean ``True`` is reduce-only. The string "true", 1, "TRUE ", "yes" are NOT: how the venue reads a non-boolean is unverified, so any other spelling is an
+    opening order (and ``intent_from_body`` refuses it as malformed). Compared by identity: a str/bool subclass with a lying ``__eq__`` cannot pass."""
+    return v is True
+
+
+def _plain_int(v: Any, *allowed: int) -> bool:
+    return type(v) is int and v in allowed
+
+
+def body_value_refusals(body: Mapping[str, Any], *, extra_keys: frozenset = frozenset()) -> List[str]:
+    """Refusal codes for the keys/values of an order body outside the closed allow-list. ``reduceOnly`` must be a real boolean; ``positionIdx`` 0 only (one-way mode; 1/2 are
+    hedge-mode slots); ``isLeverage`` absent or exactly 0 (a spot Buy with ``isLeverage`` 1 is a margin BORROW); ``marketUnit`` ``baseCoin`` only; ``timeInForce`` known."""
+    out: List[str] = []
+    for k in body:
+        if k not in ORDER_BODY_KEYS and k not in extra_keys:
+            out.append(f"UNKNOWN_BODY_FIELD:{str(k)[:30]}")
+    if "reduceOnly" in body and type(body["reduceOnly"]) is not bool:
+        out.append("REDUCE_ONLY_NOT_BOOLEAN")
+    if "positionIdx" in body and not (_plain_int(body["positionIdx"], 0) or body["positionIdx"] == "0" and type(body["positionIdx"]) is str):
+        out.append("POSITION_IDX_NOT_ONE_WAY")
+    if "isLeverage" in body and not (_plain_int(body["isLeverage"], 0) or body["isLeverage"] == "0" and type(body["isLeverage"]) is str):
+        out.append("IS_LEVERAGE_NOT_ALLOWED")
+    if "marketUnit" in body and not (type(body["marketUnit"]) is str and body["marketUnit"] == "baseCoin"):
+        out.append("MARKET_UNIT_NOT_BASE_COIN")
+    if "timeInForce" in body and not (type(body["timeInForce"]) is str and body["timeInForce"] in TIME_IN_FORCE):
+        out.append("TIME_IN_FORCE_UNKNOWN")
+    if "orderFilter" in extra_keys and "orderFilter" in body and body["orderFilter"] != "StopOrder":
+        out.append("ORDER_FILTER_UNKNOWN")
+    if "triggerPrice" in body and not (type(body["triggerPrice"]) is str and _PLAIN_DECIMAL.fullmatch(body["triggerPrice"])):
+        out.append("TRIGGER_PRICE_NOT_PLAIN_DECIMAL")
+    if "triggerDirection" in body and not (_plain_int(body["triggerDirection"], 1, 2)):
+        out.append("TRIGGER_DIRECTION_UNKNOWN")
+    return out
 
 
 def increases_exposure(body: Mapping[str, Any]) -> bool:
-    """True unless the order is PROVABLY an exit. Unknowns are exposure."""
+    """True unless the order is PROVABLY an exit. Unknowns are exposure. Spellings are EXACT: reduce-only is the boolean True on an exactly-lowercase ``linear``/``inverse``
+    category; a spot exit is exactly ``spot`` + ``Sell``. ``LINEAR``, ``"true"``, ``1``, ``SELL`` are not exits (they are refused as instruments/malformed downstream)."""
     try:
-        category = str(body.get("category", "")).lower()
-        side = str(body.get("side", "")).strip().lower()
+        category = body.get("category")
+        side = body.get("side")
+        reduce_only = body.get("reduceOnly")
     except Exception:                                              # noqa: BLE001
         return True
-    if _truthy(body.get("reduceOnly")) and category in ("linear", "inverse"):
+    if _truthy(reduce_only) and type(category) is str and category in ("linear", "inverse"):
         return False
-    if category == "spot" and side == "sell":
+    if type(category) is str and category == "spot" and type(side) is str and side == "Sell":
         lev = body.get("isLeverage")
         if lev not in (None, "", 0, "0", False):
             return True                                            # a spot sell with margin leverage can open a short: not an exit
@@ -88,16 +147,43 @@ def increases_exposure(body: Mapping[str, Any]) -> bool:
     return True
 
 
+def is_spot_sell(body: Mapping[str, Any]) -> bool:
+    try:
+        return type(body.get("category")) is str and body["category"] == "spot" and type(body.get("side")) is str and body["side"] == "Sell"
+    except Exception:                                              # noqa: BLE001
+        return False
+
+
 def intent_from_body(body: Mapping[str, Any]) -> OrderIntent:
-    """Strict parse of the fields the authority reasons about. A body that does not state them is refused, never defaulted."""
-    missing = [k for k in ("category", "symbol", "side", "qty") if not str(body.get(k, "")).strip()]
+    """Strict parse of the fields the authority reasons about. A body that does not state them is refused, never defaulted, normalised or stripped: what is judged is the exact
+    string that will be sent."""
+    missing = [k for k in ("category", "symbol", "side", "qty", "orderType") if not str(body.get(k, "")).strip()]
     if missing:
         raise EntryRefused([f"ORDER_FIELD_MISSING:{k}" for k in missing])
-    link = str(body.get("orderLinkId", "")).strip()
-    if not link:
+    raw_link = body.get("orderLinkId")
+    if raw_link is None or (isinstance(raw_link, str) and not raw_link.strip()):
         raise EntryRefused(["ORDER_FIELD_MISSING:orderLinkId"])          # an order without a deterministic id cannot be reconciled
-    return OrderIntent(category=str(body["category"]).lower(), symbol=str(body["symbol"]), side=str(body["side"]), qty=str(body["qty"]),
-                       reduce_only=_truthy(body.get("reduceOnly")), order_link_id=link, price=(None if body.get("price") in (None, "") else str(body["price"])))
+    if not isinstance(raw_link, str) or not LINK_ID.fullmatch(raw_link):
+        raise EntryRefused(["ORDER_LINK_ID_INVALID"])
+    if not all(isinstance(body[k], str) for k in ("category", "symbol", "side", "orderType")):
+        raise EntryRefused(["ORDER_FIELD_NOT_TEXT"])
+    order_type = body["orderType"]
+    if order_type not in ORDER_TYPES:
+        raise EntryRefused([f"ORDER_TYPE_UNKNOWN:{order_type[:20]}"])
+    for k in ("qty", "price"):                                          # the exit path's strict grammar: Decimal() alone accepts '1_0', non-ASCII digits, exponents, NaN
+        if k in body and body[k] not in (None, "") and not (type(body[k]) is str and _PLAIN_DECIMAL.fullmatch(body[k])):
+            raise EntryRefused([f"ORDER_{k.upper()}_NOT_PLAIN_DECIMAL"])
+    price = None if body.get("price") in (None, "") else str(body["price"])
+    if order_type == "Market" and price is not None:
+        raise EntryRefused(["MARKET_ORDER_WITH_PRICE"])                 # a Market order has no limit price; one stated here was being used to size the notional
+    tif = body.get("timeInForce")
+    bad = body_value_refusals(body)
+    if bad:
+        raise EntryRefused(bad)
+    return OrderIntent(category=body["category"], symbol=body["symbol"], side=body["side"], qty=str(body["qty"]),
+                       reduce_only=_truthy(body.get("reduceOnly")), order_link_id=raw_link, price=price, order_type=order_type,
+                       time_in_force=None if tif in (None, "") else str(tif),
+                       body={k: v for k, v in body.items() if k != "orderLinkId"})
 
 
 # ---------------------------------------------------------------- checks: (intent, venue) -> refusal code or None
@@ -113,6 +199,18 @@ def venue_check(allowed: Sequence[str]) -> Check:
     return check
 
 
+def instrument_check(legs: Mapping[Tuple[str, str], str]) -> Check:
+    """Only the carry's own legs. ``legs`` maps (category, symbol) -> the ONE side an entry may take there. Exact string comparison: no case folding, no stripping."""
+    table = dict(legs)
+
+    def check(i: OrderIntent, _v: str) -> Optional[str]:
+        want = table.get((i.category, i.symbol))
+        if want is None:
+            return f"UNKNOWN_INSTRUMENT:{i.category}:{i.symbol}"
+        return None if i.side == want else f"WRONG_DIRECTION:{i.category}:{i.symbol}:{i.side}"
+    return check
+
+
 def kill_switch_check(reader: Callable[[], Tuple[bool, str]]) -> Check:
     def check(_i: OrderIntent, _v: str) -> Optional[str]:
         try:
@@ -123,45 +221,64 @@ def kill_switch_check(reader: Callable[[], Tuple[bool, str]]) -> Check:
     return check
 
 
-def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[[str], Optional[float]]] = None) -> Check:
-    """The order's notional (qty x price) must be finite and within the cap. A market order has no price in the body: the mark is asked for; no price = refusal."""
-    def check(i: OrderIntent, _v: str) -> Optional[str]:
+def order_notional(i: OrderIntent, mark_provider: Optional[Callable[..., Optional[float]]] = None) -> Tuple[Optional[Decimal], Optional[str]]:
+    """(worst-case notional in USD, refusal code). The worst case: a MARKET order (either side) at max(mark, any stated price): it has no limit semantics, so a price field on it
+    must never LOWER the notional (reproduced: Market 1 BTC + price '1' read as $1); a limit SELL at max(limit, mark) (a limit of '1' for 100 BTC must not read as $100); a limit
+    BUY at its own limit (it cannot fill above it). No usable price = a refusal, never a guess."""
+    try:
+        qty = Decimal(i.qty)
+        px = Decimal(i.price) if i.price else None
+    except (InvalidOperation, ValueError):
+        return None, "ORDER_QTY_OR_PRICE_UNPARSABLE"
+    if not qty.is_finite() or qty <= 0:
+        return None, "ORDER_QTY_INVALID"
+    mark: Optional[Decimal] = None
+    if mark_provider is not None:
         try:
-            qty = Decimal(i.qty)
-            px = Decimal(i.price) if i.price else None
-        except (InvalidOperation, ValueError):
-            return "ORDER_QTY_OR_PRICE_UNPARSABLE"
-        if not qty.is_finite() or qty <= 0:
-            return "ORDER_QTY_INVALID"
-        mark: Optional[Decimal] = None
-        if mark_provider is not None:
-            try:
-                m = mark_provider(i.symbol)
-            except Exception:                                      # noqa: BLE001
-                m = None
-            if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
-                mark = Decimal(str(m))
-        side = i.side.strip().lower()
-        if px is None:
-            px = mark                                              # a market order: priced at the mark
-        elif side == "sell":
-            # A limit SELL can fill at the best bid however low its limit: declaring price "1" must not make 100 BTC look like $100. Cost it at the larger of limit and mark.
-            if mark is None:
-                return "NO_PRICE_FOR_NOTIONAL"
-            px = max(px, mark)
-        # a limit BUY cannot fill above its limit: its own price is the worst case
-        if px is None or not px.is_finite() or px <= 0:
-            return "NO_PRICE_FOR_NOTIONAL"
-        return None if float(qty * px) <= float(max_usd) else "NOTIONAL_ABOVE_CAP"
+            m = mark_provider(i.symbol, i.category)            # category-aware: a spot Buy is sized at the SPOT mark even when both legs are named BTCUSDT
+        except Exception:                                          # noqa: BLE001
+            m = None
+        if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
+            mark = Decimal(str(m))
+    side = i.side.strip().lower()
+    if i.order_type != "Limit":                                    # Market, or anything not provably a limit: sized at the mark, never below it
+        if mark is None:
+            return None, "NO_PRICE_FOR_NOTIONAL"
+        px = mark if px is None else max(px, mark)
+    elif px is None:
+        px = mark
+    elif side == "sell":
+        if mark is None:
+            return None, "NO_PRICE_FOR_NOTIONAL"
+        px = max(px, mark)
+    if px is None or not px.is_finite() or px <= 0:
+        return None, "NO_PRICE_FOR_NOTIONAL"
+    return qty * px, None
+
+
+def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[..., Optional[float]]] = None) -> Check:
+    """The order's notional must be finite and within the cap (see ``order_notional``)."""
+    def check(i: OrderIntent, _v: str) -> Optional[str]:
+        notional, why = order_notional(i, mark_provider)
+        if notional is None:
+            return why
+        return None if float(notional) <= float(max_usd) else "NOTIONAL_ABOVE_CAP"
     return check
 
 
-def risk_policy_check(provider: Callable[[], Tuple[Optional[RP.Policy], RP.State]], latch: Optional[RP.RiskLatch], strategy: str,
-                      clock: Callable[[], float] = time.time) -> Check:
-    """The owner-approved policy with measured inputs; a latched suspension refuses. ``provider`` failing refuses (no policy = NO_APPROVED_POLICY)."""
-    def check(_i: OrderIntent, _v: str) -> Optional[str]:
+def risk_policy_check(provider: Callable[..., Tuple[Optional[RP.Policy], RP.State]], latch: Optional[RP.RiskLatch], strategy: str,
+                      clock: Callable[[], float] = time.time,
+                      pending_notional: Optional[Callable[[OrderIntent], Optional[float]]] = None) -> Check:
+    """The owner-approved policy with measured inputs; a latched suspension refuses. ``provider`` failing refuses (no policy = NO_APPROVED_POLICY). The policy is evaluated on
+    POST-trade exposure: the provider is handed this order's own worst-case notional (``pending_notional``); a notional that cannot be established is passed as NaN so the
+    provider reports exposure UNKNOWN rather than ignoring the order."""
+    def check(i: OrderIntent, _v: str) -> Optional[str]:
         try:
-            policy, state = provider()
+            if pending_notional is not None:
+                pend = pending_notional(i)
+                policy, state = provider(float("nan") if pend is None else pend)
+            else:
+                policy, state = provider()
         except Exception:                                          # noqa: BLE001
             return "RISK_STATE_UNAVAILABLE"
         decision = RP.evaluate(policy, state)
@@ -172,6 +289,20 @@ def risk_policy_check(provider: Callable[[], Tuple[Optional[RP.Policy], RP.State
 
 
 # ---------------------------------------------------------------- the durable reservation
+
+_CANON_FIELDS = ("category", "symbol", "side", "qty", "orderType", "price", "reduceOnly", "timeInForce", "body")
+
+
+def _canonical_intent(i: OrderIntent) -> Dict[str, Any]:
+    """The FULL body the order is identified by (every wire key but the link id, in ``body``). A resend is 'identical' only if every one of these is equal."""
+    return {"category": i.category, "symbol": i.symbol, "side": i.side, "qty": i.qty, "orderType": i.order_type, "price": i.price, "reduceOnly": bool(i.reduce_only),
+            "timeInForce": i.time_in_force, "body": dict(i.body) if i.body is not None else {}}
+
+
+def _canonical(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """The same projection of a ledger row. A row written before these fields existed lacks them and therefore never equals a new intent (a conflict, never a guess)."""
+    return {k: row.get(k, "<absent>") for k in _CANON_FIELDS}
+
 
 class ReservationStore:
     """Append-only, flock-serialised ledger of entry reservations shared by every process that names the same path. The reservation is written BEFORE the order is sent."""
@@ -204,21 +335,21 @@ class ReservationStore:
             same = [r for r in rows if r["link"] == i.order_link_id]
             if same:
                 prior = same[0]
-                if (prior.get("symbol"), prior.get("side"), prior.get("qty"), prior.get("category")) == (i.symbol, i.side, i.qty, i.category):
+                if _canonical(prior) == _canonical_intent(i):
                     return None                                        # an identical resend: how a lost acknowledgement is resolved
                 return "RESERVATION_CONFLICT_SAME_ID_DIFFERENT_ORDER"
             unresolved = [r for r in rows if r["link"] not in resolved and not r.get("resolved") and isinstance(r.get("at_ms"), int) and now - r["at_ms"] <= self.window_ms]
             if len(unresolved) >= max_unresolved:
                 return "TOO_MANY_UNRESOLVED_ENTRIES"
-            os.write(fd, (json.dumps({"link": i.order_link_id, "symbol": i.symbol, "side": i.side, "qty": i.qty, "category": i.category,
-                                      "at_ms": now, "resolved": False}, sort_keys=True) + "\n").encode("utf-8"))
+            os.write(fd, (json.dumps(dict(_canonical_intent(i), link=i.order_link_id, at_ms=now, resolved=False), sort_keys=True) + "\n").encode("utf-8"))
             os.fsync(fd)
             return None
         finally:
             os.close(fd)
 
     def resolve(self, order_link_id: str) -> None:
-        """Mark a reservation resolved by APPENDING a resolution row under the same lock (never rewrites or replaces the file, so a reserve() waiting on the lock cannot append to an orphaned inode)."""
+        """NOTHING IN PRODUCTION CALLS THIS (grep: only tests). Reservations are therefore bounded by ``RESERVATION_WINDOW_MS``, not by resolution: see RUNBOOKS 'Entry reservation ledger'.
+        Mark a reservation resolved by APPENDING a resolution row under the same lock (never rewrites or replaces the file, so a reserve() waiting on the lock cannot append to an orphaned inode)."""
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -243,12 +374,76 @@ def reservation_check(store: ReservationStore, *, max_unresolved: int = MAX_UNRE
 class EntryAuthority:
     """Runs its checks in order (the reservation LAST, so a refused order reserves nothing) and raises ``EntryRefused`` with every reason found."""
 
-    def __init__(self, checks: Sequence[Check], *, name: str = "entry_authority") -> None:
+    def __init__(self, checks: Sequence[Check], *, name: str = "entry_authority", perp_symbol: Optional[str] = None, spot_symbol: Optional[str] = None,
+                 hedge_reader: Optional[Callable[[], Tuple[float, float]]] = None,
+                 policy_loader: Optional[Callable[[], Optional[RP.Policy]]] = None) -> None:
         if not checks:
             raise ValueError("an authority with no checks would approve everything; refusing to build one")
         self.checks = tuple(checks)
         self.name = name
+        self.perp_symbol = perp_symbol
+        self.spot_symbol = spot_symbol
+        #: () -> (perp short size, spot inventory), both from the VENUE's own reads (unsigned, base units). None = a spot sell can never be shown to keep the hedge.
+        self.hedge_reader = hedge_reader
+        #: () -> the owner-approved policy or None; bounds set-leverage by its ``max_leverage``.
+        self.policy_loader = policy_loader
         self.refusals: List[Tuple[str, Tuple[str, ...]]] = []
+
+    def spot_sell_keeps_hedge(self, body: Mapping[str, Any]) -> bool:
+        """True only if this spot SELL provably leaves the short perp covered, from the venue's own position and wallet reads. Anything unknowable (no reader, a failed read, a
+        non-finite number, a quote-unit or unparsable qty, another symbol) is False: the sell is then treated as exposure and refused as ``WRONG_DIRECTION``. Conservative on
+        purpose: refusing a legitimate spot exit leaves a long (price risk) that a human can close; stripping the hedge leaves a naked short."""
+        try:
+            if self.hedge_reader is None or body.get("symbol") != self.spot_symbol or body.get("category") != "spot":
+                return False
+            if body.get("marketUnit") not in (None, "baseCoin"):
+                return False
+            qty = Decimal(str(body["qty"]))
+            perp, spot = self.hedge_reader()
+            perp, spot = float(perp), float(spot)
+            if not (qty.is_finite() and qty > 0 and math.isfinite(perp) and math.isfinite(spot) and perp >= 0 and spot >= 0):
+                return False
+            return (spot - float(qty)) >= perp * (1.0 - HEDGE_SLACK)
+        except Exception:                                          # noqa: BLE001
+            return False
+
+    def exit_refusal(self, body: Mapping[str, Any]) -> Optional[str]:
+        """None if this order, which ``increases_exposure`` called an exit, is an exit of the CARRY'S OWN legs; else a refusal code. A reduce-only order must be a perp BUY
+        (the carry only ever holds a short) on exactly the bound perp symbol, linear, Market/Limit, with a positive finite qty and nothing outside the closed key list; a spot
+        SELL must be on the bound spot symbol (its hedge arithmetic is ``spot_sell_keeps_hedge``). Anything else, including a reduce-only order for another symbol/category
+        (reproduced: 'DOGEUSDT Buy qty 100000 reduceOnly'), is refused: reduce-only is the VENUE's guarantee about a position, not proof that the position is ours."""
+        try:
+            if is_spot_sell(body):
+                if self.spot_symbol is None or body.get("symbol") != self.spot_symbol:
+                    return "EXIT_NOT_BOUND:spot_symbol"
+                bad = body_value_refusals(body, extra_keys=SPOT_STOP_KEYS)
+                return bad[0] if bad else None
+            if _truthy(body.get("reduceOnly")):
+                if body.get("category") != "linear" or self.perp_symbol is None or body.get("symbol") != self.perp_symbol:
+                    return "EXIT_NOT_BOUND:perp_symbol"
+                if body.get("side") != "Buy":
+                    return "EXIT_NOT_BOUND:side"
+                if body.get("orderType") not in ORDER_TYPES:
+                    return "EXIT_NOT_BOUND:orderType"
+                q = body.get("qty")
+                if not (type(q) is str and _PLAIN_DECIMAL.fullmatch(q) and Decimal(q) > 0):
+                    return "EXIT_NOT_BOUND:qty"
+                bad = body_value_refusals(body)
+                return bad[0] if bad else None
+            return "EXIT_NOT_BOUND:not_an_exit"
+        except Exception:                                          # noqa: BLE001
+            return "EXIT_NOT_BOUND:unreadable"
+
+    def max_leverage(self) -> Optional[int]:
+        """The most leverage the owner-approved policy allows (floor of ``max_leverage``), or None when there is no readable approved policy to say."""
+        try:
+            pol = self.policy_loader() if self.policy_loader is not None else None
+            lim = getattr(pol, "max_leverage", None)
+            if pol is not None and isinstance(lim, (int, float)) and not isinstance(lim, bool) and math.isfinite(lim) and lim >= 1:
+                return int(math.floor(lim))
+        except Exception:                                          # noqa: BLE001
+            return None
+        return None
 
     def authorize(self, body: Mapping[str, Any], *, venue: str) -> OrderIntent:
         intent = intent_from_body(body)
@@ -290,24 +485,38 @@ def load_policy(path: Optional[str]) -> Optional[RP.Policy]:
         return None
 
 
-def build_for_book(*, venue: str, store: Any, state_dir: Optional[str], max_notional_usd: float, mark_provider: Optional[Callable[[str], Optional[float]]] = None,
+def build_for_book(*, venue: str, store: Any, state_dir: Optional[str], max_notional_usd: float, mark_provider: Optional[Callable[..., Optional[float]]] = None,
                    policy_path: Optional[str] = None, state_provider: Optional[Callable[[], RP.State]] = None,
-                   require_risk_policy: bool = True, strategy: str = "btcusdt_funding_carry_overlay") -> EntryAuthority:
+                   require_risk_policy: bool = True, strategy: str = "btcusdt_funding_carry_overlay", perp_symbol: Optional[str] = None,
+                   spot_symbol: Optional[str] = None, hedge_reader: Optional[Callable[[], Tuple[float, float]]] = None) -> EntryAuthority:
     """The authority a production book installs on its client. ``require_risk_policy`` is not a flag the environment can turn off: callers pass True for every venue that can
     hold real or testnet exposure. A book without a state directory keeps reservations in a temp-free in-process ledger path and says so by raising: persistence is mandatory."""
     if not state_dir:
         raise ValueError("an entry authority needs a state directory for its durable reservations and risk latch")
+    for nm, sym in (("perp_symbol", perp_symbol), ("spot_symbol", spot_symbol)):
+        if not isinstance(sym, str) or not re.fullmatch(r"[A-Z0-9]{3,20}", sym):
+            raise ValueError(f"an entry authority is bound to the carry's legs: {nm} must be a plain symbol, got {sym!r}")
     os.makedirs(state_dir, exist_ok=True)
     latch = RP.RiskLatch(os.path.join(state_dir, "risk_latch.json"))
     checks: List[Check] = [venue_check([venue])]
     reader = getattr(store, "is_kill_switch_engaged", None)
     checks.append(kill_switch_check(reader) if callable(reader) else (lambda _i, _v: "KILL_SWITCH_UNREADABLE"))
+    checks.append(instrument_check({("linear", perp_symbol): "Sell", ("spot", spot_symbol): "Buy"}))
     if require_risk_policy:
-        sp = state_provider or (lambda: RP.State())
+        sp = state_provider or (lambda pending_notional_usd=None: RP.State())
 
-        def provider() -> Tuple[Optional[RP.Policy], RP.State]:
-            return load_policy(policy_path), sp()
-        checks.append(risk_policy_check(provider, latch, strategy))
+        def provider(pending: Optional[float] = None) -> Tuple[Optional[RP.Policy], RP.State]:
+            try:
+                state = sp(pending_notional_usd=pending)
+            except TypeError:                                      # a legacy zero-argument provider: it cannot see the pending order (and says so by not using it)
+                state = sp()
+            return load_policy(policy_path), state
+
+        def pend(i: OrderIntent) -> Optional[float]:
+            n, _why = order_notional(i, mark_provider)
+            return None if n is None else float(n)
+        checks.append(risk_policy_check(provider, latch, strategy, pending_notional=pend))
     checks.append(notional_cap_check(max_notional_usd, mark_provider))
     checks.append(reservation_check(ReservationStore(os.path.join(state_dir, "entry_reservations.jsonl"))))
-    return EntryAuthority(checks, name=f"book:{venue}")
+    return EntryAuthority(checks, name=f"book:{venue}", perp_symbol=perp_symbol, spot_symbol=spot_symbol, hedge_reader=hedge_reader,
+                          policy_loader=lambda: load_policy(policy_path))

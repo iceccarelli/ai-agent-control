@@ -1,0 +1,119 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "later recorded sessions; the threshold frozen first"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": false,
+    "hedge_completeness_modelled": false,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": false,
+    "point_in_time_universe": true
+  },
+  "candidate_id": "liquidity_imbalance@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 5000.0,
+    "note": "depth at the touch"
+  },
+  "counterparty": "resting liquidity providers on the thin side of the book",
+  "drawdown_model": "per-trade loss streaks under fee drag; not measured",
+  "economic_mechanism": "Counterparty: the resting orders and slower participants on the thin side who get run over. Persists only inside the latency window of the fastest participants; disappears once the signal is tradeable at our latency (the move happens before our order arrives). Known to be real but captured by faster players; a slow participant pays the spread to chase it.",
+  "eligibility_rules": [
+    "imbalance computed from the book as of the decision timestamp only",
+    "instrument with a stated tick size and depth"
+  ],
+  "entry": "cross the spread when imbalance exceeds a registered threshold",
+  "execution_model": "taker, latency-delayed fills against the book at arrival time, not at signal time",
+  "exit": "fixed horizon or reversal",
+  "family": "liquidity_imbalance",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "provenance": "assumed",
+      "value": 5.5
+    }
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.05
+    }
+  },
+  "holding_period": "seconds to minutes",
+  "hypothesis": "Order-book depth imbalance at the top levels predicts the next short-horizon mid move enough to trade after costs.",
+  "multiple_testing_family": "liquidity_imbalance",
+  "prospective_protocol": {
+    "description": "forward shadow signal log with measured latency before any order",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
+  "rejection_conditions": [
+    "book data coarser than the signal's half-life: test refused",
+    "predicted move net of spread and measured latency not positive",
+    "adjusted p-value above 0.05",
+    "edge disappears when fills are taken at arrival time instead of signal time",
+    "net edge after taker fees not positive"
+  ],
+  "required_data": [
+    {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth",
+        "no_look_ahead"
+      ],
+      "gap": "BTC/ETH spot L2 snapshots at coarse intervals (data/orderbook); no perp book history",
+      "name": "L2 book snapshots/deltas with exchange timestamps for the traded instrument",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
+      "gap": "not collected: the repo has no trade tape for realised mid moves",
+      "name": "trade tape for realised mid moves",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "no_look_ahead"
+      ],
+      "gap": "not collected: the repo has no measured order latency",
+      "name": "measured order latency",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
+      "gap": "no hedge-leg price or fill history exists in the repo for this mechanism",
+      "name": "hedge-leg prices/fills used to neutralise any inventory this mechanism builds",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "signal decays inside our latency; spread paid on every trade",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. Such a candidate is not yet a testable specification (the verdict reports BIAS_NOT_RULED_OUT) until that data is collected."
+}

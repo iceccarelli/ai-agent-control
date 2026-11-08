@@ -320,18 +320,40 @@ writes into the recorder's directory:
 
     python3 tools/md_seal.py seal          --dir <MD_DIR> --manifest <OTHER-VOLUME>/manifest.jsonl     # run at least daily; append-only, chained
     python3 tools/md_seal.py check         --dir <MD_DIR> --manifest <OTHER-VOLUME>/manifest.jsonl     # TRUNCATED / MISSING / ALTERED against EVERY earlier seal
-    python3 tools/md_seal.py backup        --dir <MD_DIR> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl
-    python3 tools/md_seal.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl
+    python3 tools/md_seal.py backup        --dir <MD_DIR> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl --manifest <OTHER-VOLUME>/manifest.jsonl   # refuses if `check` fails; copies only sealed closed days
+    python3 tools/md_seal.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl --manifest <OTHER-VOLUME>/manifest.jsonl   # every sealed closed day needs a matching receipt
 
 `backup` copies only closed days (before today UTC), re-hashes and re-opens each copy and writes a receipt only if it recomputes; a failed copy is set aside as `.REJECTED`, nothing is
 overwritten or deleted. A backup is not proven until `restore-check` passes. Keep the manifest and receipts off the recorder's volume and record the printed head somewhere the
 recorder's host cannot write (a printed page, another account): the code cannot protect a manifest its own writer can rewrite. The recorder's default retention deletes depth-log
 segments after 2 days; do not rely on retention for evidence you have not backed up and restore-checked. Nothing here schedules itself; the schedule and the storage are yours.
 
+**Back up BEFORE retention (operational consequence).** `python3 tools/md_seal.py check|seal ... --receipts <OTHER-VOLUME>/receipts.jsonl` excuses a sealed day that is no longer in the
+directory ONLY if all hold: it is older than the oldest segment still present; the receipts verify and hold a receipt for it whose last chain value equals the sealed one; and the oldest
+remaining segment's `chain_start` equals that receipt's last chain (a run of pruned days must chain unbroken). `pruned.jsonl` is written by the recorder and is not trusted for this. A day
+pruned by the recorder's `--retention-days` BEFORE it was backed up stays a loud failure: `check` says `MISSING ... NOT backed up`, and `seal` and `backup` refuse, because evidence that was
+never copied has vanished and nobody should be able to launder that by re-sealing. Therefore: run `seal`, then `backup`, then `restore-check` daily, and keep `--retention-days` longer than
+that cycle; pass `--receipts` to `check` and `seal` once retention has started pruning. **A receipt is a claim about a copy, not the copy:** with `--receipts` alone the excuse is receipt-based only, and `check` prints a note saying so; run `restore-check` alongside, or pass `--backup <OFF-VOLUME-DIR>` to `check`/`seal` so each excused day's copy must exist there with the receipted sha256 (missing or different = not excused). If a day was pruned unbacked-up, investigate (is a copy elsewhere?); the manifest keeps reporting it (there is deliberately no automatic way to retire a sealed day: start a new
+manifest only as a recorded owner decision). `check` also reports any `md-YYYYMMDD.db` dated after today (UTC) as FUTURE and `seal` refuses it: a fabricated far-future file must not decide
+which segment is the newest. The seal manifest, receipts and backup may not be at, under, or a symlink into the recorder's directory.
+
+## The market collector: one run at a time; seal, back up, restore-check (owner-run; offline)
+`tools/market_collector.py run-once|seal|check|backup|restore-check|repair-log` take an exclusive non-blocking `flock` on `<out-root>/.lock` for the whole operation (the kernel drops it if the
+process dies). A second concurrent `run-once` returns `REFUSED_LOCKED` (no state touched; the first cycle is never renamed to `.INCOMPLETE`); `seal`, `backup` and `repair-log` refuse the same way
+with exit 2: retry after the running one finishes. An unexpected capture error mid-cycle is reported as `ABORTED` and the unfinished directory is set aside on the next run.
+
+    python3 tools/market_collector.py seal          --root <ROOT> --manifest <OTHER-VOLUME>/cseal.jsonl
+    python3 tools/market_collector.py backup        --root <ROOT> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/creceipts.jsonl --manifest <OTHER-VOLUME>/cseal.jsonl
+    python3 tools/market_collector.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/creceipts.jsonl --manifest <OTHER-VOLUME>/cseal.jsonl
+
+`backup` is bound to the seal manifest and `cycles.jsonl` like `md_seal backup`: it refuses when the root fails its seal or the log does not verify; only sealed, recorded, self-consistent cycles are
+copied and each copy must equal the sealed hashes. A cycle skipped because it fails its own manifest, is not in `cycles.jsonl` or is not sealed makes `ok` false (seal first, then back up).
+`restore-check` needs a receipt for every sealed cycle. Manifest and receipts may not be at, under or a symlink into the collector's root.
+
 ## The entry authority: why an opening order is refused, and what you must do (owner)
 Every order that can ADD exposure now passes one authority inside `BybitClient._request` (`entry_authority.py`), whoever the caller is: the carry book, `place_order`, the drills, the
-linear-stop drill, the unattended runner. A client with no authority refuses (`NO_ENTRY_AUTHORITY`). A reduce-only exit, and a spot sell, are not gated by it. The production book installs
-one that checks, in order: the venue, the persistent kill switch (read now; unreadable = engaged), your approved risk policy with MEASURED inputs (`risk_policy.py`), the order's notional cap,
+linear-stop drill, the unattended runner. A client with no authority refuses (`NO_ENTRY_AUTHORITY`). A reduce-only exit is not gated by it; a spot sell is an exit only if the venue's own position and wallet reads show the short perp stays covered (spot left >= 98% of the short), otherwise it is refused `WRONG_DIRECTION` (unreadable = refused: close the long by hand, it is price risk; a stripped hedge is a naked short). The production book installs
+one that checks, in order: the venue, the persistent kill switch (read now; unreadable = engaged), the instrument (only the carry's legs: perp Sell, spot Buy; anything else `UNKNOWN_INSTRUMENT`/`WRONG_DIRECTION`), the order type (exact `Market`/`Limit`; a Market order with a price is refused; a Market order is sized at the mark), your approved risk policy with MEASURED inputs (`risk_policy.py`), the order's notional cap,
 and a durable per-`orderLinkId` reservation (an identical resend passes, a different order under the same id is refused, at most 2 distinct unresolved entries).
 
 **Nothing is approved by default, so today the book refuses to open on testnet or mainnet.** The refusal reasons name what is missing: `NO_APPROVED_POLICY` until you write a policy file and
@@ -340,3 +362,33 @@ then `MISSING_INPUT:<name>` for every limit whose value the running book does no
 unmeasured list). That is the intended fail-closed state: do not work around it by editing limits to match what is measured. A loss/hedge/fault breach latches the strategy SUSPENDED in
 `risk_latch.json` beside the state database; it survives restarts and clears only by `RiskLatch.clear(strategy, reason=..., at_ms=...)`, which records why. The reservation ledger
 (`entry_reservations.jsonl`, same directory) is evidence: do not delete it to "unblock" an entry. Paper and shadow runs send no orders, so they are unaffected.
+
+**Reservation ledger limits (stated, not hidden).** `ReservationStore.resolve()` is **not called anywhere in production**; nothing marks a reservation done. The "at most 2 distinct unresolved
+entries" bound is therefore a 15-minute WINDOW over `entry_reservations.jsonl`, not a count of truly open entries, and an old `orderLinkId` stays reserved forever (a different body under it is a
+conflict; an identical resend is allowed). An `orderLinkId` must be exactly `[A-Za-z0-9_-]{1,36}` (no whitespace, never stripped) and "identical" means the whole canonical body (category, symbol, side,
+qty, orderType, price, reduceOnly, timeInForce). Rows written by an older version lack the type/price fields and so never equal a new order: a resend of such an id is refused, not guessed.
+**Writes on any client** are limited to an allow-list (`bybit_connection.WRITE_ENDPOINT_ALLOWLIST`: order create/cancel/cancel-all, position trading-stop/set-leverage, and the demo faucet on the demo venue
+only) and a strict canonical path; set-leverage is also bounded (linear, integer 1..10 and, on a client with an authority, no more than `DEFAULT_LEVERAGE` and the approved policy's `max_leverage`, buy == sell, the carry's perp symbol); trading-stop is limited to the exact body the client builds (linear, perp symbol, plain-decimal `stopLoss`, `tpslMode` Full, `positionIdx` 0); cancel needs an `orderId`/`orderLinkId`, cancel-all needs a symbol, and with an authority both are bound to the carry's two instruments. A new write endpoint is a reviewed code change, not a flag.
+An order-create body is a CLOSED list of keys (`entry_authority.ORDER_BODY_KEYS`; anything else `UNKNOWN_BODY_FIELD`, a spot Buy with `isLeverage` is a refused margin borrow) and a resend is "identical" only if the whole body matches. `reduceOnly` counts as an exit only as the boolean `true`, exact lowercase `linear`/`inverse`, and (with an authority) only as a perp BUY on the carry's own perp symbol; any other reduce-only order is refused `EXIT_NOT_BOUND:*`. The authority sizes a Market order from the book's snapshot mark only if that snapshot is under 30 s old and perp and spot agree within 5%; otherwise the order is refused (`NO_PRICE_FOR_NOTIONAL`).
+
+**Operator tools that build their own client cannot open an order any more (intended; the authority is not weakened for them).** `tools/linear_stop_venue_drill.py`, `tools/close_testnet_experiment.py` (default client factory),
+`tools/testnet_conformance_run.py` and `tools/drill.py` each construct a bare `BybitClient` with no entry authority, so every opening order they send is refused `NO_ENTRY_AUTHORITY` before the transport (reduce-only exits, cancels,
+set-leverage and the stop body still go through, now shape-checked). A testnet run of one of them is therefore an OWNER-run session, and needs all of: (1) an owner-written, approved policy file (`RISK_POLICY_PATH`) with the measured inputs the
+book supplies, (2) the tool to install `entry_authority.build_for_book(...)` on its client with the carry's perp/spot symbols, a state directory and a mark provider (a code change per tool, reviewed by you; none has been made), and (3) the usual testnet-only environment. Until then
+those tools can run their read-only and exit steps and will report `ENTRY_REFUSED: NO_ENTRY_AUTHORITY` on the first opening order.
+
+## Owner attestation key and registry anchor custody
+
+Two secrets decide whether `strategy_verdict.py` can say QUALIFIED or OWNER_PROFIT_EVIDENCED, and both must live where this repository, its volume and the app host cannot reach.
+
+**The key (`OWNER_ATTESTATION_KEY`).** At least 32 characters with at least 12 distinct characters (a repeated or short string is refused as no key). Generate it on your own machine (for example 32 random bytes, base64), keep it in your own password manager. It never goes in the repository, the Fly volume, Fly secrets, a `.env` the app reads, CI, or a chat. `tools/owner_console.py` reports it as set/unset only and raises a finding if it is set in an environment that looks like the app host (any `BYBIT_*` variable present): if you see that finding, remove the key there and treat it as exposed (generate a new one; old attestations stop verifying, which is correct).
+
+**Attesting evidence (on your machine only).**
+`OWNER_ATTESTATION_KEY=... python3 tools/strategy_verdict.py attest --candidate cand.json --evidence evidence.jsonl --registry hypothesis_registry.json --out attested.jsonl`
+It signs only observed-stage items (prospective, execution, owner result), and only if `counted()`'s own preconditions hold: bound to this candidate and the REGISTERED spec digest, registered before the observation started, a window not shorter than registered, not in the future. Evidence the engine would refuse anyway is refused at signing. The signature covers the evidence content including `recorded_ms`. Add the signed lines to the registry with `record_evidence`.
+
+**The anchor.** The registry seal is keyless: anyone who can write the file can delete a FAIL and reseal. The anchor is the head digest you hold outside it. Print it with `python3 tools/hypothesis_registry.py --print-anchor`, write it on paper or in an offline note, and store it away from the repository and volume. After EVERY deliberate append (a registration, evidence, an amendment) print and store the new anchor, and keep the old one only as history; pass the current one as `--anchor` when you evaluate. Without it the verdict cannot exceed PROSPECTIVE.
+
+**A changed spec is a new candidate.** The registry stores the spec digest and the cost-chain declarations (fees, slippage, funding, capacity, execution, holding period, eligibility, OOS protocol, parameter grid) at registration. A spec whose digest differs gets INSUFFICIENT_DATA with `SPEC_DIFFERS_FROM_REGISTERED(<what changed>)`. To change anything legitimately, register a NEW candidate id/version and start its ladder again. A registration from before digests were stored reports `REGISTERED_SPEC_DIGEST_MISSING`: its observed evidence is not counted, so it stays below QUALIFIED; re-register it as a new version.
+
+**What they prove, and what they do not.** The key proves that the key holder signed these claims about this candidate and spec. The anchor proves the registry still has the history it had when you recorded the anchor. Neither proves the claims are true: a key holder can sign a falsehood, and nothing here independently checks the exchange, the fills or the account. QUALIFIED means "consistent claims you signed on a registry you anchored", not "verified profit".

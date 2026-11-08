@@ -41,7 +41,7 @@ VERIFIED, ESTIMATED, PROVISIONAL, STALE, UNAVAILABLE = "VERIFIED", "ESTIMATED", 
 STATUSES = (VERIFIED, ESTIMATED, PROVISIONAL, STALE, UNAVAILABLE)
 SETTLE_MS = CP.SETTLE_MS
 STALE_AFTER_SETTLEMENTS = 2                  # the newest print should be no older than two settlement intervals while the window is open
-_SECRET_NAMES = ("BYBIT_API_KEY", "BYBIT_API_SECRET", "LIVE_TRADING_ACK")
+_SECRET_NAMES = ("BYBIT_API_KEY", "BYBIT_API_SECRET", "LIVE_TRADING_ACK", "OWNER_ATTESTATION_KEY")
 _SAFE_VALUE_NAMES = ("USE_TESTNET", "PAPER_TRADING", "BYBIT_VENUE", "CARRY_DRILL_ENABLED", "CARRY_ENTRY_BENEFIT_MODE")
 
 
@@ -59,6 +59,10 @@ def section_environment(env: Mapping[str, str]) -> Dict[str, Any]:
         findings.append("REAL MONEY IS ARMED by this environment: stop and check it is intended")
     if secrets["LIVE_TRADING_ACK"] == "set":
         findings.append("LIVE_TRADING_ACK is set; this repository's rule is that it stays unset")
+    app_host = any(str(k).startswith("BYBIT_") and str(v or "").strip() for k, v in env.items()) or str(env.get("BYBIT_VENUE") or "").strip() != ""
+    if secrets["OWNER_ATTESTATION_KEY"] == "set" and app_host:
+        findings.append("OWNER_ATTESTATION_KEY is set in an environment that looks like the app host (a BYBIT_* variable is present): the owner attestation key belongs on the owner's own "
+                        "machine only, never on the app host, the volume or Fly secrets (RUNBOOKS: Owner attestation key and registry anchor custody); remove it here and treat it as exposed")
     venue = env.get("BYBIT_VENUE")
     if venue not in (None, "") and str(venue).strip().lower() not in venues.sandbox_names() + venues.live_names():
         findings.append(f"BYBIT_VENUE {venue!r} is not a qualified venue (an unqualified or unknown name is refused everywhere)")
@@ -148,15 +152,41 @@ def section_risk() -> Dict[str, Any]:
             "unmeasured_limits": prop["unmeasured_limits"], "decision": prop["decision"]}
 
 
+def section_strategies() -> Dict[str, Any]:
+    """Every candidate specification the repository holds and the verdict the engine gives it with the evidence ON RECORD (none is recorded here, so templates are UNTESTED and the frozen
+    BTC experiment is described, not promoted). A strategy is only ever as good as its latest verdict; no return figure appears here."""
+    import glob
+    import json as _json
+    import strategy_verdict as SVD
+    out: Dict[str, Any] = {}
+    cands = [("btcusdt_funding_carry_overlay@prospective-1", SVD.btc_carry_candidate())]
+    for p in sorted(glob.glob(os.path.join(BOT, "research", "candidates", "*.json"))):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                c = _json.load(fh)
+            cands.append((str(c.get("candidate_id") or os.path.basename(p)), c))
+        except (OSError, ValueError):
+            out[os.path.basename(p)] = {"verdict": "UNREADABLE"}
+    for cid, c in cands:
+        r = SVD.evaluate(c, [])
+        out[cid] = {"verdict": r.verdict, "next_stage": r.next_stage, "spec_problems": len(r.spec_problems)}
+    counts: Dict[str, int] = {}
+    for v in out.values():
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+    return {"status": ESTIMATED, "candidates": out, "verdict_counts": counts,
+            "note": "evidence for these candidates lives in the hypothesis registry and is not read here: with none supplied every candidate is UNTESTED. No backtest return can promote a candidate."}
+
+
 def section_pnl() -> Dict[str, Any]:
-    return {"actual_realised": {"status": UNAVAILABLE, "why": "no owner-account export is supplied to this read-out; run tools/owner_ledger.py on an export you hold"},
+    return {"actual_realised": {"status": UNAVAILABLE, "why": "no owner-account export is supplied to this read-out; run tools/owner_ledger.py on an export you hold",
+                        "basis_note": "an importer's headline_realised_cash_usd is perp realised cash only, not total profit: read layers.economic_total.net_economic_pnl_usd beside it"},
             "modelled": {"status": ESTIMATED, "why": "any carry figure from the research tools is a model, never a result; keep it apart from the actual line above"}}
 
 
 def build(env: Mapping[str, str], *, funding: Optional[str] = None, backup: Optional[str] = None, now_ms: Optional[int] = None) -> Dict[str, Any]:
     now = _now_ms() if now_ms is None else min(int(now_ms), _now_ms())          # a caller can only move the clock earlier
     rep = {"environment": section_environment(env), "evidence": section_evidence(funding, now), "capital": section_capital(),
-           "eligibility": section_eligibility(env), "testnet": section_testnet(env), "risk": section_risk(), "backup": section_backup(backup), "pnl": section_pnl(), "as_of_ms": now}
+           "eligibility": section_eligibility(env), "testnet": section_testnet(env), "risk": section_risk(), "strategies": section_strategies(), "backup": section_backup(backup), "pnl": section_pnl(), "as_of_ms": now}
     for k, v in rep.items():
         if isinstance(v, dict) and "status" in v and v["status"] not in STATUSES:
             raise AssertionError(f"section {k} has a status outside the vocabulary")

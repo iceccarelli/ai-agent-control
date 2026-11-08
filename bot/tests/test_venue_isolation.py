@@ -154,8 +154,14 @@ class TestAnUnarmedMainnetClientCannotOpenExposure:
     def test_cancel_is_still_allowed_unarmed(self, store):
         client, t = make(store, BYBIT_VENUE="mainnet", USE_TESTNET=False)
         client._request("POST", "/v5/order/cancel-all", signed=True,
-                        body={"category": "spot"})
+                        body={"category": "spot", "symbol": "BTCUSDT"})       # cancel-all now names its symbol (every production caller does)
         assert [c[0] for c in t.calls] == ["POST"]
+
+    def test_a_cancel_all_without_a_symbol_is_refused_even_unarmed(self, store):
+        client, t = make(store, BYBIT_VENUE="mainnet", USE_TESTNET=False)
+        with pytest.raises(Exception, match="CANCEL_REFUSED"):
+            client._request("POST", "/v5/order/cancel-all", signed=True, body={"category": "spot"})
+        assert t.calls == []
 
     def test_the_placed_order_path_reports_not_authorized(self, store):
         client, t = make(store, BYBIT_VENUE="mainnet", USE_TESTNET=False)

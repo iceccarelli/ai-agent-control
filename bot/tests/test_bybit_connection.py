@@ -1178,11 +1178,14 @@ class TestAfter403ReadsStandDownButWritesDoNot:
         with pytest.raises(bc.PermanentAPIError, match="cooldown"):
             self._get(client, self.TICKERS)   # the refused one stays paused
 
+    #: a body the transport lets through (trading-stop is validated), so these tests exercise the 403 handling and not the body check
+    STOP_BODY = {"category": "linear", "symbol": "BTCUSDT", "stopLoss": "1", "tpslMode": "Full", "positionIdx": 0}
+
     def test_a_write_403_does_not_arm_the_read_cooldown(self, client, exchange):
         exchange.scripted = [(403, "forbidden")]
         with pytest.raises(bc.PermanentAPIError):
             client._request("POST", "/v5/position/trading-stop",
-                            body={"category": "linear"}, signed=True)
+                            body=self.STOP_BODY, signed=True)
         before = len(exchange.requests)
         self._get(client, self.TICKERS)
         assert len(exchange.requests) > before
@@ -1194,7 +1197,7 @@ class TestAfter403ReadsStandDownButWritesDoNot:
         before = len(exchange.requests)
         try:
             client._request("POST", "/v5/position/trading-stop",
-                            body={"category": "linear"}, signed=True)
+                            body=self.STOP_BODY, signed=True)
         except Exception:
             pass
         assert len(exchange.requests) > before

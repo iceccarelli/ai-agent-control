@@ -1,0 +1,119 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "last 30% of the PIT history plus walk-forward folds; universe membership frozen as of each fold's train end"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": false,
+    "hedge_completeness_modelled": false,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": true,
+    "point_in_time_universe": false
+  },
+  "candidate_id": "cross_sectional_funding@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 50000.0,
+    "note": "set by the thinnest leg's depth; not measured in this repo"
+  },
+  "counterparty": "perpetual longs in the top-funding asset (pay) and shorts in the bottom-funding asset (pay); the price leg is the risk premium, not a counterparty",
+  "drawdown_model": "to be measured on price+funding P&L; funding-only drawdown is not a drawdown",
+  "economic_mechanism": "Counterparty: leveraged longs in the high-funding perp pay shorts; long side receives from shorts in the low/negative-funding perp. Might persist because leverage demand is crowded and arbitrage capital is limited and sized by margin; might vanish when capital flows to the spread, when the high-funding asset's price rallies against the short leg (the funding is compensation for that risk, not free), or when delisting/illiquidity hits the extreme-funding names (survivorship hides that).",
+  "eligibility_rules": [
+    "symbol active at decision time per the PIT universe",
+    "minimum 30d listing age and a stated minimum open interest",
+    "8h funding interval only"
+  ],
+  "entry": "at each rebalance, rank by trailing mean funding (read via asof(previous settlement)); short top-k, long bottom-k, dollar-neutral",
+  "execution_model": "taker both legs, perp only; price-leg residual risk measured, not assumed away",
+  "exit": "next rebalance or when the rank gap falls below a registered threshold",
+  "family": "cross_sectional_funding",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "provenance": "assumed",
+      "value": 5.5
+    }
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.5
+    }
+  },
+  "holding_period": "1 to 9 settlements (registered grid; every grid cell counts as a tested variant)",
+  "hypothesis": "Across a point-in-time universe of perpetuals, the assets with the highest trailing funding keep paying more than the lowest, so short-high/long-low earns a funding spread net of costs.",
+  "multiple_testing_family": "cross_sectional_funding",
+  "prospective_protocol": {
+    "description": "register parameters and universe rule, then observe forward settlements via the trial journal; no parameter change during observation",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
+  "rejection_conditions": [
+    "adjusted p-value (Holm over every attempted variant) above 0.05 on historical_test or oos_test",
+    "net edge after assumed costs not positive",
+    "universe cannot be shown point-in-time (survivors only)",
+    "result depends on one symbol or one regime window",
+    "price-leg P&L over the sample is negative or larger in magnitude than the funding spread earned"
+  ],
+  "required_data": [
+    {
+      "declaration_keys": [
+        "point_in_time_universe"
+      ],
+      "gap": "repo has only BTC/ETH/SOL Binance funding (hand-picked survivors); no delisted symbols",
+      "name": "point-in-time perp listing/delisting records for the whole venue, including delisted symbols",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "no_future_funding_knowledge"
+      ],
+      "gap": "BTC/ETH/SOL only",
+      "name": "funding history per symbol, 8h, all listed symbols",
+      "point_in_time": true,
+      "repo_has": true
+    },
+    {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
+      "gap": "mark_price column is blank for early history (e.g. BTC 2019) and is not a hedge-grade price series",
+      "name": "mark/index price per symbol to hedge or measure the price legs",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
+      "gap": "BTC/ETH spot L2 only",
+      "name": "depth/spread per symbol for capacity and slippage",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "unhedged cross-asset price spread between the two legs: beta/idiosyncratic move can exceed funding by orders of magnitude; liquidation of the short leg in a squeeze",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. Such a candidate is not yet a testable specification (the verdict reports BIAS_NOT_RULED_OUT) until that data is collected."
+}

@@ -41,6 +41,7 @@ import logging
 import signal
 import sys
 import threading
+import math
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import datetime as dt
@@ -2364,27 +2365,77 @@ def build_close_executor(cfg: Any, store: Any, broker: Any) -> Optional[Any]:
         policy_factory=planner_policy, absence_window_s=window)
 
 
-def _entry_mark(bot: Any, symbol: str) -> Optional[float]:
-    """The book's own current mark for the symbol an order names (a market order carries no price). None = unknown = the authority refuses."""
+#: The entry authority sizes a market order at this mark. It must be as fresh as the risk inputs' own snapshot limit and, because a single wrong leg (a stale or fat-fingered
+#: print) would let an oversize order read as small, within this percent of the OTHER leg's mark. A basis wider than this is not a carry to size from; unknown = refuse.
+ENTRY_MARK_MAX_AGE_S = 30.0
+ENTRY_MARK_MAX_FUTURE_S = 5.0
+ENTRY_MARK_MAX_LEG_DEVIATION_PCT = 5.0
+
+
+def _entry_mark(bot: Any, symbol: str, now_s: Optional[Callable[[], float]] = None, category: Optional[str] = None) -> Optional[float]:
+    """The book's own current mark for the symbol an order names (a market order carries no price). None = unknown = the authority refuses.
+
+    Unknown unless: the snapshot states a finite ``observed_at_s`` no more than ``ENTRY_MARK_MAX_AGE_S`` before the (injectable) clock and not in its future; both legs' marks are
+    positive finite numbers (no bool/str); and perp and spot agree within ``ENTRY_MARK_MAX_LEG_DEVIATION_PCT`` percent. Before this a stale or one-sided snapshot sized an order."""
     snap = getattr(getattr(bot, "carry", None), "snapshot", None)
     if snap is None:
         return None
-    if symbol == getattr(bot.carry, "perp_symbol", None):
-        return getattr(snap, "perp_mark", None)
-    if symbol == getattr(bot.carry, "spot_symbol", None):
-        return getattr(snap, "spot_mark", None)
-    return None
+
+    def num(v: Any) -> Optional[float]:
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    try:
+        now = float((now_s or time.time)())
+        observed = num(getattr(snap, "observed_at_s", None))
+        perp, spot = num(getattr(snap, "perp_mark", None)), num(getattr(snap, "spot_mark", None))
+    except Exception:                                              # noqa: BLE001
+        return None
+    if observed is None or perp is None or spot is None or perp <= 0 or spot <= 0 or observed < 0:
+        return None
+    if observed - now > ENTRY_MARK_MAX_FUTURE_S or now - observed > ENTRY_MARK_MAX_AGE_S:
+        return None
+    if abs(perp - spot) / min(perp, spot) * 100.0 > ENTRY_MARK_MAX_LEG_DEVIATION_PCT:
+        return None
+    # Production names BOTH legs BTCUSDT, so the symbol alone cannot say which mark applies: the ORDER'S category does (linear/inverse = the perp leg, spot = the spot leg).
+    # Where the category is not known, the larger of the marks of the legs that carry this symbol is the conservative size.
+    is_perp = symbol == getattr(bot.carry, "perp_symbol", None)
+    is_spot = symbol == getattr(bot.carry, "spot_symbol", None)
+    if category is not None:
+        if category in ("linear", "inverse"):
+            return perp if is_perp else None
+        if category == "spot":
+            return spot if is_spot else None
+        return None
+    marks = ([perp] if is_perp else []) + ([spot] if is_spot else [])
+    return max(marks) if marks else None
 
 
-def _entry_risk_state(bot: Any) -> "Any":
-    """The risk inputs this book can honestly MEASURE now. Everything else is None, and risk_policy refuses on a missing input: so an approved policy still blocks entry
-    until the corresponding measurement exists. That is the intended present state, not a defect to paper over with defaults."""
+def _entry_hedge_read(bot: Any) -> "Tuple[float, float]":
+    """(perp short size, spot inventory) as the VENUE reports them now, for the entry authority's spot-sell check. Raises on an unreadable venue (the authority treats that as
+    'cannot show the hedge is kept' and refuses the sell)."""
+    c = bot.carry
+    broker = getattr(c.broker, "inner", c.broker)
+    return float(broker.get_perp_position(c.perp_symbol)), float(broker.get_spot_inventory(c.spot_symbol))
+
+
+def _entry_risk_state(bot: Any, pending_notional_usd: Optional[float] = None) -> "Any":
+    """The entry authority's risk inputs, from the authoritative RiskInputProvider: venue quantities and account state, the book's own snapshot, deterministic derivations. Every
+    getter is STAMPED with the time it was read (a bare value is not accepted). Anything it cannot establish is None and risk_policy refuses on it. ``pending_notional_usd`` is the
+    order being decided, so the policy sees post-trade exposure. A provider that cannot be built yields the all-unknown state (every entry refused), never a default."""
     import risk_policy as _RP
-    carry = getattr(bot, "carry", None)
-    halted = None
-    if carry is not None and getattr(carry, "state", None) is not None:
-        halted = getattr(carry.state, "name", str(carry.state)) == "HALTED"
-    return _RP.State(operational_fault=halted)
+    try:
+        prov = getattr(bot, "_risk_input_provider", None)
+        if prov is None:
+            import risk_input_provider as _RIP
+            c = bot.carry
+            prov = _RIP.RiskInputProvider(
+                broker=getattr(c.broker, "inner", c.broker), perp_symbol=c.perp_symbol, spot_symbol=c.spot_symbol,
+                snapshot_getter=lambda: getattr(c, "snapshot", None),
+                opened_ms_getter=lambda: getattr(getattr(c, "position", None), "opened_ms", None),
+                book_state_getter=lambda: (getattr(c, "state", None), int(time.time() * 1000)))
+            bot._risk_input_provider = prov
+        return prov.state(pending_notional_usd=pending_notional_usd)
+    except Exception:                                              # noqa: BLE001 - never raise out of the authority's state read
+        return _RP.State()
 
 
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
@@ -2620,10 +2671,14 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             venue=bot.client.venue, store=bot.store,
             state_dir=(os.path.dirname(os.path.abspath(str(cfg.STATE_DB_PATH))) if cfg.STATE_DB_PATH else None),
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD) * _EA.NOTIONAL_TOLERANCE,
-            mark_provider=lambda symbol: _entry_mark(bot, symbol),
+            mark_provider=lambda symbol, category=None: _entry_mark(bot, symbol, category=category),
             policy_path=(str(cfg.RISK_POLICY_PATH) or None),
-            state_provider=lambda: _entry_risk_state(bot),
-            require_risk_policy=True)
+            state_provider=lambda pending_notional_usd=None: _entry_risk_state(bot, pending_notional_usd),
+            require_risk_policy=True,
+            # Bound to the carry's own legs (short perp, long spot) and, for a spot SELL, to the venue's own position/wallet reads: a sell that would strip the hedge off
+            # the short perp is not an exit. A failed read refuses the sell (fail closed).
+            perp_symbol=bot.carry.perp_symbol, spot_symbol=bot.carry.spot_symbol,
+            hedge_reader=lambda: _entry_hedge_read(bot))
         # The staged close is built only from an OWNER-APPROVED close policy
         # (close_policy.py). Anything less leaves the original single-order
         # close exactly as it was; the reason is logged, never defaulted.

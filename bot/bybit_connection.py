@@ -149,6 +149,22 @@ DEFAULT_ENTRY_AUTHORITY: Any = None
 #: only ``/v5/order/create``: an amend can raise a quantity, a batch create is an order create. Using one needs a reviewed code change, not a flag.
 DENIED_ORDER_ENDPOINTS = frozenset({"/v5/order/amend", "/v5/order/create-batch", "/v5/order/amend-batch"})
 _NONCANONICAL = re.compile(r"[?#\s]|//|/\.\.|[A-Z]|/$")
+#: A write endpoint must be exactly this: lower-case ``/v5/...`` segments of [a-z0-9] joined by single hyphens. No ``%``, ``;``, backslash, NUL, newline, dot, query or
+#: trailing slash. ``fullmatch``, never ``match``/``$`` (``$`` accepts a trailing newline).
+_WRITE_CANONICAL = re.compile(r"/v5(/[a-z0-9]+(-[a-z0-9]+)*)+")
+#: THE ALLOW-LIST of non-GET requests this bot sends (inventoried from the code: ``place_order``/``CarryBroker`` create, the cancel paths, the protective stop, set-leverage).
+#: Everything else (withdraw, transfer, borrow, amend, batch, API-key management, ...) is refused on a BARE client; a denylist cannot enumerate what the venue adds. The value is the
+#: set of venues the path may be sent to (None = any): ``demo-apply-money`` is the demo venue's play-money faucet (``tools/fund_demo.py``) and nothing else.
+WRITE_ENDPOINT_ALLOWLIST: Dict[str, Optional[frozenset]] = {
+    "/v5/order/create": None,
+    "/v5/order/cancel": None,
+    "/v5/order/cancel-all": None,
+    "/v5/position/trading-stop": None,
+    "/v5/position/set-leverage": None,
+    "/v5/account/demo-apply-money": frozenset({"demo"}),
+}
+#: The most leverage a set-leverage request may ask for (config.DEFAULT_LEVERAGE is itself bounded to 10).
+SET_LEVERAGE_MAX = 10
 
 
 def resolve_client_venue(cfg: Any) -> str:
@@ -480,6 +496,9 @@ class BybitClient:
         #: THE common authority for new exposure (entry_authority.EntryAuthority), consulted in ``_request`` for every exposure-increasing ``/v5/order/create``. None =
         #: the module default (None in production) = a refusal: this client cannot open anything.
         self.entry_authority: Any = None
+        #: Optional runtime ROLE limit (``runtime_capability.Capability``): consulted in ``_request`` BEFORE anything is signed or sent. A public collector, a read-only monitor and an
+        #: evidence/backup process are built with a capability that cannot sign or POST. None = no role limit (the entry authority still gates new exposure).
+        self.capability: Any = None
 
         # The venue is resolved ONCE, centrally, and refused when the config
         # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
@@ -665,6 +684,87 @@ class BybitClient:
             f"{k}={v}" for k, v in params.items() if v is not None and v != ""
         )
 
+    def _check_set_leverage(self, body: Any) -> None:
+        """set-leverage changes liquidation risk on an open perp and is sent without the entry authority, so it has its own bound: exactly the four fields ``set_leverage`` builds,
+        category linear, one plain symbol (the authority's perp symbol when it has one), buy == sell, an integer in [1, SET_LEVERAGE_MAX]. (On mainnet it additionally needs live
+        authorisation: EXPOSURE_ENDPOINTS.)"""
+        ok = type(body) is dict and set(body) == {"category", "symbol", "buyLeverage", "sellLeverage"}
+        if ok:
+            lev_b, lev_s, sym = body["buyLeverage"], body["sellLeverage"], body["symbol"]
+            ok = (body["category"] == "linear" and isinstance(sym, str) and re.fullmatch(r"[A-Z0-9]{3,20}", sym) is not None
+                  and isinstance(lev_b, str) and isinstance(lev_s, str) and lev_b == lev_s and re.fullmatch(r"[1-9][0-9]?", lev_b) is not None
+                  and 1 <= int(lev_b) <= SET_LEVERAGE_MAX)
+            bound = getattr(self.entry_authority, "perp_symbol", None)
+            if ok and bound is not None and sym != bound:
+                ok = False
+            if ok and self.entry_authority is not None:
+                # With an authority the request is also bounded by the leverage this client is CONFIGURED for (cfg.DEFAULT_LEVERAGE) and by the owner-approved policy's
+                # max_leverage when one is readable: SET_LEVERAGE_MAX=10 alone let a DEFAULT_LEVERAGE=3 client send "10" (reproduced).
+                limit = min(SET_LEVERAGE_MAX, int(self.leverage))
+                get_max = getattr(self.entry_authority, "max_leverage", None)
+                pol_max = get_max() if callable(get_max) else None
+                if isinstance(pol_max, int) and not isinstance(pol_max, bool):
+                    limit = min(limit, pol_max)
+                if int(lev_b) > limit:
+                    ok = False
+        if not ok:
+            logger.critical("set-leverage REFUSED at the transport: not the bounded, bound-symbol request this client sends")
+            raise OrderNotSent("LEVERAGE_REFUSED: set-leverage outside the allow-list policy")
+
+    _PLAIN_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
+    _ID = re.compile(r"[A-Za-z0-9_-]{1,36}")
+    _SYMBOL = re.compile(r"[A-Z0-9]{3,20}")
+    _CANCEL_ALL_FILTERS = ("Order", "StopOrder", "tpslOrder")
+
+    def _bound_instruments(self) -> Optional[Dict[str, str]]:
+        """{category: symbol} the entry authority is bound to, or None when this client has no bound authority (a bare client: shape-checked only)."""
+        a = self.entry_authority
+        perp, spot = getattr(a, "perp_symbol", None), getattr(a, "spot_symbol", None)
+        if a is None or not (isinstance(perp, str) and isinstance(spot, str)):
+            return None
+        return {"linear": perp, "spot": spot}
+
+    def _check_trading_stop(self, body: Any) -> None:
+        """The protective-stop body, validated like set-leverage: exactly the fields ``_place_position_stop``/``clear_position_stop`` build (required: category linear, symbol,
+        stopLoss as a plain non-negative decimal, tpslMode Full, positionIdx 0; optional slTriggerBy/slOrderType Market); symbol == the authority's perp symbol when it has one."""
+        required = {"category", "symbol", "stopLoss", "tpslMode", "positionIdx"}
+        ok = type(body) is dict and required <= set(body) <= required | {"slTriggerBy", "slOrderType"}
+        if ok:
+            sym, sl = body["symbol"], body["stopLoss"]
+            ok = (body["category"] == "linear" and type(sym) is str and self._SYMBOL.fullmatch(sym) is not None
+                  and type(sl) is str and self._PLAIN_DECIMAL.fullmatch(sl) is not None
+                  and body["tpslMode"] == "Full" and type(body["positionIdx"]) is int and body["positionIdx"] == 0
+                  and body.get("slTriggerBy", "LastPrice") in ("LastPrice", "MarkPrice", "IndexPrice") and body.get("slOrderType", "Market") == "Market")
+            bound = getattr(self.entry_authority, "perp_symbol", None)
+            if ok and bound is not None and sym != bound:
+                ok = False
+        if not ok:
+            logger.critical("trading-stop REFUSED at the transport: not the bound-symbol protective-stop request this client sends")
+            raise OrderNotSent("TRADING_STOP_REFUSED: trading-stop outside the allow-list policy")
+
+    def _check_cancel(self, endpoint: str, body: Any) -> None:
+        """cancel: exactly category + symbol + orderId/orderLinkId (each matching the id regex, at least one); cancel-all: category + symbol (REQUIRED: a missing symbol
+        cancels the whole category) + for spot only an orderFilter from the three the client iterates. With an authority the (category, symbol) must be one of its bound
+        instruments."""
+        ok = type(body) is dict
+        if ok:
+            cat, sym = body.get("category"), body.get("symbol")
+            ok = cat in ("linear", "spot") and type(cat) is str and type(sym) is str and self._SYMBOL.fullmatch(sym) is not None
+            bound = self._bound_instruments()
+            if ok and bound is not None and bound.get(cat) != sym:
+                ok = False
+            if ok and endpoint == "/v5/order/cancel":
+                ids = [k for k in ("orderId", "orderLinkId") if k in body]
+                ok = (set(body) <= {"category", "symbol", "orderId", "orderLinkId"} and bool(ids)
+                      and all(type(body[k]) is str and self._ID.fullmatch(body[k]) is not None for k in ids))
+            elif ok:
+                ok = set(body) <= {"category", "symbol", "orderFilter"}
+                if ok and "orderFilter" in body:
+                    ok = cat == "spot" and body["orderFilter"] in self._CANCEL_ALL_FILTERS and type(body["orderFilter"]) is str
+        if not ok:
+            logger.critical("%s REFUSED at the transport: not a bound-symbol request this client sends", endpoint)
+            raise OrderNotSent(f"CANCEL_REFUSED: {endpoint} outside the allow-list policy")
+
     def _authorize_new_exposure(self, body: Any) -> None:
         """Every order that is not provably an exit passes the entry authority; a client without one refuses (``NO_ENTRY_AUTHORITY``). A reduce-only exit does not pass
         through it and is not made weaker or stronger by it."""
@@ -672,9 +772,23 @@ class BybitClient:
         if type(body) is not dict:                                  # a dict SUBCLASS can lie about .get(); only a plain dict is read
             raise OrderNotSent("ENTRY_REFUSED: ORDER_BODY_NOT_A_PLAIN_OBJECT")
         snapshot = dict(body)                                       # decided on a copy: what is judged is what was captured
-        if not _ea.increases_exposure(snapshot):
-            return
         authority = self.entry_authority if self.entry_authority is not None else DEFAULT_ENTRY_AUTHORITY
+        exposure = _ea.increases_exposure(snapshot)
+        if not exposure and _ea.is_spot_sell(snapshot):
+            # A spot SELL is an exit only if it leaves the short perp covered (venue reads). An authority that can show it does not, or cannot show it at all, makes it exposure,
+            # which the instrument check then refuses (WRONG_DIRECTION). An authority without the method (the backtester's simulated one) keeps the old exit semantics.
+            keeps = getattr(authority, "spot_sell_keeps_hedge", None)
+            if keeps is not None and keeps(snapshot) is not True:
+                exposure = True
+        if not exposure:
+            # An exit is judged against the carry's OWN legs when the authority can say (reduce-only is the venue's guarantee about a position, not proof it is ours).
+            bound_exit = getattr(authority, "exit_refusal", None)
+            if bound_exit is not None:
+                why = bound_exit(snapshot)
+                if why is not None:
+                    logger.critical("exit REFUSED at the transport: %s", why)
+                    raise OrderNotSent(f"ENTRY_REFUSED: {why}")
+            return
         if authority is None:
             logger.critical("order REFUSED at the transport: this client has no entry authority (%s)", self.venue)
             raise OrderNotSent("ENTRY_REFUSED: NO_ENTRY_AUTHORITY")
@@ -730,11 +844,27 @@ class BybitClient:
         decision-time book) is held to a wall-clock bound.
         """
         method = method.upper()
-        if method != "GET" and (_NONCANONICAL.search(endpoint) or endpoint in DENIED_ORDER_ENDPOINTS):
-            # The exposure guards below compare the endpoint string EXACTLY; a query string, case or slash variant would sail past both the live gate and the entry
-            # authority (reproduced: POST '/v5/order/create?x=1' on a mainnet-venue client reached the transport). A write endpoint must be canonical and supported.
-            raise OrderNotSent(f"ENDPOINT_REFUSED: {endpoint!r} is not a canonical, supported write endpoint")
+        if method != "GET":
+            # The exposure guards below compare the endpoint string EXACTLY; a query string, case, percent-escape or slash variant would sail past both the live gate and the entry
+            # authority (reproduced: POST '/v5/order/create?x=1' on a mainnet-venue client reached the transport, and '/v5/order/%63reate' reached it on a testnet one). A write must be
+            # a canonical path (strict fullmatch) AND on the allow-list of writes this bot actually sends, for this venue.
+            allowed_venues = WRITE_ENDPOINT_ALLOWLIST.get(endpoint, frozenset()) if isinstance(endpoint, str) else frozenset()
+            if (method != "POST" or not isinstance(endpoint, str) or not _WRITE_CANONICAL.fullmatch(endpoint) or _NONCANONICAL.search(endpoint)
+                    or endpoint in DENIED_ORDER_ENDPOINTS or endpoint not in WRITE_ENDPOINT_ALLOWLIST
+                    or (allowed_venues is not None and self.venue not in allowed_venues)):
+                raise OrderNotSent(f"ENDPOINT_REFUSED: {method} {endpoint!r} is not a canonical, allow-listed write endpoint for {self.venue}")
+        # Serialised ONCE. The entry authority judges json.loads(THIS string) and THIS string is what is signed and sent (a str subclass / __eq__ / __str__ trick can make an
+        # object read differently to the authority than to the encoder: reproduced).
+        try:
+            body_str = json.dumps(body, separators=(",", ":"), allow_nan=False) if body else ""
+        except (TypeError, ValueError) as exc:
+            raise OrderNotSent(f"BODY_REFUSED: not serialisable as plain JSON ({type(exc).__name__})") from None
         url = f"{self.base_url}{endpoint}"
+        if self.capability is not None:
+            refusal = self.capability.check(method, endpoint, bool(signed), _venues.host_of(url))
+            if refusal:
+                logger.critical("request REFUSED by the runtime capability: %s %s (%s)", method, endpoint, refusal)
+                raise OrderNotSent(f"CAPABILITY_REFUSED: {refusal}")
         self._assert_endpoint_matches_venue(url)
         if (_venues.requires_live_authorisation(self.venue)
                 and endpoint in EXPOSURE_ENDPOINTS):
@@ -749,8 +879,15 @@ class BybitClient:
         # Incremented before the attempt, not after a success: an order whose
         # response was lost still left the process, and a session log that
         # under-counts those is the one that would lie.
+        if endpoint == "/v5/position/set-leverage":
+            self._check_set_leverage(json.loads(body_str) if (type(body) is dict and body_str) else body)
+        if endpoint == "/v5/position/trading-stop":
+            self._check_trading_stop(json.loads(body_str) if (type(body) is dict and body_str) else body)
+        if endpoint in ("/v5/order/cancel", "/v5/order/cancel-all"):
+            self._check_cancel(endpoint, json.loads(body_str) if (type(body) is dict and body_str) else body)
         if endpoint == "/v5/order/create":
-            self._authorize_new_exposure(body)                     # the LAST responsible boundary: refuses BEFORE the count and before the transport
+            # the LAST responsible boundary: refuses BEFORE the count and before the transport. It judges the decoded wire string, not the caller's object.
+            self._authorize_new_exposure(json.loads(body_str) if (type(body) is dict and body_str) else body)
             self.orders_submitted += 1
         if (method == "GET" and endpoint in self.COOLDOWN_READ_ENDPOINTS
                 and time.monotonic() < self._read_cooldown_until.get(endpoint, 0.0)):
@@ -770,8 +907,7 @@ class BybitClient:
             timestamp = str(self._now_ms())
             headers: Dict[str, str] = {"Content-Type": "application/json"}
             query = self._query_string(params or {})
-            # The body is serialised ONCE and both signed and sent verbatim.
-            body_str = json.dumps(body, separators=(",", ":")) if body else ""
+            # body_str was serialised once, above, before anything was authorised; it is signed and sent verbatim.
 
             if signed:
                 payload = query if method == "GET" else body_str

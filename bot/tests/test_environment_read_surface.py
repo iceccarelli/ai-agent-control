@@ -21,7 +21,9 @@ ALLOWED = {
     "tools/reserved_holdout.py": 1,      # a disable switch
     "tools/testnet_session.py": 1,       # BYBIT_VENUE guard for the testnet session
     "tools/operator_paper_daily.py": 1,  # hands env to config
+    "tools/testnet_action_manifest.py": 1,   # records only whether the NAMED testnet credential variables are set (presence booleans), never a value
     "tools/testnet_certificate.py": 1,    # offline certificate: hands os.environ to config.is_live_authorized (main only)
+    "tools/strategy_verdict.py": 1,      # default key provider: reads ONE named variable (the owner's attestation key) at verification time; never logged, stored or serialised
     "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
     "tools/runner_alerts.py": 1,         # alert transport settings
     "tools/runner_monitor.py": 4,        # credential presence, alert settings
@@ -30,6 +32,7 @@ ALLOWED = {
                                          # settings; reads nothing else, prints no value
     "tools/execution_samples_report.py": 1,  # defaults mode/symbols from the deployment env
     "tools/close_testnet_experiment.py": 1,  # default env mapping for the LIVE_TRADING_ACK-present refusal
+    "tools/runner_supervisor.py": 1,     # copies os.environ ONLY to SCRUB it (allow-list, no BYBIT_*/LIVE_*/SUPABASE_*/secrets) for the public recorder child
 }
 
 #: Nothing here may read the environment: these are the order, risk and

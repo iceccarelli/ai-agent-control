@@ -196,3 +196,16 @@ def test_a_nan_in_an_entry_is_reported_not_crashed_into_a_false_pass(tmp_path):
     reg, _ = _sealed_pair(tmp_path)
     reg["trials"][0]["evidence"][0]["details"] = {"x": float("nan")}
     assert any("cannot be read" in p or "ALTERED" in p for p in hr.verify(reg))
+
+
+def test_the_keyless_seal_is_fooled_by_delete_and_reseal_but_an_owner_held_anchor_is_not():
+    reg = committed()
+    anchor = hr.anchor_digest(reg)
+    assert hr.verify(reg, anchor=anchor) == [] and hr.anchor_digest(copy.deepcopy(reg)) == anchor
+    gone = copy.deepcopy(reg)
+    gone["trials"] = gone["trials"][1:]
+    hr.seal(gone)
+    assert hr.verify(gone) == []                                    # a resealed registry verifies against its own (keyless) seal: untrusted
+    assert any("anchor" in p for p in hr.verify(gone, anchor=anchor))
+    assert hr.verify(reg, anchor="not-a-digest")
+    assert hr.main(["--path", hr.DEFAULT_PATH, "--print-anchor"]) == 0

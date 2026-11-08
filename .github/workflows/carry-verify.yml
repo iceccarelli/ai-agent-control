@@ -94,7 +94,7 @@ jobs:
 
       - name: Carry correctness tests
         env:
-          # tests/test_entry_gate_parity.py SKIPS without a compiler locally; here
+          # the entry-gate parity test SKIPS without a compiler locally; here
           # a missing library must fail the job, never go green on half the parity.
           REQUIRE_NATIVE_CORE: "1"
         run: >
@@ -170,8 +170,21 @@ jobs:
           tests/test_entry_authority.py
           tests/test_universe_capture.py
           tests/test_funding_cap_event_path.py
-          tests/test_supabase_migrations.py
           tests/test_owner_import.py
+          tests/test_strategy_verdict.py
+          tests/test_runtime_capability.py
+          tests/test_runtime_roles.py
+          tests/test_testnet_action_manifest.py
+          tests/test_capability_wiring.py
+          tests/test_risk_input_provider.py
+          tests/test_order_path_inventory.py
+          tests/test_market_collector.py
+          tests/test_economic_model.py
+          tests/test_economic_faults.py
+          tests/test_research_harness.py
+          tests/test_candidate_templates.py
+          tests/test_owner_import_lineage.py
+          tests/test_full_lifecycle_faults.py
           tests/test_md_broker_funding_interval.py
           tests/test_entry_authority_e2e.py
           tests/test_state_backup_promote.py
@@ -437,7 +450,7 @@ jobs:
         if: always()
         run: |
           echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Targeted carry correctness gate. Every other test file runs in the rest-of-suite job; together they cover the whole suite. Green means the code is internally consistent, not that the strategy makes money." >> "$GITHUB_STEP_SUMMARY"
+          echo "Targeted carry correctness gate. Every other test file runs in the rest-of-suite job (which leaves out tests carrying the documented data_freshness marker: those tests run in NO job here, by design, see the comment above that job). Green means the code is internally consistent, not that the strategy makes money." >> "$GITHUB_STEP_SUMMARY"
 
   production-image:
     name: production image builds and imports offline
@@ -552,8 +565,11 @@ jobs:
   # here is DERIVED by set difference against the gate's own list, so a new test
   # file is covered by exactly one of the two jobs. It excludes only tests
   # carrying the documented `data_freshness` marker (pytest.ini), which are
-  # supposed to go red as real time passes. Offline: no secret, no network
-  # trading, no order path.
+  # supposed to go red as real time passes. THAT MEANS tests marked data_freshness
+  # run in NO job of this workflow: the two jobs together cover every unmarked test
+  # file, not "the whole suite". Run them by hand (`pytest -m data_freshness`) when
+  # the corpus is refreshed or re-pinned. Offline: no secret, no network trading,
+  # no order path.
   rest-of-suite:
     name: rest of the suite (python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -587,8 +603,53 @@ jobs:
           REQUIRE_NATIVE_CORE: "1"
         run: |
           set -eu
-          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' ../.github/workflows/carry-verify.yml | sort -u > "$RUNNER_TEMP/named.txt"
+          # Named = the files the `python -m pytest` COMMANDS in this workflow list (see the script's header). A
+          # test file merely mentioned in a comment or an echo is NOT named and so is not excluded from this job.
+          awk -f ../.github/scripts/named_tests.awk ../.github/workflows/carry-verify.yml | sort -u > "$RUNNER_TEMP/named.txt"
           ls tests/test_*.py | sort > "$RUNNER_TEMP/all.txt"
+          test -s "$RUNNER_TEMP/named.txt"
+          if [ -n "$(comm -13 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt")" ]; then
+            echo "the workflow names test files that do not exist:"; comm -13 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt"; exit 1
+          fi
           comm -23 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt" > "$RUNNER_TEMP/rest.txt"
           echo "test files the correctness gate does not name: $(wc -l < "$RUNNER_TEMP/rest.txt")"
           python -m pytest -q -rs -p no:cacheprovider -m "not data_freshness" $(cat "$RUNNER_TEMP/rest.txt")
+
+  # The RLS / append-only / anon-denied / trigger guarantees of supabase/migrations are EXECUTED against a throwaway
+  # local Postgres (the pinned `pgserver` wheel: a private data directory under pytest's tmp path, unix socket only,
+  # started as the unprivileged runner user). In the other jobs those tests SKIP when pgserver is not installed, which
+  # is how they went unrun in CI. Here REQUIRE_PG=1 turns "pgserver missing or Postgres will not start" into a FAILURE
+  # in BOTH test files (each routes its fixture through the same _unavailable/REQUIRE_PG logic), and the pin lives in
+  # bot/constraints.txt like every other test dependency. This guards the fixture only: a test that is itself marked
+  # skip is not caught by REQUIRE_PG (the job narrows nothing on the command line, and a test asserts that).
+  # No Supabase project, no network service, no credential: the Supabase roles and auth.uid() are stubbed locally.
+  supabase-migrations:
+    name: supabase migrations executed on postgres (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install dependencies and the pinned disposable Postgres
+        run: python -m pip install -r requirements.txt -c constraints.txt pytest pgserver
+
+      - name: Run the Supabase tests against a real Postgres (a missing or broken Postgres fails the job)
+        env:
+          REQUIRE_PG: "1"
+        run: >
+          python -m pytest -q -rs -p no:cacheprovider
+          tests/test_supabase_migrations.py
+          tests/test_supabase_sync.py
