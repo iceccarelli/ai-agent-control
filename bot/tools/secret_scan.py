@@ -26,7 +26,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 #: (``your_api_key_xxxx``, ``changeme``, ``example``) are filtered out by ``_is_placeholder``, which
 #: judges the WHOLE value, never a substring.
 RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
-    ("private-key-block", re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
+    ("private-key-block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")),          # RSA / EC / OPENSSH / ENCRYPTED / PGP ... PRIVATE KEY [BLOCK]
     ("aws-access-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b")),
     ("github-fine-grained-token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b")),
@@ -51,6 +51,17 @@ RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("secret-assignment", re.compile(
         r"""(?ix)\b(?:(?:[a-z0-9]+[_-])+(?:secret|token)|token|[a-z0-9_]*service[_-]?role[_-]?key|
             [a-z0-9_]*aws[_-]?secret[_-]?access[_-]?key)["']?\s*[:=]\s*["']?([A-Za-z0-9/+_=-]{16,})(?![\w(.\[])""")),
+    # ---- red-team round 3 additions. Each is appended (RULES[1] must stay the AWS id rule). Group 1 is the secret part.
+    # a Supabase personal access token: ``sbp_`` + 40 hex
+    ("supabase-pat", re.compile(r"\bsbp_[0-9a-f]{40}\b")),
+    # a URL that carries a password: postgresql://user:pw@host, DATABASE_URL=..., redis://:pw@host (empty user). The password may itself contain ``@``, ``!``, ``#``.
+    ("credentialed-url", re.compile(r"""\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@'"]*:([^/\s'"]{3,})@[^\s/@'"]+""")),
+    # ``Authorization: Bearer <36+ chars>`` / ``bearer <token>`` (a header or a curl line); a template or placeholder is filtered
+    ("bearer-token", re.compile(r"(?i)\bbearer[ \t]+([A-Za-z0-9._~+/=-]{36,})")),
+    # a QUOTED value (any characters, so ``&!#.@`` are fine) assigned to password / passwd / passphrase / pwd / pw
+    ("password-literal", re.compile(r"""(?ix)(?<![a-z0-9])(?:[a-z0-9_]{0,24}(?:password|passwd|passphrase)|pwd|pw)["']?\s*[:=]\s*["']([^"'\n]{6,})["']""")),
+    # an UNQUOTED ``pw=`` / ``pwd=`` / ``password=`` / ``passphrase=`` value (libpq DSN, query string, env file)
+    ("password-assignment", re.compile(r"""(?ix)(?<![a-z0-9])(?:[a-z0-9_]{0,24}(?:password|passwd|passphrase)|pwd|pw)\s*=\s*([^\s"'&;,()]{6,})(?![\w(.\[])""")),
 )
 
 #: Words a placeholder value may be made of. A value is a placeholder only when EVERY ``_ - / + =``-separated
@@ -77,8 +88,25 @@ def _is_placeholder(value: str) -> bool:
 
 #: Rules whose group 1 must additionally look like a literal secret: not a placeholder, and mixed letters and
 #: digits (an identifier such as ``build_authorization_header`` is code, not a credential).
-_STRICT_VALUE_RULES = frozenset(("secret-literal", "secret-assignment"))
-_ASSIGNMENT_RULES = frozenset(("credential-assignment", "secret-literal", "secret-assignment"))
+_STRICT_VALUE_RULES = frozenset(("secret-literal", "secret-assignment", "password-assignment"))
+_ASSIGNMENT_RULES = frozenset(("credential-assignment", "secret-literal", "secret-assignment", "password-literal", "password-assignment"))
+#: rules whose group 1 is judged by ``_credential_value`` (not a placeholder / template / code expression)
+_CREDVALUE_RULES = frozenset(("credentialed-url", "bearer-token", "password-literal"))
+_TEMPLATE = re.compile(r"^(?:\$\{?\w*\}?|<[^>]*>|\{\{.*\}\}|\{\w*\}|%\(?\w*\)?[sd]|\.\.\.|\*+|\w*\(\))$")
+
+
+def _credential_value(rule: str, value: str) -> bool:
+    """A password / URL password / bearer token that is a real-looking literal: not a template (``${PW}``, ``<password>``, ``{{ x }}``, ``%s``), not made only of placeholder words
+    (the words may be separated by spaces or punctuation: "your password here"), and for a bearer token mixed letters/digits or mixed case."""
+    v = value.strip()
+    if not v or _TEMPLATE.match(v) or v.startswith(("$", "{{", "<")):
+        return False
+    words = [t for t in re.split(r"[^A-Za-z0-9]+", v.lower()) if t]
+    if not words or all(w in _PLACEHOLDER_WORDS or w in ("user", "pass", "postgres", "localhost", "host", "pw", "pwd", "passwd", "secret", "passphrase", "pass", "phrase") or re.fullmatch(r"x+|0+|\d{1,3}|\*+", w) for w in words):
+        return False
+    if rule == "bearer-token":
+        return (any(c.isdigit() for c in v) and any(c.isalpha() for c in v)) or (any(c.isupper() for c in v) and any(c.islower() for c in v))
+    return True
 
 
 def _looks_like_secret(value: str) -> bool:
@@ -167,6 +195,8 @@ def scan_text(text: str, _path: Optional[str] = None) -> List[Tuple[int, str]]:
             if not m:
                 continue
             if rule == "credential-assignment" and _is_placeholder(m.group(1)):
+                continue
+            if rule in _CREDVALUE_RULES and not any(_credential_value(rule, x.group(1)) for x in pattern.finditer(line)):
                 continue
             if rule in _STRICT_VALUE_RULES and not _looks_like_secret(m.group(1)):
                 # the first match may be a decoy; look at the rest of the line for a real one

@@ -55,7 +55,7 @@ def sha(s: str) -> str:
 def test_migrations_present_ordered_and_timestamped():
     assert len(FILES) >= 7
     names = [f.name for f in FILES]
-    assert all(re.fullmatch(r"20261107\d{6}_[a-z0-9_]+\.sql", n) for n in names), names
+    assert all(re.fullmatch(r"2026110[78]\d{6}_[a-z0-9_]+\.sql", n) for n in names), names
     assert names == sorted(names) and len(set(n.split("_")[0] for n in names)) == len(names)
     assert names[0].startswith("20261107000100_")
 
@@ -146,8 +146,34 @@ def test_require_pg_turns_a_missing_pgserver_into_a_failure_not_a_skip():
         _unavailable("postgres will not start", True)
 
 
+class _PG:
+    def __init__(self, psql, uri):
+        self.psql, self.uri = psql, uri
+
+    def run(self, sql, role=None, uid=None, check=True):
+        pre = ""
+        if role:
+            pre += f"set role {role};\n"
+        if uid:
+            pre += f"select set_config('request.jwt.claim.sub', '{uid}', false);\n"
+        p = subprocess.run([str(self.psql), self.uri, "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1"], input=pre + sql,
+                           capture_output=True, text=True, timeout=120)
+        if check and p.returncode != 0:
+            raise AssertionError(p.stderr)
+        return p
+
+    def fails(self, sql, match, **kw):
+        p = self.run(sql, check=False, **kw)
+        assert p.returncode != 0, f"expected failure: {sql}"
+        assert re.search(match, p.stderr, re.I), p.stderr
+        return p
+
+    def scalar(self, sql, **kw):
+        return self.run(sql, **kw).stdout.strip().splitlines()[-1]
+
+
 @pytest.fixture(scope="module")
-def pg(tmp_path_factory):
+def server(tmp_path_factory):
     require = os.environ.get("REQUIRE_PG") == "1"
     pgserver = _pgserver(require)
     d = tmp_path_factory.mktemp("pgdata")
@@ -158,35 +184,28 @@ def pg(tmp_path_factory):
     psql = Path(pgserver.__file__).parent / "pginstall" / "bin" / "psql"
     if not psql.exists():
         _unavailable("pgserver psql binary missing", require)
-    uri = srv.get_uri()
+    return _PG(psql, srv.get_uri())
 
-    class PG:
-        def run(self, sql, role=None, uid=None, check=True):
-            pre = ""
-            if role:
-                pre += f"set role {role};\n"
-            if uid:
-                pre += f"select set_config('request.jwt.claim.sub', '{uid}', false);\n"
-            p = subprocess.run([str(psql), uri, "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1"], input=pre + sql,
-                               capture_output=True, text=True, timeout=120)
-            if check and p.returncode != 0:
-                raise AssertionError(p.stderr)
-            return p
 
-        def fails(self, sql, match, **kw):
-            p = self.run(sql, check=False, **kw)
-            assert p.returncode != 0, f"expected failure: {sql}"
-            assert re.search(match, p.stderr, re.I), p.stderr
-            return p
-
-        def scalar(self, sql, **kw):
-            return self.run(sql, **kw).stdout.strip().splitlines()[-1]
-
-    h = PG()
+def _fresh(server, name, files):
+    server.run(f"create database {name};")
+    h = _PG(server.psql, server.uri.replace("@/postgres?", f"@/{name}?", 1))
     h.run(SUPABASE_STUB)
-    for f in FILES:
+    for f in files:
         h.run(f.read_text())
     return h
+
+
+@pytest.fixture(scope="module")
+def pg(server):
+    """Every migration, in order: the schema as shipped."""
+    return _fresh(server, "mig_all", FILES)
+
+
+@pytest.fixture(scope="module")
+def pg_pre(server):
+    """The schema as of 20261107000900 (before the rt4 migration closed the no-writer tables): the tests of that migration's CHECKs insert into tables the later one write-closes."""
+    return _fresh(server, "mig_pre", [f for f in FILES if f != RT4])
 
 
 A, B = str(uuid.uuid4()), str(uuid.uuid4())
@@ -323,18 +342,18 @@ def test_approval_never_defaults_true_and_needs_owner(pg):
                                         "approver_id": A, "statement_sha256": sha("s")}) == "t"
 
 
-def test_execution_session_modes_and_flat_requires_venue_read(pg):
+def test_execution_session_modes_and_flat_requires_venue_read(pg_pre):
     s = {"owner_id": A, "session_id": "S1", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1",
          "started_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("s1")}
     for bad_mode in ("LIVE", "MAINNET", "paper"):
-        pg.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps({**s, "mode": bad_mode, "session_id": "SX", "content_sha256": sha("sx" + bad_mode)}),
+        pg_pre.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps({**s, "mode": bad_mode, "session_id": "SX", "content_sha256": sha("sx" + bad_mode)}),
                  "violates", role="service_role")
-    assert put(pg, "execution_sessions", s) == "t"
+    assert put(pg_pre, "execution_sessions", s) == "t"
     e = {"owner_id": A, "session_id": "S1", "state": "FLAT_CONFIRMED", "recorded_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("e")}
-    pg.fails("select carry.put_row('execution_session_events', $j$%s$j$::jsonb);" % json.dumps(e), "violates", role="service_role")
-    pg.fails("select carry.put_row('execution_session_events', $j$%s$j$::jsonb);" % json.dumps(
+    pg_pre.fails("select carry.put_row('execution_session_events', $j$%s$j$::jsonb);" % json.dumps(e), "violates", role="service_role")
+    pg_pre.fails("select carry.put_row('execution_session_events', $j$%s$j$::jsonb);" % json.dumps(
         {**e, "state": "HALTED", "venue_position_read_sha256": sha("r"), "content_sha256": sha("e3")}), "violates", role="service_role")
-    assert put(pg, "execution_session_events", {**e, "venue_position_read_sha256": sha("r")}) == "t"
+    assert put(pg_pre, "execution_session_events", {**e, "venue_position_read_sha256": sha("r")}) == "t"
 
 
 def test_manifest_constraints(pg):
@@ -351,10 +370,11 @@ def test_manifest_constraints(pg):
 # The executed form of the red-team probes (probe.sql / probe2.sql): every case has a positive control.
 
 HARDENING = MIG_DIR / "20261107000900_carry_write_path_hardening.sql"
+RT4 = MIG_DIR / "20261108000100_carry_rt4_sync_hardening.sql"
 
 
 def test_hardening_migration_is_last_additive_and_documents_what_it_cannot_close():
-    assert FILES[-1] == HARDENING
+    assert FILES[-2] == HARDENING and FILES[-1] == RT4          # the rt4 migration is the newest; nothing numbered was edited to make room for it
     raw = HARDENING.read_text()
     code = strip_comments(raw).lower()
     assert not re.search(r"\bcreate table\b|\bdrop\b|\bgrant\b[^;]*\b(insert|update|delete|truncate|all)\b|disable row level|security definer", code)
@@ -393,31 +413,31 @@ def test_server_owns_id_and_created_at_and_a_forged_pair_is_ignored(pg):
                      "and not exists (select 1 from pg_trigger g where g.tgrelid=c.oid and g.tgname='carry_stamp_insert');") == "0"
 
 
-def test_future_dated_event_times_are_refused_but_the_present_and_the_past_are_not(pg):
+def test_future_dated_event_times_are_refused_but_the_present_and_the_past_are_not(pg_pre):
     owner = str(uuid.uuid4())
-    assert put(pg, "strategy_hypotheses", hyp(owner)) == "t"
+    assert put(pg_pre, "strategy_hypotheses", hyp(owner)) == "t"
     imp = {"owner_id": owner, "import_id": sha("fi"), "source_sha256": sha("fsrc"), "kind": "statement", "storage_ref": "s3://x",
            "status": "VERIFIED", "imported_utc": "2026-01-01T00:00:00Z", "source": "t", "content_sha256": sha("fi")}
-    assert put(pg, "owner_account_imports", imp) == "t"
+    assert put(pg_pre, "owner_account_imports", imp) == "t"
     ev = {"owner_id": owner, "import_id": sha("fi"), "status": "VERIFIED", "evidence_ref": sha("fi"), "source": "t"}
     far = {**ev, "recorded_utc": "9999-01-01T00:00:00Z", "content_sha256": sha("fe1")}
-    pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps(far), "in the future", role="service_role")
-    soon = pg.scalar("select (now() + interval '1 hour')::text;")
-    pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps({**far, "recorded_utc": soon}), "in the future", role="service_role")
-    near = pg.scalar("select to_char(now() + interval '1 minute', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"');")
-    assert put(pg, "owner_account_import_status_events", {**ev, "recorded_utc": near, "content_sha256": sha("fe2")}) == "t"   # within the 5-minute skew
-    assert put(pg, "owner_account_import_status_events", {**ev, "recorded_utc": "2026-01-02T00:00:00Z", "content_sha256": sha("fe3")}) == "t"
+    pg_pre.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps(far), "in the future", role="service_role")
+    soon = pg_pre.scalar("select (now() + interval '1 hour')::text;")
+    pg_pre.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps({**far, "recorded_utc": soon}), "in the future", role="service_role")
+    near = pg_pre.scalar("select to_char(now() + interval '1 minute', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"');")
+    assert put(pg_pre, "owner_account_import_status_events", {**ev, "recorded_utc": near, "content_sha256": sha("fe2")}) == "t"   # within the 5-minute skew
+    assert put(pg_pre, "owner_account_import_status_events", {**ev, "recorded_utc": "2026-01-02T00:00:00Z", "content_sha256": sha("fe3")}) == "t"
     # other event-time columns are covered too, and forward-looking ones are not
-    pg.fails("select carry.put_row('approval_records', $j$%s$j$::jsonb);" % json.dumps(
+    pg_pre.fails("select carry.put_row('approval_records', $j$%s$j$::jsonb);" % json.dumps(
         {"owner_id": owner, "approval_id": "APF", "subject_kind": "data_batch", "subject_ref": "b", "approved_by_owner": False,
          "decided_utc": "9999-01-01T00:00:00Z", "source": "t", "content_sha256": sha("apf")}), "in the future", role="service_role")
     sess = {"owner_id": owner, "session_id": "FUT", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1",
             "started_utc": "9999-01-01T00:00:00Z", "source": "t", "content_sha256": sha("fut")}
-    pg.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(sess), "in the future", role="service_role")
-    assert put(pg, "execution_sessions", {**sess, "started_utc": "2026-11-07T00:00:00Z"}) == "t"                  # positive control
+    pg_pre.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(sess), "in the future", role="service_role")
+    assert put(pg_pre, "execution_sessions", {**sess, "started_utc": "2026-11-07T00:00:00Z"}) == "t"                  # positive control
     pol = {"owner_id": owner, "policy_name": "p", "version": 1, "policy": {"a": 1}, "effective_from_utc": "9999-01-01T00:00:00Z",
            "source": "t", "content_sha256": sha("pol")}
-    assert put(pg, "risk_policy_versions", pol) == "t"
+    assert put(pg_pre, "risk_policy_versions", pol) == "t"
 
 
 def test_a_conflicting_resend_is_reported_false_and_never_overwrites(pg):
@@ -433,25 +453,25 @@ def test_a_conflicting_resend_is_reported_false_and_never_overwrites(pg):
     assert pg.scalar(f"select count(*) from carry.strategy_hypotheses where owner_id='{owner}';") == "1"
 
 
-def test_execution_sessions_pair_only_with_a_registered_sandbox_venue(pg):
+def test_execution_sessions_pair_only_with_a_registered_sandbox_venue(pg_pre):
     base = {"owner_id": A, "strategy": "x", "code_sha": "abcdef1", "started_utc": "2026-11-07T00:00:00Z", "source": "t"}
     n = 0
     for mode in ("PAPER", "TESTNET"):
         for venue in ("mainnet", "eu", "Testnet", "bybit", "", "main net"):
             n += 1
             row = {**base, "mode": mode, "venue": venue, "session_id": f"V{n}", "content_sha256": sha(f"v{n}")}
-            pg.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(row), "violates", role="service_role")
+            pg_pre.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(row), "violates", role="service_role")
         for venue in ("testnet", "demo"):                                              # positive control
             n += 1
             row = {**base, "mode": mode, "venue": venue, "session_id": f"V{n}", "content_sha256": sha(f"v{n}")}
-            assert put(pg, "execution_sessions", row) == "t", (mode, venue)
+            assert put(pg_pre, "execution_sessions", row) == "t", (mode, venue)
 
 
-def test_order_fill_and_balance_tables_accept_no_writes_from_anyone(pg):
+def test_order_fill_and_balance_tables_accept_no_writes_from_anyone(pg_pre):
     owner = A
     sess = {"owner_id": owner, "session_id": "S-ro", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1",
             "started_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("s-ro")}
-    assert put(pg, "execution_sessions", sess) == "t"
+    assert put(pg_pre, "execution_sessions", sess) == "t"
     order = {"owner_id": owner, "session_id": "S-ro", "venue_order_id": "o1", "symbol": "BTCUSDT", "side": "BUY", "reduce_only": False,
              "venue_payload_sha256": sha("p"), "evidence_ref": "x", "observed_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("o1")}
     snap = {"owner_id": owner, "snapshot_id": "z", "snapshot_kind": "VENUE_READ", "status": "VERIFIED", "taken_utc": "2026-11-07T00:00:00Z",
@@ -460,16 +480,16 @@ def test_order_fill_and_balance_tables_accept_no_writes_from_anyone(pg):
     fill = {"owner_id": owner, "session_id": "S-ro", "venue_order_id": "o1", "venue_fill_id": "f1", "venue_payload_sha256": sha("p"),
             "evidence_ref": "x", "observed_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("f1")}
     for table, row in (("order_refs", order), ("account_snapshots", snap), ("fill_refs", fill)):
-        pg.fails("select carry.put_row('%s', $j$%s$j$::jsonb);" % (table, json.dumps(row)), "permission denied", role="service_role")
+        pg_pre.fails("select carry.put_row('%s', $j$%s$j$::jsonb);" % (table, json.dumps(row)), "permission denied", role="service_role")
         # the table owner / superuser path is closed by the trigger even if a later migration re-grants INSERT
-        pg.fails(f"grant insert on carry.{table} to service_role; set role service_role; "
+        pg_pre.fails(f"grant insert on carry.{table} to service_role; set role service_role; "
                  f"select carry.put_row('{table}', $j${json.dumps(row)}$j$::jsonb);", "accepts no writes")
-        pg.run(f"revoke insert on carry.{table} from service_role;")
-        pg.fails(f"insert into carry.{table} default values;", "accepts no writes")
-        assert pg.scalar(f"select has_table_privilege('service_role','carry.{table}','insert');") == "f"
-        assert pg.scalar(f"select count(*) from carry.{table};", role="service_role") == "0"             # still readable
+        pg_pre.run(f"revoke insert on carry.{table} from service_role;")
+        pg_pre.fails(f"insert into carry.{table} default values;", "accepts no writes")
+        assert pg_pre.scalar(f"select has_table_privilege('service_role','carry.{table}','insert');") == "f"
+        assert pg_pre.scalar(f"select count(*) from carry.{table};", role="service_role") == "0"             # still readable
     # positive control: an ordinary table still takes the same session's other writes
-    assert put(pg, "execution_session_events", {"owner_id": owner, "session_id": "S-ro", "state": "STARTED",
+    assert put(pg_pre, "execution_session_events", {"owner_id": owner, "session_id": "S-ro", "state": "STARTED",
                                                  "recorded_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("ev-ro")}) == "t"
 
 
@@ -504,3 +524,149 @@ def test_the_service_role_still_cannot_tamper_with_the_guards(pg):
     pg.fails("truncate carry.strategy_hypotheses;", "permission denied", role="service_role")
     pg.fails("select carry.put_row('strategy_hypotheses','{}'::jsonb);", "permission denied", role="authenticated")
     pg.fails("select count(*) from carry.strategy_hypotheses;", "permission denied", role="anon")
+
+
+# --------------------------------------------------------------------------- 20261108000100 rt4 hardening
+
+NO_WRITER_TABLES = ("execution_sessions", "execution_session_events", "risk_decisions", "reconciliation_exceptions", "reconciliation_exception_resolutions")
+
+
+def test_rt4_migration_is_additive_documents_client_supplied_registered_utc_and_never_edits_a_numbered_file():
+    raw = RT4.read_text()
+    code = strip_comments(raw).lower()
+    assert not re.search(r"\bcreate table\b|\bdrop\b|\bgrant\b[^;]*\b(insert|update|delete|truncate|all)\b|disable row level|security definer", code)
+    assert code.count("not valid") >= 4                                           # existing rows are never rescanned
+    for phrase in ("registered_utc IS CLIENT-SUPPLIED", "created_at", "free-form"):
+        assert phrase in raw, phrase
+    assert "comment on column carry.experiment_registrations.registered_utc" in code and "client-supplied" in code
+    # nothing numbered before it was changed: 000900 still ends with its own baseline check and no later object appears in it
+    assert "forbid_insert_untyped" not in HARDENING.read_text() and "report_sha256" not in HARDENING.read_text()
+
+
+def test_rt4_the_write_closed_tables_are_exactly_the_tables_the_sync_writer_does_not_map():
+    """Every carry table is either written by tools/supabase_sync.py (TABLE_ORDER) or write-closed in SQL: no third state. If a writer is added for one, this test forces the
+    migration that re-opens it (with constrained columns) to be written too."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import supabase_sync as SS
+    sql = all_sql()
+    created = set(re.findall(r"create table if not exists carry\.(\w+) \(", sql))
+    closed = set(NO_WRITER_TABLES) | {"order_refs", "fill_refs", "account_snapshots"}
+    mapped = set(SS.TABLE_ORDER)
+    assert created == mapped | closed and not (mapped & closed), (sorted(created - mapped - closed), sorted(mapped & closed))
+    body = strip_comments(RT4.read_text())
+    listed = set(re.findall(r"'(\w+)'", re.search(r"foreach t in array array\[(.*?)\] loop", body, re.S).group(1)))
+    assert listed == set(NO_WRITER_TABLES)
+
+
+def test_rt4_no_writer_tables_accept_no_writes_from_anyone_and_stay_readable(pg):
+    owner = A
+    seed = {"execution_sessions": {"owner_id": owner, "session_id": "S-x", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1",
+                                   "started_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("rt4-s")},
+            "execution_session_events": {"owner_id": owner, "session_id": "S-x", "state": "STARTED", "detail": {"balance_usd": 123456.78, "email": "a@b.co"},
+                                         "recorded_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("rt4-e")},
+            "risk_decisions": {"owner_id": owner, "decision_id": "D1", "policy_name": "p", "policy_version": 1, "subject": "s", "decision": "DENY",
+                               "reasons": {"note": "free text with a balance 123456.78"}, "inputs_sha256": sha("in"), "decided_utc": "2026-11-07T00:00:00Z",
+                               "source": "t", "content_sha256": sha("rt4-d")},
+            "reconciliation_exceptions": {"owner_id": owner, "exception_id": "X1", "import_id": sha("imp"), "kind": "k", "severity": "WARN", "description": "acct 12345678 off by 1",
+                                          "amount": "12.5", "currency": "USD", "detected_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("rt4-x")},
+            "reconciliation_exception_resolutions": {"owner_id": owner, "exception_id": "X1", "resolution": "RESOLVED", "explanation": "paid to account 12345678",
+                                                     "recorded_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("rt4-r")}}
+    assert set(seed) == set(NO_WRITER_TABLES)
+    for table, row in seed.items():
+        pg.fails("select carry.put_row('%s', $j$%s$j$::jsonb);" % (table, json.dumps(row)), "permission denied", role="service_role")
+        pg.fails(f"grant insert on carry.{table} to service_role; set role service_role; select carry.put_row('{table}', $j${json.dumps(row)}$j$::jsonb);", "accepts no writes")
+        pg.run(f"revoke insert on carry.{table} from service_role;")
+        pg.fails(f"insert into carry.{table} default values;", "accepts no writes")                    # the table owner too
+        assert pg.scalar(f"select has_table_privilege('service_role','carry.{table}','insert');") == "f"
+        assert pg.scalar(f"select count(*) from carry.{table};", role="service_role") == "0"             # still readable
+    # positive control: a table the writer maps still takes its rows in the same database
+    assert put(pg, "strategy_hypotheses", hyp(owner, "H-rt4")) == "t"
+
+
+def test_rt4_the_checks_of_the_closed_tables_survive_in_the_schema_as_defence_in_depth(pg):
+    for name in ("execution_sessions_mode_sandbox_venue",):
+        assert pg.scalar(f"select count(*) from pg_constraint where conname='{name}';") == "1"
+    assert pg.scalar("select count(*) from pg_trigger where tgname='carry_no_insert' and not tgisinternal;") == str(3 + len(NO_WRITER_TABLES))
+
+
+def _imp(owner, status, **over):
+    r = {"owner_id": owner, "import_id": sha("rt4-i" + status + str(sorted(over))), "source_sha256": sha("src"), "kind": "owner_import", "storage_ref": "private://x",
+         "status": status, "imported_utc": "2026-11-07T00:00:00Z", "source": "t"}
+    r["content_sha256"] = r["import_id"]
+    r.update(over)
+    return r
+
+
+def test_rt4_a_verified_or_reconciled_import_row_must_name_its_sealed_report_hash(pg):
+    owner = str(uuid.uuid4())
+    for status in ("VERIFIED", "RECONCILED"):
+        row = _imp(owner, status)
+        pg.fails("select carry.put_row('owner_account_imports', $j$%s$j$::jsonb);" % json.dumps(row), "violates", role="service_role")
+        pg.fails("select carry.put_row('owner_account_imports', $j$%s$j$::jsonb);" % json.dumps({**row, "report_sha256": "not-a-hash"}), "violates|invalid", role="service_role")
+        ok = _imp(owner, status, report_sha256=sha("report-" + status))
+        assert put(pg, "owner_account_imports", ok) == "t"                          # positive control
+        assert pg.scalar(f"select report_sha256 from carry.owner_account_imports where owner_id='{owner}' and import_id='{ok['import_id']}';") == sha("report-" + status)
+    for status in ("PROVISIONAL", "ESTIMATED", "STALE", "DISPUTED", "INCOMPLETE", "UNAVAILABLE"):
+        assert put(pg, "owner_account_imports", _imp(owner, status)) == "t"          # weaker statuses make no claim and need no report hash
+    # the constraint is the load-bearing line: dropping it lets the unbound claim in (so the test above can fail)
+    pg.run("alter table carry.owner_account_imports drop constraint owner_import_verified_status_names_its_report;")
+    assert put(pg, "owner_account_imports", _imp(owner, "VERIFIED", source_sha256=sha("other"))) == "t"
+    pg.run("alter table carry.owner_account_imports add constraint owner_import_verified_status_names_its_report "
+           "check (status not in ('VERIFIED', 'RECONCILED') or report_sha256 is not null) not valid;")
+    pg.fails("select carry.put_row('owner_account_imports', $j$%s$j$::jsonb);" % json.dumps(_imp(owner, "RECONCILED", source_sha256=sha("other2"))), "violates", role="service_role")
+
+
+def _evrow(owner, level, details, n):
+    return {"owner_id": owner, "trial_id": "T1", "level": level, "result": "r:PASS", "provenance": "run-1", "details": details, "recorded_utc": "2026-11-07T00:00:00Z",
+            "source": "t", "content_sha256": sha(f"rt4-ev{n}")}
+
+
+def test_rt4_financial_evidence_is_bound_to_a_hash_and_carries_no_owner_figure(pg):
+    owner = str(uuid.uuid4())
+    assert put(pg, "strategy_hypotheses", hyp(owner)) == "t"
+    assert put(pg, "experiment_registrations", reg(owner)) == "t"
+    h1, h2 = sha("report"), sha("log")
+    n = 0
+    for level, field in (("OWNER_ACCOUNT_VERIFIED", "import_report_sha256"), ("TESTNET_MECHANICS", "execution_log_sha256")):
+        for bad in ({}, {"status": "RECONCILED"}, {field: "x" * 64}, {field: h1[:63]}, {field: h1.upper()}, {"metrics": {field: "nope"}}, {"metrics": "scalar"}):
+            n += 1
+            pg.fails("select carry.put_row('experiment_evidence', $j$%s$j$::jsonb);" % json.dumps(_evrow(owner, level, bad, n)), "violates", role="service_role")
+        for good in ({field: h1}, {"metrics": {field: h2}}):
+            n += 1
+            assert put(pg, "experiment_evidence", _evrow(owner, level, good, n)) == "t"
+    for level in ("BACKTEST", "PROSPECTIVE"):                                      # other levels make no such claim
+        n += 1
+        assert put(pg, "experiment_evidence", _evrow(owner, level, {}, n)) == "t"
+    for bad in ({"net_usd_after_all_costs": "1000000"}, {"metrics": {"net_usd_after_all_costs": "1000000"}},
+                {"import_report_sha256": h1, "metrics": {"net_usd_after_all_costs": 5}}):
+        n += 1
+        pg.fails("select carry.put_row('experiment_evidence', $j$%s$j$::jsonb);" % json.dumps(_evrow(owner, "OWNER_ACCOUNT_VERIFIED", bad, n)), "violates", role="service_role")
+    n += 1
+    assert put(pg, "experiment_evidence", _evrow(owner, "BACKTEST", {"metrics": {"sharpe": "1.25"}}, n)) == "t"     # an ordinary metric is fine
+
+
+def test_rt4_registered_utc_is_documented_client_supplied_and_created_at_is_the_server_clock(pg):
+    owner = str(uuid.uuid4())
+    assert pg.scalar("select col_description('carry.experiment_registrations'::regclass, (select attnum from pg_attribute where attrelid='carry.experiment_registrations'::regclass and attname='registered_utc'));").startswith("CLIENT-SUPPLIED")
+    assert put(pg, "strategy_hypotheses", hyp(owner)) == "t"
+    assert put(pg, "experiment_registrations", reg(owner, registered_utc="2020-01-01T00:00:00Z")) == "t"           # a backdated claim is accepted (documented) ...
+    row = pg.scalar(f"select registered_utc < '2021-01-01' and created_at > now() - interval '1 minute' from carry.experiment_registrations where owner_id='{owner}';")
+    assert row == "t"                                                                                            # ... and is visible: created_at is the server's, not the client's
+
+
+def test_rt4_reapplying_the_migration_changes_nothing(pg):
+    before = pg.scalar("select count(*) from pg_constraint where connamespace='carry'::regnamespace;")
+    pg.run(RT4.read_text())
+    assert pg.scalar("select count(*) from pg_constraint where connamespace='carry'::regnamespace;") == before
+    assert pg.scalar("select has_table_privilege('service_role','carry.risk_decisions','insert');") == "f"
+
+
+def test_rt4_mutation_the_write_closing_trigger_and_revoke_are_load_bearing(server):
+    """On a scratch copy: without the trigger and the revoke the free-form insert goes through (so the refusals above are the migration's doing, not an accident)."""
+    h = _fresh(server, "mig_mut", FILES)
+    row = {"owner_id": A, "session_id": "S-mut", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1", "started_utc": "2026-11-07T00:00:00Z",
+           "source": "t", "content_sha256": sha("mut")}
+    h.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(row), "permission denied", role="service_role")
+    h.run("drop trigger carry_no_insert on carry.execution_sessions; grant insert on carry.execution_sessions to service_role;")
+    assert put(h, "execution_sessions", row) == "t"

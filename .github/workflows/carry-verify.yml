@@ -450,7 +450,7 @@ jobs:
         if: always()
         run: |
           echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Targeted carry correctness gate. Every other test file runs in the rest-of-suite job; together they cover the whole suite. Green means the code is internally consistent, not that the strategy makes money." >> "$GITHUB_STEP_SUMMARY"
+          echo "Targeted carry correctness gate. Every other test file runs in the rest-of-suite job (which leaves out tests carrying the documented data_freshness marker: those tests run in NO job here, by design, see the comment above that job). Green means the code is internally consistent, not that the strategy makes money." >> "$GITHUB_STEP_SUMMARY"
 
   production-image:
     name: production image builds and imports offline
@@ -565,8 +565,11 @@ jobs:
   # here is DERIVED by set difference against the gate's own list, so a new test
   # file is covered by exactly one of the two jobs. It excludes only tests
   # carrying the documented `data_freshness` marker (pytest.ini), which are
-  # supposed to go red as real time passes. Offline: no secret, no network
-  # trading, no order path.
+  # supposed to go red as real time passes. THAT MEANS tests marked data_freshness
+  # run in NO job of this workflow: the two jobs together cover every unmarked test
+  # file, not "the whole suite". Run them by hand (`pytest -m data_freshness`) when
+  # the corpus is refreshed or re-pinned. Offline: no secret, no network trading,
+  # no order path.
   rest-of-suite:
     name: rest of the suite (python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -616,7 +619,9 @@ jobs:
   # local Postgres (the pinned `pgserver` wheel: a private data directory under pytest's tmp path, unix socket only,
   # started as the unprivileged runner user). In the other jobs those tests SKIP when pgserver is not installed, which
   # is how they went unrun in CI. Here REQUIRE_PG=1 turns "pgserver missing or Postgres will not start" into a FAILURE
-  # (in the migrations test itself), and the pin lives in bot/constraints.txt like every other test dependency.
+  # in BOTH test files (each routes its fixture through the same _unavailable/REQUIRE_PG logic), and the pin lives in
+  # bot/constraints.txt like every other test dependency. This guards the fixture only: a test that is itself marked
+  # skip is not caught by REQUIRE_PG (the job narrows nothing on the command line, and a test asserts that).
   # No Supabase project, no network service, no credential: the Supabase roles and auth.uid() are stubbed locally.
   supabase-migrations:
     name: supabase migrations executed on postgres (python ${{ matrix.python }})
@@ -641,7 +646,7 @@ jobs:
       - name: Install dependencies and the pinned disposable Postgres
         run: python -m pip install -r requirements.txt -c constraints.txt pytest pgserver
 
-      - name: Run the Supabase tests against a real Postgres (cannot skip)
+      - name: Run the Supabase tests against a real Postgres (a missing or broken Postgres fails the job)
         env:
           REQUIRE_PG: "1"
         run: >

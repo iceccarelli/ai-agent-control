@@ -374,6 +374,41 @@ def test_the_pg_requirement_is_enforced_by_the_supabase_test_itself():
     assert "REQUIRE_PG" in src and 'importorskip("pgserver"' not in src
 
 
+def _overclaims(text):
+    """Phrases the workflow must not use: they claim more than the jobs deliver."""
+    bad = [p for p in ("together they cover the whole suite", "(cannot skip)", "cannot skip)") if p in text]
+    if "run in NO job" not in text:
+        bad.append("missing: data_freshness tests run in NO job")
+    return bad
+
+
+def test_rt4_6_the_overclaim_detector_can_fail(text):
+    assert _overclaims(text) == []
+    assert _overclaims(text + "\n# together they cover the whole suite") and _overclaims(text.replace("(a missing or broken", "(cannot skip) (a missing or broken"))
+    assert _overclaims(text.replace("run in NO job", "run in some job"))
+
+
+def test_rt4_6_the_workflow_does_not_overclaim_coverage_or_skip_proofs(text):
+    # tests marked data_freshness are excluded by the rest job and named by no other: they run in NO job, and the comments must say so
+    assert _overclaims(text) == []
+    assert text.count('-m "not data_freshness"') == 1 and "-m data_freshness" in text.replace("`pytest -m data_freshness`", "-m data_freshness")
+    # the statement is true only while such tests exist: if none do, the comment is stale and this test says so
+    marked = 0
+    for f in os.listdir(os.path.join(BOT, "tests")):
+        if f.startswith("test_") and f.endswith(".py"):
+            marked += open(os.path.join(BOT, "tests", f), encoding="utf-8").read().count("pytest.mark.data_freshness")
+    assert marked > 0, "no test carries data_freshness any more: delete the 'run in NO job' caveat and the deselection"
+    job = _pg_job(text)
+    assert "-k " not in job and "--deselect" not in job and " -m \"" not in job
+
+
+def test_rt4_6_both_pg_test_files_route_their_fixture_through_require_pg():
+    for name in ("test_supabase_migrations.py", "test_supabase_sync.py"):
+        src = open(os.path.join(HERE, name), encoding="utf-8").read()
+        assert "def _unavailable(" in src and "REQUIRE_PG" in src and "importorskip(" + '"pgserver"' not in src, name
+        assert len(re.findall(r"pytest\.skip\(", src)) == 1, name
+
+
 def test_every_action_is_pinned_by_sha_and_every_workflow_is_read_only():
     wf_dir = os.path.join(REPO, ".github", "workflows")
     for name in sorted(os.listdir(wf_dir)):

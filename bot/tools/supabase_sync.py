@@ -219,7 +219,7 @@ _SPEC_TEXT = {
     "collector_status": ("owner_id:uuid collector_name:nb state:enum:RUNNING|STALLED|STOPPED|ERROR|UNKNOWN observed_utc:ts last_record_utc:ts? lag_seconds:num? "
                          "detail:obj? source:nb schema_version:uint content_sha256:hex"),
     "owner_account_imports": ("owner_id:uuid import_id:hex source_sha256:hex kind:nb period_start_utc:ts? period_end_utc:ts? row_count:uint? storage_ref:nb "
-                              "status:enum:" + "|".join(OWNER_STATUSES) + " imported_utc:ts source:nb schema_version:uint content_sha256:hex"),
+                              "status:enum:" + "|".join(OWNER_STATUSES) + " report_sha256:hex? imported_utc:ts source:nb schema_version:uint content_sha256:hex"),
     "owner_account_import_status_events": ("owner_id:uuid import_id:hex status:enum:" + "|".join(OWNER_STATUSES) + " reason:code? evidence_ref:hex? recorded_utc:ts "
                                            "source:nb schema_version:uint content_sha256:hex"),
     "risk_policy_versions": ("owner_id:uuid policy_name:nb version:int policy:json effective_from_utc:ts source:nb schema_version:uint content_sha256:hex"),
@@ -265,10 +265,21 @@ class Col:
 # nested kinds: uint, num (int or exact decimal string), unum (>= 0), bool, hex64, code (UPPER_SNAKE), word (short identifier), status (owner status word),
 #               metric (bool | int | decimal string | word | list of words), verdict (ok|fail|skipped|PASS|FAIL), "?" suffix is accepted for every kind: None = absent.
 EVIDENCE_METRICS = ("capacity_usd", "complete", "fees_measured", "fills_measured", "independent_observations", "multiple_testing_adjusted", "n_variants_tested",
-                    "net_edge_bps_after_costs", "net_usd_after_all_costs", "point_in_time", "registered_before_observation", "universe_point_in_time", "unknown_cost_inputs",
-                    "uses_future_information", "venue", "rejection_conditions_fired", "sharpe", "n", "sortino", "max_drawdown_pct", "hit_rate", "trades", "observations")
+                    "net_edge_bps_after_costs", "point_in_time", "registered_before_observation", "universe_point_in_time", "unknown_cost_inputs",
+                    "uses_future_information", "venue", "rejection_conditions_fired", "sharpe", "n", "sortino", "max_drawdown_pct", "hit_rate", "trades", "observations",
+                    "observation_started_ms", "observation_ended_ms", "observed_settlements", "coverage", "fills_count", "fee_observations_count")
+#: Supabase carries NO second financial truth: the owner's P&L figure (``net_usd_after_all_costs``) is deliberately NOT a whitelisted metric. It lives in the hashed import report
+#: the owner holds; an evidence row can only name that report by its sha256 (``import_report_sha256``) or an execution log by its sha256 (``execution_log_sha256``).
+EVIDENCE_BINDING_HASHES = ("import_report_sha256", "execution_log_sha256")
+#: Evidence levels that make a claim about real money / a real venue: they are refused unless the row names the hashed artifact it is bound to.
+LEVEL_REQUIRES_HASH = {"OWNER_ACCOUNT_VERIFIED": "import_report_sha256", "TESTNET_MECHANICS": "execution_log_sha256"}
+#: Keys of a strategy_verdict / registry evidence ``details`` that are deliberately NOT synced (mapped away, and reported): the owner report attachment (privacy), the candidate
+#: binding words, and the owner's figure and its labels (no second financial truth).
+EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest")
+EVIDENCE_DROPPED_METRICS = ("net_usd_after_all_costs", "owner_figure_basis", "import_status", "candidate_id", "spec_digest")
 OBJ_SCHEMAS: Dict[Tuple[str, str], Dict[str, Any]] = {
-    ("experiment_evidence", "details"): {**{m: "metric" for m in EVIDENCE_METRICS}, "metrics": {m: "metric" for m in EVIDENCE_METRICS}, "data_sha256": "hex64", "status": "status"},
+    ("experiment_evidence", "details"): {**{m: "metric" for m in EVIDENCE_METRICS}, "metrics": {**{m: "metric" for m in EVIDENCE_METRICS}, **{h: "hex64" for h in EVIDENCE_BINDING_HASHES}},
+                                         "data_sha256": "hex64", "status": "status", **{h: "hex64" for h in EVIDENCE_BINDING_HASHES}},
     ("md_seal_receipts", "receipt"): {"segment": "word", "records": "uint", "first_id": "uint", "last_id": "uint", "last_chain": "hex64", "sha256": "hex64"},
     ("collector_status", "detail"): {"segments": "uint", "records": "uint", "gaps": "uint", "restarts": "uint", "reconnects": "uint", "lag_seconds": "unum",
                                      "last_error_code": "code", "batch_sha256": "hex64"},
@@ -462,6 +473,16 @@ def row_hash(table: str, row: Mapping[str, Any]) -> str:
     return content_sha256({k: v for k, v in row.items() if k not in excl})
 
 
+def _bound_hash(details: Any, name: str) -> Optional[str]:
+    """The sha256 an evidence row names under ``name`` (top level or inside ``metrics``): valid hex64 with at least 8 distinct characters (not 64 x 'a'); both places agree if both set."""
+    if not isinstance(details, Mapping):
+        return None
+    vals = [x for x in (details.get(name), (details.get("metrics") or {}).get(name) if isinstance(details.get("metrics"), Mapping) else None) if x is not None]
+    if not vals or any(not (isinstance(x, str) and _HEX64.match(x) and len(set(x)) >= 8) for x in vals) or len(set(vals)) != 1:
+        return None
+    return vals[0]
+
+
 def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
     """Why a row would be refused by the table (empty = fine). Unknown columns, missing required columns, kinds, vocabularies, cross-column rules, content hash."""
     if table not in SPECS:
@@ -489,6 +510,8 @@ def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
             out.append("import_id:must_equal_content_sha256")
         if r.get("period_start_utc") and r.get("period_end_utc") and _ts_dt(r["period_end_utc"]) < _ts_dt(r["period_start_utc"]):
             out.append("period:end_before_start")
+        if r["status"] in ("VERIFIED", "RECONCILED") and not r.get("report_sha256"):
+            out.append("report_sha256:VERIFIED_RECONCILED_requires_the_sealed_report_hash")
     if table == "owner_account_import_status_events":
         if r["status"] in ("VERIFIED", "RECONCILED") and r.get("evidence_ref") != r["import_id"]:
             out.append("evidence_ref:VERIFIED_RECONCILED_requires_the_import_row_hash")
@@ -503,6 +526,10 @@ def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
         out.append("superseded_by:self")
     if table == "incident_events" and r["state"] in ("MITIGATED", "RESOLVED") and not _nb(r.get("note")):
         out.append("note:required_for_MITIGATED_RESOLVED")
+    if table == "experiment_evidence" and r["level"] in LEVEL_REQUIRES_HASH:
+        need = LEVEL_REQUIRES_HASH[r["level"]]
+        if not _bound_hash(r.get("details"), need):
+            out.append(f"details.{need}:{r['level']}_requires_the_sha256_of_the_artifact_it_is_bound_to")
     if table == "experiment_registrations" and not all(_nb(r[k]) for k in ("prospective_period",)):
         out.append("prospective_period:blank")
     if HASH_RULE[table] != "registry" and row_hash(table, r) != r["content_sha256"]:
@@ -513,7 +540,7 @@ def row_problems(table: str, row: Mapping[str, Any]) -> List[str]:
 # ------------------------------------------------------------------ SECRET GUARD
 
 _KEY_EXACT = frozenset("""apikey secret secretkey apisecret uid accountid userid memberid email emailaddress ip ipaddress password passwd token accesstoken refreshtoken
-sessiontoken authorization privatekey servicerolekey anonkey publishablekey clientsecret bearer jwt""".split())
+sessiontoken authorization privatekey servicerolekey anonkey publishablekey clientsecret bearer jwt pw pwd passphrase mnemonic seedphrase recoveryphrase""".split())
 _KEY_PARTS = ("secret", "apikey", "password", "privatekey", "authorization", "servicerole", "publishablekey", "anonkey", "accesstoken")
 #: a key whose WORDS (snake_case, kebab-case, camelCase, spaces) include one of these names an account / balance / identity field: none exists in this app's schemas.
 _KEY_TOKENS = frozenset("""acct account accounts balance balances wallet wallets equity position positions pnl address iban phone mobile name ssn passport dob birthday
@@ -531,6 +558,7 @@ _VALUE_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("email_address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")),
     ("uuid_in_text", re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![0-9A-Za-z])")),
     ("internal_hostname", re.compile(r"(?i)(?<![A-Za-z0-9-])(?:[a-z0-9-]+\.)+(?:internal|intranet|corp|lan|local|localdomain|private|vpc|flycast)(?:\.[a-z0-9-]+)*(?![A-Za-z0-9-])")),
+    ("assigned_pw", re.compile(r"""(?i)(?<![a-z0-9])(?:pw|pwd|passphrase|mnemonic)\s*[:=]\s*["']?[^\s"',;]{4,}""")),
     ("plain_english_secret", re.compile(r"(?i)\b(?:password|passwd|passphrase|pwd)\b\s*(?:is|was|=|:|equals|set to|changed to)\s+[\"']?(?P<w>[^\s\"',;]{4,})")),
     ("ipv4_address", re.compile(r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])")),
     ("long_hex_token", re.compile(r"(?<![0-9A-Za-z])(?:0[xX])?[0-9a-fA-F]{24,}(?![0-9A-Za-z])")),
@@ -609,6 +637,23 @@ def _opaque_token(s: str) -> bool:
 
 
 _VALUE_RULES_BY_NAME = dict(_VALUE_RULES)
+#: A seed / recovery phrase is 12+ short lowercase words in a row (BIP39: 3-8 letters). Ordinary prose almost always has a function word within twelve; a streak of 12 words with
+#: none of these (and at least 10 distinct) is refused. Cheap and deliberately over-eager: a refusal is a fail-closed, a leaked phrase is not recoverable.
+_SEED_RUN = re.compile(r"(?<![a-z0-9_])[a-z]{3,8}(?:[ ,;]+[a-z]{3,8}){11,}(?![a-z0-9_])")
+_FUNCTION_WORDS = frozenset("the and for that this with are was from not but you your our their its has have had will would can could should may might been being than then into onto over under".split())
+
+
+def _seed_phrase(s: str) -> bool:
+    for m in _SEED_RUN.finditer(s.lower()):
+        streak: List[str] = []
+        for w in re.split(r"[ ,;]+", m.group(0)) + ["the"]:
+            if w in _FUNCTION_WORDS:
+                if len(streak) >= 12 and len(set(streak)) >= 10:
+                    return True
+                streak = []
+            else:
+                streak.append(w)
+    return False
 
 
 def _shape_rules(s: str) -> List[str]:
@@ -618,6 +663,8 @@ def _shape_rules(s: str) -> List[str]:
         hits.append("plain_english_secret")
     if _has_ipv6(s):
         hits.append("ipv6_address")
+    if _seed_phrase(s):
+        hits.append("seed_phrase_like")
     if _opaque_token(s) or _letters_only_token(s):
         hits.append("opaque_credential_like")
     return hits
@@ -786,8 +833,34 @@ def registrable(entry: Mapping[str, Any]) -> List[str]:
     return miss
 
 
-def registration_puts(owner_id: str, entry: Mapping[str, Any], *, source: Optional[str] = None) -> List[Put]:
-    """hypothesis row + experiment_registrations row for one registry entry (the registry's own entry_digest is the registration's content_sha256)."""
+def _verified_registry(registry: Any) -> Mapping[str, Any]:
+    """The registry must pass ``hypothesis_registry.verify`` (sealed; no trial altered, backdated, removed or un-sealed; no evidence wiped or edited). Refused by problem name."""
+    import hypothesis_registry as hr
+    if not isinstance(registry, Mapping) or not isinstance(registry.get("trials"), list):
+        raise SyncError("registry is not a registry mapping with a trials list")
+    try:
+        problems = hr.verify(registry)          # type: ignore[arg-type]
+    except (AttributeError, TypeError, ValueError, KeyError):
+        raise SyncError("registry is malformed: hypothesis_registry.verify could not read it") from None
+    if problems:
+        raise SyncError("registry refused (hypothesis_registry.verify): " + "; ".join(str(x)[:160] for x in problems[:4]))
+    return registry
+
+
+def registration_puts(owner_id: str, entry: Mapping[str, Any], *, registry: Mapping[str, Any], source: Optional[str] = None) -> List[Put]:
+    """hypothesis row + experiment_registrations row for one registry entry (the registry's own entry_digest is the registration's content_sha256). The REGISTRY the entry lives in
+    is required and is verified first (``hypothesis_registry.verify``): an entry cannot be synced out of a registry that was backdated, wiped or never sealed, and ``entry`` must be
+    that registry's own, unaltered entry. ``registered_utc`` is still CLIENT-SUPPLIED data (see the migration note): the seal proves it was not edited afterwards, not that the
+    clock was honest; consumers must rely on the row's ``created_at`` for when the registration reached the database."""
+    import hypothesis_registry as hr
+    reg = _verified_registry(registry)
+    mine = next((t for t in reg["trials"] if isinstance(t, Mapping) and t.get("trial_id") == entry.get("trial_id")), None)
+    if mine is None or hr.entry_digest(dict(mine)) != hr.entry_digest(dict(entry)):
+        raise SyncError(f"{entry.get('trial_id')!r} is not an unaltered entry of the verified registry")
+    return _registration_puts(owner_id, entry, source=source)
+
+
+def _registration_puts(owner_id: str, entry: Mapping[str, Any], *, source: Optional[str] = None) -> List[Put]:
     miss = registrable(entry)
     if miss:
         raise SyncError(f"{entry.get('trial_id')!r} is not an experiment registration: missing {miss}")
@@ -804,6 +877,36 @@ def registration_puts(owner_id: str, entry: Mapping[str, Any], *, source: Option
         "multiple_testing_family": str(entry["multiple_testing_family"]), "prospective_period": pp if isinstance(pp, str) else canonical_json(pp),
         "registered_utc": utc(entry["registered_utc"]), "note": entry.get("note")}, source=src, content=_registry_digest(entry))
     return [hyp, Put(reg.table, reg.row, attest=_registry_attest(reg.row))]
+
+
+_IMPORT_REF = re.compile(r"\bimp_[0-9a-f]{32}\b")
+
+
+def registry_evidence_details(details: Any) -> Tuple[Dict[str, Any], List[str]]:
+    """The DELIBERATE mapping of a registry / strategy_verdict evidence ``details`` onto the whitelisted evidence columns. Dropped, and returned by name so the caller can report it:
+    ``attachment`` (the owner's whole import report: privacy, never synced), ``candidate_id`` / ``spec_digest`` (binding words, not evidence), and the metrics
+    ``net_usd_after_all_costs`` / ``owner_figure_basis`` / ``import_status`` (the owner's figure is not stored in Supabase: it lives in the hashed report; the hash is kept). Everything else
+    is passed through and judged by the whitelist as usual: an unlisted field is a REFUSAL, never a silent strip. Hash fields (``import_report_sha256``, ``execution_log_sha256``,
+    ``data_sha256``) are typed columns, exempt from the secret guard's long-hex rule only when they are exactly a sha256."""
+    if not isinstance(details, Mapping):
+        return {}, []
+    out = dict(details)
+    dropped = [k for k in EVIDENCE_DROPPED_DETAILS if k in out]
+    for k in EVIDENCE_DROPPED_DETAILS:
+        out.pop(k, None)
+    m = out.get("metrics")
+    if isinstance(m, Mapping):
+        m = dict(m)
+        dropped += [f"metrics.{k}" for k in EVIDENCE_DROPPED_METRICS if k in m]
+        for k in EVIDENCE_DROPPED_METRICS:
+            m.pop(k, None)
+        out["metrics"] = m
+    return out, dropped
+
+
+def _evidence_provenance(prov: Any) -> Any:
+    """An importer id (``imp_`` + 32 hex) in a provenance line is a hash-shaped token the guard rightly refuses as free text; the bound sha256 is in the typed details field instead."""
+    return _IMPORT_REF.sub("imp_ref", prov) if isinstance(prov, str) else prov
 
 
 def evidence_put(owner_id: str, trial_id: str, level: str, *, result: str, provenance: str, details: Optional[Mapping[str, Any]] = None, recorded_utc: Any,
@@ -824,14 +927,15 @@ def verdict_evidence_put(owner_id: str, trial_id: str, item: Any, *, source: Opt
     ms = g("recorded_ms") or 0
     if not ms:
         raise SyncError("evidence has no recorded_ms: refusing to invent a time")
-    return evidence_put(owner_id, trial_id, sv.STAGE_TO_REGISTRY_LEVEL[stage], result=f"{stage}:{g('result')}", provenance=g("provenance") or "none",
-                        details={"metrics": dict(g("metrics") or {}), "data_sha256": g("data_sha256"), "status": g("status")}, recorded_utc=int(ms),
-                        source=_src(source, "tools/strategy_verdict.py"))
+    details, _dropped = registry_evidence_details({"metrics": dict(g("metrics") or {}), "data_sha256": g("data_sha256"), "status": g("status")})
+    return evidence_put(owner_id, trial_id, sv.STAGE_TO_REGISTRY_LEVEL[stage], result=f"{stage}:{g('result')}", provenance=_evidence_provenance(g("provenance") or "none"),
+                        details=details, recorded_utc=int(ms), source=_src(source, "tools/strategy_verdict.py"))
 
 
 def registry_puts(owner_id: str, registry: Mapping[str, Any], *, source: Optional[str] = None) -> Tuple[List[Put], List[str]]:
     """Every registrable trial with its evidence, amendments, abandonment and supersession. Entries that are not registrations (the legacy seed) are SKIPPED WITH A
     REASON, never silently. A supersession whose successor is not itself registrable is skipped and reported."""
+    _verified_registry(registry)                    # refuse a backdated / wiped / unsealed registry before anything is mapped
     puts: List[Put] = []
     skipped: List[str] = []
     ok_ids = set()
@@ -846,10 +950,13 @@ def registry_puts(owner_id: str, registry: Mapping[str, Any], *, source: Optiona
     for t in trials:
         if t.get("trial_id") not in ok_ids:
             continue
-        puts += registration_puts(owner_id, t, source=src)
+        puts += _registration_puts(owner_id, t, source=src)
         tid = t["trial_id"]
-        for ev in t.get("evidence", []) or []:
-            puts.append(evidence_put(owner_id, tid, ev["level"], result=ev["result"], provenance=ev["provenance"], details=ev.get("details"), recorded_utc=ev["recorded_utc"], source=src))
+        for i, ev in enumerate(t.get("evidence", []) or []):
+            det, dropped = registry_evidence_details(ev.get("details"))
+            if dropped:
+                skipped.append(f"{tid}: evidence[{i}] not synced by design: {', '.join(dropped)}")
+            puts.append(evidence_put(owner_id, tid, ev["level"], result=ev["result"], provenance=_evidence_provenance(ev["provenance"]), details=det, recorded_utc=ev["recorded_utc"], source=src))
         for am in t.get("amendments", []) or []:
             puts.append(_finish("experiment_amendments", owner_id, {"trial_id": tid, "what": am["what"], "why": am["why"], "recorded_utc": utc(am["recorded_utc"])}, source=src))
         ab = t.get("abandoned")
@@ -944,6 +1051,88 @@ def _path_get(rep: Any, path: str) -> Any:
     return cur
 
 
+#: The importer's own file roles (``tools/owner_import.ROLES``; a test pins parity). A RECONCILED report needs the executions, the transaction log and BOTH wallet snapshots.
+IMPORT_ROLES = ("linear_execution", "spot_execution", "transaction_log", "wallet_opening", "wallet_closing")
+RECONCILED_ROLES = ("linear_execution", "transaction_log", "wallet_opening", "wallet_closing")
+#: A RECONCILED/VERIFIED account window is at least one day (three funding settlements) long, holds at least one perp execution and one funding settlement.
+MIN_RECONCILED_WINDOW_DAYS = 1.0
+_FIGURE_COMPONENTS = ("perp_realised_usd", "perp_fees_usd", "funding_net_usd", "interest_usd", "other_cash_lines_usd")
+_DAY_MS = 86_400_000
+
+
+def _fnum(v: Any) -> Optional[float]:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+def _close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-6)
+
+
+def _semantic_problems(report: Mapping[str, Any], status: str, layers: Mapping[str, Any], real: Optional[Mapping[str, Any]]) -> List[str]:
+    """Recompute what the digests cannot protect: a digest only proves the report is unaltered SINCE it was sealed, and a forger who edits a figure simply reseals. So the
+    arithmetic the importer did is redone here from the report's own parts: realised net = the sum of its five components; economic net = realised net + BTC economic P&L +
+    change in perpetual unrealised P&L; partial net = the sum of the known components; a RECONCILED/VERIFIED account has a real window (>= a day, internally consistent), non-zero
+    execution and funding counts, and lists the executions, the transaction log and both wallet files. This remains a consistency check: the source files are NOT available here,
+    so a forger who edits every figure coherently and reseals still passes it. The owner's files (their sha256 are listed in ``lineage.files``) are what could refute that."""
+    out: List[str] = []
+    if real is not None:
+        figs = real.get("figures")
+        net = real.get("net_realised_cash_usd")
+        partial = real.get("partial_net_of_known_components_usd")
+        if not isinstance(figs, Mapping) or any(k not in figs for k in _FIGURE_COMPONENTS):
+            out.append("realised_cash:figures_missing")
+        else:
+            vals = {k: figs[k] for k in _FIGURE_COMPONENTS}
+            if any(v is not None and _fnum(v) is None for v in vals.values()):
+                out.append("realised_cash:figure_not_a_number")
+            else:
+                known = [float(v) for v in vals.values() if v is not None]
+                if net is not None:
+                    if len(known) != len(vals):
+                        out.append("realised_cash:net_present_with_an_unknown_component")
+                    elif _fnum(net) is None or not _close(float(net), math.fsum(known)):
+                        out.append("realised_cash:net_is_not_the_sum_of_its_components")
+                if partial is not None and (_fnum(partial) is None or not _close(float(partial), math.fsum(known))):
+                    out.append("realised_cash:partial_net_is_not_the_sum_of_the_known_components")
+        if status in ("VERIFIED", "RECONCILED") and net is None:
+            out.append(f"realised_cash:no_net_under_{status}")
+    econ = layers.get("economic_total") if isinstance(layers.get("economic_total"), Mapping) else None
+    inv = layers.get("inventory_valuation") if isinstance(layers.get("inventory_valuation"), Mapping) else None
+    if econ is not None and econ.get("net_economic_pnl_usd") is not None:
+        en = _fnum(econ.get("net_economic_pnl_usd"))
+        parts = [_fnum((real or {}).get("net_realised_cash_usd")), _fnum((inv or {}).get("btc_economic_pnl_usd")), _fnum((inv or {}).get("change_in_perp_unrealised_usd"))]
+        if en is None or any(x is None for x in parts):
+            out.append("economic_total:net_without_all_of_its_components")
+        elif not _close(en, math.fsum(parts)):
+            out.append("economic_total:net_is_not_the_sum_of_its_components")
+    if status in ("VERIFIED", "RECONCILED"):
+        lin = report.get("lineage") if isinstance(report.get("lineage"), Mapping) else {}
+        files = lin.get("files") if isinstance(lin.get("files"), list) else []
+        roles = [f.get("role") for f in files if isinstance(f, Mapping)]
+        if any(r not in IMPORT_ROLES for r in roles):
+            out.append("lineage.files:unknown_role")
+        missing = [r for r in RECONCILED_ROLES if r not in roles]
+        if missing:
+            out.append(f"lineage.files:{status}_lacks_{'+'.join(missing)}")
+        led = report.get("ledger") if isinstance(report.get("ledger"), Mapping) else {}
+        win = led.get("window") if isinstance(led.get("window"), Mapping) else {}
+        lo, hi = win.get("opening_ts_ms"), win.get("closing_ts_ms")
+        if not all(isinstance(x, int) and not isinstance(x, bool) for x in (lo, hi)) or hi <= lo:
+            out.append("ledger.window:missing_or_not_increasing")
+        else:
+            days = (hi - lo) / _DAY_MS
+            if days < MIN_RECONCILED_WINDOW_DAYS:
+                out.append(f"ledger.window:shorter_than_{MIN_RECONCILED_WINDOW_DAYS:g}_day_for_{status}")
+            if _fnum(win.get("days")) is None or not _close(float(win["days"]), days):
+                out.append("ledger.window:days_do_not_match_the_timestamps")
+        rec = led.get("records") if isinstance(led.get("records"), Mapping) else {}
+        for k in ("perp_executions", "funding_settlements"):
+            v = rec.get(k)
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                out.append(f"ledger.records.{k}:zero_or_missing_under_{status}")
+    return out
+
+
 def verify_import_report(report: Any) -> List[str]:
     """Why a report is NOT a valid, self-consistent ``owner_import`` report (empty = valid). Recomputes ``report_sha256`` (the importer's ``_seal`` digest of the body), the
     lineage ``digest`` (files, marks, stages, and every figure's value + provenance digest, which is itself recomputed), then checks the status against its own layers
@@ -1010,6 +1199,7 @@ def verify_import_report(report: Any) -> List[str]:
         out.append(f"status:{status}_without_a_realised_cash_layer")
     if real is not None and real.get("status") != status:
         out.append("status:differs_from_the_realised_cash_layer")
+    out += _semantic_problems(report, status, layers, real)
     headline = report.get("headline_realised_cash_usd")
     if headline is not None:
         net = real.get("net_realised_cash_usd") if real is not None else None
@@ -1025,7 +1215,7 @@ def verify_import_report(report: Any) -> List[str]:
 def owner_import_puts(owner_id: str, report: Mapping[str, Any], *, imported_utc: Any, storage_ref: str, source_sha256: Optional[str] = None, kind: str = "owner_import",
                       source: Optional[str] = None) -> List[Put]:
     """A VALID, SEALED ``owner_import`` report -> ONE owner_account_imports row. The report is first verified (``verify_import_report``: digests recompute, status in the eight
-    words and consistent with its layers and headline); any problem refuses it, by name. Only this whitelist is then read: ``status``, ``lineage.files[*].sha256`` (digested into
+    words and consistent with its layers and headline); any problem refuses it, by name. Only this whitelist is then read: ``status``, ``report_sha256`` (stored so a VERIFIED/RECONCILED row names the sealed report it comes from; the database requires it), ``lineage.files[*].sha256`` (digested into
     the source hash unless ``source_sha256`` is given), ``ledger.window`` opening/closing ms if both are integers, and the number of lineage files. The report's rows, figures,
     balances, flags, marks and identifiers are never copied. import_id = content hash of the stored metadata."""
     problems = verify_import_report(report)
@@ -1042,7 +1232,7 @@ def owner_import_puts(owner_id: str, report: Mapping[str, Any], *, imported_utc:
         period = {"period_start_utc": utc(lo), "period_end_utc": utc(hi)}
     nfiles = len(report["lineage"]["files"])
     return [_finish("owner_account_imports", owner_id, {"source_sha256": source_sha256, "kind": kind, **period, "row_count": nfiles or None, "storage_ref": storage_ref,
-                                                         "status": status, "imported_utc": utc(imported_utc)}, source=_src(source, "tools/owner_import.py"))]
+                                                         "status": status, "report_sha256": report["report_sha256"], "imported_utc": utc(imported_utc)}, source=_src(source, "tools/owner_import.py"))]
 
 
 def import_status_event_put(owner_id: str, import_id: str, status: str, recorded_utc: Any, *, reason: Optional[str] = None, evidence_ref: Optional[str] = None,

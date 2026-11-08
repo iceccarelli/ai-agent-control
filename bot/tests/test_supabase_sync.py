@@ -3,11 +3,12 @@
 STATIC tests (always run, any Python): the module's table specs against the SQL parsed from supabase/migrations, canonicalisation, the secret guard (hostile table +
 positive control), the client protocol, conflict reporting against an in-memory client, no-environment/no-network source checks, and three mutation checks.
 EXECUTED tests: every migration applied into a DISPOSABLE local Postgres (the ``pgserver`` wheel, private data dir, unix socket) and the plan written through a fake
-service-role client that calls ``carry.put_row`` via SQL. They SKIP cleanly when ``pgserver`` is missing. Nothing here contacts Supabase or any network service.
+service-role client that calls ``carry.put_row`` via SQL. They SKIP cleanly when ``pgserver`` is missing, UNLESS REQUIRE_PG=1 (the CI job), where that is a FAILURE. Nothing here contacts Supabase or any network service.
 Secret-shaped test strings are assembled from fragments at run time so this file never contains a literal credential.
 """
 import dataclasses
 import functools
+import importlib
 import json
 import os
 import re
@@ -61,6 +62,8 @@ def sql_tables():
         for c, vals in re.findall(r"check \((\w+) in \(([^)]*)\)\)", body):
             enums[c] = tuple(re.findall(r"'(\w+)'", vals))
         out[name] = {"cols": cols, "uniques": uniques, "fks": fks, "enums": enums}
+    for tbl, col, typ, rest in re.findall(r"alter table carry\.(\w+) add column if not exists (\w+) (carry\.sha256_hex|text|integer|bigint|numeric|boolean|jsonb|timestamptz|uuid)\b([^;]*);", sql):
+        out[tbl]["cols"][col] = {"notnull": "not null" in rest, "default": " default " in (" " + rest)}      # a column added by a later migration
     return out
 
 
@@ -90,7 +93,16 @@ def make_registry():
     hr.register_experiment(reg, "T4", **{**base, "hypothesis_id": "H4", "mechanism": "m4"})
     hr.supersede(reg, "T3", "T4", "re-specified")
     reg["trials"].append({"trial_id": "legacy_seed", "status": "frozen_absent", "source": "project_status"})   # not a registration: must be skipped, visibly
+    hr.seal(reg)                                                  # registry_puts refuses a registry that does not verify
     return reg
+
+
+def _regp(owner, entry, mod=None):
+    """registration_puts needs the sealed registry the entry lives in: seal a one-entry registry around a hand-built entry."""
+    import hypothesis_registry as hr
+    reg = {"trials": [entry]}
+    hr.seal(reg)
+    return (mod or SS).registration_puts(owner, entry, registry=reg)
 
 
 def policy():
@@ -294,8 +306,9 @@ def test_import_report_row_holds_no_raw_owner_data():
     row = SS.owner_import_puts(A, OI._seal(hostile), imported_utc=1762387300000, storage_ref="private://x")[0].row     # sealed WITH the hostile extras: they are not copied
     blob = json.dumps(row)
     assert "SENTINEL" not in blob and "476.275" not in blob and "12345" not in blob
-    assert set(row) <= {"owner_id", "import_id", "source_sha256", "kind", "period_start_utc", "period_end_utc", "row_count", "storage_ref", "status", "imported_utc",
+    assert set(row) <= {"owner_id", "import_id", "source_sha256", "kind", "period_start_utc", "period_end_utc", "row_count", "storage_ref", "status", "report_sha256", "imported_utc",
                         "source", "schema_version", "content_sha256"}
+    assert row["report_sha256"] == OI._seal(hostile)["report_sha256"] and "report_sha256" not in {k for k in row if k not in ("report_sha256",)}
     assert row["row_count"] == len(import_report()["lineage"]["files"])              # the count of FILES hashed, not any record
     with pytest.raises(SS.SyncError):
         SS.owner_import_puts(A, {"status": "RECONCILED"}, imported_utc=1762387300000, storage_ref="x")       # no lineage hashes: refuses rather than inventing a source hash
@@ -344,7 +357,7 @@ def _shapes():
         "aws key": "AK" + "IA" + "ABCDEFGHIJKLMNOP",
         "slack token": "xo" + "xb-" + "1234567890-abcdefghijkl",
         "bearer": "Authorization: Bear" + "er " + "abcdefghijklmnopqrstuvwxyz012345",
-        "credentialed url": "post" + "gres://svc:hunter2pw@db.example.com/postgres",
+        "credentialed url": "post" + "gres://svc" + ":hunter2pw@" + "db.example.com/postgres",
         "url token param": "https://api.example.com/v1/x?api" + "_key=abc123def456ghi",
         "assigned secret": "api_" + "secret = " + "Zx81Qp92LmN",
         "exchange style key": "kR3" + "mQ9xTz" + "A1bC7dEf" + "G2hJ",
@@ -530,9 +543,9 @@ def _mutant(old, new):
 
 def test_mutation_secret_guard_account_identifier_field_names():
     with pytest.raises(SS.SecretGuardError):
-        SS.registration_puts(A, reg_entry(costs={"uid": "7"}))
+        _regp(A, reg_entry(costs={"uid": "7"}))
     m = _mutant("if n in _KEY_EXACT:", "if False:")
-    assert m.registration_puts(A, reg_entry(costs={"uid": "7"}))     # mutant lets an account id field through: the field-name tests would fail on it
+    assert _regp(A, reg_entry(costs={"uid": "7"}), m)     # mutant lets an account id field through: the field-name tests would fail on it
 
 
 def test_mutation_secret_guard_value_shapes():
@@ -826,7 +839,7 @@ GUARD_VALUES = {
 def test_rt3_3_account_like_keys_are_refused_anywhere_in_a_value_tree(key):
     assert SS.scan_value({"outer": [{key: 1}]}) and SS.scan_value({key: 1})
     with pytest.raises(SS.SecretGuardError):
-        SS.registration_puts(A, reg_entry(costs={"outer": {key: 1}}))
+        _regp(A, reg_entry(costs={"outer": {key: 1}}))
 
 
 @pytest.mark.parametrize("name", sorted(GUARD_VALUES))
@@ -841,7 +854,7 @@ def test_rt3_3_token_shaped_values_are_refused_as_values_and_as_keys_in_every_ta
               lambda: SS.md_seal_receipt_put(A, seal_id="s", batch_id="b", manifest_sha256=H("f"), manifest_rows=1, sealed_utc=1762300800000, receipt={"segment": v}),
               lambda: SS.collector_status_put(A, "c", "RUNNING", 1762300800000, detail={"last_error_code": v}),
               lambda: SS.incident_put(A, "I", "WARN", "title " + v, 1762300800000),
-              lambda: SS.registration_puts(A, reg_entry(costs={"note": [v]}))]
+              lambda: _regp(A, reg_entry(costs={"note": [v]}))]
     for b in builds:
         with pytest.raises(SS.SecretGuardError) as ei:
             b()
@@ -877,7 +890,7 @@ def test_rt3_3_pathologically_deep_values_are_refused():
         cur["a"] = {}
         cur = cur["a"]
     with pytest.raises(SS.SyncError):
-        SS.registration_puts(A, reg_entry(costs=deep))
+        _regp(A, reg_entry(costs=deep))
     assert SS.scan_value(deep, "x") != [] or True                                    # the scanner itself terminates on it
 
 
@@ -1050,7 +1063,7 @@ def test_rt3_mutation_whitelist_and_guard_rules():
     m2 = _mutant("    for m in _ALNUM_RUN.finditer(s):", "    for m in []:")
     assert m2.incident_put(A, "I", "WARN", "t " + tok, 1762300800000)
     m3 = _mutant("    if any(w in _KEY_TOKENS for w in words):", "    if False:")
-    assert m3.registration_puts(A, reg_entry(costs={"acct": "1"}))
+    assert _regp(A, reg_entry(costs={"acct": "1"}), m3)
     h32 = "abcdef" * 5 + "ab"                                            # letters only: the long-hex rule is the ONLY one that sees it
     with pytest.raises(SS.SecretGuardError):
         SS.incident_put(A, "I", "WARN", "t " + h32, 1762300800000)
@@ -1122,16 +1135,53 @@ class PG:
         return self.run(sql, **kw).stdout.strip().splitlines()[-1]
 
 
+def _unavailable(reason, require):
+    """No disposable Postgres: SKIP, or FAIL when the environment promised one (REQUIRE_PG=1). Same contract as tests/test_supabase_migrations.py."""
+    if require:
+        pytest.fail(f"REQUIRE_PG=1 but the executed Supabase tests cannot run: {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
+def _pgserver(require, importer=importlib.import_module):
+    try:
+        return importer("pgserver")
+    except ImportError:
+        _unavailable("no disposable Postgres (pip install pgserver): the writer was NOT executed against SQL", require)
+
+
+def test_rt4_6_require_pg_turns_a_missing_or_broken_pgserver_into_a_failure_not_a_skip():
+    def missing(name):
+        raise ImportError(name)
+
+    with pytest.raises(pytest.fail.Exception, match="REQUIRE_PG=1"):
+        _pgserver(True, missing)
+    with pytest.raises(pytest.skip.Exception):
+        _pgserver(False, missing)                       # positive control: without the promise it still skips
+    sentinel = object()
+    assert _pgserver(True, lambda name: sentinel) is sentinel
+    with pytest.raises(pytest.fail.Exception):
+        _unavailable("postgres will not start", True)
+    with pytest.raises(pytest.skip.Exception):
+        _unavailable("postgres will not start", False)
+
+
+def test_rt4_6_this_file_has_no_unconditional_skip_path_around_the_pg_fixture():
+    src = Path(__file__).read_text()
+    assert "importorskip(" + '"pgserver"' not in src and "REQUIRE_PG" in src
+    assert len(re.findall(r"pytest\.skip\(", src)) == 1            # the one inside _unavailable
+
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
-    pgserver = pytest.importorskip("pgserver", reason="no disposable Postgres (pip install pgserver): the writer was NOT executed against SQL")
+    require = os.environ.get("REQUIRE_PG") == "1"
+    pgserver = _pgserver(require)
     try:
         srv = pgserver.get_server(tmp_path_factory.mktemp("pgdata_sync"), cleanup_mode="stop")
     except Exception as e:  # pragma: no cover
-        pytest.skip(f"cannot start disposable postgres: {e}")
+        _unavailable(f"cannot start disposable postgres: {e}", require)
     psql = Path(pgserver.__file__).parent / "pginstall" / "bin" / "psql"
     if not psql.exists():
-        pytest.skip("pgserver psql binary missing")
+        _unavailable("pgserver psql binary missing", require)
     return PG(psql, srv.get_uri())
 
 
@@ -1217,7 +1267,7 @@ def test_conflicting_duplicate_is_reported_against_real_postgres(pg):
     client = SqlClient(pg)
     # same trial_id, different registration content -> put_row False for both; the writer must say CONFLICT, and the stored row must stay the original
     reg = next(x for x in puts if x.table == "experiment_registrations" and x.row["trial_id"] == "T1")
-    changed_reg = next(x for x in SS.registration_puts(A, reg_entry(trial_id="T1", mechanism="a different mechanism")) if x.table == "experiment_registrations")
+    changed_reg = next(x for x in _regp(A, reg_entry(trial_id="T1", mechanism="a different mechanism")) if x.table == "experiment_registrations")
     rep = SS.write(dataclasses.replace(SS.plan(A, []), puts=(changed_reg,)), client)
     assert not rep.ok and rep.results[0].outcome == SS.CONFLICT
     assert pg.scalar(f"select mechanism from carry.experiment_registrations where trial_id='T1' and owner_id='{A}';", role="service_role") == "funding carry earns the basis"
@@ -1275,7 +1325,7 @@ def test_pre_fix_schema_could_not_replay_evidence_of_an_abandoned_trial(server):
 def test_rt3_every_whitelisted_object_shape_lands_and_round_trips_in_real_postgres(pg):
     owner = str(uuid.uuid4())
     seal_cols = {"segment": "md-20261101.db", "records": 5, "first_id": 1, "last_id": 5, "last_chain": H("c"), "sha256": H("e")}
-    puts = [SS.registration_puts(owner, make_registry()["trials"][0])[0], SS.registration_puts(owner, make_registry()["trials"][0])[1]]
+    puts = [SS.registration_puts(owner, make_registry()["trials"][0], registry=make_registry())[0], SS.registration_puts(owner, make_registry()["trials"][0], registry=make_registry())[1]]
     for kind, obj in POSITIVE_OBJECTS:
         if kind == "evidence":
             puts.append(SS.evidence_put(owner, "T1", "BACKTEST", result=f"r{len(puts)}", provenance="p", details=obj, recorded_utc=1762300800000 + len(puts)))
@@ -1334,7 +1384,7 @@ def test_a_report_whose_headline_does_not_declare_it_is_realised_cash_only_is_re
 # --------------------------------------------------------------------------- red-team round 4 (A): the registry digest is attested, not trusted
 
 def _reg_put(**over):
-    return next(x for x in SS.registration_puts(A, reg_entry(**over)) if x.table == "experiment_registrations")
+    return next(x for x in _regp(A, reg_entry(**over)) if x.table == "experiment_registrations")
 
 
 def test_rt4_a_a_registration_whose_content_changed_under_the_same_digest_is_refused():
@@ -1447,3 +1497,438 @@ def test_rt4_a_same_digest_same_key_but_a_different_attested_row_is_a_conflict_n
     pl = SS.plan(A, [good, twin])
     assert len(pl.puts) == 1 and len(pl.conflicts) == 1 and pl.collapsed == 0
     assert SS.plan(A, [good, good]).collapsed == 1                                                    # positive control: an identical resend collapses
+
+
+# --------------------------------------------------------------------------- red-team round 4 (rt4-1..4): semantic report checks, bound evidence, verified registry, registry evidence
+
+def _forged(fn, base="RECONCILED"):
+    """A forger's report: edit, refresh every figure copy in the lineage from the edited report, then recompute every provenance, lineage and report digest by hand
+    (the importer's own ``_seal`` would refuse an edited figure with an 'unexplained sum mismatch'; a forger does not use it)."""
+    r = json.loads(json.dumps(real_reports()[base]))
+    fn(r)
+    for path, e in r["lineage"]["figures"].items():
+        e["value"] = SS._path_get(r, path)
+    return _reseal_by_hand(r)
+
+
+def _problems(rep):
+    return SS.verify_import_report(rep)
+
+
+def test_rt4_1_positive_controls_every_real_importer_status_passes_the_semantic_checks():
+    for name in ("RECONCILED", "PROVISIONAL"):
+        assert _problems(real_reports()[name]) == [], name
+    for st in ("ESTIMATED", "PROVISIONAL", "STALE", "DISPUTED", "INCOMPLETE", "UNAVAILABLE"):
+        assert _problems(resealed(st)) == [], st
+    assert SS.IMPORT_ROLES == OI.ROLES and set(SS.RECONCILED_ROLES) <= set(OI.ROLES)
+    assert SS._FIGURE_COMPONENTS == tuple(real_reports()["RECONCILED"]["layers"]["realised_cash"]["figures"]) or set(SS._FIGURE_COMPONENTS) == set(real_reports()["RECONCILED"]["layers"]["realised_cash"]["figures"])
+
+
+def test_rt4_1_a_resealed_economic_total_that_is_not_the_sum_of_its_parts_is_refused():
+    def edit(r):
+        r["layers"]["economic_total"]["net_economic_pnl_usd"] = 1e9
+    probs = _problems(_forged(edit))
+    assert "economic_total:net_is_not_the_sum_of_its_components" in probs
+    _refused(_forged(edit), "economic_total:net_is_not_the_sum_of_its_components")
+    # the economic figure is only believed together with ALL of its parts
+    def drop_part(r):
+        r["layers"]["inventory_valuation"]["btc_economic_pnl_usd"] = None
+    assert "economic_total:net_without_all_of_its_components" in _problems(_forged(drop_part))
+
+
+def test_rt4_1_a_resealed_realised_net_headline_or_partial_that_is_not_the_sum_is_refused():
+    def edit(r):
+        r["layers"]["realised_cash"]["net_realised_cash_usd"] = 99999.0
+        r["headline_realised_cash_usd"] = 99999.0
+        r["layers"]["economic_total"]["net_economic_pnl_usd"] = 99999.0 - 1000.0
+    assert "realised_cash:net_is_not_the_sum_of_its_components" in _problems(_forged(edit))
+    def one_component(r):                       # edit ONE component and nothing else
+        r["layers"]["realised_cash"]["figures"]["perp_realised_usd"] = 5000.0
+    assert "realised_cash:net_is_not_the_sum_of_its_components" in _problems(_forged(one_component))
+    def partial(r):
+        r["layers"]["realised_cash"]["partial_net_of_known_components_usd"] = 12345.0
+    assert "realised_cash:partial_net_is_not_the_sum_of_the_known_components" in _problems(_forged(partial, base="PROVISIONAL"))
+    def net_with_unknown(r):
+        r["layers"]["realised_cash"]["figures"]["interest_usd"] = None
+    assert "realised_cash:net_present_with_an_unknown_component" in _problems(_forged(net_with_unknown))
+    def not_a_number(r):
+        r["layers"]["realised_cash"]["figures"]["funding_net_usd"] = "9"
+    assert "realised_cash:figure_not_a_number" in _problems(_forged(not_a_number))
+
+
+def test_rt4_1_reconciled_needs_a_real_window_counts_and_the_source_files():
+    def short(r):
+        w = r["ledger"]["window"]
+        w["opening_ts_ms"] = w["closing_ts_ms"] - 3_600_000
+        w["days"] = 1 / 24
+    assert any(p.startswith("ledger.window:shorter_than") for p in _problems(_forged(short)))
+    def lying_days(r):
+        r["ledger"]["window"]["days"] = 30.0
+    assert "ledger.window:days_do_not_match_the_timestamps" in _problems(_forged(lying_days))
+    def backwards(r):
+        w = r["ledger"]["window"]
+        w["opening_ts_ms"], w["closing_ts_ms"] = w["closing_ts_ms"], w["opening_ts_ms"]
+    assert "ledger.window:missing_or_not_increasing" in _problems(_forged(backwards))
+    for k in ("perp_executions", "funding_settlements"):
+        def zero(r, k=k):
+            r["ledger"]["records"][k] = 0
+        assert f"ledger.records.{k}:zero_or_missing_under_RECONCILED" in _problems(_forged(zero)), k
+    def no_wallet(r):
+        r["lineage"]["files"] = [f for f in r["lineage"]["files"] if f["role"] != "wallet_closing"]
+    assert any("lacks_wallet_closing" in p for p in _problems(_forged(no_wallet)))
+    def bad_role(r):
+        r["lineage"]["files"][0]["role"] = "invented"
+    assert "lineage.files:unknown_role" in _problems(_forged(bad_role))
+    # the same short window under a WEAKER status is a legitimate importer output: PROVISIONAL is not held to the RECONCILED floors
+    assert _problems(_forged(lambda r: r["ledger"]["window"].update(days=r["ledger"]["window"]["days"]), base="PROVISIONAL")) == []
+
+
+def test_rt4_1_the_semantic_check_cannot_see_the_owners_files_and_says_so():
+    # a coherent forgery (every part edited consistently, then resealed) passes: that is the documented limit, not a bug to hide
+    assert "NOT available here" in SS._semantic_problems.__doc__ and "lineage.files" in SS._semantic_problems.__doc__
+
+    def coherent(r):
+        f = r["layers"]["realised_cash"]["figures"]
+        f["perp_realised_usd"] += 100.0
+        net = r["layers"]["realised_cash"]["net_realised_cash_usd"] + 100.0
+        r["layers"]["realised_cash"]["net_realised_cash_usd"] = net
+        r["headline_realised_cash_usd"] = net
+        r["layers"]["economic_total"]["net_economic_pnl_usd"] += 100.0
+    assert _problems(_forged(coherent)) == []
+
+
+def test_rt4_1_mutation_each_semantic_rule_is_load_bearing():
+    forged = {
+        "econ": _forged(lambda r: r["layers"]["economic_total"].update(net_economic_pnl_usd=1e9)),
+        "net": _forged(lambda r: r["layers"]["realised_cash"]["figures"].update(perp_realised_usd=5000.0)),
+        "days": _forged(lambda r: r["ledger"]["window"].update(opening_ts_ms=r["ledger"]["window"]["closing_ts_ms"] - 3_600_000, days=1 / 24)),
+        "count": _forged(lambda r: r["ledger"]["records"].update(funding_settlements=0)),
+        "role": _forged(lambda r: r["lineage"].update(files=[f for f in r["lineage"]["files"] if f["role"] != "wallet_opening"])),
+    }
+    assert all(_problems(r) for r in forged.values())
+    anchors = {"econ": ('elif not _close(en, math.fsum(parts)):', "elif False:"),
+               "net": ('elif _fnum(net) is None or not _close(float(net), math.fsum(known)):', "elif False:"),
+               "days": ("if days < MIN_RECONCILED_WINDOW_DAYS:", "if False:"),
+               "count": ("if not isinstance(v, int) or isinstance(v, bool) or v < 1:", "if False:"),
+               "role": ("if missing:\n            out.append(", "if False:\n            out.append(")}
+    for k, (old, new) in anchors.items():
+        m = _mutant(old, new)
+        if k == "econ":
+            assert not any("economic_total" in p for p in m.verify_import_report(forged[k]))
+        if k == "days":
+            assert not any("shorter_than" in p for p in m.verify_import_report(forged[k]))
+        if k == "net":
+            assert not any("net_is_not_the_sum" in p for p in m.verify_import_report(forged[k]))
+        if k == "count":
+            assert not any("zero_or_missing" in p for p in m.verify_import_report(forged[k]))
+        if k == "role":
+            assert not any("lacks_" in p for p in m.verify_import_report(forged[k]))
+    # the call itself is the load-bearing line too
+    m = _mutant("    out += _semantic_problems(report, status, layers, real)\n", "")
+    assert all(m.verify_import_report(r) == [] for r in forged.values())
+
+
+def test_rt4_1_the_importer_output_is_unaffected_through_the_sync_path():
+    for name in ("RECONCILED", "PROVISIONAL"):
+        assert SS.owner_import_puts(A, real_reports()[name], imported_utc=1762387300000, storage_ref="private://x")
+
+
+# ---- rt4-2: evidence is bound to the hashed artifact it speaks about
+
+IMP_HASH, LOG_HASH = "3c9a1f5e7b2d4086" * 4, "7f1e2d3c4b5a6988" * 4
+
+
+def _evp(level, details, **kw):
+    return SS.evidence_put(A, "T1", level, result=kw.pop("result", "r:PASS"), provenance=kw.pop("provenance", "run-1"), details=details, recorded_utc=1762300800000)
+
+
+def test_rt4_2_owner_and_testnet_evidence_without_the_bound_hash_is_refused():
+    for level, field in (("OWNER_ACCOUNT_VERIFIED", "import_report_sha256"), ("TESTNET_MECHANICS", "execution_log_sha256")):
+        for det in ({}, {"status": "RECONCILED"}, {"metrics": {"venue": "testnet"}}, {field: "z" * 64}, {field: "a" * 64}, {field: H("1")[:63]},
+                    {"metrics": {field: IMP_HASH}, field: LOG_HASH}):               # a hash of 64 'a' is not a hash; two different hashes are not one binding
+            with pytest.raises(SS.SyncError) as ei:
+                _evp(level, det)
+            assert field in str(ei.value) or "bad_hex64" in str(ei.value), (level, det)
+        # positive controls: the hash in details, or in metrics, or both and equal
+        assert _evp(level, {field: IMP_HASH})
+        assert _evp(level, {"metrics": {field: IMP_HASH}})
+        assert _evp(level, {field: IMP_HASH, "metrics": {field: IMP_HASH}})
+    assert _evp("BACKTEST", {})                                  # other levels make no such claim and need no hash
+    assert _evp("OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": IMP_HASH, "status": "RECONCILED"}).row["details"]["import_report_sha256"] == IMP_HASH
+
+
+def test_rt4_2_the_owner_figure_is_not_a_whitelisted_metric_so_supabase_carries_no_second_financial_truth():
+    assert "net_usd_after_all_costs" not in SS.EVIDENCE_METRICS
+    for det in ({"net_usd_after_all_costs": "1000000", "import_report_sha256": IMP_HASH}, {"metrics": {"net_usd_after_all_costs": "1000000"}, "import_report_sha256": IMP_HASH}):
+        with pytest.raises(SS.SyncError) as ei:
+            _evp("OWNER_ACCOUNT_VERIFIED", det)
+        assert "not_whitelisted" in str(ei.value)
+    # PoC: the unbound claim of the red team
+    with pytest.raises(SS.SyncError):
+        SS.plan(A, [SS.evidence_put(A, "btcusdt_funding_carry_overlay@prospective-1", "OWNER_ACCOUNT_VERIFIED", result="reconciled_owner_result:PASS", provenance="owner statement",
+                                    details={"status": "RECONCILED", "metrics": {"net_usd_after_all_costs": "1000000"}}, recorded_utc="2026-11-01T00:00:00Z")])
+
+
+def test_rt4_2_a_hand_built_unbound_row_never_reaches_the_client():
+    good = _evp("OWNER_ACCOUNT_VERIFIED", {"import_report_sha256": IMP_HASH, "status": "RECONCILED"})
+    row = dict(good.row, details={"status": "RECONCILED"})
+    row["content_sha256"] = SS.row_hash("experiment_evidence", row)
+    with pytest.raises(SS.SyncError):
+        SS.plan(A, [SS.Put("experiment_evidence", row)])
+    forged = dataclasses.replace(SS.plan(A, [good]), puts=(SS.Put("experiment_evidence", row),))
+    client = MemClient()
+    with pytest.raises(SS.SyncError):
+        SS.write(forged, client)
+    assert client.calls == 0
+
+
+def test_rt4_2_mutation_binding_rule_is_load_bearing():
+    with pytest.raises(SS.SyncError):
+        _evp("OWNER_ACCOUNT_VERIFIED", {})
+    m = _mutant("    if table == \"experiment_evidence\" and r[\"level\"] in LEVEL_REQUIRES_HASH:", "    if False:")
+    assert m.evidence_put(A, "T1", "OWNER_ACCOUNT_VERIFIED", result="r:PASS", provenance="run-1", details={}, recorded_utc=1762300800000)
+    m2 = _mutant('"net_edge_bps_after_costs", "point_in_time"', '"net_edge_bps_after_costs", "net_usd_after_all_costs", "point_in_time"')
+    assert m2.evidence_put(A, "T1", "BACKTEST", result="r", provenance="p", details={"metrics": {"net_usd_after_all_costs": "5"}}, recorded_utc=1762300800000)
+
+
+# ---- rt4-3: a registry that does not verify cannot be synced
+
+def _sealed_registry():
+    import copy
+    return copy.deepcopy(make_registry())
+
+
+def test_rt4_3_positive_control_a_verified_registry_syncs():
+    puts, skipped = SS.registry_puts(A, _sealed_registry())
+    assert puts and len(skipped) >= 1
+
+
+def test_rt4_3_backdated_wiped_unsealed_or_added_trials_are_refused_by_registry_puts():
+    reg = _sealed_registry()
+    reg["trials"][0]["registered_utc"] = "2020-01-01T00:00:00Z"                  # backdated, not resealed
+    with pytest.raises(SS.SyncError, match="ALTERED"):
+        SS.registry_puts(A, reg)
+    reg = _sealed_registry()
+    reg["trials"][0]["evidence"] = []                                            # evidence wiped
+    with pytest.raises(SS.SyncError, match="evidence was ALTERED|ALTERED or removed"):
+        SS.registry_puts(A, reg)
+    reg = _sealed_registry()
+    del reg["integrity"]
+    with pytest.raises(SS.SyncError, match="not sealed"):
+        SS.registry_puts(A, reg)
+    reg = _sealed_registry()
+    reg["trials"] = reg["trials"][1:]                                            # a trial removed
+    with pytest.raises(SS.SyncError, match="REMOVED"):
+        SS.registry_puts(A, reg)
+    reg = _sealed_registry()
+    reg["trials"].append(dict(reg["trials"][0], trial_id="T9"))                  # a trial added without save()
+    with pytest.raises(SS.SyncError, match="not sealed"):
+        SS.registry_puts(A, reg)
+    for junk in (None, [], {"trials": "x"}, {"trials": [7], "integrity": {"entries": {}}}):
+        with pytest.raises(SS.SyncError):
+            SS.registry_puts(A, junk)
+
+
+def test_rt4_3_registration_puts_verifies_the_registry_it_is_given_and_the_entry_in_it():
+    import hypothesis_registry as hr
+    reg = _sealed_registry()
+    entry = reg["trials"][0]
+    assert SS.registration_puts(A, entry, registry=reg)
+    with pytest.raises(TypeError):
+        SS.registration_puts(A, entry)                                           # the registry is REQUIRED
+    backdated = _sealed_registry()
+    backdated["trials"][0]["registered_utc"] = "2020-01-01T00:00:00Z"
+    with pytest.raises(SS.SyncError, match="ALTERED"):
+        SS.registration_puts(A, backdated["trials"][0], registry=backdated)
+    altered = dict(entry, mechanism="a different mechanism")                      # an entry that is not the registry's own
+    with pytest.raises(SS.SyncError, match="not an unaltered entry"):
+        SS.registration_puts(A, altered, registry=reg)
+    other = {"trials": [dict(entry, trial_id="OTHER")]}
+    hr.seal(other)
+    with pytest.raises(SS.SyncError, match="not an unaltered entry"):
+        SS.registration_puts(A, entry, registry=other)
+
+
+def test_rt4_3_the_red_team_poc_backdated_registration_is_refused_end_to_end():
+    import hypothesis_registry as hr
+    reg = {"trials": []}
+    hr.register_experiment(reg, "cand1", hypothesis_id="h", mechanism="m", family="f", strategy="s", universe=["BTCUSDT"], input_data_sha256=H("a"), code_sha="abcdef1",
+                           data_window={"a": 1}, parameter_grid={"a": [1]}, costs={"b": 1}, statistical_design={"t": "x"}, train_test={"s": "y"}, multiple_testing_family="f",
+                           prospective_period="p")
+    hr.seal(reg)
+    assert SS.registry_puts(A, reg)[0]
+    reg["trials"][0]["registered_utc"] = "2020-01-01T00:00:00Z"
+    assert hr.verify(reg)                                                         # the registry itself knows
+    with pytest.raises(SS.SyncError):
+        SS.registry_puts(A, reg)
+
+
+def test_rt4_3_mutation_the_verify_call_is_load_bearing():
+    reg = _sealed_registry()
+    reg["trials"][0]["registered_utc"] = "2020-01-01T00:00:00Z"
+    m = _mutant("        problems = hr.verify(registry)          # type: ignore[arg-type]", "        problems = []")
+    assert m.registry_puts(A, reg)[0]                                             # without the call the backdated registry syncs
+
+
+# ---- rt4-4: evidence that backs a verdict can be synced, deliberately mapped
+
+def _verdict_items():
+    import strategy_verdict as sv
+    return [
+        sv.EvidenceItem(stage="prospective_observation", result="PASS", provenance="prospective run 1", recorded_ms=1762300800000, candidate_id="cand1", spec_digest=H("5"),
+                        metrics={"complete": True, "observation_started_ms": 1762000000000, "observation_ended_ms": 1762300000000, "observed_settlements": 30, "coverage": 1.0}),
+        sv.EvidenceItem(stage="execution_validation", result="PASS", provenance="testnet drill 7", recorded_ms=1762300800000, candidate_id="cand1", spec_digest=H("5"),
+                        metrics={"venue": "testnet", "fills_measured": True, "fees_measured": True, "fills_count": 12, "fee_observations_count": 12, "execution_log_sha256": LOG_HASH,
+                                 "candidate_id": "cand1", "spec_digest": H("5"), "observation_started_ms": 1762000000000}),
+        sv.EvidenceItem(stage="reconciled_owner_result", result="PASS", provenance="owner_import report imp_" + "0123456789abcdef" * 2, recorded_ms=1762300800000,
+                        candidate_id="cand1", spec_digest=H("5"), status="RECONCILED", attachment=import_report(),
+                        metrics={"net_usd_after_all_costs": 1476.275, "owner_figure_basis": "economic_total", "import_report_sha256": IMP_HASH, "import_status": "RECONCILED",
+                                 "observation_started_ms": 1762000000000}),
+    ]
+
+
+def test_rt4_4_every_verdict_stage_syncs_with_typed_hashes_and_no_owner_report_figure_or_free_text():
+    for item in _verdict_items():
+        put = SS.verdict_evidence_put(A, "cand1", item)
+        d = put.row["details"]
+        blob = json.dumps(put.row)
+        assert "attachment" not in blob and "net_usd_after_all_costs" not in blob and "1476" not in blob and "spec_digest" not in blob and "candidate_id" not in d
+        assert SS.scan_row(put.table, put.row) == [] and SS.plan(A, [put]).puts
+        if put.row["level"] == "OWNER_ACCOUNT_VERIFIED":
+            assert d["metrics"]["import_report_sha256"] == IMP_HASH and "imp_ref" in put.row["provenance"] and "0123456789abcdef" not in put.row["provenance"]
+            assert d["status"] == "RECONCILED"
+        if put.row["level"] == "TESTNET_MECHANICS":
+            assert d["metrics"]["execution_log_sha256"] == LOG_HASH
+        if put.row["level"] == "PROSPECTIVE":
+            assert d["metrics"]["observation_started_ms"] == 1762000000000 and d["metrics"]["coverage"] == "1"
+
+
+def test_rt4_4_a_registry_holding_all_verdict_evidence_syncs_and_reports_what_it_did_not_sync():
+    import hypothesis_registry as hr
+    import strategy_verdict as sv
+    reg = {"trials": []}
+    base = dict(hypothesis_id="h", mechanism="m", family="f", strategy="s", universe=["BTCUSDT"], input_data_sha256=H("a"), code_sha="abcdef1", data_window={"a": 1},
+                parameter_grid={"a": [1]}, costs={"b": 1}, statistical_design={"t": "x"}, train_test={"s": "y"}, multiple_testing_family="f", prospective_period="p")
+    hr.register_experiment(reg, "cand1", **base)
+    for it in _verdict_items():
+        hr.add_evidence(reg, "cand1", sv.STAGE_TO_REGISTRY_LEVEL[it.stage], result=f"{it.stage}:{it.result}", provenance=it.provenance,
+                        details={"metrics": dict(it.metrics), "data_sha256": it.data_sha256, "status": it.status, "candidate_id": it.candidate_id, "spec_digest": it.spec_digest,
+                                 "attachment": it.attachment})
+    hr.seal(reg)
+    puts, skipped = SS.registry_puts(A, reg)
+    ev = [p for p in puts if p.table == "experiment_evidence"]
+    assert {p.row["level"] for p in ev} == {"PROSPECTIVE", "TESTNET_MECHANICS", "OWNER_ACCOUNT_VERIFIED"}
+    assert SS.plan(A, puts).puts
+    blob = json.dumps([p.row for p in ev])
+    assert "net_usd_after_all_costs" not in blob and "import_report" not in blob.replace("import_report_sha256", "") and "attachment" not in blob
+    assert any("attachment" in s and "not synced by design" in s for s in skipped) and any("metrics.net_usd_after_all_costs" in s for s in skipped)
+    # registry evidence and the direct verdict mapping produce the SAME row for the same item
+    direct = SS.verdict_evidence_put(A, "cand1", _verdict_items()[2])
+    via = next(p for p in ev if p.row["level"] == "OWNER_ACCOUNT_VERIFIED")
+    assert direct.row["details"] == via.row["details"] and direct.row["provenance"] == via.row["provenance"]
+
+
+def test_rt4_4_unlisted_metrics_are_still_refused_not_stripped_and_hash_fields_are_typed():
+    item = _verdict_items()[0]
+    item.metrics["spread_note"] = "x"
+    with pytest.raises(SS.SyncError, match="not_whitelisted"):
+        SS.verdict_evidence_put(A, "cand1", item)
+    bad = _verdict_items()[1]
+    bad.metrics["execution_log_sha256"] = "sk" + "-" + "proj1234567890abcdefghijklmnop"
+    with pytest.raises(SS.SyncError):
+        SS.verdict_evidence_put(A, "cand1", bad)
+    # a typed hash field is exempt from the long-hex rule ONLY when it is exactly a sha256; the same hex in a free-text metric is still refused
+    with pytest.raises(SS.SecretGuardError):
+        SS.evidence_put(A, "cand1", "BACKTEST", result="r", provenance=LOG_HASH, details={}, recorded_utc=1762300800000)
+
+
+def test_rt4_4_poc3_stage_table_every_stage_now_maps():
+    import strategy_verdict as sv
+    stages = {it.stage for it in _verdict_items()}
+    assert stages == {"prospective_observation", "execution_validation", "reconciled_owner_result"}
+    for it in _verdict_items():
+        SS.verdict_evidence_put(A, "cand1", it)                  # none of them refuses (they refused on the previous tree)
+    assert set(sv.STAGE_TO_REGISTRY_LEVEL) >= stages
+
+
+def test_rt4_4_mutation_dropping_the_attachment_and_figure_is_load_bearing():
+    item = _verdict_items()[2]
+    m = _mutant('EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest")', "EVIDENCE_DROPPED_DETAILS = ()")
+    det = {"metrics": dict(item.metrics), "attachment": item.attachment}
+    out, dropped = m.registry_evidence_details(det)
+    assert "attachment" in out and "attachment" not in dropped                   # mutant would carry the owner report onward (and the whitelist would then refuse the whole row)
+    out, dropped = SS.registry_evidence_details(det)
+    assert "attachment" not in out and "metrics.net_usd_after_all_costs" in dropped
+
+
+# ---- rt4-7: SecretGuard additions (pw= / pwd= assignments, seed phrases)
+
+SEED = "aban" + "don ability able about above absent absorb abstract absurd abuse access accident"       # 12 BIP39-style words, assembled so the file holds no phrase
+
+
+@pytest.mark.parametrize("text,rule", [("conn pw" + "=hunter22x", "assigned_pw"), ("pw" + "d: Tr0ub4dor", "assigned_pw"), ("PW" + "D = 'abcd1234'", "assigned_pw"),
+                                       ("pass" + "phrase=correcthorse", "assigned_pw"), (SEED, "seed_phrase_like"), (SEED.replace(" ", ", "), "seed_phrase_like"),
+                                       ("note: " + SEED.upper(), "seed_phrase_like"), (SEED + " " + SEED, "seed_phrase_like")])
+def test_rt4_7_pw_assignments_and_seed_phrases_are_refused_in_every_free_text_column(text, rule):
+    assert rule in SS._shape_rules(text)
+    for put in (lambda: SS.incident_put(A, "I", "WARN", text, 1762300800000), lambda: SS.incident_event_put(A, "I", "OPENED", 1762300800000, note=text)):
+        with pytest.raises(SS.SecretGuardError):
+            put()
+    with pytest.raises(SS.SecretGuardError):
+        _regp(A, reg_entry(costs={"remark": text}))
+
+
+def test_rt4_7_pw_and_mnemonic_field_names_are_refused_even_with_innocent_values():
+    for key in ("pw", "pwd", "passphrase", "mnemonic", "seed_phrase", "recoveryPhrase"):
+        with pytest.raises(SS.SecretGuardError):
+            _regp(A, reg_entry(costs={key: 1}))
+
+
+def test_rt4_7_positive_controls_prose_numbers_and_random_seed_params_pass():
+    for text in ("funding carry earns the basis when settlement spreads exceed the cost of the hedge across venues and sizes",
+                 "restarted the collector, lag back to one second after the reconnect storm settled down overnight and stayed there",
+                 "eleven short words in a row never trip the twelve word rule here ok", "pwd of the repo", "power=12 pwr=3", "the seed is 42"):
+        assert SS._shape_rules(text) == [], text
+    assert _regp(A, reg_entry(costs={"seed": 42, "pw_ratio": 1.5}))
+    assert SS.incident_event_put(A, "I", "OPENED", 1762300800000, note="restarted, lag back to 1s")
+
+
+def test_rt4_7_mutation_the_new_guard_rules_are_load_bearing():
+    with pytest.raises(SS.SecretGuardError):
+        SS.incident_put(A, "I", "WARN", SEED, 1762300800000)
+    m = _mutant('    if _seed_phrase(s):\n        hits.append("seed_phrase_like")', "    pass")
+    assert m.incident_put(A, "I", "WARN", SEED, 1762300800000)
+    m2 = _mutant('    ("assigned_pw", re.compile(', '    ("assigned_pw", re.compile(r"(?!x)x") if True else re.compile(')
+    assert m2.incident_put(A, "I", "WARN", "conn pw" + "=hunter22x", 1762300800000)
+
+
+def test_rt4_executed_verdict_evidence_and_a_bound_import_land_in_real_postgres_and_unbound_ones_cannot(pg):
+    import hypothesis_registry as hr
+    import strategy_verdict as sv
+    owner = str(uuid.uuid4())
+    reg = {"trials": []}
+    base = dict(hypothesis_id="h", mechanism="m", family="f", strategy="s", universe=["BTCUSDT"], input_data_sha256=H("a"), code_sha="abcdef1", data_window={"a": 1},
+                parameter_grid={"a": [1]}, costs={"b": 1}, statistical_design={"t": "x"}, train_test={"s": "y"}, multiple_testing_family="f", prospective_period="p")
+    hr.register_experiment(reg, "cand1", **base)
+    for it in _verdict_items():
+        hr.add_evidence(reg, "cand1", sv.STAGE_TO_REGISTRY_LEVEL[it.stage], result=f"{it.stage}:{it.result}", provenance=it.provenance,
+                        details={"metrics": dict(it.metrics), "data_sha256": it.data_sha256, "status": it.status, "candidate_id": it.candidate_id, "spec_digest": it.spec_digest,
+                                 "attachment": it.attachment})
+    hr.seal(reg)
+    puts, _ = SS.registry_puts(owner, reg)
+    puts += SS.owner_import_puts(owner, import_report(), imported_utc=1762387300000, storage_ref="private://owner/imports/rt4")
+    rep = SS.write(SS.plan(owner, puts), SqlClient(pg))
+    assert rep.ok, rep.results
+    stored = pg.scalar(f"select count(*) from carry.experiment_evidence where owner_id='{owner}';")
+    assert stored == "3"
+    assert pg.scalar(f"select count(*) from carry.experiment_evidence where owner_id='{owner}' and (details::text like '%net_usd%' or details::text like '%attachment%');") == "0"
+    assert pg.scalar(f"select report_sha256 from carry.owner_account_imports where owner_id='{owner}';") == import_report()["report_sha256"]
+    # the database refuses what the writer would also refuse: a RECONCILED import with no report hash and an owner-level evidence row with no bound hash
+    row = next(p.row for p in puts if p.table == "owner_account_imports")
+    unbound = {k: v for k, v in row.items() if k != "report_sha256"}
+    unbound["source_sha256"] = H("9")
+    unbound["content_sha256"] = unbound["import_id"] = SS.row_hash("owner_account_imports", dict(unbound, import_id="x"))
+    with pytest.raises(SS.SyncError):
+        SS.plan(owner, [SS.Put("owner_account_imports", unbound)])
+    with pytest.raises(AssertionError):
+        SqlClient(pg).put_row("owner_account_imports", unbound)

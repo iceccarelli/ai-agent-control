@@ -185,3 +185,83 @@ def test_rule_set_has_a_mutation_guard():
     names = {n for n, _ in SS.RULES}
     for needed in ("sb-secret-key", "slack-webhook", "stripe-live-key", "secret-literal", "secret-assignment"):
         assert needed in names, needed
+
+
+# ---- red-team round 3 (rt3-7): shapes the scanner missed. Every literal is assembled at run time so this file is not itself a finding.
+
+def _rt3_cases():
+    pw = "Hx9" + "!q#Lm.2" + "&v@Zt"                       # a password with & ! # . @ in it
+    return {
+        "database_url": ("DATABASE_" + "URL=post" + "gresql://app" + ":" + pw + "@db" + ".example" + ".com:5432/carry", "credentialed-url"),
+        "postgres_plain": ("dsn = 'post" + "gresql://svc" + ":hunter2" + "pw@10.0.0.5/db'", "credentialed-url"),
+        "redis_empty_user": ("REDIS_" + "URL=red" + "is://" + ":s3cr3t" + "Pw9@cache.internal:6379/0", "credentialed-url"),
+        "password_special_chars": ('db_pass' + 'word = "' + pw + '"', "password-literal"),
+        "password_json": ('{"pass' + 'word": "' + pw + '"}', "password-literal"),
+        "passphrase_quoted": ('pass' + 'phrase: "' + "correct horse " + "battery9" + '"', "password-literal"),
+        "pw_quoted": ("pw = '" + "Tr0ub4dor" + "&3'", "password-literal"),
+        "pwd_unquoted": ("host=db user=app " + "pw" + "d=" + "Tr0ub4dor3x", "password-assignment"),
+        "pw_unquoted": ("conn?" + "pw" + "=" + "Tr0ub4dor3x&ssl=1", "password-assignment"),
+        "bearer_header": ("Author" + "ization: Bear" + "er " + "kQ7zWm3xLp9vRn2bTy5Hc8Jd4Fg6Aw1Se0Uq", "bearer-token"),
+        "supabase_pat": ("SUPABASE_ACCESS_" + "TOKEN=sb" + "p_" + "0123456789abcdef" * 2 + "01234567", "supabase-pat"),
+        "pgp_block": ("-----BEGIN " + "PGP PRIVATE KEY" + " BLOCK-----", "private-key-block"),
+        "openssh_block": ("-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----", "private-key-block"),
+        "encrypted_block": ("-----BEGIN " + "ENCRYPTED PRIVATE" + " KEY-----", "private-key-block"),
+    }
+
+
+def test_rt3_7_each_missed_shape_is_found_by_a_named_rule():
+    for name, (text, rule) in _rt3_cases().items():
+        assert rule in [r for _, r in SS.scan_text(text)], name
+
+
+def test_rt3_7_the_report_for_these_shapes_never_prints_the_value(tmp_path, capsys):
+    f = tmp_path / "x.txt"
+    f.write_text("\n".join(t for t, _ in _rt3_cases().values()) + "\n")
+    assert SS.main([str(f)]) == 1
+    out = capsys.readouterr().out
+    for t, _ in _rt3_cases().values():
+        assert t not in out
+    for frag in ("hunter2", "Tr0ub4dor", "kQ7zWm3x", "s3cr3t", "0123456789abcdef"):
+        assert frag not in out
+
+
+def test_rt3_7_positive_controls_templates_placeholders_and_code_are_not_findings():
+    for text in ('DATABASE_URL=postgresql://user:password@localhost:5432/db', 'url = "postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}/db"',
+                 "redis://:<password>@host:6379", 'password = "<your password>"', 'password = "changeme"', 'passphrase: "your passphrase here"',
+                 'password = os.environ["PW"]', 'pw = _open01(power, "power")', "PWD=$(pwd)", "pwd=${PWD}", 'password = "{{ vault.pw }}"',
+                 'Authorization: Bearer ${TOKEN}', 'headers = {"Authorization": "Bearer " + token}', "bearer = 'Bearer'", "Bearer abcdef",
+                 "-----BEGIN PUBLIC KEY-----", 'sbp_ prefix', "https://example.com/path:80@x", "postgresql://localhost:5432/db", 'password = ""'):
+        assert SS.scan_text(text) == [], text
+
+
+def test_rt3_7_a_short_or_prose_password_literal_is_not_over_matched():
+    # quoted values under six characters and ordinary prose are not credentials (the rule is a net, not a sieve)
+    assert SS.scan_text('password = "abc"') == [] and SS.scan_text("the password is stored in vault") == []
+
+
+def test_rt3_7_a_decoy_first_match_does_not_hide_a_later_real_one():
+    text = 'url = "postgresql://user:password@localhost/x"; real = "post' + 'gresql://app' + ':kQ7zWm3xLp9v' + '@db.example.com/x"'
+    assert "credentialed-url" in [r for _, r in SS.scan_text(text)]
+
+
+def test_rt3_7_mutation_each_new_rule_is_load_bearing():
+    import re as _re
+    for rule in ("supabase-pat", "credentialed-url", "bearer-token", "password-literal", "password-assignment", "private-key-block"):
+        probes = [t for t, r in _rt3_cases().values() if r == rule]
+        assert probes, rule
+        saved = SS.RULES
+        try:
+            SS.RULES = tuple((n, (_re.compile(r"(?!x)x") if n == rule else rx)) for n, rx in saved)
+            missed = [t for t in probes if rule in [r for _, r in SS.scan_text(t)]]
+        finally:
+            SS.RULES = saved
+        assert missed == [], rule
+        assert all(rule in [r for _, r in SS.scan_text(t)] for t in probes), rule      # restored
+
+
+def test_rt3_7_new_rules_scan_pathological_lines_in_bounded_time():
+    import time
+    t = time.time()
+    lines = [("pass" + "word='") * 20000, ("p" + "w=") * 30000, "a://b:" * 30000, "a://:" * 30000 + "@", "bearer " + "a" * 300000, "x_" * 100000 + "p" + "w="]
+    SS.scan_text("\n".join(lines))
+    assert time.time() - t < 5
