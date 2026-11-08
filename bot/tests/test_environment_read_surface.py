@@ -23,6 +23,7 @@ ALLOWED = {
     "tools/operator_paper_daily.py": 1,  # hands env to config
     "tools/testnet_action_manifest.py": 1,   # records only whether the NAMED testnet credential variables are set (presence booleans), never a value
     "tools/testnet_certificate.py": 1,    # offline certificate: hands os.environ to config.is_live_authorized (main only)
+    "tools/strategy_verdict.py": 1,      # default key provider: reads ONE named variable (the owner's attestation key) at verification time; never logged, stored or serialised
     "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
     "tools/runner_alerts.py": 1,         # alert transport settings
     "tools/runner_monitor.py": 4,        # credential presence, alert settings
