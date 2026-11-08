@@ -496,8 +496,8 @@ def test_every_status_partition_is_requested_with_its_own_cursor_chain(tmp_path)
     m = run2(tmp_path, v, sleeps=sleeps)
     base = venues.rest_for("mainnet") + "/v5/market/instruments-info?category=linear&limit=1000"
     assert v.urls == [base, base + "&status=Trading", base + "&status=Trading&cursor=p1", base + "&status=PendingOpen", base + "&status=PreLaunch",
-                      base + "&status=Delivering", base + "&status=Closed", venues.rest_for("mainnet") + "/v5/market/tickers?category=linear"]
-    assert [(p["category"], p["status"]) for p in m["partitions"]] == [("linear", None)] + [("linear", s) for s in UC.STATUSES]
+                      base + "&status=Delivering", base + "&status=Closed", base + "&status=Settling", venues.rest_for("mainnet") + "/v5/market/tickers?category=linear"]
+    assert [(p["category"], p["status"]) for p in m["partitions"]] == [("linear", None)] + [("linear", s) for s in UC.QUERIED_STATUSES]
     assert len(sleeps) == len(v.urls) - 1 and all(0 < x <= UC.MAX_BACKOFF_S for x in sleeps)        # polite pacing between every request
     assert m["schema"] == "universe_capture/v2" and m["categories"] == ["linear"]
 
@@ -534,7 +534,7 @@ def test_a_venue_that_ignores_the_status_parameter_is_not_credited_as_observing_
 
 
 def test_retry_on_http_429_and_on_retcode_10006_with_injected_backoff(tmp_path):
-    ok = env([inst("BTCUSDT")])
+    ok = env([inst("BTCUSDT"), inst("ETHUSDT")])               # the same set as the default control (they must agree)
     sleeps = []
     v = V2Venue({("linear", "Trading"): {"": [UC.HttpStatusError(429), UC.HttpStatusError(429), ok]},
                  ("linear", "PendingOpen"): {"": [env([], retCode=10006, retMsg="Too many visits"), env([], category="linear")]}})
@@ -551,7 +551,7 @@ def test_exhausted_retries_are_recorded_not_raised(tmp_path):
     assert outcomes(m)[("linear", "Closed")] == "TRANSPORT_ERROR:HTTP_429"
     rl = env([], retCode=10006, retMsg="Too many visits")
     m = run2(tmp_path, V2Venue({("linear", "Closed"): {"": [rl] * 9}}), retries=1, name="v2b")
-    assert outcomes(m)[("linear", "Closed")] == "REFUSED_BY_VENUE:10006/Too many visits" and m["partitions"][-1]["pages"][0]["attempts"] == 2
+    assert outcomes(m)[("linear", "Closed")] == "REFUSED_BY_VENUE:10006/Too many visits" and part_of(m, "Closed")["pages"][0]["attempts"] == 2
 
 
 def test_transport_errors_and_malformed_bodies_are_outcomes(tmp_path):
@@ -599,10 +599,10 @@ def test_a_hostile_cursor_never_becomes_a_url_and_an_oversize_body_is_fatal(tmp_
 
 
 def test_arguments_are_validated(tmp_path):
-    for kw in (dict(categories=["option"]), dict(statuses=["Settling"]), dict(categories=[])):
+    for kw in (dict(categories=["option"]), dict(statuses=["Bogus"]), dict(categories=[])):
         with pytest.raises(UC.CaptureError):
             run2(tmp_path, V2Venue(), **kw)
-    for bad in ({"status": "Closed;x"}, {"status": "Settling"}, {"category": "option"}):
+    for bad in ({"status": "Closed;x"}, {"status": "Bogus"}, {"category": "option"}):
         with pytest.raises(UC.CaptureError):
             UC.request_url(UC.PATH_INSTRUMENTS, **bad)
     with pytest.raises(UC.CaptureError):
@@ -733,7 +733,7 @@ def test_stale_and_unverified_datasets(tmp_path):
     ticks = iter(range(NOW, NOW + 10 ** 9, UC.MAX_SPAN_MS))
     m = run2(tmp_path, V2Venue(), name="v2b", clock_ms=lambda: next(ticks))
     assert m["dataset_status"] == "STALE"                                                        # responses further apart than one point in time
-    nov = V2Venue({("linear", None): chain([[inst("BTCUSDT")]], time_ms=None)})
+    nov = V2Venue({("linear", None): chain([[inst("BTCUSDT"), inst("ETHUSDT")]], time_ms=None)})
     assert run2(tmp_path, nov, name="v2c", clock_ms=slow)["dataset_status"] == "UNVERIFIED"
 
 
@@ -761,7 +761,9 @@ def test_verify_accepts_an_honest_capture_and_returns_the_documented_schema(tmp_
     assert c["dataset_status"] == "COMPLETE" and c["dataset_status_claimed"] == "COMPLETE" and c["delisting_observability"] == "OBSERVED"
     assert c["status_coverage"]["Closed"] == "OBSERVED_ROWS" and c["status_coverage_by_category"]["linear"]["default"] == "OBSERVED_ROWS"
     assert c["universe_rows"] == 3 and c["rejected_tickers_count"] == 1 and c["rejected_instruments_count"] == 0 and c["conflicts"] == []
-    assert {"category": "linear", "status": "Closed", "outcome": "OBSERVED_ROWS", "rows_total": 1, "complete": True, "pages": 1, "by_contract_type": {"LinearPerpetual": 1}} in c["partitions"]
+    cl = next(p for p in c["partitions"] if p["status"] == "Closed")
+    assert {k: cl[k] for k in ("category", "status", "outcome", "rows_total", "complete", "pages", "by_contract_type", "anomalies")} == {
+        "category": "linear", "status": "Closed", "outcome": "OBSERVED_ROWS", "rows_total": 1, "complete": True, "pages": 1, "by_contract_type": {"LinearPerpetual": 1}, "anomalies": []}
     assert UC.verify_capture_dir(d) == r                                                          # pure: a second call changes nothing
 
 
@@ -889,7 +891,7 @@ def test_cli_capture_prints_a_machine_readable_summary_and_verify_wraps_the_veri
     rc, text = cli(tmp_path, ["capture", "--out-dir", out], capsys=capsys)
     s = json.loads(text)
     assert rc == 0 and s["dataset_status"] == "COMPLETE" and s["delisting_observability"] == "OBSERVED" and s["status_coverage"]["Closed"] == "OBSERVED_EMPTY"
-    assert s["manifest"] == os.path.join(out, "manifest.json") and s["conflicts"] == [] and set(UC.STATUSES) | {"default"} == set(s["status_coverage"])
+    assert s["manifest"] == os.path.join(out, "manifest.json") and s["conflicts"] == [] and set(UC.QUERIED_STATUSES) | {"default"} == set(s["status_coverage"])
     rc, text = cli(tmp_path, ["verify", "--dir", out], capsys=capsys)
     assert rc == 0 and json.loads(text)["ok"] is True
     open(os.path.join(out, "stray"), "w").write("x")
@@ -1139,3 +1141,449 @@ def test_a_refused_closed_partition_is_complete_at_capture_level_but_survivors_o
     assert "survivors only" in txt and "NOT observed" in txt
     assert "no Closed rows served" in UC.describe_delisting_observability("OBSERVED", "OBSERVED_EMPTY") and "does not prove" in UC.describe_delisting_observability("OBSERVED", "OBSERVED_EMPTY")
     assert "survivors only" not in UC.describe_delisting_observability("OBSERVED", "OBSERVED_ROWS")
+
+
+# ================================================================ owner-shaped regressions (compact fixtures built from the SHAPES the owner reported;
+# the real capture directory is NOT available here, so no byte of it appears in this file)
+
+def empty_body(echo="", nxt=None, **kw):
+    """A successful (retCode 0) instruments-info answer with an EMPTY list. ``echo``: a category string, '' or 'OMIT' (the key is absent)."""
+    res = {"list": []}
+    if echo != "OMIT":
+        res["category"] = echo
+    if nxt is not None:
+        res["nextPageCursor"] = nxt
+    d = {"retCode": 0, "retMsg": "OK", "result": res, "time": NOW}
+    d.update(kw)
+    return json.dumps(d, indent=1).encode()
+
+
+TRD = [inst("BTCUSDT"), inst("ETHUSDT"), inst("SOLUSDT")]
+PRE = [inst("NEWUSDT", status="PreLaunch", symbolId="sid-NEW")]
+OLD = inst("OLDUSDT", status="Closed", deliveryTime="1700000000000", symbolId="sid-old", upperFundingRate="", lowerFundingRate="")
+
+
+def owner_parts(over=None):
+    """Documented statuses answered the way the owner saw them: PendingOpen/Delivering empty with a blank category echo; the rest with rows. The Settling probe
+    is left to the V2Venue default (an empty list that DOES echo 'linear')."""
+    p = {("linear", None): chain([TRD]), ("linear", "Trading"): chain([TRD]), ("linear", "PreLaunch"): chain([PRE]),
+         ("linear", "PendingOpen"): {"": empty_body("")}, ("linear", "Delivering"): {"": empty_body("OMIT")}, ("linear", "Closed"): chain([[OLD]])}
+    p.update(over or {})
+    return p
+
+
+def owner_run(tmp_path, name="own", over=None):
+    m = run2(tmp_path, V2Venue(owner_parts(over), tickers=[tick(r["symbol"]) for r in TRD]), name=name)
+    return m, str(tmp_path / name)
+
+
+def test_positive_control_the_owner_shaped_clean_capture_is_complete_for_scope(tmp_path):
+    m, d = owner_run(tmp_path)
+    assert m["dataset_status"] == "COMPLETE" and m["delisting_observability"] == "OBSERVED" and m["rules_version"] == UC.RULES_VERSION
+    v = UC.verify_capture_dir(d)
+    assert v["ok"] is True, v["problems"]
+    s = UC.describe_scope(d)
+    assert s["verdict"] == "COMPLETE_FOR_SCOPE" and s["blockers"] == [] and s["scope"] == "linear USDT perpetual lifecycle universe"
+    assert s["statuses"]["complete"] == ["Trading", "PendingOpen", "PreLaunch", "Delivering", "Closed"]
+    assert s["statuses"]["complete_with_anomaly"] == ["PendingOpen", "Delivering"] and s["statuses"]["empty_undocumented"] == ["Settling"]
+    assert s["legacy_manifest"] is False and s["raw_integrity_ok"] is True
+
+
+# ---------------------------------------------------------------- task 1: the empty-result anomaly
+
+@pytest.mark.parametrize("echo,recorded", [("", ""), ("OMIT", "MISSING")])
+def test_an_empty_documented_status_with_a_blank_or_absent_category_is_observed_empty_and_the_anomaly_is_recorded(tmp_path, echo, recorded):
+    raw = empty_body(echo)
+    m, d = owner_run(tmp_path, over={("linear", "Delivering"): {"": raw}})
+    p = part_of(m, "Delivering")
+    assert p["outcome"] == "OBSERVED_EMPTY" and p["complete"] is True and p["rows_total"] == 0
+    pg = p["pages"][0]
+    assert pg["category_echo"] == recorded != "linear" and p["anomalies"] == [f"category_echo_{'empty' if echo == '' else 'missing'}"]
+    assert open(os.path.join(d, pg["file"]), "rb").read() == raw and pg["params"] == {"category": "linear", "limit": 1000, "status": "Delivering"}
+    assert isinstance(pg["server_time_ms"], int) and isinstance(pg["recv_ms"], int)           # server and receive times kept
+    assert m["required_status_coverage"]["covered_with_anomaly"].count("Delivering") == 1
+    assert UC.verify_capture_dir(d)["ok"] is True
+
+
+def test_positive_control_an_empty_status_that_echoes_linear_has_no_anomaly(tmp_path):
+    m, _d = owner_run(tmp_path, over={("linear", "Delivering"): {"": empty_body("linear")}})
+    p = part_of(m, "Delivering")
+    assert p["outcome"] == "OBSERVED_EMPTY" and p["anomalies"] == [] and p["pages"][0]["category_echo"] == "linear"
+
+
+def test_an_empty_answer_with_a_next_cursor_is_not_observed_empty(tmp_path):
+    pages = {"": empty_body("", nxt="n1"), "n1": empty_body("linear")}
+    m, _d = owner_run(tmp_path, over={("linear", "Delivering"): pages})
+    p = part_of(m, "Delivering")
+    assert p["outcome"] == "PARTIAL" and "still names a next cursor" in p["error"] and p["complete"] is False
+    assert m["dataset_status"] == "PARTIAL" and "Delivering" in m["required_status_coverage"]["uncovered"]
+
+
+@pytest.mark.parametrize("echo", ["", "OMIT", "linear"])
+def test_an_empty_answer_with_a_non_zero_retcode_is_refused_whatever_the_echo(tmp_path, echo):
+    m, _d = owner_run(tmp_path, over={("linear", "Delivering"): {"": empty_body(echo, retCode=10001, retMsg="params error")}})
+    assert part_of(m, "Delivering")["outcome"] == "REFUSED_BY_VENUE:10001/params error" and "Delivering" in m["required_status_coverage"]["uncovered"]
+
+
+@pytest.mark.parametrize("bad", ["spot", "inverse", "LINEAR", 5, None])
+def test_an_unexpected_category_echo_is_never_accepted_even_when_empty(tmp_path, bad):
+    body = json.dumps({"retCode": 0, "retMsg": "OK", "result": {"category": bad, "list": [], "nextPageCursor": ""}, "time": NOW}).encode()
+    m, _d = owner_run(tmp_path, over={("linear", "Delivering"): {"": body}})
+    assert part_of(m, "Delivering")["outcome"] == "TRANSPORT_ERROR:MalformedEnvelope" and m["delisting_observability"] == "OBSERVED"
+
+
+def test_the_anomaly_path_is_narrow_rows_default_control_later_pages_and_other_categories(tmp_path):
+    # a NON-empty list with a blank echo
+    blank_rows = json.dumps({"retCode": 0, "retMsg": "OK", "result": {"category": "", "list": [inst("OLDUSDT", status="Closed")], "nextPageCursor": ""}, "time": NOW}).encode()
+    m, _d = owner_run(tmp_path, name="a", over={("linear", "Closed"): {"": blank_rows}})
+    assert part_of(m, "Closed")["outcome"] == "TRANSPORT_ERROR:MalformedEnvelope"
+    # the default control may not be empty-with-blank-echo
+    m, _d = owner_run(tmp_path, name="b", over={("linear", None): {"": empty_body("")}})
+    assert part_of(m, None)["outcome"] == "TRANSPORT_ERROR:MalformedEnvelope" and m["dataset_status"] == "PARTIAL"
+    # a later page of a chain (inconsistent pages): page 2 blank echo
+    two = {"": env([OLD], "n1", category="linear"), "n1": empty_body("")}
+    m, _d = owner_run(tmp_path, name="c", over={("linear", "Closed"): two})
+    p = part_of(m, "Closed")
+    assert p["outcome"] == "PARTIAL" and p["complete"] is False and m["delisting_observability"] == "NOT_OBSERVED"
+    # other categories never get the path
+    assert UC.derive_partition("inverse", "Closed", [empty_body("")])["outcome"] == "TRANSPORT_ERROR:MalformedEnvelope"
+    assert UC.derive_partition("linear", "Closed", [empty_body("")])["outcome"] == "OBSERVED_EMPTY"
+
+
+def test_an_empty_answer_for_a_status_outside_the_documented_enum_gets_no_coverage_credit(tmp_path):
+    for echo in ("", "linear"):
+        m, d = owner_run(tmp_path, name=f"s{echo or 'blank'}", over={("linear", "Settling"): {"": empty_body(echo)}})
+        p = part_of(m, "Settling")
+        assert p["outcome"] == "UNDOCUMENTED_STATUS_EMPTY" and not p["outcome"].startswith("OBSERVED")
+        rsc = m["required_status_coverage"]
+        assert "Settling" not in rsc["covered"] and "Settling" not in rsc["required"] and rsc["excluded_undocumented"] == {"Settling": "UNDOCUMENTED_STATUS_EMPTY"}
+        assert m["dataset_status"] == "COMPLETE" and UC.verify_capture_dir(d)["ok"] is True      # a probe never makes or breaks the documented coverage
+    assert UC.derive_partition("linear", "Settling", [env([inst("QUSDT", status="Settling")])])["outcome"] == "UNDOCUMENTED_STATUS_ROWS"
+
+
+def test_documented_statuses_not_covered_are_listed_with_their_reason(tmp_path):
+    m = run2(tmp_path, V2Venue(owner_parts()), statuses=["Closed"])                 # PendingOpen, PreLaunch... never asked
+    rsc = m["required_status_coverage"]
+    assert rsc["covered"] == ["Closed"] and rsc["uncovered"]["Trading"] == "NOT_QUERIED"
+    s = UC.describe_scope(str(tmp_path / "v2"))
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and "STATUS_Trading_NOT_QUERIED" in {b["code"] for b in s["blockers"]}
+
+
+def test_a_status_partition_with_no_evidence_of_full_coverage_blocks_the_scope(tmp_path):
+    cut = {"": env([OLD], "n1", category="linear")}                                      # the chain's next page is never obtained (page cap of 1)
+    m = run2(tmp_path, V2Venue(owner_parts({("linear", "Closed"): cut})), max_pages=1)
+    assert part_of(m, "Closed")["outcome"] == "PARTIAL" and m["delisting_observability"] == "NOT_OBSERVED"
+    s = UC.describe_scope(str(tmp_path / "v2"))
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and s["statuses"]["partial"] == ["Closed"] and "Closed" not in s["statuses"]["complete"]
+    assert {"STATUS_Closed_PARTIAL", "DELISTING_NOT_OBSERVED", "DATASET_PARTIAL"} <= {b["code"] for b in s["blockers"]}
+
+
+# ---------------------------------------------------------------- task 2: mixed-status pages
+
+def owner_closed_pages(n_closed1=995, n_open=5, n_closed2=58):
+    """The shape the owner reported for status=Closed: page 1 = 1000 rows (995 Closed + 5 PendingOpen), page 2 = 58 Closed rows."""
+    closed = [inst(f"C{i}USDT", status="Closed", deliveryTime="1700000000000", symbolId=f"sid-c{i}", upperFundingRate="", lowerFundingRate="") for i in range(n_closed1 + n_closed2)]
+    odd = [inst(f"PO{i}USDT", status="PendingOpen", symbolId=f"sid-po{i}") for i in range(n_open)]
+    page1 = closed[:n_closed1] + odd
+    return {"": env(page1, PCT, category="linear"), urllib.parse.unquote(PCT): env(closed[n_closed1:], "", category="linear")}, odd
+
+
+def test_owner_shaped_mixed_closed_page_without_any_other_partition_appearance_is_conflicted_and_recorded_exactly(tmp_path):
+    pages, odd = owner_closed_pages()
+    m, d = owner_run(tmp_path, over={("linear", "Closed"): pages})
+    p = part_of(m, "Closed")
+    assert p["outcome"] == "CONFLICTED:STATUS_MISMATCH" and p["complete"] is False and p["rows_total"] == 1058 and [x["rows"] for x in p["pages"]] == [1000, 58]
+    sm = p["status_mismatch"]
+    assert sm["count"] == 5 and sm["by_actual_status"] == {"PendingOpen": 5} and sm["by_verdict"] == {"CONTRADICTED": 5} and sm["requested"] == "Closed"
+    e = sm["rows"][0]
+    assert {"symbol", "symbolId", "actual_status", "row_sha256", "page", "unknown_status", "reconciliation"} <= set(e)
+    assert [x["symbol"] for x in sm["rows"]] == [f"PO{i}USDT" for i in range(5)] and e["symbolId"] == "sid-po0" and e["actual_status"] == "PendingOpen" and e["page"] == 1
+    assert e["row_sha256"] == UC._row_sha(odd[0]) and "was observed complete" in " ".join(e["reconciliation"]["evidence"])     # the PendingOpen partition said 'empty'
+    assert open(os.path.join(d, p["pages"][0]["file"]), "rb").read() == pages[""]            # the exact raw page is kept
+    rows = {r["symbol"]: r for r in uni2(m, d)}
+    assert rows["PO0USDT"]["status"] == "PendingOpen" and rows["PO0USDT"]["seen_in"] == ["linear:Closed"]      # neither relabelled Closed nor dropped
+    assert sum(1 for r in rows.values() if r["status"] == "Closed") == 1053
+    assert m["dataset_status"] == "CONFLICTED" and m["delisting_observability"] == "NOT_OBSERVED" and "Closed" in m["required_status_coverage"]["uncovered"]
+    assert UC.verify_capture_dir(d)["ok"] is True
+    s = UC.describe_scope(d)
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and s["statuses"]["conflicted"] == ["Closed"] and len(s["mismatched_rows"]) == 5
+    assert "STATUS_Closed_CONFLICTED" in {b["code"] for b in s["blockers"]}
+
+
+def test_owner_shaped_mixed_closed_page_with_the_five_symbols_in_their_own_partition_is_partial_and_corroborated(tmp_path):
+    pages, odd = owner_closed_pages()
+    m, d = owner_run(tmp_path, over={("linear", "Closed"): pages, ("linear", "PendingOpen"): chain([odd]), ("linear", None): chain([TRD + odd])})     # the default returns Trading AND PendingOpen
+    p = part_of(m, "Closed")
+    assert p["outcome"] == "PARTIAL:STATUS_MISMATCH" and p["complete"] is False                    # explained, yet never a clean Closed partition
+    assert p["status_mismatch"]["by_verdict"] == {"CORROBORATED": 5} and p["status_mismatch"]["rows"][0]["reconciliation"]["evidence"] == [
+        "linear:PendingOpen shows PO0USDT as PendingOpen", "linear:default shows PO0USDT as PendingOpen"]
+    assert m["conflicts"] == [] and m["dataset_status"] == "PARTIAL" and m["delisting_observability"] == "NOT_OBSERVED"
+    rows = {r["symbol"]: r for r in uni2(m, d)}
+    assert rows["PO0USDT"]["seen_in"] == ["linear:Closed", "linear:PendingOpen", "linear:default"] and rows["PO0USDT"]["conflict"] is False
+    assert UC.verify_capture_dir(d)["ok"] is True
+    s = UC.describe_scope(d)
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and s["statuses"]["partial"] == ["Closed"] and s["statuses"]["conflicted"] == []
+
+
+def test_a_mismatched_row_corroborated_only_by_the_default_control_while_its_partition_was_refused_is_partial(tmp_path):
+    pages, odd = owner_closed_pages(n_closed1=4, n_open=2, n_closed2=1)
+    refused = {"": env([], retCode=10001, retMsg="params error")}
+    m, _d = owner_run(tmp_path, over={("linear", "Closed"): pages, ("linear", "PendingOpen"): refused, ("linear", None): chain([TRD + odd])})
+    p = part_of(m, "Closed")
+    assert p["outcome"] == "PARTIAL:STATUS_MISMATCH" and p["status_mismatch"]["by_verdict"] == {"CORROBORATED": 2}
+    assert p["status_mismatch"]["rows"][0]["reconciliation"]["evidence"] == ["linear:default shows PO0USDT as PendingOpen"]
+
+
+def test_a_mismatched_row_that_another_partition_shows_with_a_different_status_is_conflicted(tmp_path):
+    pages, odd = owner_closed_pages(n_closed1=4, n_open=1, n_closed2=1)
+    other = dict(odd[0], status="Trading")
+    m, _d = owner_run(tmp_path, over={("linear", "Closed"): pages, ("linear", "Trading"): chain([TRD + [other]]), ("linear", None): chain([TRD + [other]])})
+    p = part_of(m, "Closed")
+    assert p["outcome"] == "CONFLICTED:STATUS_MISMATCH" and any("shows PO0USDT as Trading" in x for x in p["status_mismatch"]["rows"][0]["reconciliation"]["evidence"])
+    assert m["dataset_status"] == "CONFLICTED" and any(c["kind"] == "symbol_variants" and c["symbol"] == "PO0USDT" for c in m["conflicts"])
+
+
+def test_status_leakage_on_a_later_page_is_found_per_row_and_page(tmp_path):
+    leak = {"": env([OLD, inst("O2USDT", status="Closed", symbolId="sid-o2", deliveryTime="1700000000000")], "n1", category="linear"),
+            "n1": env([inst("O3USDT", status="Closed", symbolId="sid-o3", deliveryTime="1700000000000"), inst("LEAKUSDT", status="Trading", symbolId="sid-leak")], "", category="linear")}
+    m, _d = owner_run(tmp_path, over={("linear", "Closed"): leak})
+    p = part_of(m, "Closed")
+    assert p["outcome"].endswith("STATUS_MISMATCH") and not p["complete"] and p["rows_total"] == 4
+    e = p["status_mismatch"]["rows"]
+    assert len(e) == 1 and e[0]["symbol"] == "LEAKUSDT" and e[0]["page"] == 2 and e[0]["actual_status"] == "Trading"
+
+
+def test_every_row_with_another_status_still_means_the_venue_ignored_the_parameter(tmp_path):
+    m, _d = owner_run(tmp_path, over={("linear", "Closed"): chain([TRD])})                # all rows Trading in status=Closed
+    p = part_of(m, "Closed")
+    assert p["outcome"].startswith("REFUSED_BY_VENUE:status_param_not_honored(3 rows") and p["status_mismatch"]["count"] == 3
+    assert all(r["seen_in"] == ["linear:Trading", "linear:default"] for r in uni2(m, str(tmp_path / "own")) if r["symbol"] in {"BTCUSDT", "ETHUSDT", "SOLUSDT"})
+
+
+@pytest.mark.parametrize("status", ["Weird", "closed", "", None, 7])
+def test_unknown_or_missing_status_values_make_their_partition_non_complete(tmp_path, status):
+    bad = inst("ODDUSDT", symbolId="sid-odd")
+    if status is None:
+        bad.pop("status")
+    else:
+        bad["status"] = status
+    m, d = owner_run(tmp_path, over={("linear", None): chain([TRD + [bad]])})
+    p = part_of(m, None)
+    assert p["outcome"] == "PARTIAL:UNKNOWN_STATUS" and p["complete"] is False and p["status_mismatch"]["unknown_status"]["count"] == 1
+    assert p["status_mismatch"]["unknown_status"]["rows"][0]["actual_status"] in ("MISSING", "INVALID", "Weird", "closed")
+    assert m["dataset_status"] == "PARTIAL" and UC.verify_capture_dir(d)["ok"] is True
+    # inside a status-filtered partition it is also a mismatch
+    m2, _ = owner_run(tmp_path, name="own2", over={("linear", "Closed"): chain([[OLD, bad]])})
+    assert part_of(m2, "Closed")["outcome"].endswith("STATUS_MISMATCH") and part_of(m2, "Closed")["status_mismatch"]["rows"][0]["unknown_status"] is True
+
+
+def test_default_control_must_agree_with_the_partitions_it_is_documented_to_return(tmp_path):
+    extra = inst("ADDUSDT", symbolId="sid-add")
+    m, d = owner_run(tmp_path, over={("linear", None): chain([TRD + [extra]])})               # default shows a Trading symbol the Trading partition omits
+    t = part_of(m, "Trading")
+    assert t["outcome"] == "CONFLICTED:DEFAULT_CONTROL" and t["status_mismatch"]["control_gaps"]["count"] == 1 and m["dataset_status"] == "CONFLICTED"
+    m, _d = owner_run(tmp_path, name="own2", over={("linear", "Trading"): chain([TRD + [extra]])})        # reverse: the partition has one the default omits
+    assert part_of(m, None)["outcome"] == "CONFLICTED:DEFAULT_CONTROL" and m["dataset_status"] == "CONFLICTED"
+    assert UC.verify_capture_dir(d)["ok"] is True
+
+
+def test_repeated_symbols_and_symbolids_under_the_status_contract(tmp_path):
+    m, _d = owner_run(tmp_path, name="same", over={("linear", None): chain([TRD + [TRD[0]]]), ("linear", "Trading"): chain([TRD + [TRD[0]]])})
+    assert m["dataset_status"] == "COMPLETE" and m["conflicts"] == []                    # an identical repeat is one record
+    changed = dict(TRD[0], lotSizeFilter=dict(TRD[0]["lotSizeFilter"], qtyStep="0.01"))
+    m, _d = owner_run(tmp_path, name="diff", over={("linear", "Trading"): chain([TRD + [changed]]), ("linear", None): chain([TRD + [changed]])})
+    assert m["dataset_status"] == "CONFLICTED" and m["conflicts"][0]["kind"] == "symbol_variants"
+    twin = inst("XBTUSDT", symbolId=TRD[0]["symbolId"])
+    m, d = owner_run(tmp_path, name="twin", over={("linear", "Trading"): chain([TRD + [twin]]), ("linear", None): chain([TRD + [twin]])})
+    assert m["dataset_status"] == "CONFLICTED" and any(c["kind"] == "symbolId_multiple_symbols" for c in m["conflicts"])
+    assert "CONFLICT" in {b["code"] for b in UC.describe_scope(d)["blockers"]}
+
+
+def test_a_renamed_instrument_with_a_valid_lifecycle_stays_complete_for_scope(tmp_path):
+    old = inst("OLDNAMEUSDT", status="Closed", deliveryTime="1700000000000", symbolId="sid-ren", upperFundingRate="", lowerFundingRate="", launchTime="1585526400000")
+    new = inst("NEWNAMEUSDT", symbolId="sid-ren", launchTime="1700000100000")
+    trd = TRD + [new]
+    m, d = owner_run(tmp_path, over={("linear", None): chain([trd]), ("linear", "Trading"): chain([trd]), ("linear", "Closed"): chain([[old]])})
+    assert m["conflicts"] == [] and m["renames"] == [{"category": "linear", "symbolId": "sid-ren", "from": "OLDNAMEUSDT", "to": "NEWNAMEUSDT"}]
+    assert m["dataset_status"] == "COMPLETE" and UC.verify_capture_dir(d)["ok"] is True
+    assert UC.describe_scope(d)["verdict"] == "COMPLETE_FOR_SCOPE"             # NEWNAME has no ticker: informational (instruments_without_ticker), not a blocker
+
+
+# ---------------------------------------------------------------- task 3: verification re-derives everything; describe_scope
+
+def retarget(tmp_path, src, fn, name):
+    dst = str(tmp_path / name)
+    shutil.copytree(src, dst)
+    fn(dst)
+    return UC.verify_capture_dir(dst), dst
+
+
+def test_verification_rejects_every_claim_that_the_raw_bytes_do_not_support(tmp_path):
+    pages, _odd = owner_closed_pages(n_closed1=5, n_open=2, n_closed2=1)
+    m, d = owner_run(tmp_path, over={("linear", "Closed"): pages})
+    assert UC.verify_capture_dir(d)["ok"] is True
+
+    def edit(fn):
+        return edit_manifest(fn)
+
+    def part_m(man, st):
+        return next(p for p in man["partitions"] if p["status"] == st)
+
+    cases = {
+        "echo_claim": (edit(lambda x: part_m(x, "Delivering")["pages"][0].update(category_echo="linear")), "category_echo"),
+        "anomalies_claim": (edit(lambda x: part_m(x, "Delivering").update(anomalies=[])), "anomalies"),
+        "mismatch_dropped": (edit(lambda x: part_m(x, "Closed")["status_mismatch"].update(count=0, rows=[], by_actual_status={}, by_verdict={})), "status_mismatch"),
+        "mismatch_verdict": (edit(lambda x: part_m(x, "Closed")["status_mismatch"]["rows"][0]["reconciliation"].update(verdict="CORROBORATED")), "status_mismatch"),
+        "outcome_claim": (edit(lambda x: part_m(x, "Closed").update(outcome="OBSERVED_ROWS", complete=True)), "manifest says"),
+        "coverage_claim": (edit(lambda x: x["status_coverage"].update(Closed="OBSERVED_ROWS")), "status_coverage"),
+        "required_claim": (edit(lambda x: x["required_status_coverage"].update(covered=list(UC.STATUSES))), "required_status_coverage"),
+        "enum_claim": (edit(lambda x: x["status_enum"]["documented"].append("Settling")), "status_enum"),
+        "delisting_claim": (edit(lambda x: x.update(delisting_observability="OBSERVED")), "delisting_observability"),
+        "dataset_claim": (edit(lambda x: x.update(dataset_status="COMPLETE")), "dataset_status"),
+        "rules_claim": (edit(lambda x: x.pop("rules_version")), "rules_version"),
+        "undocumented_credited": (edit(lambda x: part_m(x, "Settling").update(outcome="OBSERVED_EMPTY")), "manifest says"),
+    }
+    for name, (fn, needle) in cases.items():
+        r, _dst = retarget(tmp_path, d, fn, name)
+        assert r["ok"] is False and any(needle in p for p in r["problems"]), (name, r["problems"])
+        assert r["coverage"]["dataset_status"] == "UNVERIFIED" or r["coverage"]["dataset_status"] != "COMPLETE", name
+
+    def swap_page(dd):                                   # raw page replaced AND its hash refreshed: only re-derivation sees the lie
+        f = "linear_Closed_page0001.json"
+        open(os.path.join(dd, f), "wb").write(env([OLD], category="linear"))
+        refresh_sha(dd, f)
+    r, _ = retarget(tmp_path, d, swap_page, "swap")
+    assert r["ok"] is False and any("manifest says" in p or "rows_total" in p for p in r["problems"])
+
+    def flip(dd):
+        f = os.path.join(dd, "linear_Delivering_page0001.json")
+        b = bytearray(open(f, "rb").read())
+        b[-2] ^= 1
+        open(f, "wb").write(bytes(b))
+    r, _ = retarget(tmp_path, d, flip, "flip")
+    assert r["ok"] is False and any("modified" in p for p in r["problems"])
+
+
+def test_describe_scope_never_trusts_the_manifest_and_blocks_on_raw_tampering(tmp_path):
+    _m, d = owner_run(tmp_path)
+    assert UC.describe_scope(d)["verdict"] == "COMPLETE_FOR_SCOPE"
+    r, dst = retarget(tmp_path, d, edit_manifest(lambda x: x.update(dataset_status="COMPLETE", delisting_observability="OBSERVED")), "same")
+    assert r["ok"] is True                                                                       # an honest claim edit that equals the derivation changes nothing
+
+    def lie(dd):                                                                                  # manifest says everything is fine, raw Closed page is a refusal
+        f = "linear_Closed_page0001.json"
+        open(os.path.join(dd, f), "wb").write(env([], retCode=10001, retMsg="params error"))
+        refresh_sha(dd, f)
+    r, dst = retarget(tmp_path, d, lie, "lie")
+    s = UC.describe_scope(dst)
+    assert r["ok"] is False and s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and "Closed" in s["statuses"]["refused_or_failed"]
+    assert {"STATUS_Closed_REFUSED_BY_VENUE", "DELISTING_NOT_OBSERVED"} <= {b["code"] for b in s["blockers"]}
+    open(os.path.join(dst, "linear_Closed_page0001.json"), "ab").write(b" ")                     # hash now differs from the manifest: integrity blocker
+    s = UC.describe_scope(dst)
+    assert s["raw_integrity_ok"] is False and s["blockers"][0]["code"] == "RAW_INTEGRITY" and s["dataset_status"] == "UNVERIFIED"
+    assert UC.describe_scope(str(tmp_path / "nowhere"))["verdict"] == "NOT_COMPLETE_FOR_SCOPE"
+
+
+def test_describe_scope_judges_a_legacy_manifest_from_its_raw_bytes_and_reports_stale_claims(tmp_path):
+    pages, _odd = owner_closed_pages(n_closed1=5, n_open=2, n_closed2=1)
+    _m, d = owner_run(tmp_path, over={("linear", "Closed"): pages})
+
+    def legacy(dd):                                    # what the older code wrote: no rules_version, blank-echo pages claimed as malformed, mixed Closed claimed as refused
+        def go(x):
+            x.pop("rules_version"), x.pop("status_enum"), x.pop("required_status_coverage")
+            for p in x["partitions"]:
+                p.pop("anomalies"), p.pop("status_mismatch")
+                for pg in p["pages"]:
+                    pg.pop("category_echo")
+                if p["status"] in ("PendingOpen", "Delivering"):
+                    p["outcome"], p["complete"] = "TRANSPORT_ERROR:MalformedEnvelope", False
+            x["dataset_status"] = "COMPLETE"
+        edit_manifest(go)(dd)
+    r, dst = retarget(tmp_path, d, legacy, "legacy")
+    assert r["ok"] is False                                                                        # strict verify refuses stale claims
+    s = UC.describe_scope(dst)
+    assert s["integrity_problems"] == []
+    assert s["legacy_manifest"] is True and s["raw_integrity_ok"] is True and s["legacy_claim_differences"]
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and s["statuses"]["conflicted"] == ["Closed"] and s["dataset_status"] == "CONFLICTED"      # from the raw bytes, not the claim
+    assert "PendingOpen" in s["statuses"]["complete_with_anomaly"] and "Delivering" in s["statuses"]["complete_with_anomaly"]
+
+
+def test_describe_scope_blocks_a_stale_capture_even_when_every_partition_is_complete(tmp_path):
+    m = run2(tmp_path, V2Venue(owner_parts(), tickers=[tick(r["symbol"]) for r in TRD], tickers_time=NOW - 60_000), clock_ms=Clock(NOW + 60_000))
+    assert m["dataset_status"] == "STALE" and m["required_status_coverage"]["uncovered"] == {}
+    s = UC.describe_scope(str(tmp_path / "v2"))
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and [b["code"] for b in s["blockers"]] == ["DATASET_STALE"] and s["statuses"]["partial"] == []
+
+
+def test_cli_scope_prints_the_verdict_and_exit_codes(tmp_path, capsys):
+    _m, d = owner_run(tmp_path)
+    assert UC.main(["scope", "--dir", d]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "COMPLETE_FOR_SCOPE" and out["scope"] == UC.SCOPE
+    pages, _ = owner_closed_pages(n_closed1=3, n_open=1, n_closed2=1)
+    _m2, d2 = owner_run(tmp_path, name="mixed", over={("linear", "Closed"): pages})
+    assert UC.main(["scope", "--dir", d2]) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and out["blockers"] and out["reasons"]
+    assert UC.main(["scope", "--dir", str(tmp_path / "missing")]) == 1
+
+
+# ---------------------------------------------------------------- mutation checks: each new guard, switched off, must make a regression above fail
+
+def test_mutation_strict_category_makes_the_empty_owner_responses_unparseable(tmp_path, monkeypatch):
+    real = UC._parse_page
+    monkeypatch.setattr(UC, "_parse_page", lambda b, c, allow_empty_anomaly=False: real(b, c, allow_empty_anomaly=False))
+    m, _d = owner_run(tmp_path)
+    assert part_of(m, "Delivering")["outcome"] == "TRANSPORT_ERROR:MalformedEnvelope" and m["required_status_coverage"]["uncovered"]
+
+
+def test_mutation_without_the_status_contract_a_mixed_closed_page_would_look_complete(tmp_path, monkeypatch):
+    real = UC.derive_partition
+
+    def lenient(cat, st, bodies, **kw):
+        d = real(cat, st, bodies, **kw)
+        if d["outcome"].startswith("PARTIAL:STATUS_MISMATCH"):
+            d.update(outcome="OBSERVED_ROWS", complete=True)
+        return d
+    monkeypatch.setattr(UC, "derive_partition", lenient)
+    pages, _ = owner_closed_pages(n_closed1=3, n_open=1, n_closed2=1)
+    m, d = owner_run(tmp_path, over={("linear", "Closed"): pages, ("linear", "PendingOpen"): chain([[inst("PO0USDT", status="PendingOpen", symbolId="sid-po0")]])})
+    assert part_of(m, "Closed")["complete"] is True and m["delisting_observability"] == "OBSERVED"         # the pre-fix verdict this suite forbids
+    assert UC.verify_capture_dir(d)["ok"] is True                                                    # (verification uses the same mutated rule here: only the real code refuses)
+
+
+def test_mutation_without_reconciliation_a_contradicted_mismatch_would_only_be_partial(tmp_path, monkeypatch):
+    monkeypatch.setattr(UC, "_reconcile_default_control", lambda parts: [p.__setitem__("control_gaps", []) for p in parts])
+    real = UC.apply_status_contract
+
+    def no_conflict(parts):
+        real(parts)
+        for p in parts:
+            if p["outcome"].startswith("CONFLICTED:"):
+                p["outcome"] = p["outcome"].replace("CONFLICTED", "PARTIAL")
+    monkeypatch.setattr(UC, "apply_status_contract", no_conflict)
+    pages, _ = owner_closed_pages(n_closed1=3, n_open=1, n_closed2=1)
+    m, _d = owner_run(tmp_path, over={("linear", "Closed"): pages})
+    assert part_of(m, "Closed")["outcome"] == "PARTIAL:STATUS_MISMATCH" and m["dataset_status"] == "PARTIAL"      # the real run above says CONFLICTED
+
+
+def test_mutation_crediting_the_undocumented_probe_changes_required_coverage(tmp_path, monkeypatch):
+    monkeypatch.setattr(UC, "STATUSES", UC.STATUSES + ("Settling",))
+    m, _d = owner_run(tmp_path)
+    assert "Settling" in m["required_status_coverage"]["required"]                                      # i.e. it WOULD be treated as documented: the guard is the tuple, not luck
+    assert part_of(m, "Settling")["outcome"] == "OBSERVED_EMPTY"
+
+
+def test_mutation_scope_that_ignores_partial_would_call_a_partial_capture_complete(tmp_path, monkeypatch):
+    pages, _ = owner_closed_pages(n_closed1=3, n_open=1, n_closed2=1)
+    _m, d = owner_run(tmp_path, over={("linear", "Closed"): pages})
+    assert UC.describe_scope(d)["verdict"] == "NOT_COMPLETE_FOR_SCOPE"
+    real = UC.verify_capture_dir
+
+    def cosmetic(path, **kw):
+        r = real(path, **kw)
+        r["coverage"] = dict(r["coverage"], dataset_status="COMPLETE", delisting_observability="OBSERVED", conflicts=[], partitions=[
+            dict(p, outcome="OBSERVED_ROWS", complete=True, anomalies=[], status_mismatch=dict(p["status_mismatch"], count=0, rows=[])) for p in r["coverage"]["partitions"]])
+        return r
+    monkeypatch.setattr(UC, "verify_capture_dir", cosmetic)
+    assert UC.describe_scope(d)["verdict"] == "COMPLETE_FOR_SCOPE"                                      # cosmetic manipulation is what the real derivation prevents
