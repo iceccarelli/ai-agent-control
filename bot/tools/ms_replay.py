@@ -116,10 +116,12 @@ class LocalLedger:
         net       = price_leg + funding - fees - slippage
     realised/unrealised split price_leg by whether the group is flat."""
 
-    def __init__(self) -> None:
+    def __init__(self, exit_fee_bps_perp: float = 0.0, exit_fee_bps_spot: float = 0.0) -> None:
         self.fills: List[T.Fill] = []
         self.funding_events: List[Tuple[str, int, float, str]] = []
         self.marks: Dict[str, float] = {}
+        self.books: Dict[str, Tuple[float, float]] = {}            # key -> (best bid, best ask) of the latest mark that carried a book; absent => valued at the mark (MID_FALLBACK)
+        self.exit_fee_bps = {"linear": float(exit_fee_bps_perp), "spot": float(exit_fee_bps_spot)}
         self.taker_slip = 0.0
         self.adverse = 0.0
         self.unknown_funding = 0
@@ -145,8 +147,13 @@ class LocalLedger:
         else:
             self.taker_slip += usd
 
-    def mark(self, symbol: str, ts_ms: int, price: float) -> None:
+    def mark(self, symbol: str, ts_ms: int, price: float, bid: Optional[float] = None, ask: Optional[float] = None) -> None:
+        """``bid`` / ``ask`` (optional): an OPEN position is valued at what CLOSING it would yield (a long at the bid, a short at the ask, less the taker exit fee), never at mid."""
         self.marks[symbol] = price
+        if bid is not None and ask is not None and 0 < float(bid) <= float(ask) and math.isfinite(float(ask)):
+            self.books[symbol] = (float(bid), float(ask))
+        else:
+            self.books.pop(symbol, None)
 
     def pnl(self) -> Dict[str, float]:
         cat = self._cat
@@ -159,7 +166,18 @@ class LocalLedger:
             k = f.symbol if cat.get(f.fill_id, "linear") == "linear" else "SPOT:" + f.symbol
             pos[k] = pos.get(k, 0.0) + s * f.qty
             fees += f.fee_usd
-        unreal_mtm = sum(q * self.marks.get(k, 0.0) for k, q in pos.items())
+        unreal_mtm = 0.0
+        mid_fallback = False
+        for k, q in pos.items():
+            if abs(q) < 1e-9:
+                continue
+            bk = self.books.get(k)
+            if bk is None:
+                mid_fallback = True
+                unreal_mtm += q * self.marks.get(k, 0.0)
+                continue
+            px = bk[0] if q > 0 else bk[1]
+            unreal_mtm += q * px - abs(q) * px * self.exit_fee_bps["spot" if k.startswith("SPOT:") else "linear"] / 1e4
         price_actual = cash + unreal_mtm
         funding = sum(x[2] for x in self.funding_events)
         price_leg = price_actual + self.taker_slip
@@ -167,7 +185,7 @@ class LocalLedger:
         flat = all(abs(q) < 1e-9 for q in pos.values())
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": slippage, "adverse_selection": self.adverse, "taker_slippage": self.taker_slip,
                 "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": price_leg + funding - fees - slippage,
-                "unknown_funding_events": self.unknown_funding}
+                "unknown_funding_events": self.unknown_funding, "valuation": "MID_FALLBACK" if mid_fallback else "EXIT_SIDE", "flags": ["MID_FALLBACK"] if mid_fallback else []}
 
 
 # ------------------------------------------------------------------ the world: point-in-time lookups over the series
@@ -417,6 +435,7 @@ class GroupRecord:
     regime: str = "ALL"
     kind: str = "NORMAL"
     price_usd: float = 0.0
+    mid_fallback: bool = False                                      # an open leg at the end had no book: valued at the mark, flagged
     fees_usd: float = 0.0
     funding_usd: float = 0.0
     adverse_usd: float = 0.0
@@ -489,6 +508,8 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
     mk_engine = lambda: EX.ExecutionEngine(store, send_order=tr.send_order, cancel_order=tr.cancel_order, venue_state=tr.venue_state, policy=cfg.exec_policy, qty_steps=qty_steps)  # noqa: E731
     eng = mk_engine()
     led = ledger_factory()
+    if isinstance(led, LocalLedger):
+        led.exit_fee_bps = {"linear": float(cfg.fill.taker_bps_perp), "spot": float(cfg.fill.taker_bps_spot)}
     instruments: Dict[str, T.Instrument] = {}
     spot_instruments: Dict[str, T.Instrument] = {}
     for x in series:
@@ -644,9 +665,10 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
         # (2) snapshots + marks
         snaps = snapshots(now)
         for sym, s in snaps.items():
-            led.mark(sym, now, s.mark)
+            led.mark(sym, now, s.mark, bid=s.bids[0].price if s.bids else None, ask=s.asks[0].price if s.asks else None)         # open legs are valued at the EXIT side of the book
             if s.spot_mark is not None:
-                led.mark("SPOT:" + sym, now, s.spot_mark)
+                sb, sa, _ = w.book(sym, "spot", now)
+                led.mark("SPOT:" + sym, now, s.spot_mark, bid=sb[0].price if sb else None, ask=sa[0].price if sa else None)
         # (3) resting orders
         tr.advance(now)
         flush(now)
@@ -803,7 +825,13 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
         for (sym, cat), q in last_marks.items():
             if abs(q) > 1e-12:
                 m = w.mark(sym, cfg.end_ms) if cat == "linear" else w.spot_mark(sym, cfg.end_ms)
-                rec.price_usd += q * (m or 0.0)
+                bb, ba, _ = w.book(sym, cat, cfg.end_ms)
+                if bb and ba:                                       # what CLOSING it would yield: a long at the bid, a short at the ask, less the taker exit fee (same as the ledger)
+                    px = bb[0].price if q > 0 else ba[0].price
+                    rec.price_usd += q * px - abs(q) * px * (cfg.fill.taker_bps_perp if cat == "linear" else cfg.fill.taker_bps_spot) / 1e4
+                else:
+                    rec.price_usd += q * (m or 0.0)
+                    rec.mid_fallback = True
         rec.fees_usd = sum(f.fee_usd for f in gf)
         if gf:
             rec.entry_ts = min(f.ts_ms for f in gf)
@@ -934,6 +962,7 @@ def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int]
     cfg0 = results[0].cfg
     for i, r in enumerate(results):
         assert_net_identity(r.pnl, f"window {i}: ")
+    valuation = "MID_FALLBACK" if any(r.pnl.get("valuation") == "MID_FALLBACK" or any(g.mid_fallback for g in r.groups.values()) for r in results) else "EXIT_SIDE"
     tot = {"price_leg": 0.0, "funding": 0.0, "fees": 0.0, "slippage": 0.0, "adverse_selection": 0.0, "taker_slippage": 0.0, "net": 0.0}
     for r in results:
         for k in tot:
@@ -997,7 +1026,7 @@ def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int]
         "schema": "ms_replay_report/1", "variant_id": cfg0.variant_id, "spec_digest": cfg0.spec_digest, "mode": "REPLAY_SIMULATED_TRANSPORT",
         "window": {"start_ms": min(r.cfg.start_ms for r in results), "end_ms": max(r.cfg.end_ms for r in results), "step_ms": cfg0.step_ms, "n_windows": len(results)},
         "pnl": {"gross_usd": tot["price_leg"] + tot["funding"], "net_usd": tot["net"], "fees_usd": tot["fees"], "funding_usd": tot["funding"], "price_leg_usd": tot["price_leg"],
-                "slippage_usd": tot["slippage"], "taker_slippage_usd": tot["taker_slippage"], "adverse_selection_usd": tot["adverse_selection"],
+                "valuation": valuation, "slippage_usd": tot["slippage"], "taker_slippage_usd": tot["taker_slippage"], "adverse_selection_usd": tot["adverse_selection"],
                 "note": "ONE net definition: net = gross - fees - slippage with gross = price leg AT MID + funding; slippage = taker walk + adverse selection, each charged exactly once. The "
                         "taker walk is already inside the fill prices (the price leg adds it back to reach mid, then it is subtracted as slippage); adverse selection is a modelled post-fill "
                         "markout that is in NO fill price, so it is subtracted here and only here. Fees are subtracted once. Funding is credited/debited at the actual settlement timestamp"},

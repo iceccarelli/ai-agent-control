@@ -160,7 +160,14 @@ def check_net_identity(pr):
     openq = collections.defaultdict(float)
     for f, c in fills:
         openq[(f.symbol, c)] += f.qty if f.side == "Buy" else -f.qty
-    mtm = sum(q * led.marks[k] for k, q in openq.items() if abs(q) > 1e-12)
+    # OPEN legs are valued at what CLOSING them would yield (deliberate change from "at mid"): a long at the BID, a short at the ASK, less the modelled taker exit fee. The synthetic book
+    # is mid -/+ half the configured spread, so the exit price is re-derived here from the mark and the config, not read back from the ledger.
+    half = res.cfg.synthetic_spread_bps / 2e4
+    mtm = 0.0
+    for (sym, c), q in openq.items():
+        if abs(q) > 1e-12:
+            px = led.marks[(sym, c)] * (1 - half if q > 0 else 1 + half)
+            mtm += q * px - abs(q) * px * (res.cfg.fill.taker_bps_perp if c == "linear" else res.cfg.fill.taker_bps_spot) / 1e4
     funding = led.pnl()["funding"]
     fees = sum(f.fee_usd for f, _c in fills)
     adverse = sum(g.adverse_usd for g in res.groups.values())
@@ -222,7 +229,8 @@ def check_consistent(pr, *, allow_open=True):
         assert rr["net_pnl_usd"] == pytest.approx(net) == pytest.approx(res.pnl["net"])
         assert lp["realised_net_usd"] + lp["unrealised_usd"] == pytest.approx(net)
         assert sum(r["net_pnl_usd"] for r in rr["symbols"]) == pytest.approx(net)
-        assert net == pytest.approx(p["net"] - led.pnl()["adverse_selection"])
+        # the raw ledger values open legs AT MID; the one net deliberately values them at the exit side (exit_adjustment, incl. the taker exit fee)
+        assert net == pytest.approx(p["net"] + led.pnl()["exit_adjustment"] - led.pnl()["adverse_selection"])
     # no unreconciled leg is ever a claimable profit
     open_legs = [k for k, leg in p["per_leg"].items() if abs(leg["qty"]) > 1e-9]
     if open_legs:
@@ -1163,6 +1171,38 @@ def test_the_pnl_card_shows_the_replay_net_with_realised_and_unrealised_beside_i
     assert card["basis"] == "SIMULATED"
 
 
+def test_a_long_and_a_short_open_at_the_end_of_a_run_are_valued_at_the_exit_side_and_the_report_says_so(tmp_path):
+    pr = go(tmp_path, world(), cfg(**SHORT))
+    res, led = pr.result, pr.ledger
+    legs = collections.defaultdict(list)
+    for f in res.fills:
+        legs[(f.group_id, f.symbol, res.fills_cat.get(f.fill_id, "linear"))].append(f)
+    half = res.cfg.synthetic_spread_bps / 2e4
+    unreal_mid = unreal_exit = 0.0
+    signs = set()
+    for (gid, sym, c), fs in legs.items():
+        q = sum(f.qty if f.side == "Buy" else -f.qty for f in fs)
+        if abs(q) < 1e-12:
+            continue
+        signs.add(q > 0)
+        entry = [f for f in fs if (f.side == "Buy") == (q > 0)]
+        avg = sum(f.qty * f.price for f in entry) / sum(f.qty for f in entry)                       # the open leg's cost basis
+        m = led.marks[(sym, c)]
+        px = m * (1 - half if q > 0 else 1 + half)                                                  # long -> BID, short -> ASK
+        fee = abs(q) * px * (res.cfg.fill.taker_bps_perp if c == "linear" else res.cfg.fill.taker_bps_spot) / 1e4
+        unreal_mid += q * (m - avg)
+        unreal_exit += q * (px - avg) - fee
+    assert signs == {True, False}, "a long (spot) and a short (perp) must both be open"
+    assert unreal_exit < unreal_mid
+    exit_side, at_mid = unreal_exit, unreal_mid
+    p = led.pnl()
+    assert p["unrealised"] == pytest.approx(exit_side, rel=1e-9, abs=1e-6)                           # unrealised == hand-computed exit-side value minus exit fees
+    assert p["exit_adjustment"] == pytest.approx(exit_side - at_mid, rel=1e-9, abs=1e-6)
+    assert p["valuation"] == "EXIT_SIDE" and "MID_FALLBACK" not in p["flags"]
+    assert p["unrealised"] - p["exit_adjustment"] == pytest.approx(at_mid, rel=1e-9, abs=1e-6)       # mid-valued unrealised + (exit side - mid) == exit-side unrealised
+    assert pr.report["pnl"]["valuation"] == "EXIT_SIDE"
+
+
 def test_open_legs_are_valued_at_the_exit_side_of_the_book_less_the_taker_exit_fee():
     led = MP.LedgerAdapter("ASSUMED", exit_fee_bps_perp=5.5, exit_fee_bps_spot=10.0)
     now = 1_700_000_000_000
@@ -1171,6 +1211,7 @@ def test_open_legs_are_valued_at_the_exit_side_of_the_book_less_the_taker_exit_f
     led.mark("XUSDT", now + 1, 100.0)
     led.mark("SPOT:XUSDT", now + 1, 100.0)
     base = led.pnl()
+    assert base["valuation"] == "MID_FALLBACK" and "MID_FALLBACK" in base["flags"]                  # no book: valued at the mark AND flagged, never silently mid
     assert base["unrealised"] == pytest.approx(0.0) and base["exit_adjustment"] == 0.0               # no book: valued at the mark, as before
     led.mark("XUSDT", now + 2, 100.0, bid=99.5, ask=100.5)                                           # short perp closes by BUYING at the ask
     led.mark("SPOT:XUSDT", now + 2, 100.0, bid=99.8, ask=100.2)                                      # long spot closes by SELLING at the bid

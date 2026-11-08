@@ -430,3 +430,30 @@ def test_an_unknown_interval_symbol_is_not_allocated_by_a_scan_that_honours_the_
     early = [g for g in r.groups.values() if "BBBUSDT" in g.symbols and g.entry_ts is not None and g.entry_ts < CHANGE + 2 * D]
     assert early == []                                                                         # not allocated while ANY print in its window has an unknown interval
     assert any("BBBUSDT" in g.symbols for g in r.groups.values())                              # positive control: allocated once every print in the window is known
+
+
+def test_local_ledger_values_open_legs_at_the_exit_side_less_the_exit_fee_and_flags_a_missing_book():
+    led = RP.LocalLedger(exit_fee_bps_perp=5.5, exit_fee_bps_spot=10.0)
+    led.record_fill(T.Fill("f1", "G", "P", "XUSDT", "Sell", 10.0, 100.0, 0.02, "USDT", "MAKER", T0, "SIMULATED"), category="linear")
+    led.record_fill(T.Fill("f2", "G", "S", "XUSDT", "Buy", 10.0, 100.0, 0.02, "USDT", "MAKER", T0, "SIMULATED"), category="spot")
+    led.mark("XUSDT", T0 + 1, 100.0)
+    led.mark("SPOT:XUSDT", T0 + 1, 100.0)
+    p0 = led.pnl()
+    assert p0["unrealised"] == pytest.approx(0.0) and p0["valuation"] == "MID_FALLBACK" and p0["flags"] == ["MID_FALLBACK"]      # no book: the mark, and SAID so
+    led.mark("XUSDT", T0 + 2, 100.0, bid=99.5, ask=100.5)                    # short perp: closes by buying at the ASK
+    led.mark("SPOT:XUSDT", T0 + 2, 100.0, bid=99.8, ask=100.2)               # long spot: closes by selling at the BID
+    p = led.pnl()
+    want = (100.0 - 100.5) * 10 - 10 * 100.5 * 5.5 / 1e4 + (99.8 - 100.0) * 10 - 10 * 99.8 * 10.0 / 1e4
+    assert p["valuation"] == "EXIT_SIDE" and p["flags"] == []
+    assert p["unrealised"] == pytest.approx(want) and p["net"] == pytest.approx(p0["net"] + want)
+    RP.assert_net_identity(p)
+
+
+def test_replay_values_open_positions_at_the_exit_side_in_the_ledger_the_group_records_and_the_report():
+    r = go(c=cfg(end_ms=T0 + 5 * D, hold_ms=10 * D))
+    assert r.pnl["valuation"] == "EXIT_SIDE" and r.pnl["unrealised"] not in (None, 0.0) and r.pnl["unrealised"] < 0      # crossing the spread + exit fees costs money
+    RP.assert_net_identity(r.pnl)
+    net = sum(g.price_usd + g.funding_usd - g.fees_usd - g.adverse_usd for g in r.groups.values())
+    assert net == pytest.approx(r.pnl["net"], abs=1e-6)                     # the per-group end-of-run valuation is the SAME exit-side one
+    assert not any(g.mid_fallback for g in r.groups.values())
+    assert RP.build_report([r])["pnl"]["valuation"] == "EXIT_SIDE"

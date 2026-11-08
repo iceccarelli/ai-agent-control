@@ -127,6 +127,16 @@ class LedgerAdapter:
         else:
             self.books.pop((sym, cat), None)
 
+    def _mid_fallback(self, ledger_pnl: Mapping[str, Any]) -> bool:
+        """True when an OPEN leg has no book at its latest mark: it is valued at the mark, and that is flagged, never silent."""
+        for key, r in ledger_pnl["per_leg"].items():
+            if abs(r["qty"]) < 1e-12:
+                continue
+            cat, sym = key.split("/", 1)[1].split(":", 1)
+            if self.books.get((sym, cat)) is None:
+                return True
+        return False
+
     def _exit_adjustment(self, ledger_pnl: Mapping[str, Any], symbol: Optional[str] = None) -> float:
         """What valuing the OPEN legs at the exit side of the book (plus the modelled taker exit fee) changes versus the mark the ledger used. 0.0 for a leg with no book."""
         adj = 0.0
@@ -164,12 +174,13 @@ class LedgerAdapter:
         price_leg = price_actual + taker                                          # AT MID
         funding, fees = known("funding"), known("fees")
         adj = self._exit_adjustment(p)
+        mid_fb = self._mid_fallback(p)
         price_leg += adj
         net = price_leg + funding - fees - taker - adverse
         unreal = p["unrealised_price"]
         unreal = None if unreal is None else unreal + adj                         # the value of closing what is open NOW (exit side of the book, less the taker exit fee)
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": taker + adverse, "adverse_selection": adverse, "taker_slippage": taker,
-                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]), "status": p["status"],
+                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]) + (["MID_FALLBACK"] if mid_fb else []), "valuation": "MID_FALLBACK" if mid_fb else "EXIT_SIDE", "status": p["status"],
                 "prov": p["prov"], "ledger": p}
 
 
