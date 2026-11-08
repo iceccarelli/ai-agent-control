@@ -321,7 +321,7 @@ def register_experiment(registry: Dict[str, Any], trial_id: str, **fields: Any) 
     missing = [k for k in REQUIRED_REGISTRATION if k not in fields or fields[k] in (None, "", [], {})]
     if missing:
         raise ValueError(f"experiment {trial_id!r} is not registered: missing {missing}")
-    extra = sorted(set(fields) - set(REQUIRED_REGISTRATION) - {"note", "source"})
+    extra = sorted(set(fields) - set(REQUIRED_REGISTRATION) - {"note", "source", "spec_digest", "spec_declarations"})
     if extra:
         raise ValueError(f"unknown registration field(s) {extra}; put commentary in 'note'")
     return record(registry, trial_id, status="registered", registered_utc=_now(), evidence=[], amendments=[], **fields)

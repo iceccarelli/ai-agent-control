@@ -41,7 +41,7 @@ VERIFIED, ESTIMATED, PROVISIONAL, STALE, UNAVAILABLE = "VERIFIED", "ESTIMATED", 
 STATUSES = (VERIFIED, ESTIMATED, PROVISIONAL, STALE, UNAVAILABLE)
 SETTLE_MS = CP.SETTLE_MS
 STALE_AFTER_SETTLEMENTS = 2                  # the newest print should be no older than two settlement intervals while the window is open
-_SECRET_NAMES = ("BYBIT_API_KEY", "BYBIT_API_SECRET", "LIVE_TRADING_ACK")
+_SECRET_NAMES = ("BYBIT_API_KEY", "BYBIT_API_SECRET", "LIVE_TRADING_ACK", "OWNER_ATTESTATION_KEY")
 _SAFE_VALUE_NAMES = ("USE_TESTNET", "PAPER_TRADING", "BYBIT_VENUE", "CARRY_DRILL_ENABLED", "CARRY_ENTRY_BENEFIT_MODE")
 
 
@@ -59,6 +59,10 @@ def section_environment(env: Mapping[str, str]) -> Dict[str, Any]:
         findings.append("REAL MONEY IS ARMED by this environment: stop and check it is intended")
     if secrets["LIVE_TRADING_ACK"] == "set":
         findings.append("LIVE_TRADING_ACK is set; this repository's rule is that it stays unset")
+    app_host = any(str(k).startswith("BYBIT_") and str(v or "").strip() for k, v in env.items()) or str(env.get("BYBIT_VENUE") or "").strip() != ""
+    if secrets["OWNER_ATTESTATION_KEY"] == "set" and app_host:
+        findings.append("OWNER_ATTESTATION_KEY is set in an environment that looks like the app host (a BYBIT_* variable is present): the owner attestation key belongs on the owner's own "
+                        "machine only, never on the app host, the volume or Fly secrets (RUNBOOKS: Owner attestation key and registry anchor custody); remove it here and treat it as exposed")
     venue = env.get("BYBIT_VENUE")
     if venue not in (None, "") and str(venue).strip().lower() not in venues.sandbox_names() + venues.live_names():
         findings.append(f"BYBIT_VENUE {venue!r} is not a qualified venue (an unqualified or unknown name is refused everywhere)")

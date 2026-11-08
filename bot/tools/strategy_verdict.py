@@ -183,8 +183,8 @@ def env_key_provider() -> Optional[str]:
 def _key_bytes(key: Any) -> Optional[bytes]:
     if isinstance(key, str):
         key = key.encode("utf-8")
-    if not isinstance(key, (bytes, bytearray)) or len(key) < MIN_ATTESTATION_KEY_CHARS:
-        return None                                                    # an unset or trivially short key cannot attest anything
+    if not isinstance(key, (bytes, bytearray)) or len(key) < MIN_ATTESTATION_KEY_CHARS or len(set(bytes(key))) < MIN_ATTESTATION_KEY_DISTINCT:
+        return None                                                    # an unset, short or low-entropy-looking key cannot attest anything
     return bytes(key)
 
 
@@ -193,7 +193,7 @@ def owner_attest(digest: str, candidate_id: str, spec_digest: str, key: Any) -> 
     read by the caller from somewhere outside this repository. Proves 'the key holder signed these claims', nothing more. Raises SpecError for a missing/short key."""
     kb = _key_bytes(key)
     if kb is None:
-        raise SpecError(f"an attestation key of at least {MIN_ATTESTATION_KEY_CHARS} characters is required")
+        raise SpecError(f"an attestation key of at least {MIN_ATTESTATION_KEY_CHARS} characters with at least {MIN_ATTESTATION_KEY_DISTINCT} distinct characters is required")
     msg = json.dumps(["owner-attest/1", str(digest), str(candidate_id), str(spec_digest)], separators=(",", ":")).encode("utf-8")
     return hmac.new(kb, msg, hashlib.sha256).hexdigest()
 
@@ -203,6 +203,8 @@ def evidence_digest(item: EvidenceItem) -> str:
     att = item.attachment
     body = {"stage": item.stage, "result": item.result, "provenance": item.provenance, "metrics": item.metrics, "data_sha256": item.data_sha256, "status": item.status,
             "candidate_id": item.candidate_id, "spec_digest": item.spec_digest, "report_sha256": att.get("report_sha256") if isinstance(att, Mapping) else None}
+    if item.stage in OBSERVED_STAGES:
+        body["recorded_ms"] = item.recorded_ms                 # recorded_ms gates timing (prospective: recorded >= end), so it is part of what the owner signs
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
@@ -257,7 +259,10 @@ SETTLEMENT_FIT_TOLERANCE = 1.05                # observed_settlements * interval
 MIN_PROSPECTIVE_SETTLEMENTS = 30
 MIN_PROSPECTIVE_COVERAGE = 0.90
 OWNER_ATTESTATION_KEY_ENV = "OWNER_ATTESTATION_KEY"
-MIN_ATTESTATION_KEY_CHARS = 16
+MIN_ATTESTATION_KEY_CHARS = 32
+MIN_ATTESTATION_KEY_DISTINCT = 12       # 'aaaaaaaaaaaaaaaa' (red-team 4) is long enough to look like a key and is not one
+#: The cost-chain declarations stored in the registry beside the registered spec digest (so a drift can be NAMED, not only detected).
+REGISTERED_DECLARATION_KEYS = ("fee_model", "slippage_model", "funding_model", "capacity_model", "execution_model", "holding_period", "eligibility_rules", "OOS_protocol", "parameter_grid")
 MIN_EXECUTION_FILLS = 20
 #: Statuses an owner-import economic layer may carry for its figure to be read at all (STALE / UNAVAILABLE / DISPUTED / INCOMPLETE are never a figure).
 OWNER_FIGURE_OK_STATUSES = ("ESTIMATED", "PROVISIONAL", "RECONCILED", "VERIFIED")
@@ -283,6 +288,22 @@ def _verified_entry(registry: Optional[Mapping[str, Any]], spec: Mapping[str, An
         return None
     import hypothesis_registry as hr
     return None if hr.verify(registry) else entry
+
+
+def _registered_spec_problem(registry: Optional[Mapping[str, Any]], spec: Mapping[str, Any]) -> Optional[str]:
+    """None if the spec in hand is the one that was registered; ``SPEC_DIFFERS_FROM_REGISTERED(...)`` if the registered digest differs (names the declarations that drifted);
+    ``REGISTERED_SPEC_DIGEST_MISSING`` for a registration made before digests were stored (unbound); None when there is no entry to compare with."""
+    entry = _registry_entry(registry, str(spec.get("candidate_id")))
+    if entry is None:
+        return None
+    want = entry.get("spec_digest")
+    if not _is_hex64(want):
+        return "REGISTERED_SPEC_DIGEST_MISSING"
+    if want != spec_digest(spec):
+        decl = entry.get("spec_declarations") if isinstance(entry.get("spec_declarations"), Mapping) else {}
+        drift = [k for k in REGISTERED_DECLARATION_KEYS if k in decl and decl[k] != spec.get(k)]
+        return "SPEC_DIFFERS_FROM_REGISTERED(" + (",".join(drift) if drift else "other fields") + "); register a NEW candidate id/version for a changed spec"
+    return None
 
 
 def _anchored_variants(registry: Mapping[str, Any], entry: Mapping[str, Any]) -> int:
@@ -355,6 +376,9 @@ def _registry_binding(item: EvidenceItem, spec: Mapping[str, Any], registry: Opt
     import hypothesis_registry as hr
     if hr.verify(registry):
         return "REGISTRY_FAILS_ITS_INTEGRITY_CHECK"
+    drift = _registered_spec_problem(registry, spec)
+    if drift:
+        return drift
     reg_ms = _utc_ms(entry.get("registered_utc"))
     start = item.metrics.get("observation_started_ms")
     if reg_ms is None or isinstance(start, bool) or not isinstance(start, int) or start <= reg_ms:
@@ -447,10 +471,15 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapp
     carry real provenance, and (for the observed stages) be backed by a registration that verifies and PRE-DATES the observation. ``now_ms`` (default: the clock) bounds the end of
     any observation: an observation cannot end in the future. An observed-stage PASS additionally needs the owner's attestation (``key_provider``, default the
     OWNER_ATTESTATION_KEY environment variable); without a verifiable key it is NOT counted (OWNER_ATTESTATION_UNVERIFIABLE)."""
-    if item.result == FAIL:
-        return True, None
     if item.result == INCONCLUSIVE:
         return False, "INCONCLUSIVE"
+    if item.result == FAIL:
+        # killing is easy, but only for THIS candidate and THIS spec (and the registered one): evidence about another candidate/spec is not a kill of this one
+        bad = _candidate_binding(item, spec)
+        drift = _registered_spec_problem(registry, spec)
+        if bad or (drift and drift.startswith("SPEC_DIFFERS")):
+            return False, bad or drift
+        return True, None
     now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     prov = item.provenance.strip()
     if len(prov) < 6 or prov.lower() in WEAK_PROVENANCE:
@@ -460,6 +489,9 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapp
         return False, bad
     m = item.metrics
     s = item.stage
+    drift = _registered_spec_problem(registry, spec)
+    if drift and drift.startswith("SPEC_DIFFERS"):
+        return False, drift
     entry = _verified_entry(registry, spec)
     if s in OFFLINE_STAGES and (not _is_hex64(item.data_sha256) or len(set(item.data_sha256)) < 8):
         return False, "OFFLINE_PASS_WITHOUT_REAL_DATA_HASH"
@@ -611,6 +643,12 @@ def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem], *, regis
     if problems:
         return VerdictResult(UNTESTED, ["the candidate specification is invalid or incomplete"] + problems[:10], "hypothesis", stages, ignored, problems)
     stages["hypothesis"] = PASS                                                  # a valid, complete specification IS the registered hypothesis
+    drift = _registered_spec_problem(registry, spec)
+    if drift and drift.startswith("SPEC_DIFFERS"):
+        # The spec in hand is not the one that was registered (a cost label flipped, a floor loosened...): nothing gathered or signed can be bound to it.
+        return VerdictResult(INSUFFICIENT_DATA, [drift], "registration", stages, ignored, problems)
+    if drift:
+        reasons.append(drift + ": the registration holds no spec digest, so the spec cannot be bound to it and observed evidence is not counted (verdict stays below QUALIFIED)")
     by_stage: Dict[str, List[EvidenceItem]] = {s: [] for s in LADDER}
     for e in evidence:
         by_stage[e.stage].append(e)
@@ -701,7 +739,8 @@ def register_candidate(registry: Dict[str, Any], spec: Mapping[str, Any], *, cod
         registry, str(spec["candidate_id"]), hypothesis_id=str(spec["candidate_id"]), mechanism=str(spec["economic_mechanism"]), family=str(spec.get("family") or "unclassified"),
         strategy=str(spec["candidate_id"]), universe=spec["eligibility_rules"], input_data_sha256=dict(input_data_sha256), code_sha=str(code_sha),
         data_window=spec["OOS_protocol"].get("data_window") or spec["OOS_protocol"], parameter_grid=spec.get("parameter_grid") or {"fixed": True},
-        costs={k: spec[k] for k in ("fee_model", "funding_model", "slippage_model")}, statistical_design=spec["OOS_protocol"],
+        costs={k: spec[k] for k in ("fee_model", "funding_model", "slippage_model")}, spec_digest=spec_digest(spec),
+        spec_declarations={k: spec[k] for k in REGISTERED_DECLARATION_KEYS if k in spec}, statistical_design=spec["OOS_protocol"],
         train_test=spec["OOS_protocol"]["train_test_boundary"], multiple_testing_family=str(spec.get("multiple_testing_family") or spec["candidate_id"]),
         prospective_period=spec["prospective_protocol"], source="tools/strategy_verdict.py")
 
@@ -710,7 +749,8 @@ def record_evidence(registry: Dict[str, Any], candidate_id: str, item: EvidenceI
     import hypothesis_registry as hr
     hr.add_evidence(registry, candidate_id, STAGE_TO_REGISTRY_LEVEL[item.stage], result=f"{item.stage}:{item.result}", provenance=item.provenance or "none",
                     details={"metrics": dict(item.metrics), "data_sha256": item.data_sha256, "status": item.status, "candidate_id": item.candidate_id or candidate_id,
-                             "spec_digest": item.spec_digest, "attachment": item.attachment, "attestation": item.attestation, "report_attestation": item.report_attestation})
+                             "spec_digest": item.spec_digest, "attachment": item.attachment, "attestation": item.attestation, "report_attestation": item.report_attestation,
+                             "recorded_ms": item.recorded_ms})
 
 
 def evidence_from_registry(registry: Mapping[str, Any], candidate_id: str) -> List[EvidenceItem]:
@@ -726,9 +766,13 @@ def evidence_from_registry(registry: Mapping[str, Any], candidate_id: str) -> Li
         d = ev.get("details") or {}
         if stage not in LADDER or result not in (PASS, FAIL, INCONCLUSIVE):
             continue
+        reg_ms = _utc_ms(ev.get("recorded_utc")) or 0
+        claimed = d.get("recorded_ms")
+        # the attested claim of when it was recorded may not be LATER than the registry's own append time (1s resolution): a later claim is clamped, so its attestation fails
+        rec = min(claimed, reg_ms + 999) if _int(claimed) and claimed >= 0 else reg_ms
         out.append(EvidenceItem(stage=stage, result=result, provenance=str(ev.get("provenance") or ""), metrics=d.get("metrics") or {}, data_sha256=d.get("data_sha256"),
                                 status=d.get("status"), candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest"), attachment=d.get("attachment"),
-                                recorded_ms=_utc_ms(ev.get("recorded_utc")) or 0, attestation=d.get("attestation"), report_attestation=d.get("report_attestation")))
+                                recorded_ms=rec, attestation=d.get("attestation"), report_attestation=d.get("report_attestation")))
     return out
 
 
@@ -780,6 +824,17 @@ def btc_carry_candidate() -> Dict[str, Any]:
     }
 
 
+def _attest_precondition(signed: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapping[str, Any]], key: Any, now: int) -> Optional[str]:
+    """Why the owner must NOT sign this observed-stage item: the reason ``counted`` (or the pending-prospective check) would refuse it anyway. None = fine to sign.
+    A signature must never launder evidence the engine would reject, and must never be given for an unregistered or drifted candidate."""
+    if registry is None:
+        return "NO_REGISTRY_GIVEN(--registry is required to attest observed evidence)"
+    if signed.result == INCONCLUSIVE:                                    # the running-observation marker: same binding as the pending check in evaluate()
+        return _candidate_binding(signed, spec) or _registry_binding(signed, spec, registry, now)
+    ok, why = counted(signed, spec, registry, now_ms=now, key_provider=lambda: key)
+    return None if ok else why
+
+
 def _attest_main(argv: Sequence[str]) -> int:
     """``strategy_verdict.py attest --candidate C --evidence E.jsonl [--out F]``: the OWNER'S tool. Reads the key from OWNER_ATTESTATION_KEY (never from argv), adds the owner
     attestation to every observed-stage evidence item and prints/writes the JSONL. Run it where the key lives; the key is not stored or echoed."""
@@ -787,6 +842,8 @@ def _attest_main(argv: Sequence[str]) -> int:
     ap.add_argument("--candidate", required=True)
     ap.add_argument("--evidence", required=True)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--registry", default=None, help="the registry the evidence will be evaluated against; REQUIRED to attest observed evidence (the same preconditions as counted())")
+    ap.add_argument("--now-ms", type=int, default=None)
     a = ap.parse_args(list(argv))
     key = env_key_provider()
     if _key_bytes(key) is None:
@@ -796,12 +853,21 @@ def _attest_main(argv: Sequence[str]) -> int:
         spec = json.load(open(a.candidate, encoding="utf-8"))
         items = [evidence_from_dict(json.loads(x)) for x in open(a.evidence, encoding="utf-8") if x.strip()]
         sd, cid = spec_digest(spec), spec.get("candidate_id")
+        registry = None
+        if a.registry:
+            import hypothesis_registry as hr
+            registry = hr.load(a.registry)
+        now = min(int(time.time() * 1000), a.now_ms) if a.now_ms is not None else int(time.time() * 1000)
         out = []
         for it in items:
             if it.stage in OBSERVED_STAGES:
                 if it.candidate_id != cid or it.spec_digest != sd:
                     raise SpecError(f"{it.stage} evidence is not about this candidate/spec; refusing to attest it")
-                it = attest_item(it, key)
+                signed = attest_item(it, key)
+                why = _attest_precondition(signed, spec, registry, key, now)
+                if why:
+                    raise SpecError(f"{it.stage} evidence would not be counted ({why}); refusing to attest it")
+                it = signed
             out.append(json.dumps(evidence_to_dict(it), sort_keys=True, allow_nan=False))
     except (OSError, ValueError, TypeError, SpecError) as exc:
         print(f"strategy_verdict attest: {type(exc).__name__}: {exc}", file=sys.stderr)

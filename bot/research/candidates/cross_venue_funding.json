@@ -11,7 +11,7 @@
   "bias_declarations": {
     "fills_modelled_against_real_depth": false,
     "hedge_completeness_modelled": false,
-    "no_future_funding_knowledge": true,
+    "no_future_funding_knowledge": false,
     "no_look_ahead": true,
     "point_in_time_universe": true
   },
@@ -70,10 +70,10 @@
       "declaration_keys": [
         "no_future_funding_knowledge"
       ],
-      "gap": "BTC on Binance and Bybit exists; different intervals and no collateral-transfer cost data",
+      "gap": "only BTC funding prints on two venues exist, with different settlement intervals and no alignment to a common clock; no collateral-transfer cost data (see the per-venue transfer item); the second venue is unqualified",
       "name": "funding history for the same symbol on two venues, aligned to settlement clocks",
       "point_in_time": true,
-      "repo_has": true
+      "repo_has": false
     },
     {
       "declaration_keys": [

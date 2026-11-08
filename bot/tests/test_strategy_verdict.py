@@ -21,7 +21,7 @@ DAY = 86_400_000
 REG_UTC = "2026-01-01T00:00:00Z"      # every registry here is registered at this fixed instant (patched), so observations can be placed deterministically after it
 FUTURE_MS = 4_000_000_000_000        # an observation that starts after any registration made while these tests run
 NOW_MS = FUTURE_MS + 90 * DAY         # the clock handed to the engine: after every observation window built below
-KEY = "test-only-owner-key-0123456789"     # the owner's secret for THESE tests only; production reads OWNER_ATTESTATION_KEY, which this repository never holds
+KEY = "test-only-owner-key-0123456789-abcdefgh-XYZ"     # the owner's secret for THESE tests only; production reads OWNER_ATTESTATION_KEY, which this repository never holds
 KEYP = lambda: KEY                          # injected key provider
 _AUTO = object()
 
@@ -649,14 +649,17 @@ def test_rt3_1_the_key_is_read_from_the_environment_by_default(monkeypatch):
 
 
 def test_rt3_1_the_attest_cli_signs_observed_evidence_from_the_environment_key(tmp_path, monkeypatch, capsys):
+    import hypothesis_registry as hr
     cand = tmp_path / "c.json"; cand.write_text(json.dumps(spec()))
+    regf = tmp_path / "reg.json"; regf.write_text(json.dumps(REG))
     evf = tmp_path / "e.jsonl"; out = tmp_path / "o.jsonl"
     plain = ev("prospective_observation", attest=False)
     evf.write_text(json.dumps(SV.evidence_to_dict(plain)) + "\n")
+    monkeypatch.setattr(SV.time, "time", lambda: NOW_MS / 1000)           # the CLI's clock (it can only be moved earlier by --now-ms)
     monkeypatch.delenv(SV.OWNER_ATTESTATION_KEY_ENV, raising=False)
-    assert SV.main(["attest", "--candidate", str(cand), "--evidence", str(evf), "--out", str(out)]) == 2          # no key: nothing signed
+    assert SV.main(["attest", "--candidate", str(cand), "--evidence", str(evf), "--out", str(out), "--registry", str(regf)]) == 2          # no key: nothing signed
     monkeypatch.setenv(SV.OWNER_ATTESTATION_KEY_ENV, KEY)
-    assert SV.main(["attest", "--candidate", str(cand), "--evidence", str(evf), "--out", str(out)]) == 0
+    assert SV.main(["attest", "--candidate", str(cand), "--evidence", str(evf), "--out", str(out), "--registry", str(regf)]) == 0
     signed = SV.evidence_from_dict(json.loads(out.read_text()))
     assert counted(signed, spec(), REG) == (True, None) and KEY not in out.read_text() + capsys.readouterr().out
     evf.write_text(json.dumps(dict(SV.evidence_to_dict(plain), candidate_id="someone_else")) + "\n")
@@ -769,7 +772,7 @@ def test_rt3_4_cost_pass_must_carry_the_chain_digest_recomputed_from_the_spec():
         assert counted(item, spec(), REG)[1] == "COST_CHAIN_DIGEST_NOT_RECOMPUTED_FROM_THE_SPEC"
     # the digest is of THIS spec's cost labels: cost evidence for different fees does not carry over
     other = spec(fee_model={"maker_bps": lab(1.0), "taker_bps": lab(2.0)})
-    assert counted(SV.EvidenceItem(**dict(SV.evidence_to_dict(good), spec_digest=SV.spec_digest(other))), other, REG)[1] == "COST_CHAIN_DIGEST_NOT_RECOMPUTED_FROM_THE_SPEC"
+    assert counted(SV.EvidenceItem(**dict(SV.evidence_to_dict(good), spec_digest=SV.spec_digest(other))), other, _registry(other))[1] == "COST_CHAIN_DIGEST_NOT_RECOMPUTED_FROM_THE_SPEC"
     import economic_model as EM
     assert SV.cost_chain_digest(spec()) == EM.cost_chain_digest(spec())
     cap = ev("capacity_test")
@@ -779,7 +782,7 @@ def test_rt3_4_cost_pass_must_carry_the_chain_digest_recomputed_from_the_spec():
 def test_rt3_4_assumed_cost_inputs_never_pass_whatever_the_metric_says():
     allass = spec(funding_model={"expected_bps_per_settlement": lab(0.3, "assumed")})
     item = ev("cost_model", spec_=allass)
-    assert counted(item, allass, REG)[1] == "ALL_COST_INPUTS_ASSUMED"
+    assert counted(item, allass, _registry(allass))[1] == "ALL_COST_INPUTS_ASSUMED"
     assert counted(ev("cost_model"), spec(), REG) == (True, None)                                          # positive control: funding is modelled, not assumed
     named = ev("cost_model", metrics={"assumed_names": ["fees.taker"]})
     assert counted(named, spec(), REG)[1] == "ASSUMED_COST_INPUTS_CANNOT_PASS"
@@ -811,3 +814,166 @@ def test_rt3_7_a_pending_prospective_needs_a_started_attested_running_marker():
     assert evaluate(spec(), off + [pend()], key_provider=lambda: None).verdict == SV.PROMISING              # no key: cannot verify
     future = pend(metrics={"observation_started_ms": NOW_MS + DAY})
     assert evaluate(spec(), off + [future]).verdict == SV.PROMISING                                         # has not started yet
+
+
+# ---------------------------------------------------------------- round 4
+
+def _ladder(s_, extra=True):
+    items = [ev(x, spec_=s_) for x in OFFLINE]
+    if extra:
+        items += [ev("prospective_observation", spec_=s_), ev("execution_validation", spec_=s_)]
+    return items
+
+
+def test_rt4_1_a_spec_that_differs_from_the_registered_one_gets_no_verdict_from_that_registration():
+    s0 = spec(funding_model={"expected_bps_per_settlement": lab(0.3, "assumed")})
+    reg = _registry(s0)
+    s1 = copy.deepcopy(s0)
+    s1["funding_model"]["expected_bps_per_settlement"]["provenance"] = "measured"                  # the PoC: one provenance flipped after registration
+    for items in (_ladder(s1, extra=False), _ladder(s1)):
+        r = evaluate(s1, items, registry=reg)
+        assert r.verdict == SV.INSUFFICIENT_DATA and r.reasons[0].startswith("SPEC_DIFFERS_FROM_REGISTERED(funding_model)"), r.reasons
+    # evaluate_registered goes through the same door
+    r = SV.evaluate_registered(reg, s1, now_ms=NOW_MS, key_provider=KEYP)
+    assert r.verdict == SV.INSUFFICIENT_DATA
+    # positive control: the registered spec itself is not refused for drift (its all-assumed costs cap it at INSUFFICIENT_DATA for the cost reason instead)
+    r0 = evaluate(s0, [ev(x, spec_=s0) for x in OFFLINE], registry=reg)
+    assert not any("SPEC_DIFFERS" in x for x in r0.reasons)
+    # positive control 2: a spec registered AS s1 climbs normally
+    reg1 = _registry(s1)
+    assert evaluate(s1, _ladder(s1, extra=False), registry=reg1).verdict == SV.PROMISING
+    assert evaluate(s1, _ladder(s1), registry=reg1).verdict == SV.QUALIFIED
+    # counted() refuses a PASS (and a FAIL) of the drifted spec too
+    assert counted(ev("cost_model", spec_=s1), s1, reg)[1].startswith("SPEC_DIFFERS_FROM_REGISTERED")
+    assert counted(ev("cost_model", "FAIL", spec_=s1), s1, reg)[1].startswith("SPEC_DIFFERS_FROM_REGISTERED")
+
+
+def test_rt4_1_every_cost_chain_declaration_is_stored_and_a_drift_names_it():
+    reg = _registry()
+    e = reg["trials"][0]
+    assert e["spec_digest"] == SV.spec_digest(spec())
+    assert set(e["spec_declarations"]) >= {"fee_model", "slippage_model", "funding_model", "capacity_model", "execution_model", "holding_period", "eligibility_rules", "OOS_protocol"}
+    for k, v in (("capacity_model", {"min_viable_capacity_usd": 1.0}), ("holding_period", "1d"), ("execution_model", "maker"), ("eligibility_rules", ["anything"]),
+                 ("OOS_protocol", {"train_test_boundary": "2020-01-01", "data_window": "x"}), ("fee_model", {"maker_bps": lab(0.1), "taker_bps": lab(0.1)})):
+        s1 = spec(**{k: v})
+        r = evaluate(s1, _ladder(s1, extra=False), registry=reg)
+        assert r.verdict == SV.INSUFFICIENT_DATA and f"SPEC_DIFFERS_FROM_REGISTERED({k}" in r.reasons[0], (k, r.reasons)
+
+
+def test_rt4_1_a_registration_without_a_spec_digest_is_unbound_not_a_crash_and_stays_below_qualified():
+    import hypothesis_registry as hr
+    reg = _registry()
+    for t in reg["trials"]:
+        t.pop("spec_digest"); t.pop("spec_declarations")                                               # a registry written before digests were stored
+    hr.seal(reg)
+    r = evaluate(spec(), _ladder(spec()), registry=reg)
+    assert r.verdict == SV.PROMISING and any("REGISTERED_SPEC_DIGEST_MISSING" in x for x in r.reasons), (r.verdict, r.reasons)
+    assert counted(ev("prospective_observation"), spec(), reg)[1] == "REGISTERED_SPEC_DIGEST_MISSING"
+    assert evaluate(spec(), _ladder(spec(), extra=False), registry=reg).verdict == SV.PROMISING          # offline rungs still count: nothing crashes
+
+
+@pytest.mark.parametrize("key", ["aaaaaaaaaaaaaaaa", "a" * 40, "ab" * 20, "abcdefghijk" * 4, "short-but-varied-1234567890", "0123456789" * 4])
+def test_rt4_2_a_repetitive_or_short_key_attests_nothing(key):
+    assert SV._key_bytes(key) is None
+    with pytest.raises(SV.SpecError):
+        SV.owner_attest(H, "cand1", "d", key)
+    weak = ev("prospective_observation", attest=False)
+    item = dataclasses_replace(weak, attestation="0" * 64)
+    assert counted(item, spec(), REG, key_provider=lambda: key)[1].startswith("OWNER_ATTESTATION_UNVERIFIABLE")
+
+
+def dataclasses_replace(item, **kw):
+    import dataclasses
+    return dataclasses.replace(item, **kw)
+
+
+def test_rt4_2_a_key_of_enough_length_and_variety_is_accepted():
+    good = "k3Y-" + "Zq9xLm2Vb7Np4Rt8Wc5Hd1Fs6Jg0" + "Ae"
+    assert len(good) >= SV.MIN_ATTESTATION_KEY_CHARS and len(set(good)) >= SV.MIN_ATTESTATION_KEY_DISTINCT
+    assert SV._key_bytes(good) is not None and len(SV.owner_attest(H, "c", "d", good)) == 64
+    assert SV.MIN_ATTESTATION_KEY_CHARS >= 32 and SV.MIN_ATTESTATION_KEY_DISTINCT >= 12
+
+
+def test_rt4_4_evidence_for_another_candidate_or_spec_is_not_counted_and_cannot_kill():
+    other = ev("oos_test", "FAIL")
+    wrong_cand = SV.EvidenceItem(**dict(SV.evidence_to_dict(other), candidate_id="someone_else"))
+    wrong_spec = SV.EvidenceItem(**dict(SV.evidence_to_dict(other), spec_digest=H))
+    assert counted(other, spec(), REG) == (True, None)                                                  # positive control: a bound FAIL kills
+    assert counted(wrong_cand, spec(), REG)[1] == "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"
+    assert counted(wrong_spec, spec(), REG)[1] == "EVIDENCE_GATHERED_AGAINST_A_DIFFERENT_SPEC"
+    assert counted(wrong_cand, spec())[1] == "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"                        # also with no registry
+    base = [ev(x) for x in OFFLINE]
+    r = evaluate(spec(), [wrong_cand] + base)
+    assert r.verdict != SV.REJECTED and r.stages["oos_test"] != SV.FAIL
+    assert evaluate(spec(), [other] + base).verdict == SV.REJECTED
+
+
+def test_rt4_4_recorded_ms_is_part_of_what_the_owner_signs():
+    it = ev("prospective_observation")
+    assert counted(it, spec(), REG) == (True, None)
+    later = dataclasses_replace(it, recorded_ms=it.recorded_ms + DAY)                                   # moved after signing: the signature no longer verifies
+    assert counted(later, spec(), REG)[1].startswith("OWNER_ATTESTATION_UNVERIFIABLE")
+    assert SV.evidence_digest(it) != SV.evidence_digest(later)
+
+
+def test_rt4_4_registry_recorded_time_is_clamped_to_the_registry_append_time():
+    import hypothesis_registry as hr
+    from unittest import mock
+    reg = _registry()
+    it = ev("prospective_observation")
+    with mock.patch.object(hr, "_now", lambda: "2026-01-02T00:00:00Z"):
+        SV.record_evidence(reg, "cand1", it)
+    got = SV.evidence_from_registry(reg, "cand1")
+    assert got[0].recorded_ms == it.recorded_ms - 0 or got[0].recorded_ms <= SV._utc_ms("2026-01-02T00:00:00Z") + 999
+    assert got[0].recorded_ms == SV._utc_ms("2026-01-02T00:00:00Z") + 999                               # the claim (far in the future) is clamped to the append time
+    assert counted(got[0], spec(), reg)[0] is False                                                       # so it fails (end after the append time / signature)
+    # an honest claim (recorded no later than appended) round-trips unchanged and verifies
+    honest = ev("prospective_observation", recorded_ms=SV._utc_ms("2026-01-01T12:00:00Z"))
+    reg2 = _registry()
+    with mock.patch.object(hr, "_now", lambda: "2026-01-02T00:00:00Z"):
+        SV.record_evidence(reg2, "cand1", honest)
+    assert SV.evidence_from_registry(reg2, "cand1")[0].recorded_ms == honest.recorded_ms
+
+
+def _attest_run(tmp_path, monkeypatch, item, s_=None, registry=_AUTO):
+    s_ = s_ if s_ is not None else spec()
+    cand = tmp_path / "c.json"; cand.write_text(json.dumps(s_))
+    evf = tmp_path / "e.jsonl"; evf.write_text(json.dumps(SV.evidence_to_dict(item)) + "\n")
+    out = tmp_path / "o.jsonl"; out.unlink(missing_ok=True)
+    args = ["attest", "--candidate", str(cand), "--evidence", str(evf), "--out", str(out)]
+    if registry is _AUTO:
+        registry = REG
+    if registry is not None:
+        regf = tmp_path / "r.json"; regf.write_text(json.dumps(registry)); args += ["--registry", str(regf)]
+    monkeypatch.setattr(SV.time, "time", lambda: NOW_MS / 1000)
+    monkeypatch.setenv(SV.OWNER_ATTESTATION_KEY_ENV, KEY)
+    return SV.main(args), out
+
+
+def test_rt4_4_the_attest_cli_refuses_to_sign_evidence_that_would_be_refused_anyway(tmp_path, monkeypatch, capsys):
+    good = ev("prospective_observation", attest=False)
+    rc, out = _attest_run(tmp_path, monkeypatch, good)
+    assert rc == 0 and out.exists()                                                                       # positive control
+    capsys.readouterr()
+    # no registry
+    rc, out = _attest_run(tmp_path, monkeypatch, good, registry=None)
+    assert rc == 2 and not out.exists() and "NO_REGISTRY_GIVEN" in capsys.readouterr().err
+    # observation started before the registration
+    early = ev("prospective_observation", attest=False, metrics={"observation_started_ms": SV._utc_ms(REG_UTC) - 1000})
+    rc, out = _attest_run(tmp_path, monkeypatch, early)
+    assert rc == 2 and not out.exists() and "OBSERVATION_DID_NOT_START_AFTER_REGISTRATION" in capsys.readouterr().err
+    # too short a window
+    short = ev("prospective_observation", attest=False, metrics={"observation_ended_ms": FUTURE_MS + DAY}, recorded_ms=FUTURE_MS + DAY)
+    rc, out = _attest_run(tmp_path, monkeypatch, short)
+    assert rc == 2 and not out.exists() and "PROSPECTIVE_DURATION_SHORTER_THAN_REGISTERED_WINDOW" in capsys.readouterr().err
+    # a drifted spec (registered one differs)
+    drift = spec(capacity_model={"min_viable_capacity_usd": 1.0})
+    rc, out = _attest_run(tmp_path, monkeypatch, ev("prospective_observation", spec_=drift, attest=False), s_=drift)
+    assert rc == 2 and not out.exists() and "SPEC_DIFFERS_FROM_REGISTERED" in capsys.readouterr().err
+    # the running-observation marker (INCONCLUSIVE) is signable when bound, and not when it starts before registration
+    marker = ev("prospective_observation", "INCONCLUSIVE", attest=False, metrics={"complete": False})
+    rc, out = _attest_run(tmp_path, monkeypatch, marker)
+    assert rc == 0
+    bad_marker = ev("prospective_observation", "INCONCLUSIVE", attest=False, metrics={"complete": False, "observation_started_ms": 1})
+    rc, out = _attest_run(tmp_path, monkeypatch, bad_marker)
+    assert rc == 2

@@ -187,3 +187,11 @@ def test_zero_fee_unlabelled_cost_and_non_pit_data_are_refused():
     # the harness refuses the same zero at the cost layer
     with pytest.raises(RH.CostError):
         RH.net_edge_bps(10.0, {"fee_bps": {"value": 0.0, "provenance": "assumed"}, "slippage_bps": {"value": 1.0, "provenance": "assumed"}})
+
+
+def test_rt4_cross_venue_funding_history_is_not_claimed_as_in_the_repo():
+    s = load("cross_venue_funding")
+    row = next(d for d in s["required_data"] if d["name"].startswith("funding history for the same symbol on two venues"))
+    assert row["repo_has"] is False and "interval" in row["gap"] and "transfer" in row["gap"]       # its own gap names what is missing
+    assert s["bias_declarations"]["no_future_funding_knowledge"] is False                           # declaration consistent with the missing data
+    assert "no_future_funding_knowledge" in missing_declarations(s)
