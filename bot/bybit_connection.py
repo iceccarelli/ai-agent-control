@@ -697,9 +697,73 @@ class BybitClient:
             bound = getattr(self.entry_authority, "perp_symbol", None)
             if ok and bound is not None and sym != bound:
                 ok = False
+            if ok and self.entry_authority is not None:
+                # With an authority the request is also bounded by the leverage this client is CONFIGURED for (cfg.DEFAULT_LEVERAGE) and by the owner-approved policy's
+                # max_leverage when one is readable: SET_LEVERAGE_MAX=10 alone let a DEFAULT_LEVERAGE=3 client send "10" (reproduced).
+                limit = min(SET_LEVERAGE_MAX, int(self.leverage))
+                get_max = getattr(self.entry_authority, "max_leverage", None)
+                pol_max = get_max() if callable(get_max) else None
+                if isinstance(pol_max, int) and not isinstance(pol_max, bool):
+                    limit = min(limit, pol_max)
+                if int(lev_b) > limit:
+                    ok = False
         if not ok:
             logger.critical("set-leverage REFUSED at the transport: not the bounded, bound-symbol request this client sends")
             raise OrderNotSent("LEVERAGE_REFUSED: set-leverage outside the allow-list policy")
+
+    _PLAIN_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
+    _ID = re.compile(r"[A-Za-z0-9_-]{1,36}")
+    _SYMBOL = re.compile(r"[A-Z0-9]{3,20}")
+    _CANCEL_ALL_FILTERS = ("Order", "StopOrder", "tpslOrder")
+
+    def _bound_instruments(self) -> Optional[Dict[str, str]]:
+        """{category: symbol} the entry authority is bound to, or None when this client has no bound authority (a bare client: shape-checked only)."""
+        a = self.entry_authority
+        perp, spot = getattr(a, "perp_symbol", None), getattr(a, "spot_symbol", None)
+        if a is None or not (isinstance(perp, str) and isinstance(spot, str)):
+            return None
+        return {"linear": perp, "spot": spot}
+
+    def _check_trading_stop(self, body: Any) -> None:
+        """The protective-stop body, validated like set-leverage: exactly the fields ``_place_position_stop``/``clear_position_stop`` build (required: category linear, symbol,
+        stopLoss as a plain non-negative decimal, tpslMode Full, positionIdx 0; optional slTriggerBy/slOrderType Market); symbol == the authority's perp symbol when it has one."""
+        required = {"category", "symbol", "stopLoss", "tpslMode", "positionIdx"}
+        ok = type(body) is dict and required <= set(body) <= required | {"slTriggerBy", "slOrderType"}
+        if ok:
+            sym, sl = body["symbol"], body["stopLoss"]
+            ok = (body["category"] == "linear" and type(sym) is str and self._SYMBOL.fullmatch(sym) is not None
+                  and type(sl) is str and self._PLAIN_DECIMAL.fullmatch(sl) is not None
+                  and body["tpslMode"] == "Full" and type(body["positionIdx"]) is int and body["positionIdx"] == 0
+                  and body.get("slTriggerBy", "LastPrice") in ("LastPrice", "MarkPrice", "IndexPrice") and body.get("slOrderType", "Market") == "Market")
+            bound = getattr(self.entry_authority, "perp_symbol", None)
+            if ok and bound is not None and sym != bound:
+                ok = False
+        if not ok:
+            logger.critical("trading-stop REFUSED at the transport: not the bound-symbol protective-stop request this client sends")
+            raise OrderNotSent("TRADING_STOP_REFUSED: trading-stop outside the allow-list policy")
+
+    def _check_cancel(self, endpoint: str, body: Any) -> None:
+        """cancel: exactly category + symbol + orderId/orderLinkId (each matching the id regex, at least one); cancel-all: category + symbol (REQUIRED: a missing symbol
+        cancels the whole category) + for spot only an orderFilter from the three the client iterates. With an authority the (category, symbol) must be one of its bound
+        instruments."""
+        ok = type(body) is dict
+        if ok:
+            cat, sym = body.get("category"), body.get("symbol")
+            ok = cat in ("linear", "spot") and type(cat) is str and type(sym) is str and self._SYMBOL.fullmatch(sym) is not None
+            bound = self._bound_instruments()
+            if ok and bound is not None and bound.get(cat) != sym:
+                ok = False
+            if ok and endpoint == "/v5/order/cancel":
+                ids = [k for k in ("orderId", "orderLinkId") if k in body]
+                ok = (set(body) <= {"category", "symbol", "orderId", "orderLinkId"} and bool(ids)
+                      and all(type(body[k]) is str and self._ID.fullmatch(body[k]) is not None for k in ids))
+            elif ok:
+                ok = set(body) <= {"category", "symbol", "orderFilter"}
+                if ok and "orderFilter" in body:
+                    ok = cat == "spot" and body["orderFilter"] in self._CANCEL_ALL_FILTERS and type(body["orderFilter"]) is str
+        if not ok:
+            logger.critical("%s REFUSED at the transport: not a bound-symbol request this client sends", endpoint)
+            raise OrderNotSent(f"CANCEL_REFUSED: {endpoint} outside the allow-list policy")
 
     def _authorize_new_exposure(self, body: Any) -> None:
         """Every order that is not provably an exit passes the entry authority; a client without one refuses (``NO_ENTRY_AUTHORITY``). A reduce-only exit does not pass
@@ -717,6 +781,13 @@ class BybitClient:
             if keeps is not None and keeps(snapshot) is not True:
                 exposure = True
         if not exposure:
+            # An exit is judged against the carry's OWN legs when the authority can say (reduce-only is the venue's guarantee about a position, not proof it is ours).
+            bound_exit = getattr(authority, "exit_refusal", None)
+            if bound_exit is not None:
+                why = bound_exit(snapshot)
+                if why is not None:
+                    logger.critical("exit REFUSED at the transport: %s", why)
+                    raise OrderNotSent(f"ENTRY_REFUSED: {why}")
             return
         if authority is None:
             logger.critical("order REFUSED at the transport: this client has no entry authority (%s)", self.venue)
@@ -810,6 +881,10 @@ class BybitClient:
         # under-counts those is the one that would lie.
         if endpoint == "/v5/position/set-leverage":
             self._check_set_leverage(json.loads(body_str) if (type(body) is dict and body_str) else body)
+        if endpoint == "/v5/position/trading-stop":
+            self._check_trading_stop(json.loads(body_str) if (type(body) is dict and body_str) else body)
+        if endpoint in ("/v5/order/cancel", "/v5/order/cancel-all"):
+            self._check_cancel(endpoint, json.loads(body_str) if (type(body) is dict and body_str) else body)
         if endpoint == "/v5/order/create":
             # the LAST responsible boundary: refuses BEFORE the count and before the transport. It judges the decoded wire string, not the caller's object.
             self._authorize_new_exposure(json.loads(body_str) if (type(body) is dict and body_str) else body)

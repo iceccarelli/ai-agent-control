@@ -78,23 +78,68 @@ class OrderIntent:
     price: Optional[str] = None
     order_type: str = ""
     time_in_force: Optional[str] = None
+    #: Every key of the wire body except ``orderLinkId`` (its own ledger key). The reservation identifies an order by ALL of it: a resend that differs in any field is a conflict.
+    body: Optional[Mapping[str, Any]] = None
+
+
+#: The CLOSED allow-list of ``/v5/order/create`` body keys this bot sends (``place_order``/``_category_order_fields``/``CarryBroker``). Anything else is refused as
+#: ``UNKNOWN_BODY_FIELD``: a venue silently honours fields nothing here reasons about (``isLeverage`` margin borrow, ``triggerPrice``/``orderFilter`` conditional orders,
+#: ``takeProfit``/``stopLoss``, ``closeOnTrigger``, ``tpslMode``, ``positionIdx`` hedge slots, ``marketUnit`` quote sizing, ...). A new key needs a reviewed change here.
+ORDER_BODY_KEYS = frozenset({"category", "symbol", "side", "orderType", "qty", "price", "timeInForce", "orderLinkId", "reduceOnly", "positionIdx", "isLeverage", "marketUnit"})
+#: A spot SELL exit may additionally be the spot protective stop (``place_stop_order``: a conditional ``StopOrder``).
+SPOT_STOP_KEYS = frozenset({"orderFilter", "triggerPrice", "triggerDirection"})
+TIME_IN_FORCE = ("GTC", "IOC", "FOK", "PostOnly")
+_PLAIN_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
 
 
 def _truthy(v: Any) -> bool:
-    """Only the boolean True or the exact string "true" is reduce-only. 1, "TRUE ", "yes" are NOT: how the venue reads a non-boolean is unverified, so it is treated as an entry."""
-    return v is True or v == "true"
+    """ONLY the boolean ``True`` is reduce-only. The string "true", 1, "TRUE ", "yes" are NOT: how the venue reads a non-boolean is unverified, so any other spelling is an
+    opening order (and ``intent_from_body`` refuses it as malformed). Compared by identity: a str/bool subclass with a lying ``__eq__`` cannot pass."""
+    return v is True
+
+
+def _plain_int(v: Any, *allowed: int) -> bool:
+    return type(v) is int and v in allowed
+
+
+def body_value_refusals(body: Mapping[str, Any], *, extra_keys: frozenset = frozenset()) -> List[str]:
+    """Refusal codes for the keys/values of an order body outside the closed allow-list. ``reduceOnly`` must be a real boolean; ``positionIdx`` 0 only (one-way mode; 1/2 are
+    hedge-mode slots); ``isLeverage`` absent or exactly 0 (a spot Buy with ``isLeverage`` 1 is a margin BORROW); ``marketUnit`` ``baseCoin`` only; ``timeInForce`` known."""
+    out: List[str] = []
+    for k in body:
+        if k not in ORDER_BODY_KEYS and k not in extra_keys:
+            out.append(f"UNKNOWN_BODY_FIELD:{str(k)[:30]}")
+    if "reduceOnly" in body and type(body["reduceOnly"]) is not bool:
+        out.append("REDUCE_ONLY_NOT_BOOLEAN")
+    if "positionIdx" in body and not (_plain_int(body["positionIdx"], 0) or body["positionIdx"] == "0" and type(body["positionIdx"]) is str):
+        out.append("POSITION_IDX_NOT_ONE_WAY")
+    if "isLeverage" in body and not (_plain_int(body["isLeverage"], 0) or body["isLeverage"] == "0" and type(body["isLeverage"]) is str):
+        out.append("IS_LEVERAGE_NOT_ALLOWED")
+    if "marketUnit" in body and not (type(body["marketUnit"]) is str and body["marketUnit"] == "baseCoin"):
+        out.append("MARKET_UNIT_NOT_BASE_COIN")
+    if "timeInForce" in body and not (type(body["timeInForce"]) is str and body["timeInForce"] in TIME_IN_FORCE):
+        out.append("TIME_IN_FORCE_UNKNOWN")
+    if "orderFilter" in extra_keys and "orderFilter" in body and body["orderFilter"] != "StopOrder":
+        out.append("ORDER_FILTER_UNKNOWN")
+    if "triggerPrice" in body and not (type(body["triggerPrice"]) is str and _PLAIN_DECIMAL.fullmatch(body["triggerPrice"])):
+        out.append("TRIGGER_PRICE_NOT_PLAIN_DECIMAL")
+    if "triggerDirection" in body and not (_plain_int(body["triggerDirection"], 1, 2)):
+        out.append("TRIGGER_DIRECTION_UNKNOWN")
+    return out
 
 
 def increases_exposure(body: Mapping[str, Any]) -> bool:
-    """True unless the order is PROVABLY an exit. Unknowns are exposure."""
+    """True unless the order is PROVABLY an exit. Unknowns are exposure. Spellings are EXACT: reduce-only is the boolean True on an exactly-lowercase ``linear``/``inverse``
+    category; a spot exit is exactly ``spot`` + ``Sell``. ``LINEAR``, ``"true"``, ``1``, ``SELL`` are not exits (they are refused as instruments/malformed downstream)."""
     try:
-        category = str(body.get("category", "")).lower()
-        side = str(body.get("side", "")).strip().lower()
+        category = body.get("category")
+        side = body.get("side")
+        reduce_only = body.get("reduceOnly")
     except Exception:                                              # noqa: BLE001
         return True
-    if _truthy(body.get("reduceOnly")) and category in ("linear", "inverse"):
+    if _truthy(reduce_only) and type(category) is str and category in ("linear", "inverse"):
         return False
-    if category == "spot" and side == "sell":
+    if type(category) is str and category == "spot" and type(side) is str and side == "Sell":
         lev = body.get("isLeverage")
         if lev not in (None, "", 0, "0", False):
             return True                                            # a spot sell with margin leverage can open a short: not an exit
@@ -104,7 +149,7 @@ def increases_exposure(body: Mapping[str, Any]) -> bool:
 
 def is_spot_sell(body: Mapping[str, Any]) -> bool:
     try:
-        return str(body.get("category", "")).lower() == "spot" and str(body.get("side", "")).strip().lower() == "sell"
+        return type(body.get("category")) is str and body["category"] == "spot" and type(body.get("side")) is str and body["side"] == "Sell"
     except Exception:                                              # noqa: BLE001
         return False
 
@@ -129,9 +174,13 @@ def intent_from_body(body: Mapping[str, Any]) -> OrderIntent:
     if order_type == "Market" and price is not None:
         raise EntryRefused(["MARKET_ORDER_WITH_PRICE"])                 # a Market order has no limit price; one stated here was being used to size the notional
     tif = body.get("timeInForce")
+    bad = body_value_refusals(body)
+    if bad:
+        raise EntryRefused(bad)
     return OrderIntent(category=body["category"], symbol=body["symbol"], side=body["side"], qty=str(body["qty"]),
                        reduce_only=_truthy(body.get("reduceOnly")), order_link_id=raw_link, price=price, order_type=order_type,
-                       time_in_force=None if tif in (None, "") else str(tif))
+                       time_in_force=None if tif in (None, "") else str(tif),
+                       body={k: v for k, v in body.items() if k != "orderLinkId"})
 
 
 # ---------------------------------------------------------------- checks: (intent, venue) -> refusal code or None
@@ -238,13 +287,13 @@ def risk_policy_check(provider: Callable[..., Tuple[Optional[RP.Policy], RP.Stat
 
 # ---------------------------------------------------------------- the durable reservation
 
-_CANON_FIELDS = ("category", "symbol", "side", "qty", "orderType", "price", "reduceOnly", "timeInForce")
+_CANON_FIELDS = ("category", "symbol", "side", "qty", "orderType", "price", "reduceOnly", "timeInForce", "body")
 
 
 def _canonical_intent(i: OrderIntent) -> Dict[str, Any]:
-    """The FULL body the order is identified by. A resend is 'identical' only if every one of these is equal."""
+    """The FULL body the order is identified by (every wire key but the link id, in ``body``). A resend is 'identical' only if every one of these is equal."""
     return {"category": i.category, "symbol": i.symbol, "side": i.side, "qty": i.qty, "orderType": i.order_type, "price": i.price, "reduceOnly": bool(i.reduce_only),
-            "timeInForce": i.time_in_force}
+            "timeInForce": i.time_in_force, "body": dict(i.body) if i.body is not None else {}}
 
 
 def _canonical(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -323,7 +372,8 @@ class EntryAuthority:
     """Runs its checks in order (the reservation LAST, so a refused order reserves nothing) and raises ``EntryRefused`` with every reason found."""
 
     def __init__(self, checks: Sequence[Check], *, name: str = "entry_authority", perp_symbol: Optional[str] = None, spot_symbol: Optional[str] = None,
-                 hedge_reader: Optional[Callable[[], Tuple[float, float]]] = None) -> None:
+                 hedge_reader: Optional[Callable[[], Tuple[float, float]]] = None,
+                 policy_loader: Optional[Callable[[], Optional[RP.Policy]]] = None) -> None:
         if not checks:
             raise ValueError("an authority with no checks would approve everything; refusing to build one")
         self.checks = tuple(checks)
@@ -332,6 +382,8 @@ class EntryAuthority:
         self.spot_symbol = spot_symbol
         #: () -> (perp short size, spot inventory), both from the VENUE's own reads (unsigned, base units). None = a spot sell can never be shown to keep the hedge.
         self.hedge_reader = hedge_reader
+        #: () -> the owner-approved policy or None; bounds set-leverage by its ``max_leverage``.
+        self.policy_loader = policy_loader
         self.refusals: List[Tuple[str, Tuple[str, ...]]] = []
 
     def spot_sell_keeps_hedge(self, body: Mapping[str, Any]) -> bool:
@@ -351,6 +403,44 @@ class EntryAuthority:
             return (spot - float(qty)) >= perp * (1.0 - HEDGE_SLACK)
         except Exception:                                          # noqa: BLE001
             return False
+
+    def exit_refusal(self, body: Mapping[str, Any]) -> Optional[str]:
+        """None if this order, which ``increases_exposure`` called an exit, is an exit of the CARRY'S OWN legs; else a refusal code. A reduce-only order must be a perp BUY
+        (the carry only ever holds a short) on exactly the bound perp symbol, linear, Market/Limit, with a positive finite qty and nothing outside the closed key list; a spot
+        SELL must be on the bound spot symbol (its hedge arithmetic is ``spot_sell_keeps_hedge``). Anything else, including a reduce-only order for another symbol/category
+        (reproduced: 'DOGEUSDT Buy qty 100000 reduceOnly'), is refused: reduce-only is the VENUE's guarantee about a position, not proof that the position is ours."""
+        try:
+            if is_spot_sell(body):
+                if self.spot_symbol is None or body.get("symbol") != self.spot_symbol:
+                    return "EXIT_NOT_BOUND:spot_symbol"
+                bad = body_value_refusals(body, extra_keys=SPOT_STOP_KEYS)
+                return bad[0] if bad else None
+            if _truthy(body.get("reduceOnly")):
+                if body.get("category") != "linear" or self.perp_symbol is None or body.get("symbol") != self.perp_symbol:
+                    return "EXIT_NOT_BOUND:perp_symbol"
+                if body.get("side") != "Buy":
+                    return "EXIT_NOT_BOUND:side"
+                if body.get("orderType") not in ORDER_TYPES:
+                    return "EXIT_NOT_BOUND:orderType"
+                q = body.get("qty")
+                if not (type(q) is str and _PLAIN_DECIMAL.fullmatch(q) and Decimal(q) > 0):
+                    return "EXIT_NOT_BOUND:qty"
+                bad = body_value_refusals(body)
+                return bad[0] if bad else None
+            return "EXIT_NOT_BOUND:not_an_exit"
+        except Exception:                                          # noqa: BLE001
+            return "EXIT_NOT_BOUND:unreadable"
+
+    def max_leverage(self) -> Optional[int]:
+        """The most leverage the owner-approved policy allows (floor of ``max_leverage``), or None when there is no readable approved policy to say."""
+        try:
+            pol = self.policy_loader() if self.policy_loader is not None else None
+            lim = getattr(pol, "max_leverage", None)
+            if pol is not None and isinstance(lim, (int, float)) and not isinstance(lim, bool) and math.isfinite(lim) and lim >= 1:
+                return int(math.floor(lim))
+        except Exception:                                          # noqa: BLE001
+            return None
+        return None
 
     def authorize(self, body: Mapping[str, Any], *, venue: str) -> OrderIntent:
         intent = intent_from_body(body)
@@ -425,4 +515,5 @@ def build_for_book(*, venue: str, store: Any, state_dir: Optional[str], max_noti
         checks.append(risk_policy_check(provider, latch, strategy, pending_notional=pend))
     checks.append(notional_cap_check(max_notional_usd, mark_provider))
     checks.append(reservation_check(ReservationStore(os.path.join(state_dir, "entry_reservations.jsonl"))))
-    return EntryAuthority(checks, name=f"book:{venue}", perp_symbol=perp_symbol, spot_symbol=spot_symbol, hedge_reader=hedge_reader)
+    return EntryAuthority(checks, name=f"book:{venue}", perp_symbol=perp_symbol, spot_symbol=spot_symbol, hedge_reader=hedge_reader,
+                          policy_loader=lambda: load_policy(policy_path))

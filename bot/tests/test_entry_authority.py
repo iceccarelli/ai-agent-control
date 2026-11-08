@@ -92,7 +92,7 @@ GOOD = RP.State(trade_loss_usd=0.0, loss_today_usd=0.0, strategy_drawdown_usd=0.
 # ---------------------------------------------------------------- what counts as exposure
 
 @pytest.mark.parametrize("body,expected", [
-    (order(), True), (order(side="Buy"), True), (order(side="Buy", reduceOnly=True), False), (order(side="Buy", reduceOnly="true"), False),
+    (order(), True), (order(side="Buy"), True), (order(side="Buy", reduceOnly=True), False), (order(side="Buy", reduceOnly="true"), True),
     (order(category="spot", side="Buy"), True), (order(category="spot", side="Sell"), False), (order(category="spot", side="Sell", reduceOnly=True), False),
     (order(category="option"), True), (order(category="weird"), True), (order(category=""), True), (order(side="???"), True), (order(reduceOnly="no"), True),
     (order(category="spot", side="Buy", reduceOnly=True), True)])          # spot has no reduce-only: a flagged spot BUY is still an entry
@@ -420,7 +420,7 @@ def test_a_margin_spot_sell_is_exposure_not_an_exit(extra):
 @pytest.mark.parametrize("flag", [1, "TRUE ", "True", "yes", "1", 1.0])
 def test_only_the_exact_reduce_only_forms_make_an_order_an_exit(flag):
     assert EA.increases_exposure(order(side="Buy", reduceOnly=flag)) is True
-    assert EA.increases_exposure(order(side="Buy", reduceOnly=True)) is False and EA.increases_exposure(order(side="Buy", reduceOnly="true")) is False
+    assert EA.increases_exposure(order(side="Buy", reduceOnly=True)) is False and EA.increases_exposure(order(side="Buy", reduceOnly="true")) is True
 
 
 def test_a_dict_subclass_that_lies_is_refused_and_an_authority_that_errors_does_not_approve(store, tmp_path):
@@ -549,7 +549,7 @@ def test_positive_control_honest_market_and_limit_orders_pass(tmp_path):
     (order(symbol="BTCUSDT "), "UNKNOWN_INSTRUMENT:linear:BTCUSDT "),
     (order(side="Buy"), "WRONG_DIRECTION:linear:BTCUSDT:Buy"),                 # a perp LONG (the carry is short)
     (order(side="sell"), "WRONG_DIRECTION:linear:BTCUSDT:sell"),
-    (order(category="spot", side="Sell", isLeverage=1), "WRONG_DIRECTION:spot:BTCUSDT:Sell"),   # a leveraged spot sell: not an exit, not an entry direction
+    (order(category="spot", side="Sell", isLeverage=1), "IS_LEVERAGE_NOT_ALLOWED"),   # a leveraged spot sell: not an exit, refused as a margin order
 ])
 def test_only_the_carry_legs_in_their_direction_are_authorised(tmp_path, body, code):
     a = _bare_auth(tmp_path, mark=lambda s: 50_000.0 if s == "BTCUSDT" else None)
@@ -619,7 +619,7 @@ def test_spot_sell_positive_controls_flat_perp_proportional_close(store, tmp_pat
 
 def test_spot_sell_in_a_quote_unit_cannot_be_shown_to_keep_the_hedge(store, tmp_path):
     c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, hedge=lambda: (0.0, 1.0)))
-    with pytest.raises(bc.PermanentAPIError, match="WRONG_DIRECTION"):
+    with pytest.raises(bc.PermanentAPIError, match="MARKET_UNIT_NOT_BASE_COIN"):               # not an exit (hedge cannot be shown), and not a base-coin order either
         c._request("POST", "/v5/order/create", body=_spot_sell(orderLinkId="Q1", marketUnit="quoteCoin"), signed=True)
 
 
@@ -787,7 +787,7 @@ def test_a_str_subclass_cannot_show_the_authority_different_data_than_the_wire(s
 
 def test_an_eq_true_reduce_only_cannot_pass_as_an_exit(store, tmp_path):
     c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s: 50_000.0))
-    with pytest.raises(bc.PermanentAPIError, match="NOTIONAL_ABOVE_CAP"):
+    with pytest.raises(bc.PermanentAPIError, match="REDUCE_ONLY_NOT_BOOLEAN"):
         c._request("POST", "/v5/order/create", body=order(qty="1000", reduceOnly=_EqTrue("false"), orderLinkId="T2"), signed=True)
     assert sent_orders(v) == []
 
@@ -822,3 +822,280 @@ def test_the_canonical_regex_refuses_independently_of_the_allow_list(store, monk
     with pytest.raises(bc.OrderNotSent, match="ENDPOINT_REFUSED"):
         c._request("POST", endpoint, body={"qty": "1"}, signed=True)
     assert v.requests == []
+
+
+# ================================================================ round 3 (red team): reduce-only binding, leverage/stop/cancel bodies, closed body, mark sanity
+
+def _bound(tmp_path, **kw):
+    """An authority bound to BTCUSDT perp+spot with no risk policy (the binding checks are what is tested)."""
+    kw.setdefault("mark", lambda s: 100_000.0)
+    kw.setdefault("max_usd", 1_000_000.0)
+    return build(tmp_path, require_policy=False, **kw)
+
+
+def _send(c, endpoint, body):
+    """Send; a VENUE error from the fake (not a local refusal) means the request was sent, which is all the positive controls need."""
+    try:
+        return c._request("POST", endpoint, body=body, signed=True)
+    except bc.OrderNotSent:
+        raise
+    except bc.PermanentAPIError as exc:
+        if str(exc).startswith(("ENTRY_REFUSED", "ENDPOINT_REFUSED", "LIVE_NOT")):
+            raise
+        return None
+
+
+# ---- 1. reduceOnly: only boolean True, exact lowercase category, and only the carry's own perp ------------------------------------------------------------------
+
+@pytest.mark.parametrize("body", [order(side="Buy", reduceOnly="true"), order(side="Buy", reduceOnly=1), order(side="Buy", reduceOnly="TRUE"), order(side="Buy", reduceOnly="True"),
+                                  order(side="Buy", reduceOnly=1.0), order(side="Buy", reduceOnly=["x"]),
+                                  order(category="LINEAR", side="Buy", reduceOnly=True), order(category="Linear", side="Buy", reduceOnly=True),
+                                  order(category="INVERSE", side="Buy", reduceOnly=True), order(category=" linear", side="Buy", reduceOnly=True),
+                                  order(category="spot", side="SELL"), order(category="SPOT", side="Sell"), order(category="spot", side="sell"), order(category="spot", side=" Sell")])
+def test_only_exact_spellings_count_as_an_exit(body):
+    assert EA.increases_exposure(body) is True
+
+
+def test_exact_reduce_only_still_counts_as_an_exit_positive_control():
+    assert EA.increases_exposure(order(side="Buy", reduceOnly=True)) is False
+    assert EA.increases_exposure(order(category="spot", side="Sell")) is False
+
+
+@pytest.mark.parametrize("body", [
+    order(symbol="DOGEUSDT", side="Buy", reduceOnly=True, qty="100000", orderType="Limit", price="1", orderLinkId="E1"),
+    order(symbol="ETHUSDT", side="Buy", reduceOnly=True, orderLinkId="E2"),
+    order(category="inverse", side="Buy", reduceOnly=True, orderLinkId="E3"),
+    order(category="option", side="Buy", reduceOnly=True, orderLinkId="E4"),
+    order(side="Sell", reduceOnly=True, orderLinkId="E5"),                      # the carry only ever holds a short: its exit is a perp BUY
+    order(side="Buy", reduceOnly=True, orderLinkId="E6", leverage="100"),       # unknown key
+])
+def test_a_reduce_only_order_for_anything_but_the_carrys_own_perp_is_refused(store, tmp_path, body):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.PermanentAPIError, match="ENTRY_REFUSED"):
+        _send(c, "/v5/order/create", body)
+    assert sent_orders(v) == []
+
+
+def test_the_carrys_own_reduce_only_exit_still_reaches_the_transport_positive_control(store, tmp_path):
+    c, v = client(store, _bound(tmp_path))
+    _send(c, "/v5/order/create", order(side="Buy", reduceOnly=True, orderLinkId="E7", positionIdx=0))
+    assert len(sent_orders(v)) == 1
+
+
+@pytest.mark.parametrize("flag", ["true", "TRUE", 1, "1", "yes"])
+def test_a_non_boolean_reduce_only_is_never_an_exit_and_is_refused_as_malformed(store, tmp_path, flag):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.PermanentAPIError, match="ENTRY_REFUSED"):
+        _send(c, "/v5/order/create", order(side="Buy", reduceOnly=flag, symbol="DOGEUSDT", orderLinkId="E8"))
+    with pytest.raises(bc.PermanentAPIError, match="ENTRY_REFUSED"):
+        _send(c, "/v5/order/create", order(side="Sell", reduceOnly=flag, orderLinkId="E9"))
+    assert sent_orders(v) == []
+
+
+def test_category_spelled_upper_case_is_not_the_carrys_instrument(store, tmp_path):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.PermanentAPIError, match="UNKNOWN_INSTRUMENT"):
+        _send(c, "/v5/order/create", order(category="LINEAR", orderLinkId="E10"))
+    assert sent_orders(v) == []
+
+
+# ---- 2. set-leverage is bounded by the configured leverage and the approved policy ---------------------------------------------------------------------------------
+
+class _Cfg3(Cfg):
+    DEFAULT_LEVERAGE = 3
+
+
+def _lev(level):
+    return {"category": "linear", "symbol": "BTCUSDT", "buyLeverage": level, "sellLeverage": level}
+
+
+def _client3(store, authority):
+    v = Recorder()
+    c = bc.BybitClient(config=_Cfg3(), store=store, transport=v)
+    c.entry_authority = authority
+    return c, v
+
+
+def test_set_leverage_above_the_configured_leverage_is_refused_with_an_authority(store, tmp_path):
+    c, v = _client3(store, _bound(tmp_path))
+    assert c.leverage == 3
+    with pytest.raises(bc.OrderNotSent, match="LEVERAGE_REFUSED"):
+        _send(c, "/v5/position/set-leverage", _lev("10"))
+    with pytest.raises(bc.OrderNotSent, match="LEVERAGE_REFUSED"):
+        _send(c, "/v5/position/set-leverage", _lev("4"))
+    assert v.requests == []
+    _send(c, "/v5/position/set-leverage", _lev("3"))                              # positive control: the configured leverage
+    _send(c, "/v5/position/set-leverage", _lev("2"))
+    assert len([r for r in v.requests if r["url"].endswith("set-leverage")]) == 2
+
+
+def test_set_leverage_above_the_approved_policys_max_leverage_is_refused(store, tmp_path):
+    pol = dataclasses.replace(POLICY, max_leverage=2.0)
+    a = build(tmp_path, policy=pol, state=GOOD)
+    c, v = _client3(store, a)
+    with pytest.raises(bc.OrderNotSent, match="LEVERAGE_REFUSED"):
+        _send(c, "/v5/position/set-leverage", _lev("3"))
+    assert v.requests == []
+    _send(c, "/v5/position/set-leverage", _lev("2"))
+    assert len(v.requests) == 1
+
+
+def test_set_leverage_with_an_authority_but_no_readable_policy_is_bounded_by_the_config_only(store, tmp_path):
+    c, v = _client3(store, _bound(tmp_path))
+    _send(c, "/v5/position/set-leverage", _lev("3"))
+    assert len(v.requests) == 1
+
+
+# ---- 3. trading-stop and cancel bodies ----------------------------------------------------------------------------------------------------------------------------
+
+def _stop(**kw):
+    b = {"category": "linear", "symbol": "BTCUSDT", "stopLoss": "50000.5", "tpslMode": "Full", "slTriggerBy": "LastPrice", "slOrderType": "Market", "positionIdx": 0}
+    b.update(kw)
+    return b
+
+
+def test_trading_stop_positive_controls_the_bodies_the_client_builds(store, tmp_path):
+    c, v = client(store, _bound(tmp_path))
+    _send(c, "/v5/position/trading-stop", _stop())
+    _send(c, "/v5/position/trading-stop", {"category": "linear", "symbol": "BTCUSDT", "stopLoss": "0", "tpslMode": "Full", "positionIdx": 0})
+    assert len(v.requests) == 2
+    cb, vb = _bare_client(store)
+    _send(cb, "/v5/position/trading-stop", {"category": "linear", "symbol": "BTCUSDT", "stopLoss": "1", "tpslMode": "Full", "positionIdx": 0})
+    assert len(vb.requests) == 1
+
+
+@pytest.mark.parametrize("body", [
+    _stop(symbol="DOGEUSDT"), _stop(category="spot"), _stop(category="inverse"), _stop(category="LINEAR"), _stop(positionIdx=1), _stop(positionIdx=2), _stop(positionIdx="1"),
+    _stop(stopLoss="1e5"), _stop(stopLoss="-5"), _stop(stopLoss=" 5"), _stop(stopLoss=5), _stop(stopLoss=""), _stop(stopLoss="NaN"), _stop(stopLoss="5.5.5"),
+    _stop(takeProfit="1"), _stop(tpLimitPrice="1"), _stop(slSize="1"), _stop(extra="x"), _stop(tpslMode="Partial"), _stop(slOrderType="Limit"), _stop(slTriggerBy="Bogus"),
+    _stop(trailingStop="100"), _stop(activePrice="1"),
+    {k: x for k, x in _stop().items() if k != "stopLoss"}, {k: x for k, x in _stop().items() if k != "symbol"}, {k: x for k, x in _stop().items() if k != "positionIdx"},
+    [], None,
+])
+def test_trading_stop_outside_the_allow_list_is_refused(store, tmp_path, body):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.OrderNotSent, match="TRADING_STOP_REFUSED"):
+        _send(c, "/v5/position/trading-stop", body)
+    assert v.requests == []
+
+
+def test_trading_stop_shape_is_refused_on_a_bare_client_too(store):
+    c, v = _bare_client(store)
+    with pytest.raises(bc.OrderNotSent, match="TRADING_STOP_REFUSED"):
+        _send(c, "/v5/position/trading-stop", _stop(takeProfit="1"))
+    with pytest.raises(bc.OrderNotSent, match="TRADING_STOP_REFUSED"):
+        _send(c, "/v5/position/trading-stop", _stop(positionIdx=1))
+    assert v.requests == []
+
+
+@pytest.mark.parametrize("body", [
+    {"category": "linear", "symbol": "DOGEUSDT", "orderLinkId": "C1"},
+    {"category": "linear", "symbol": "BTCUSDT"},                                  # no id at all
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": ""},
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": " C1"},
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "C1\n"},
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "C" * 37},
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": 5},
+    {"category": "linear", "symbol": "BTCUSDT", "orderId": "a b"},
+    {"category": "option", "symbol": "BTCUSDT", "orderLinkId": "C1"},
+    {"category": "LINEAR", "symbol": "BTCUSDT", "orderLinkId": "C1"},
+    {"category": "linear", "orderLinkId": "C1"},                                  # no symbol
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "C1", "orderFilter": "StopOrder"},
+    {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "C1", "x": "y"},
+    {"category": "spot", "symbol": "ETHUSDT", "orderLinkId": "C1"},
+])
+def test_cancel_outside_the_allow_list_is_refused(store, tmp_path, body):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.OrderNotSent, match="CANCEL_REFUSED"):
+        _send(c, "/v5/order/cancel", body)
+    assert v.requests == []
+
+
+@pytest.mark.parametrize("body", [{"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "C1"}, {"category": "spot", "symbol": "BTCUSDT", "orderLinkId": "C-1_x"},
+                                  {"category": "linear", "symbol": "BTCUSDT", "orderId": "1234-abcd-5678"}, {"category": "linear", "symbol": "BTCUSDT", "orderId": "9", "orderLinkId": "C1"}])
+def test_cancel_positive_controls(store, tmp_path, body):
+    c, v = client(store, _bound(tmp_path))
+    _send(c, "/v5/order/cancel", body)
+    assert len(v.requests) == 1
+
+
+@pytest.mark.parametrize("body", [
+    {"category": "linear"},                                                       # the whole category
+    {"category": "spot"},
+    {"category": "linear", "symbol": ""},
+    {"category": "linear", "symbol": "DOGEUSDT"},
+    {"category": "spot", "symbol": "DOGEUSDT", "orderFilter": "Order"},
+    {"category": "option", "symbol": "BTCUSDT"},
+    {"category": "linear", "symbol": "BTCUSDT", "settleCoin": "USDT"},
+    {"category": "linear", "symbol": "BTCUSDT", "orderFilter": "Bogus"},
+    {"category": "linear", "symbol": "BTCUSDT", "orderFilter": "StopOrder"},      # a spot filter on a perp
+    {"category": "spot", "symbol": "BTCUSDT", "orderFilter": "Bogus"},
+])
+def test_cancel_all_needs_the_bound_symbol_and_a_known_shape(store, tmp_path, body):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.OrderNotSent, match="CANCEL_REFUSED"):
+        _send(c, "/v5/order/cancel-all", body)
+    assert v.requests == []
+
+
+@pytest.mark.parametrize("body", [{"category": "linear", "symbol": "BTCUSDT"}, {"category": "spot", "symbol": "BTCUSDT", "orderFilter": "Order"},
+                                  {"category": "spot", "symbol": "BTCUSDT", "orderFilter": "StopOrder"}, {"category": "spot", "symbol": "BTCUSDT", "orderFilter": "tpslOrder"}])
+def test_cancel_all_positive_controls(store, tmp_path, body):
+    c, v = client(store, _bound(tmp_path))
+    _send(c, "/v5/order/cancel-all", body)
+    assert len(v.requests) == 1
+
+
+def test_cancel_all_without_a_symbol_is_refused_even_on_a_bare_client(store):
+    c, v = _bare_client(store)
+    with pytest.raises(bc.OrderNotSent, match="CANCEL_REFUSED"):
+        _send(c, "/v5/order/cancel-all", {"category": "linear"})
+    assert v.requests == []
+
+
+# ---- 4. a closed allow-list of order-create body keys, and the whole canonical body on resend -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("extra", [dict(triggerPrice="1"), dict(orderFilter="StopOrder"), dict(takeProfit="1"), dict(stopLoss="1"), dict(closeOnTrigger=True), dict(tpslMode="Full"),
+                                   dict(leverage="100"), dict(smpType="None"), dict(slippageTolerance="1"), dict(tpTriggerBy="LastPrice"), dict(bogus=1)])
+def test_an_unknown_order_body_key_is_refused(tmp_path, extra):
+    a = _bound(tmp_path)
+    reasons = _auth_refusal(a, order(**extra))
+    assert reasons and any(r.startswith("UNKNOWN_BODY_FIELD") for r in reasons), reasons
+
+
+@pytest.mark.parametrize("extra", [dict(isLeverage=1), dict(isLeverage="1"), dict(isLeverage=True), dict(isLeverage=0.5), dict(positionIdx=1), dict(positionIdx=2), dict(positionIdx="2"),
+                                   dict(marketUnit="quoteCoin"), dict(reduceOnly="false"), dict(timeInForce="Bogus")])
+def test_a_forbidden_value_of_an_allowed_key_is_refused(tmp_path, extra):
+    a = _bound(tmp_path)
+    assert _auth_refusal(a, order(**extra)) is not None
+
+
+def test_a_spot_buy_with_margin_borrow_is_refused_and_never_sent(store, tmp_path):
+    c, v = client(store, _bound(tmp_path))
+    with pytest.raises(bc.PermanentAPIError, match="ENTRY_REFUSED"):
+        _send(c, "/v5/order/create", order(category="spot", side="Buy", isLeverage=1, orderLinkId="B1"))
+    assert sent_orders(v) == []
+
+
+def test_every_key_the_code_legitimately_sends_is_allowed_positive_control(tmp_path):
+    for n, b in enumerate([order(orderLinkId="P1", positionIdx=0), order(category="spot", side="Buy", orderLinkId="P2", isLeverage=0, marketUnit="baseCoin"),
+                           order(orderType="Limit", price="100000", timeInForce="PostOnly", orderLinkId="P3"),
+                           order(category="spot", side="Buy", orderType="Limit", price="100000", isLeverage="0", orderLinkId="P4")]):
+        assert _auth_refusal(_bound(tmp_path / f"a{n}"), b) is None, b
+
+
+@pytest.mark.parametrize("changed", [dict(positionIdx=0), dict(isLeverage=0), dict(marketUnit="baseCoin"), dict(positionIdx="0")])
+def test_a_resend_compares_the_whole_canonical_body(tmp_path, changed):
+    a = _bound(tmp_path)
+    first = order(orderLinkId="Z1")
+    assert _auth_refusal(a, first) is None
+    assert _auth_refusal(a, dict(first)) is None                                  # positive control: the identical resend
+    reasons = _auth_refusal(a, dict(first, **changed))
+    assert reasons is not None and "RESERVATION_CONFLICT_SAME_ID_DIFFERENT_ORDER" in reasons
+
+
+def test_the_ledger_row_carries_the_whole_body(tmp_path):
+    a = _bound(tmp_path)
+    assert _auth_refusal(a, order(orderLinkId="Z2", positionIdx=0)) is None
+    rows = [json.loads(x) for x in open(str(tmp_path / "state" / "entry_reservations.jsonl")).read().splitlines() if x.strip()]
+    assert rows[0]["body"]["positionIdx"] == 0 and "orderLinkId" not in rows[0]["body"]

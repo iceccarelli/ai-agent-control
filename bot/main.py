@@ -41,6 +41,7 @@ import logging
 import signal
 import sys
 import threading
+import math
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import datetime as dt
@@ -2364,15 +2365,40 @@ def build_close_executor(cfg: Any, store: Any, broker: Any) -> Optional[Any]:
         policy_factory=planner_policy, absence_window_s=window)
 
 
-def _entry_mark(bot: Any, symbol: str) -> Optional[float]:
-    """The book's own current mark for the symbol an order names (a market order carries no price). None = unknown = the authority refuses."""
+#: The entry authority sizes a market order at this mark. It must be as fresh as the risk inputs' own snapshot limit and, because a single wrong leg (a stale or fat-fingered
+#: print) would let an oversize order read as small, within this percent of the OTHER leg's mark. A basis wider than this is not a carry to size from; unknown = refuse.
+ENTRY_MARK_MAX_AGE_S = 30.0
+ENTRY_MARK_MAX_FUTURE_S = 5.0
+ENTRY_MARK_MAX_LEG_DEVIATION_PCT = 5.0
+
+
+def _entry_mark(bot: Any, symbol: str, now_s: Optional[Callable[[], float]] = None) -> Optional[float]:
+    """The book's own current mark for the symbol an order names (a market order carries no price). None = unknown = the authority refuses.
+
+    Unknown unless: the snapshot states a finite ``observed_at_s`` no more than ``ENTRY_MARK_MAX_AGE_S`` before the (injectable) clock and not in its future; both legs' marks are
+    positive finite numbers (no bool/str); and perp and spot agree within ``ENTRY_MARK_MAX_LEG_DEVIATION_PCT`` percent. Before this a stale or one-sided snapshot sized an order."""
     snap = getattr(getattr(bot, "carry", None), "snapshot", None)
     if snap is None:
         return None
+
+    def num(v: Any) -> Optional[float]:
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    try:
+        now = float((now_s or time.time)())
+        observed = num(getattr(snap, "observed_at_s", None))
+        perp, spot = num(getattr(snap, "perp_mark", None)), num(getattr(snap, "spot_mark", None))
+    except Exception:                                              # noqa: BLE001
+        return None
+    if observed is None or perp is None or spot is None or perp <= 0 or spot <= 0 or observed < 0:
+        return None
+    if observed - now > ENTRY_MARK_MAX_FUTURE_S or now - observed > ENTRY_MARK_MAX_AGE_S:
+        return None
+    if abs(perp - spot) / min(perp, spot) * 100.0 > ENTRY_MARK_MAX_LEG_DEVIATION_PCT:
+        return None
     if symbol == getattr(bot.carry, "perp_symbol", None):
-        return getattr(snap, "perp_mark", None)
+        return perp
     if symbol == getattr(bot.carry, "spot_symbol", None):
-        return getattr(snap, "spot_mark", None)
+        return spot
     return None
 
 

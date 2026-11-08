@@ -96,3 +96,65 @@ def test_a_breach_suspends_new_exposure_and_latches_but_a_reduce_only_exit_still
     w.bot.client._request("POST", CREATE, body={"category": "linear", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "qty": qty, "reduceOnly": True,
                                                 "orderLinkId": "EXITAFTERBREACH"}, signed=True)
     assert w.venue.requests_by_path[CREATE] == 2 and abs(w.venue.net_position()) < 1e-9
+
+
+# ---- the authority's mark: fresh and plausible, or unknown (round 3) ---------------------------------------------------------------------------------------------
+
+class _Snap:
+    def __init__(self, perp=100_000.0, spot=100_010.0, at=1_000.0):
+        self.perp_mark, self.spot_mark, self.observed_at_s = perp, spot, at
+
+
+class _Carry:
+    perp_symbol = "BTCUSDT"
+    spot_symbol = "BTCUSDT"
+
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+
+class _Bot:
+    def __init__(self, snapshot):
+        self.carry = _Carry(snapshot)
+
+
+def _mark(snap, symbol="BTCUSDT", now=1_005.0):
+    from main import _entry_mark
+    return _entry_mark(_Bot(snap), symbol, now_s=lambda: now)
+
+
+def test_entry_mark_positive_control_a_fresh_plausible_snapshot_gives_the_mark():
+    assert _mark(_Snap()) == 100_000.0
+
+
+@pytest.mark.parametrize("snap", [
+    _Snap(at=1_000.0 - 3600),                       # an hour old
+    _Snap(at=1_000.0 - 31),                         # just past the limit
+    _Snap(at=1_005.0 + 60),                         # stamped in the future: a broken clock
+    _Snap(at=None), _Snap(at="x"), _Snap(at=float("nan")), _Snap(at=True),
+    _Snap(perp=1.0), _Snap(spot=1.0), _Snap(perp=100_000.0, spot=120_000.0), _Snap(perp=100_000.0, spot=80_000.0),   # a leg far from the other
+    _Snap(perp=0.0), _Snap(perp=-5.0), _Snap(perp=float("nan")), _Snap(perp=float("inf")), _Snap(perp=None), _Snap(spot=None), _Snap(perp=True), _Snap(spot="100000"),
+])
+def test_entry_mark_is_unknown_for_a_stale_future_or_implausible_snapshot(snap):
+    assert _mark(snap) is None
+
+
+def test_entry_mark_is_unknown_for_a_symbol_that_is_not_a_carry_leg_or_without_a_snapshot():
+    assert _mark(_Snap(), symbol="DOGEUSDT") is None
+    assert _mark(None) is None
+
+
+def test_entry_mark_uses_the_injected_clock_not_the_wall_clock():
+    assert _mark(_Snap(at=1_000.0), now=1_029.0) == 100_000.0
+    assert _mark(_Snap(at=1_000.0), now=1_031.0) is None
+
+
+def test_a_stale_snapshot_makes_a_market_entry_unsizeable_and_refused(tmp_path):
+    from main import _entry_mark
+    bot = _Bot(_Snap(at=1_000.0 - 3600))
+    a = EA.build_for_book(venue="testnet", store=type("S", (), {"is_kill_switch_engaged": staticmethod(lambda: (False, ""))})(), state_dir=str(tmp_path / "s"),
+                          max_notional_usd=102.0, mark_provider=lambda s: _entry_mark(bot, s, now_s=lambda: 1_005.0), require_risk_policy=False,
+                          perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
+    with pytest.raises(EA.EntryRefused) as e:
+        a.authorize({"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Market", "qty": "0.001", "orderLinkId": "S1"}, venue="testnet")
+    assert "NO_PRICE_FOR_NOTIONAL" in e.value.reasons
