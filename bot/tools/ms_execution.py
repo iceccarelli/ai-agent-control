@@ -171,6 +171,9 @@ class LegRuntime:
     attempts: int = 0
     sent_ms: Optional[int] = None
     forced: Decimal = Decimal(0)    # qty removed from this entry leg by a forced close (liquidation)
+    recon_qty: Decimal = Decimal(0)     # part of ``filled`` that was adopted from the order's cumulative quantity (no execution seen yet)
+    recon_cost: Decimal = Decimal(0)
+    recon_fees: Decimal = Decimal(0)
 
     @property
     def plan_qty(self) -> Decimal:
@@ -250,6 +253,7 @@ class ExecutionEngine:
         self.halted_symbols: set = set()
         self.fill_ids: set = set()
         self.positions_exp: Dict[str, Decimal] = {}
+        self.spot_base: Dict[str, Decimal] = {}      # spot key -> balance the client held that this engine did not buy (venue - expected), captured from a COMPLETE read at submit
         self.anomalies: List[Dict[str, Any]] = []
         for e in self.journal.entries:
             self._apply(e)
@@ -291,6 +295,9 @@ class ExecutionEngine:
         if typ == "SYMBOL_UNBLOCK":
             self.blocked_symbols.pop(b["symbol"], None)
             return
+        if typ == "BASELINE":
+            self.spot_base[b["key"]] = _D(b["qty"])
+            return
         if typ == "ANOMALY":
             self.anomalies.append({"group_id": gid, **b})
             return
@@ -329,9 +336,26 @@ class ExecutionEngine:
             self.fill_ids.add(f["fill_id"])
             l = g.legs[f["leg_id"]]
             q, px = _Dq(f["qty"]), _Dq(f["price"])
+            fee = _D(f["fee_usd"])
+            if str(f["fill_id"]).startswith("recon:"):                 # adopted from the order's cumulative quantity: remembered so the real executions can replace it
+                l.recon_qty += q
+                l.recon_cost += q * px
+                l.recon_fees += fee
+            elif l.recon_qty > 0:                                      # a real execution for quantity a recon fill already booked: REPLACE that part, never add to it
+                a = min(q, l.recon_qty)
+                share = a / l.recon_qty
+                dc, df = l.recon_cost * share, l.recon_fees * share
+                l.recon_qty -= a
+                l.recon_cost -= dc
+                l.recon_fees -= df
+                l.filled -= a
+                l.cost -= dc
+                l.fees -= df
+                k0 = _poskey(l.plan.category, l.plan.symbol)
+                self.positions_exp[k0] = self.positions_exp.get(k0, Decimal(0)) - _sgn(f["side"]) * a
             l.filled += q
             l.cost += q * px
-            l.fees += _D(f["fee_usd"])
+            l.fees += fee
             if l.status in (SENT, UNKNOWN, NEW):
                 l.status = LIVE
             if l.filled >= l.plan_qty - EPS:
@@ -410,12 +434,29 @@ class ExecutionEngine:
         if why:
             self._set_state(g, G.FAILED, why, now_ms)                  # never submitted: nothing to unwind
             return g.state
+        self._capture_spot_baseline(g, now_ms)
         for lp in g.plan.legs:
             ok = self._send_leg(g, lp, "ENTRY", None, now_ms)
             if not ok:
                 break
         self._settle(g, now_ms)
         return g.state
+
+    def _capture_spot_baseline(self, g: GroupRuntime, ts: int) -> None:
+        """A spot balance includes holdings the client already owned (the premise is BTC the client owns). Record, from a COMPLETE venue read taken before this group sends anything,
+        how much of each spot balance is NOT the engine's, so that flat can later be verified on the DELTA. No complete read -> no baseline -> the group cannot close by delta."""
+        keys = [_poskey(lp.category, lp.symbol) for lp in g.plan.legs if lp.category == "spot"]
+        keys = [k for k in keys if self.positions_exp.get(k, Decimal(0)) == 0 or k not in self.spot_base]     # an engine-held key keeps its baseline; an idle one is re-read
+        if not keys:
+            return
+        view = self._read_venue()
+        pos = view.get("positions") if view else None
+        if pos is None or not bool(view.get("complete", False)):
+            return
+        for k in keys:
+            q = _D(pos.get(k, 0)) - self.positions_exp.get(k, Decimal(0))
+            if self.spot_base.get(k) != q:
+                self._emit("BASELINE", "", ts, {"key": k, "qty": str(q)})
 
     def on_ack(self, ack: Any, group_id: str, leg_id: str, now_ms: int) -> None:
         g = self.groups.get(group_id)
@@ -550,7 +591,7 @@ class ExecutionEngine:
         view = self._read_venue()
         if view is None or view.get("positions") is None:
             self.halt_new_exposure("UNKNOWN_VENUE_POSITION", now_ms)
-        elif "UNKNOWN_VENUE_POSITION" in self.halts:
+        elif "UNKNOWN_VENUE_POSITION" in self.halts and bool(view.get("complete", False)):
             self.resume_new_exposure("UNKNOWN_VENUE_POSITION", now_ms)       # a COMPLETE position read is the only thing that lifts it
         if view is None:
             return
@@ -801,8 +842,15 @@ class ExecutionEngine:
             return False
         for l in g.entry_legs():                                                   # EVERY leg key, spot included: flat is the venue's own read, never fill arithmetic
             k = _poskey(l.plan.category, l.plan.symbol)
-            if abs(_D(pos.get(k, 0)) - self.positions_exp.get(k, Decimal(0))) > EPS:
-                self._emit("ANOMALY", g.plan.group_id, ts, {"code": "NOT_FLAT_ON_VENUE", "key": k, "venue": str(pos.get(k, 0)), "expected": str(self.positions_exp.get(k, 0))})
+            base = Decimal(0)
+            if l.plan.category == "spot":                                          # a balance includes what the client already owned: verify the DELTA over the captured baseline
+                if k not in self.spot_base:
+                    if not any(a.get("group_id") == g.plan.group_id and a.get("code") == "SPOT_BASELINE_MISSING" for a in self.anomalies):
+                        self._emit("ANOMALY", g.plan.group_id, ts, {"code": "SPOT_BASELINE_MISSING", "key": k})
+                    return False                                                   # fail closed: stays EXITING, never CLOSED, never a guess
+                base = self.spot_base[k]
+            if abs(_D(pos.get(k, 0)) - base - self.positions_exp.get(k, Decimal(0))) > EPS:
+                self._emit("ANOMALY", g.plan.group_id, ts, {"code": "NOT_FLAT_ON_VENUE", "key": k, "venue": str(pos.get(k, 0)), "expected": str(self.positions_exp.get(k, 0) + base)})
                 self.halt_new_exposure(f"POSITION_MISMATCH:{k}", ts)
                 self._emit("HALT_GROUP", g.plan.group_id, ts, {"reason": f"NOT_FLAT_ON_VENUE:{k}"})
                 return True

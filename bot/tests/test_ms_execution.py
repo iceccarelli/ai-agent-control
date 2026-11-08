@@ -2,6 +2,7 @@
 data, restart, crash between acceptance and persistence, risk breach, instrument halt, funding interval change, cancel race). Simulated venue only; no network, no clock."""
 from __future__ import annotations
 
+from decimal import Decimal
 import json
 import os
 import sys
@@ -602,3 +603,96 @@ def test_mutation_ignoring_the_completeness_of_the_read_is_caught(monkeypatch):
     monkeypatch.setattr(EX.ExecutionEngine, "_read_venue", always_complete)
     with pytest.raises(AssertionError):
         check_closed_needs_a_complete_read()
+
+
+# ---------------------------------------------------------------- round-2 fixes
+
+def test_an_incomplete_venue_read_does_not_lift_the_unknown_position_halt():
+    h = H()
+    h.v.positions_unknown = True
+    h.e.reconcile(1000)
+    assert "UNKNOWN_VENUE_POSITION" in h.e.halts
+    h.v.positions_unknown = False
+    h.v.incomplete_view = True
+    h.e.reconcile(2000)
+    assert "UNKNOWN_VENUE_POSITION" in h.e.halts                       # an incomplete read may miss rows: it cannot lift the halt
+    h.v.incomplete_view = False
+    h.e.reconcile(3000)
+    assert "UNKNOWN_VENUE_POSITION" not in h.e.halts                   # positive control: a complete read does
+
+
+@pytest.mark.parametrize("link,key", [(PL, "linear:XUSDT"), (SL, "spot:XUSDT")])
+def test_a_recon_adopted_fill_is_not_double_counted_when_the_real_execution_arrives_later(link, key):
+    h = H()
+    h.start()
+    f = h.v.execute(link, 10, 100.0, 3000)
+    h.v.hidden_executions.add(f.fill_id)                               # executed at the venue, the execution is not (yet) visible
+    h.e.reconcile(4000)
+    leg = next(l for l in h.e.groups[GID].legs.values() if l.link == link)
+    assert leg.filled == 10                                            # adopted from the order's cumulative quantity
+    h.v.hidden_executions.clear()
+    h.e.reconcile(5000)                                                # the real execution is now visible
+    assert leg.filled <= leg.plan_qty and leg.filled == 10
+    assert Decimal(h.e.positions()[key]) == Decimal(str(h.v.book[key]))
+    h.e.reconcile(6000)
+    assert leg.filled == 10 and not any(k.startswith("POSITION_MISMATCH") for k in h.e.halts)
+
+
+def test_a_partial_real_execution_replaces_only_its_part_of_the_recon_fill():
+    h = H()
+    h.start()
+    f = h.v.execute(PL, 10, 100.0, 3000)
+    h.v.hidden_executions.add(f.fill_id)
+    h.e.reconcile(4000)
+    leg = h.e.groups[GID].legs[PERP]
+    h.e.on_fill(T.Fill("real-1", GID, PERP, "XUSDT", "Sell", 4.0, 100.0, 0.0, "USDT", "MAKER", 4100, "SIMULATED"), 4100)
+    assert leg.filled == 10 and h.e.positions()["linear:XUSDT"] == "-10"
+
+
+def _exit_all(h, t=5_100):
+    for k, o in list(h.v.orders.items()):
+        if "-x" in k:
+            h.fill(k, o["qty"], 100.0, t, liq="TAKER")
+
+
+def test_preexisting_spot_inventory_does_not_block_a_perfectly_hedged_and_exited_group():
+    h = H()
+    h.v.book["spot:XUSDT"] = 3.0                                       # BTC the client already owned
+    h.start()
+    h.fill(PL, 10)
+    h.fill(SL, 10)
+    assert h.state() == G.HEDGED
+    h.e.request_exit(GID, 5_000)
+    _exit_all(h)
+    h.e.step(6_000)
+    assert h.state() == G.CLOSED and not h.e.halts
+    assert h.v.book["spot:XUSDT"] == pytest.approx(3.0)
+
+
+def test_a_real_residual_spot_delta_still_blocks_closed_with_inventory_present():
+    h = H()
+    h.v.book["spot:XUSDT"] = 3.0
+    h.start()
+    h.fill(PL, 10)
+    h.fill(SL, 10)
+    h.e.request_exit(GID, 5_000)
+    h.v.position_override["spot:XUSDT"] = 5.0                          # 2 more than the inventory the venue should show after the exit
+    _exit_all(h)
+    h.e.step(6_000)
+    assert h.state() != G.CLOSED
+    assert any(a.get("code") == "NOT_FLAT_ON_VENUE" for a in h.e.anomalies)
+
+
+def test_without_a_baseline_the_group_cannot_be_closed_by_delta_and_says_why():
+    h = H()
+    h.v.book["spot:XUSDT"] = 3.0
+    h.v.incomplete_view = True                                         # the pre-submit read is incomplete: no baseline can be captured
+    h.start()
+    h.fill(PL, 10)
+    h.fill(SL, 10)
+    h.e.request_exit(GID, 5_000)
+    _exit_all(h)
+    h.v.incomplete_view = False
+    h.e.step(6_000)
+    assert h.state() == G.EXITING
+    assert any(a.get("code") == "SPOT_BASELINE_MISSING" for a in h.e.anomalies)
