@@ -1557,7 +1557,8 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
         return {x["t"]: x for x in results[name]["rows"]}
     if n_rows < min_rows:
         for name in sorted(results):
-            ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping {hold_days}-day rows (< {min_rows})")
+            if not ledger.knows(name):                      # an identical re-run is the same trial, not a new one
+                ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping {hold_days}-day rows (< {min_rows})")
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family_ledger": fam, "n_variants_counted": ledger.n_variants,
                     "reason": f"{n_rows} aligned {hold_days}-day holding rows; need >= {min_rows}. " + out["grid"]["statement"]
                               + f" This capture spans {out['grid']['window_days_available']} days (shortfall {out['grid']['shortfall_days']} days)",
@@ -1565,7 +1566,8 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
         return out
     series_by = {n: [by_t(n)[t]["net_bps"] for t in common_sorted] for n in sorted(results)}
     for name, rets in series_by.items():
-        ledger.record(name, params_of[name], rets, horizon=1)
+        if RH.series_digest(rets) not in ledger.returns_digests(name):          # same variant on the very same series = the same trial; new data or a new name counts
+            ledger.record(name, params_of[name], rets, horizon=1)
     folds = RH.walk_forward_folds(n_rows, train_min=max(20, n_rows // 2), test_len=max(5, n_rows // 10), label_horizon=1, embargo=1)
     oos: List[float] = []
     chosen: List[str] = []

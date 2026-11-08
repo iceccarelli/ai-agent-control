@@ -22,6 +22,11 @@ MECHANISMS = ("cross_sectional_funding", "spot_perp_basis", "cross_venue_funding
               "passive_execution", "liquidity_imbalance")
 
 
+#: next-hypothesis DRAFTS proposed by tools/candidate_competition.py: specification only, registered UNTESTED, held to exactly the same truthfulness rules
+DRAFTS = ("funding_regime_conditioned_entry", "cross_interval_funding_dispersion", "hedgeable_majors_basis_convergence")
+ALL = MECHANISMS + DRAFTS
+
+
 def load(name):
     with open(os.path.join(CAND, name + ".json"), encoding="utf-8") as f:
         return json.load(f)
@@ -44,12 +49,26 @@ def missing_declarations(spec):
     return sorted({k for d in spec["required_data"] if d["repo_has"] is False for k in d["declaration_keys"]})
 
 
-def test_exactly_the_eight_mechanisms_exist():
+def test_exactly_the_eight_mechanisms_and_the_declared_drafts_exist():
     have = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(CAND, "*.json")))
-    assert have == sorted(MECHANISMS), have
+    assert have == sorted(ALL), have
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", DRAFTS)
+def test_a_draft_claims_no_start_date_no_data_it_lacks_and_is_labelled_a_proposal(name):
+    s = load(name)
+    assert s["prospective_protocol"]["start_ms"] is None and s["proposed_by"].startswith("tools/candidate_competition.py")
+    assert "DRAFT PROPOSED" in s["status_note"] and "No start date is claimed" in s["status_note"]
+    assert not any(k in s for k in ("start_ms", "data_window_start", "registered_at", "sealed_at"))
+    # the draft's own data rows decide its declarations: every missing row's keys are False, and at least one row is missing
+    assert missing_declarations(s) and declared_without_data(s) == []
+    # a draft must not out-claim the repository: multi-symbol Bybit data, universes and depth are NOT in the repo
+    if name != "funding_regime_conditioned_entry":
+        assert s["bias_declarations"]["point_in_time_universe"] is False and s["bias_declarations"]["fills_modelled_against_real_depth"] is False
+
+
+
+@pytest.mark.parametrize("name", ALL)
 def test_template_is_a_specification_whose_declarations_are_truthful(name):
     """The repo lacks data the candidate needs to rule out some biases: those declarations are NOT True, so the spec is not yet testable (UNTESTED)."""
     s = load(name)
@@ -71,7 +90,7 @@ def test_template_is_a_specification_whose_declarations_are_truthful(name):
 
 
 def test_no_template_claims_to_have_ruled_out_a_bias_its_own_required_data_says_it_cannot():
-    for name in MECHANISMS:
+    for name in ALL:
         s = load(name)
         assert declared_without_data(s) == [], name
         assert missing_declarations(s), f"{name}: needs data the repo lacks, so at least one declaration must be False"
@@ -81,7 +100,7 @@ def test_no_template_claims_to_have_ruled_out_a_bias_its_own_required_data_says_
     assert load("cash_and_carry")["bias_declarations"]["fills_modelled_against_real_depth"] is False       # its own L2 depth item says repo_has False
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", ALL)
 def test_hedge_declaration_true_only_if_a_hedge_data_item_exists_and_is_whole(name):
     """Round 3: cash_and_carry declared hedge completeness while its own data row says the basis is partial; three others declared it with no hedge row at all."""
     s = load(name)
@@ -92,7 +111,7 @@ def test_hedge_declaration_true_only_if_a_hedge_data_item_exists_and_is_whole(na
         assert any("hedge_completeness_modelled" in d["declaration_keys"] and d["repo_has"] is False for d in s["required_data"]), name
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", ALL)
 def test_every_missing_data_row_has_a_real_gap_description(name):
     for d in load(name)["required_data"]:
         if d["repo_has"] is False:
@@ -102,12 +121,12 @@ def test_every_missing_data_row_has_a_real_gap_description(name):
 def test_in_sample_mean_is_not_labelled_measured_as_a_forecast():
     f = load("cash_and_carry")["funding_model"]["expected_bps_per_settlement"]
     assert f["provenance"] == "derived" and "forecast" in f["note"].lower()
-    for name in MECHANISMS:
+    for name in ALL:
         for e in load(name)["funding_model"].values():
             assert not (e["provenance"] == "measured" and "note" not in e), (name, e)
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", ALL)
 def test_true_declaration_over_missing_data_is_rejected(name):
     s = load(name)
     for i, d in enumerate(s["required_data"]):
@@ -128,7 +147,7 @@ def test_true_declaration_over_missing_data_is_rejected(name):
     assert declared_without_data(healed) == [] and SV.spec_problems(healed) == []
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", ALL)
 def test_prospective_protocol_is_machine_readable_and_claims_no_start(name):
     pp = load(name)["prospective_protocol"]
     assert isinstance(pp, dict) and pp["description"] and pp["start_ms"] is None                 # a template cannot have started observing
@@ -137,7 +156,7 @@ def test_prospective_protocol_is_machine_readable_and_claims_no_start(name):
     assert SV._prospective_floors({"prospective_period": pp})["min_duration_ms"] == pp["min_duration_ms"]       # the verdict layer reads it
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", ALL)
 def test_template_states_what_data_the_repo_lacks(name):
     s = load(name)
     for d in s["required_data"]:
@@ -147,7 +166,7 @@ def test_template_states_what_data_the_repo_lacks(name):
         assert any(d["repo_has"] is False for d in s["required_data"]), f"{name}: claims the repo has everything"
 
 
-@pytest.mark.parametrize("name", MECHANISMS)
+@pytest.mark.parametrize("name", ALL)
 def test_template_is_registrable_only_once_its_data_exists(name):
     import hypothesis_registry as hr
     s = load(name)
@@ -201,7 +220,7 @@ def test_rt4_cross_venue_funding_history_is_not_claimed_as_in_the_repo():
 def test_venue_stated_is_used_only_for_numbers_the_repos_published_schedule_states():
     import carry_costs as CC
     saw = 0
-    for name in MECHANISMS:
+    for name in ALL:
         s = load(name)
         for comp in ("fee_model", "slippage_model", "funding_model"):
             for k, e in s[comp].items():
@@ -213,7 +232,7 @@ def test_venue_stated_is_used_only_for_numbers_the_repos_published_schedule_stat
     f = load("spot_perp_basis")["fee_model"]                                                                  # the stray 6.0 is gone: per-leg published numbers, so spot+perp prices at 31.0
     assert f["taker_bps"]["value"] == CC.TAKER_BPS_PERP and f["spot_taker_bps"]["value"] == CC.TAKER_BPS_SPOT
     assert 2 * (f["taker_bps"]["value"] + f["spot_taker_bps"]["value"]) == CC.ROUND_TRIP_FEE_BPS_SPOT_PERP == 31.0
-    for name in MECHANISMS:                                                                                    # nothing was upgraded to measured/modelled without a data basis
+    for name in ALL:                                                                                    # nothing was upgraded to measured/modelled without a data basis
         for comp in ("fee_model", "slippage_model"):
             assert all(e["provenance"] in ("assumed", "venue_stated") for e in load(name)[comp].values()), name
 

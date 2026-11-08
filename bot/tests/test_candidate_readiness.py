@@ -39,7 +39,8 @@ def rowof(rep, name):
 def test_every_candidate_and_the_btc_description_has_a_row_with_a_reasoned_verdict(report):
     names = {r["name"] for r in report["candidates"]}
     assert names == {"cash_and_carry", "cross_sectional_funding", "cross_venue_funding", "liquidity_imbalance", "market_neutral_relative_value", "passive_execution",
-                     "spot_perp_basis", "spread_microstructure", "btcusdt_funding_carry_overlay"}
+                     "spot_perp_basis", "spread_microstructure", "btcusdt_funding_carry_overlay",
+                     "funding_regime_conditioned_entry", "cross_interval_funding_dispersion", "hedgeable_majors_basis_convergence"}          # + the registered next-hypothesis drafts (UNTESTED)
     for r in report["candidates"]:
         assert r["readiness_verdict"] in ("UNTESTED", "INSUFFICIENT_DATA", "REJECTED") and r["readiness_reasons"], r["name"]
         assert r["verdict_rank_ceiling"] == "INSUFFICIENT_DATA"
@@ -1090,13 +1091,35 @@ def test_too_few_rows_states_the_window_and_counts_every_variant_in_a_persistent
     assert out["independent_holding_rows"] < 60 and out["survivorship_free_claim"] is False
     n1 = out["n_variants_counted"]
     assert n1 == 4 and out["multiple_testing_scope"] == "PERSISTENT_LEDGER_FILE"                       # 2 formations x 1 k x 2 cost scenarios
-    # a "fresh process": the in-memory high-water marks are gone; the file keeps the family count
+    # a "fresh process": the in-memory high-water marks are gone; the file keeps the family count (neither reset to 0 nor inflated by an identical re-run)
     RH._FAMILY_HIGH_WATER.clear()
     RH._PATH_HIGH_WATER.clear()
     out2 = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, formation_days_grid=(7, 14), top_k_grid=(1,), hold_days=7, min_rows=60)
-    assert out2["n_variants_counted"] == 2 * n1
+    assert out2["n_variants_counted"] == n1
+    # a different grid (new variants) enlarges the persisted family
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    out3 = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, formation_days_grid=(7, 14, 30), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out3["n_variants_counted"] == n1 + 2
     with pytest.raises(RH.HarnessError, match="LEDGER_PATH_REQUIRED"):
         CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=None)
+
+
+def test_new_data_in_a_tested_family_is_a_new_trial_and_an_identical_rerun_is_not(tmp_path):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    lp = str(tmp_path / "t.jsonl")
+    kw = dict(ledger_path=lp, formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=10)
+    a = CR.evaluate_family(_world(200, seed=1), CR.FAMILY_DIRECTIONAL, **kw)
+    assert a["status"] == "WALK_FORWARD_DONE"
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    same = CR.evaluate_family(_world(200, seed=1), CR.FAMILY_DIRECTIONAL, **kw)
+    assert same["n_variants_counted"] == a["n_variants_counted"]
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    other = CR.evaluate_family(_world(200, seed=2), CR.FAMILY_DIRECTIONAL, **kw)
+    assert other["n_variants_counted"] == 2 * a["n_variants_counted"]
 
 
 def test_positive_control_a_planted_persistent_funding_spread_is_promising_not_rejected(tmp_path):

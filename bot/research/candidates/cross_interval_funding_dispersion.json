@@ -1,0 +1,127 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "universe membership frozen as of each fold's train end; cohort definitions fixed before any holding window is read"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": false,
+    "hedge_completeness_modelled": false,
+    "no_future_funding_knowledge": false,
+    "no_look_ahead": true,
+    "point_in_time_universe": false
+  },
+  "candidate_id": "cross_interval_funding_dispersion@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 50000.0,
+    "note": "set by the thinnest leg's depth; not measured in this repo"
+  },
+  "counterparty": "leveraged longs in high-funding perps (pay) and shorts in low-funding perps (pay), within the same funding-interval cohort",
+  "drawdown_model": "measured on price+funding P&L of the dollar-neutral perp book; funding-only drawdown is not a drawdown",
+  "economic_mechanism": "Counterparty: leveraged longs in the high-funding perp pay; shorts in the low/negative-funding perp pay. Hypothesis: the 'funding level predicts the next funding' relation differs by funding-interval cohort (480m / 240m / 60m) because shorter intervals re-price the premium more often and are capped per print differently, so ranking WITHIN a cohort (on interval-normalised bps/day) predicts the holding-window funding better than ranking across cohorts, which mixes a mechanical interval artefact with the economic signal. Persists while the cohorts keep different re-pricing cadence; vanishes if the cross-cohort ranking is just as predictive, if cohorts are too thin, or when the high-funding names are delisted or squeezed (a perp-only spread is NOT a carry: price legs are the risk).",
+  "eligibility_rules": [
+    "symbol active at decision time per the PIT universe (verified universe_capture, Closed contracts included)",
+    "funding interval is per symbol as the venue states it; ranking uses interval-normalised bps/day within the cohort",
+    "minimum 30d listing age and a stated minimum open interest",
+    "a cohort with fewer than 2 x top_k eligible symbols at a decision produces no row"
+  ],
+  "entry": "at each rebalance on the fixed non-overlapping grid, within each cohort short the top-k and long the bottom-k by trailing interval-normalised funding, dollar-neutral",
+  "execution_model": "taker both legs, perp only; price-leg residual and beta to the equal-weight universe measured, not assumed away",
+  "exit": "next rebalance or delivery of a leg",
+  "family": "cross_interval_funding_dispersion",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "note": "carry_costs.TAKER_BPS_PERP: the PERP leg's base-tier taker fee (published schedule); the spot leg is spot_taker_bps. A spot+perp round trip is 2 x (taker_bps + spot_taker_bps) = 31.0 bps",
+      "provenance": "venue_stated",
+      "value": 5.5
+    }
+  },
+  "funding_interval_handling": {
+    "method": "interval-normalised: funding_bps_per_day = rate_bps * 1440 / fundingInterval_min per symbol; holding-horizon funding = bps/day x days; per-interval cohorts (480m / 240m / 60m) reported separately; settlement grid is per symbol; a Closed contract earns nothing after its deliveryTime",
+    "source_of_interval_facts": "OWNER-OBSERVED live probe (unverified in this repo): Bybit funding interval is per symbol (480m, 240m, sometimes 60m) and 14 of the top 20 positive-funding perps over $5M turnover were 240m contracts",
+    "unknown_interval": "funding normalisation UNKNOWN -> the candidate cannot pass"
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.5
+    }
+  },
+  "holding_period": "7 days on a fixed non-overlapping grid (hold grid registered; every cell counts as a tested variant)",
+  "hypothesis": "Ranking perps by trailing interval-normalised funding within funding-interval cohorts earns a larger net funding spread than ranking across cohorts.",
+  "multiple_testing_family": "cross_interval_funding_dispersion",
+  "proposed_by": "tools/candidate_competition.py (next-hypothesis draft)",
+  "prospective_protocol": {
+    "description": "register thresholds then observe forward basis excursions and fills on testnet mechanics",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
+  "rejection_conditions": [
+    "adjusted p-value (Holm over every attempted variant) above 0.05 on historical_test or oos_test",
+    "within-cohort ranking does not beat cross-cohort ranking by a registered margin",
+    "net edge after assumed costs not positive",
+    "universe cannot be shown point-in-time (survivors only)",
+    "price-leg P&L over the sample is negative or larger in magnitude than the funding spread earned"
+  ],
+  "required_data": [
+    {
+      "declaration_keys": [
+        "point_in_time_universe"
+      ],
+      "gap": "a verified universe_capture with an OBSERVED Closed partition is needed; the repo holds none",
+      "name": "point-in-time perp listing/delisting records for the whole venue, including delisted symbols",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "no_future_funding_knowledge"
+      ],
+      "gap": "BTC/ETH/SOL Binance 8h and BTC Bybit only in this repo; Bybit's multi-symbol 480m/240m/60m history is not in the repo",
+      "name": "funding history per symbol with that symbol's own fundingInterval, all listed symbols incl. Closed",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
+      "gap": "no multi-symbol Bybit mark-kline dataset in the repo",
+      "name": "mark price per symbol to measure the price legs",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
+      "gap": "BTC/ETH spot L2 only",
+      "name": "depth/spread per symbol for capacity and slippage",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "unhedged cross-asset price spread between the two legs: beta/idiosyncratic move can exceed funding by orders of magnitude; liquidation of the short leg in a squeeze",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. DRAFT PROPOSED by tools/candidate_competition.py after the credible candidates all failed or stayed untestable on the data that exists; it is registered UNTESTED. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. No start date is claimed: the registration that opens a window sets and seals it."
+}

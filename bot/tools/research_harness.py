@@ -994,6 +994,11 @@ class VariantLedger:
         hs = [h for h in hs if isinstance(h, int)]
         return max(hs) if hs else None
 
+    def knows(self, name: str) -> bool:
+        """True when ANY trial (tested or rejected) of this variant name is already in the ledger. Used to make an identical re-run idempotent: the same variant on the same series is
+        one trial, not a new one, while a different series (new data) or a new name still enlarges the family."""
+        return any(t.strategy_id == name for t in self._tl.trials)
+
     def returns_digests(self, name: str) -> frozenset:
         return frozenset(m.get("returns_sha256") for t, m in zip(self._tl.trials, self._meta) if t.strategy_id == name and m.get("returns_sha256"))
 
