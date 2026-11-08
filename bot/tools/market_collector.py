@@ -1125,6 +1125,14 @@ def _backup_locked(src: str, dest: str, receipts: str, copy_fn: Callable[[str, s
 
 
 def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, Any]:
+    """See ``_restore_check``. Any unexpected error while reading damaged input is REPORTED as a failed check, never raised."""
+    try:
+        return _restore_check(backup_dir, receipts, manifest)
+    except (KeyError, ValueError, TypeError, AttributeError, OSError, EC.ChainDesync) as exc:
+        return {"ok": False, "problems": [f"restore check could not complete: {type(exc).__name__}: {str(exc)[:200]}"], "checked": 0}
+
+
+def _restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, Any]:
     """A backup is not proven until this passes: every receipted copy exists, is self-consistent and hashes as receipted, AND every cycle the seal ``manifest`` holds has
     a receipt whose manifest and tree hashes equal the sealed ones (mirrors ``md_seal.restore_check``: a backup that silently omits a sealed cycle proves nothing)."""
     problems: List[str] = []
@@ -1148,9 +1156,13 @@ def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, An
                     problems.append(f"{name}: the receipt's {k} differs from the sealed value")
     n = 0
     for r in _log_rows(receipts):
-        name = r["cycle"]
-        path = os.path.join(backup_dir, name)
+        name = r.get("cycle")
         n += 1
+        if (not isinstance(name, str) or not name or name != os.path.basename(name) or name in (".", "..")
+                or not isinstance(r.get("manifest_sha256"), str) or not isinstance(r.get("tree_sha256"), str)):
+            problems.append(f"receipt row {n}: malformed (needs a plain cycle name and manifest_sha256/tree_sha256 text); a garbled receipt proves nothing")
+            continue
+        path = os.path.join(backup_dir, name)
         if not os.path.isdir(path):
             problems.append(f"{name}: receipted but missing from the backup")
             continue
@@ -1280,12 +1292,20 @@ def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, dur
     h: Dict[str, Any] = {"schema": HEALTH_SCHEMA, "root": root, "interval_ms": interval_ms, "started_ms": t0, "status": "RUNNING", "stop_reason": None, "cycles_run": 0,
                          "cycles_ok": 0, "cycles_partial": 0, "last_cycle": None, "gaps": {"missed_expected_cycles_total": 0, "last": None}, "consecutive_failures": 0,
                          "max_consecutive_failures": max_consecutive_failures, "rate_limit_events_total": 0, "disk": None, "last_seal": None, "last_backup": None,
-                         "last_restore_check": None, "refusal": None}
+                         "last_restore_check": None, "refusal": None,
+                         "hook_cadence_ms": {k: n * interval_ms for k, n in (("last_seal", seal_every if seal_manifest else 0), ("last_backup", backup_every if backup_to else 0),
+                                                                         ("last_restore_check", restore_check_every if backup_to else 0)) if n and n > 0}}
 
     def _flush() -> None:
         h["written_ms"] = int(clock())
         if os.path.isdir(root):
             _write_health(hp, h)
+
+    def _flush_quiet() -> None:
+        try:
+            _flush()
+        except Exception:                             # the original error is the one to surface
+            pass
 
     def _disk() -> List[str]:
         probs = root_guard(root, reserve_bytes, free_bytes_fn)
@@ -1298,7 +1318,7 @@ def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, dur
             res = fn()
             h[name] = {"at_ms": int(clock()), "ok": bool(res.get("ok", True)), "detail": {k: res[k] for k in res if k in ("ok", "problems", "sealed_new", "cycles_total", "backed_up",
                                                                                                                      "failed", "rejected", "checked")}}
-        except (CollectorError, UC.CaptureError, OSError, EC.ChainDesync) as exc:
+        except Exception as exc:                          # ANY failure of a hook is recorded (a KeyError on damaged input must not end collection)
             h[name] = {"at_ms": int(clock()), "ok": False, "detail": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
 
     def _stop(reason: str, status: str = "STOPPED") -> Dict[str, Any]:
@@ -1306,62 +1326,74 @@ def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, dur
         _flush()
         return h
 
-    cycles = 0
-    while True:
-        if stop_file and os.path.lexists(stop_file):
-            return _stop("stop_file")
-        if max_cycles is not None and cycles >= max_cycles:
-            return _stop("max_cycles")
-        now = int(clock())
-        if end_ms is not None and now >= end_ms:
-            return _stop("duration")
-        probs = _disk()
-        if probs:
-            h["refusal"] = {"code": "DISK_GUARD", "problems": probs}
-            return _stop("disk_guard", "REFUSED")
-        t_cycle = now
-        try:
-            res = run_once(root, t_cycle, fetch, clock, sleep=sleep, max_symbols=max_symbols, depth=depth, trades_limit=trades_limit, interval_ms=interval_ms,
-                           reserve_bytes=reserve_bytes, max_bytes=max_bytes, free_bytes_fn=free_bytes_fn, max_retries=max_retries, backoff_s=backoff_s)
-        except CollectorError as exc:
-            res = {"status": "ABORTED", "reason": f"{type(exc).__name__}: {exc}"}
-        cycles += 1
-        h["cycles_run"] = cycles
-        st = res.get("status")
-        if st in ("REFUSED_STORAGE", "REFUSED_LOG", "REFUSED_LOCKED"):
-            h["refusal"] = {"code": st, "reason": res.get("reason"), "detail": res.get("detail")}
-            return _stop(st.lower(), "REFUSED")
-        if st in ("OK", "PARTIAL"):
-            h["cycles_ok" if st == "OK" else "cycles_partial"] += 1
-            h["last_cycle"] = {"cycle": res["cycle"], "cycle_ms": t_cycle, "status": st, "counts": res["counts"], "partial_reasons": res["partial_reasons"],
-                               "finished_ms": int(clock())}
-            h["rate_limit_events_total"] += int(res["counts"].get("rate_limit_events", 0))
-            if res["gaps"]:
-                h["gaps"]["missed_expected_cycles_total"] += sum(int(g.get("missed_expected_cycles", 0)) for g in res["gaps"])
-                h["gaps"]["last"] = res["gaps"][-1]
-            h["consecutive_failures"] = 0 if st == "OK" else h["consecutive_failures"] + 1
-        else:                                            # ABORTED / REFUSED_CLOCK: nothing was recorded for this slot
-            h["consecutive_failures"] += 1
-            h["last_cycle"] = {"cycle": res.get("cycle"), "cycle_ms": t_cycle, "status": st, "reason": res.get("reason"), "finished_ms": int(clock())}
-        if h["consecutive_failures"] >= max_consecutive_failures:
-            h["refusal"] = {"code": "CONSECUTIVE_FAILURES", "count": h["consecutive_failures"]}
-            return _stop("consecutive_failures", "REFUSED")
-        if seal_manifest and seal_every > 0 and cycles % seal_every == 0:
-            _hook("last_seal", lambda: seal_cycles(root, seal_manifest))
-        if backup_to and backup_every > 0 and cycles % backup_every == 0:
-            _hook("last_backup", lambda: backup_cycles(root, backup_to, receipts, manifest=seal_manifest))
-        if backup_to and restore_check_every > 0 and cycles % restore_check_every == 0:
-            _hook("last_restore_check", lambda: restore_check(backup_to, receipts, seal_manifest))
-        _flush()
-        # wait for the next slot (rate-limit-aware: a throttled cycle waits longer, capped), checking the stop file between short sleeps
-        extra = min(BACKOFF_CAP_S, backoff_s * (2 ** min(h["consecutive_failures"], 5))) if (h["consecutive_failures"] or res.get("counts", {}).get("rate_limit_events")) else 0.0
-        due = t_cycle + interval_ms + int(extra * 1000)
-        while int(clock()) < due:
+    def _loop() -> Dict[str, Any]:
+        cycles = 0
+        while True:
             if stop_file and os.path.lexists(stop_file):
-                break
-            if end_ms is not None and int(clock()) >= end_ms:
-                break
-            sleep(min(STOP_SLICE_S, max(0.0, (due - int(clock())) / 1000.0)) or 0.001)
+                return _stop("stop_file")
+            if max_cycles is not None and cycles >= max_cycles:
+                return _stop("max_cycles")
+            now = int(clock())
+            if end_ms is not None and now >= end_ms:
+                return _stop("duration")
+            probs = _disk()
+            if probs:
+                h["refusal"] = {"code": "DISK_GUARD", "problems": probs}
+                return _stop("disk_guard", "REFUSED")
+            t_cycle = now
+            try:
+                res = run_once(root, t_cycle, fetch, clock, sleep=sleep, max_symbols=max_symbols, depth=depth, trades_limit=trades_limit, interval_ms=interval_ms,
+                               reserve_bytes=reserve_bytes, max_bytes=max_bytes, free_bytes_fn=free_bytes_fn, max_retries=max_retries, backoff_s=backoff_s)
+            except CollectorError as exc:
+                res = {"status": "ABORTED", "reason": f"{type(exc).__name__}: {exc}"}
+            cycles += 1
+            h["cycles_run"] = cycles
+            st = res.get("status")
+            if st in ("REFUSED_STORAGE", "REFUSED_LOG", "REFUSED_LOCKED"):
+                h["refusal"] = {"code": st, "reason": res.get("reason"), "detail": res.get("detail")}
+                return _stop(st.lower(), "REFUSED")
+            if st in ("OK", "PARTIAL"):
+                h["cycles_ok" if st == "OK" else "cycles_partial"] += 1
+                h["last_cycle"] = {"cycle": res["cycle"], "cycle_ms": t_cycle, "status": st, "counts": res["counts"], "partial_reasons": res["partial_reasons"],
+                                   "finished_ms": int(clock())}
+                h["rate_limit_events_total"] += int(res["counts"].get("rate_limit_events", 0))
+                if res["gaps"]:
+                    h["gaps"]["missed_expected_cycles_total"] += sum(int(g.get("missed_expected_cycles", 0)) for g in res["gaps"])
+                    h["gaps"]["last"] = res["gaps"][-1]
+                h["consecutive_failures"] = 0 if st == "OK" else h["consecutive_failures"] + 1
+            else:                                            # ABORTED / REFUSED_CLOCK: nothing was recorded for this slot
+                h["consecutive_failures"] += 1
+                h["last_cycle"] = {"cycle": res.get("cycle"), "cycle_ms": t_cycle, "status": st, "reason": res.get("reason"), "finished_ms": int(clock())}
+            if h["consecutive_failures"] >= max_consecutive_failures:
+                h["refusal"] = {"code": "CONSECUTIVE_FAILURES", "count": h["consecutive_failures"]}
+                return _stop("consecutive_failures", "REFUSED")
+            if seal_manifest and seal_every > 0 and cycles % seal_every == 0:
+                _hook("last_seal", lambda: seal_cycles(root, seal_manifest, now_ms=int(clock())))
+            if backup_to and backup_every > 0 and cycles % backup_every == 0:
+                _hook("last_backup", lambda: backup_cycles(root, backup_to, receipts, manifest=seal_manifest, now_ms=int(clock())))
+            if backup_to and restore_check_every > 0 and cycles % restore_check_every == 0:
+                _hook("last_restore_check", lambda: restore_check(backup_to, receipts, seal_manifest))
+            _flush()
+            # wait for the next slot (rate-limit-aware: a throttled cycle waits longer, capped), checking the stop file between short sleeps
+            extra = min(BACKOFF_CAP_S, backoff_s * (2 ** min(h["consecutive_failures"], 5))) if (h["consecutive_failures"] or res.get("counts", {}).get("rate_limit_events")) else 0.0
+            due = t_cycle + interval_ms + int(extra * 1000)
+            while int(clock()) < due:
+                if stop_file and os.path.lexists(stop_file):
+                    break
+                if end_ms is not None and int(clock()) >= end_ms:
+                    break
+                sleep(min(STOP_SLICE_S, max(0.0, (due - int(clock())) / 1000.0)) or 0.001)
+
+    try:
+        return _loop()
+    except KeyboardInterrupt:
+        h["status"], h["stop_reason"] = "STOPPED", "interrupted"
+        _flush_quiet()
+        raise
+    except BaseException as exc:                      # the final health state is never left at RUNNING after an abnormal exit
+        h["status"], h["stop_reason"] = "CRASHED", f"{type(exc).__name__}: {exc}"[:300]
+        _flush_quiet()
+        raise
 
 
 # ---------------------------------------------------------------- CLI

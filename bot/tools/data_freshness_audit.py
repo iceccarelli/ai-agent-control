@@ -12,8 +12,12 @@ Three separate axes in the output (they are never merged into one green light):
                       STALE     data exists but a cycle stream or a dataset/symbol/field is older than its expected cadence allows.
                       PARTIAL   data exists and is not stale but something is missing or unproved: a gap, a dataset that is not COMPLETE or does not re-hash, a status partition
                                 the universe capture never took (Closed, PreLaunch), a failed or never-run backup, a failed or never-run restore-check, a skipped verification.
-                      HEALTHY   real, complete, fresh data AND a passing backup AND a passing restore-check (from the collector's health report or run live here) AND every
-                                dataset re-hashes. Anything else is not HEALTHY.
+                      HEALTHY   real, complete, fresh data AND a backup, a restore-check and a seal that were VERIFIED HERE (``--backup-dir --receipts --seal-manifest``: the
+                                restore-check and the seal check are run live) AND young enough (DEFAULT_OPS_MAX_AGE_MS, tightened by the cadence the collector records; or
+                                ``--ops-max-age-ms``) AND every dataset re-hashes AND every history window ended within the history max age (DEFAULT 3 days, or
+                                ``--history-max-age-ms``; a window that ended long ago can never be HEALTHY). ``health.json`` is UNAUTHENTICATED (anyone with the directory
+                                can write it): an ok record in it that was not confirmed by a live check is reported as ``*_CLAIMED_NOT_VERIFIED`` (PARTIAL) and can never make
+                                HEALTHY; a failure it admits to is believed (that direction is safe). Anything else is not HEALTHY.
   research_readiness  NO_DATA | NOT_READY | READY. READY needs every declared research-universe symbol COMPLETE in every history dataset present, the status partitions
                       present, and no dataset UNVERIFIED/CONFLICTED. It is independent of backup state and of freshness.
 Exit code: 0 only for HEALTHY; 1 PARTIAL; 3 STALE; 4 NO_DATA; 2 refusal (root inside Git, not a directory). ``--require-ready`` makes a non-READY readiness a non-zero exit too.
@@ -42,6 +46,11 @@ SCHEMA = "data_freshness_audit/v1"
 STALE_FACTOR = 3                                    # newer than 3 expected intervals is fresh (cycles); history uses MH.STALE_INTERVALS past the window end
 REQUIRED_STATUS_PARTITIONS = ("Trading", "Closed", "PreLaunch")
 MAX_CYCLE_MANIFESTS = 200
+DAY_MS = 86_400_000
+DEFAULT_HISTORY_MAX_AGE_MS = 3 * DAY_MS               # a history window that ended longer ago than this is STALE unless the owner passes --history-max-age-ms
+DEFAULT_OPS_MAX_AGE_MS = 3 * DAY_MS                   # newest seal / backup (receipt) / restore-check older than this is STALE; the collector's recorded cadence x OPS_CADENCE_FACTOR can only TIGHTEN it
+OPS_CADENCE_FACTOR = 3
+FUTURE_SKEW_MS = 5 * 60_000
 EXIT = {"HEALTHY": 0, "PARTIAL": 1, "STALE": 3, "NO_DATA": 4}
 
 
@@ -142,10 +151,13 @@ def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, 
                 sec["incomplete_symbols"].append(sym)
             if isinstance(last, int) and iv and not delivery and now - last > MH.STALE_INTERVALS * iv + (now - (man.get("request") or {}).get("end_ms", now)):
                 sec["stale_symbols"].append(sym)               # data older than its cadence allows, relative to the requested window end
-        # A backfill is judged against ITS OWN requested window end (a window the owner closed in the past is not "stale"); ``--history-max-age-ms`` additionally calls a dataset
-        # whose window ended longer ago than that STALE (for a corpus that is supposed to be refreshed). A continuing feed is judged by the cycle section.
+        # A backfill is judged against ITS OWN requested window end for per-symbol lag, AND its window end must be recent (history max age, default 3 days): a window that ended
+        # long ago is STALE, never HEALTHY. A continuing feed is judged by the cycle section.
         wend = (man.get("request") or {}).get("end_ms")
-        if history_max_age_ms and isinstance(wend, int) and now - wend > history_max_age_ms:
+        max_age = DEFAULT_HISTORY_MAX_AGE_MS if history_max_age_ms is None else history_max_age_ms
+        if not isinstance(wend, int):
+            sec["stale_symbols"] = sorted(man["symbols"])                      # a dataset that does not say when its window ended cannot be shown fresh
+        elif now - wend > max_age:
             sec["stale_symbols"] = sorted(man["symbols"])
             sec["window_age_ms"] = now - wend
         if verify:
@@ -193,30 +205,76 @@ def _status_partitions(root: str, explicit: Optional[str], issues: List[Dict[str
     return res
 
 
-def _backup_section(root: str, health: Optional[Mapping[str, Any]], live: Mapping[str, Optional[str]], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
-    sec: Dict[str, Any] = {"backup": None, "restore_check": None, "seal": None, "source": "health_report"}
+def _safe(fn: Callable[..., Dict[str, Any]], *args: Any) -> Dict[str, Any]:
+    """A live check over damaged input is a FAILED check with a reason, never a traceback."""
+    try:
+        return fn(*args)
+    except Exception as exc:                          # noqa: BLE001 - damaged evidence must be reported, whatever shape the damage takes
+        return {"ok": False, "problems": [f"check could not complete: {type(exc).__name__}: {str(exc)[:200]}"], "checked": None}
+
+
+def _newest_at_ms(rows: Sequence[Any]) -> Optional[int]:
+    ts = [r.get("at_ms") for r in rows if isinstance(r, dict) and isinstance(r.get("at_ms"), int) and not isinstance(r.get("at_ms"), bool)]
+    return max(ts) if ts else None
+
+
+def _ops_limit(health: Optional[Mapping[str, Any]], key: str, override: Optional[int]) -> int:
+    """Oldest acceptable age of a seal / backup / restore-check. An explicit value wins. Else DEFAULT_OPS_MAX_AGE_MS, TIGHTENED (never loosened: health.json is unauthenticated)
+    by OPS_CADENCE_FACTOR x the cadence the collector recorded for that hook."""
+    if override is not None:
+        return override
+    cad = ((health or {}).get("hook_cadence_ms") or {}).get(key)
+    if isinstance(cad, int) and not isinstance(cad, bool) and cad > 0:
+        return min(DEFAULT_OPS_MAX_AGE_MS, OPS_CADENCE_FACTOR * cad)
+    return DEFAULT_OPS_MAX_AGE_MS
+
+
+def _backup_section(root: str, health: Optional[Mapping[str, Any]], live: Mapping[str, Optional[str]], issues: List[Dict[str, Any]], now: int = 0,
+                    ops_max_age_ms: Optional[int] = None) -> Dict[str, Any]:
+    sec: Dict[str, Any] = {"backup": None, "restore_check": None, "seal": None, "source": "health_report", "stale": False}
     for key, name in (("last_backup", "backup"), ("last_restore_check", "restore_check"), ("last_seal", "seal")):
         rec = (health or {}).get(key)
-        sec[name] = rec
+        sec[name] = dict(rec, verified=False) if isinstance(rec, dict) else None
+    at: Dict[str, Optional[int]] = {k: (v or {}).get("at_ms") if isinstance(v, dict) else None for k, v in (("backup", sec["backup"]), ("restore_check", sec["restore_check"]), ("seal", sec["seal"]))}
     if live.get("backup_dir") and live.get("receipts") and live.get("seal_manifest"):
-        rc = MC.restore_check(live["backup_dir"], live["receipts"], live["seal_manifest"])
-        ck = MC.check_cycles(root, live["seal_manifest"])
-        sec["restore_check"] = {"ok": bool(rc["ok"]), "live": True, "detail": {"problems": rc.get("problems", [])[:5], "checked": rc.get("checked")}}
-        sec["seal"] = {"ok": bool(ck["ok"]), "live": True, "detail": {"problems": ck.get("problems", [])[:5]}}
-        if sec["backup"] is None and rc["ok"]:
-            sec["backup"] = {"ok": True, "live": True, "detail": "every sealed cycle has a receipt that re-hashes (restore-check)"}
+        rc = _safe(MC.restore_check, live["backup_dir"], live["receipts"], live["seal_manifest"])
+        ck = _safe(MC.check_cycles, root, live["seal_manifest"])
+        try:
+            receipt_at = _newest_at_ms(MC._log_rows(live["receipts"]))
+            seal_at = _newest_at_ms(MC._log_rows(live["seal_manifest"]))
+        except Exception:                                                       # noqa: BLE001
+            receipt_at = seal_at = None
+        sec["restore_check"] = {"ok": bool(rc["ok"]), "live": True, "verified": True, "at_ms": now, "detail": {"problems": rc.get("problems", [])[:5], "checked": rc.get("checked")}}
+        sec["seal"] = {"ok": bool(ck["ok"]), "live": True, "verified": True, "at_ms": seal_at, "detail": {"problems": ck.get("problems", [])[:5]}}
+        sec["backup"] = {"ok": bool(rc["ok"]) and receipt_at is not None, "live": True, "verified": True, "at_ms": receipt_at,
+                         "detail": "every sealed cycle has a receipt that re-hashes (restore-check); at_ms is the newest receipt" if rc["ok"] and receipt_at is not None
+                         else {"problems": rc.get("problems", [])[:5] or ["no receipt on record"]}}
+        at = {"backup": receipt_at, "restore_check": now, "seal": seal_at}
         sec["source"] = "live_check"
-    for name, label in (("backup", "BACKUP"), ("restore_check", "RESTORE_CHECK"), ("seal", "SEAL")):
+    for name, label, key in (("backup", "BACKUP", "last_backup"), ("restore_check", "RESTORE_CHECK", "last_restore_check"), ("seal", "SEAL", "last_seal")):
         rec = sec[name]
         if rec is None:
             issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": f"{label}_NEVER_RAN", "detail": f"no {name.replace('_', '-')} on record: nothing proves the data can be restored"})
-        elif not rec.get("ok"):
+            continue
+        if not rec.get("ok"):
             issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": f"{label}_FAILED", "detail": json.dumps(rec.get("detail"), default=str)[:300]})
+            continue
+        if not rec.get("verified"):                                              # an ok record nothing here confirmed: health.json is unauthenticated
+            issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": f"{label}_CLAIMED_NOT_VERIFIED",
+                           "detail": f"{MC.HEALTH_NAME} claims an ok {name.replace('_', '-')} but no live check was run (pass --backup-dir --receipts --seal-manifest); a claim is not evidence"})
+        t = at[name]
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0 or t > now + FUTURE_SKEW_MS:
+            issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": f"{label}_BAD_TIMESTAMP", "detail": f"the {name.replace('_', '-')} record has no usable past timestamp ({t!r})"})
+            continue
+        limit = _ops_limit(health, key, ops_max_age_ms)
+        if now - t > limit:
+            sec["stale"] = True
+            issues.append({"axis": "data_freshness", "level": "STALE", "code": f"{label}_STALE", "detail": f"newest {name.replace('_', '-')} is {(now - t) // 1000}s old; the limit is {limit // 1000}s"})
     return sec
 
 
 def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[str] = None, universe_capture: Optional[str] = None, verify: bool = True, history_max_age_ms: Optional[int] = None,
-          backup_dir: Optional[str] = None, receipts: Optional[str] = None, seal_manifest: Optional[str] = None,
+          backup_dir: Optional[str] = None, receipts: Optional[str] = None, seal_manifest: Optional[str] = None, ops_max_age_ms: Optional[int] = None,
           clock: Callable[[], int] = lambda: int(time.time() * 1000)) -> Dict[str, Any]:
     now = int(clock()) if now_ms is None else now_ms
     root = os.path.abspath(root)
@@ -234,7 +292,7 @@ def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[st
     cycles = _cycle_section(root, now, health, issues)
     history = _history_sections(root, now, verify, issues, universe, history_max_age_ms)
     parts = _status_partitions(root, universe_capture, issues)
-    backups = _backup_section(root, health, {"backup_dir": backup_dir, "receipts": receipts, "seal_manifest": seal_manifest}, issues)
+    backups = _backup_section(root, health, {"backup_dir": backup_dir, "receipts": receipts, "seal_manifest": seal_manifest}, issues, now, ops_max_age_ms)
     if health:
         if health.get("status") == "REFUSED":
             issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": "COLLECTOR_REFUSED", "detail": json.dumps(health.get("refusal"), default=str)[:200]})
@@ -242,7 +300,7 @@ def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[st
             issues.append({"axis": "data_freshness", "level": "PARTIAL", "code": "COLLECTOR_FAILING", "detail": f"{health['consecutive_failures']} consecutive failure(s)"})
     has_data = cycles["latest_complete_cycle"] is not None or any(h["symbols"] for h in history.values()) or any(h.get("dataset_status") for h in history.values())
     has_rows = cycles["latest_complete_cycle"] is not None or any((s.get("rows") or 0) > 0 for h in history.values() for s in h["symbols"].values())
-    stale = bool(cycles["stale"] or cycles.get("stale_fields")) or any(h["stale_symbols"] or h.get("dataset_status") == "STALE" for h in history.values())
+    stale = bool(cycles["stale"] or cycles.get("stale_fields") or backups["stale"]) or any(h["stale_symbols"] or h.get("dataset_status") == "STALE" for h in history.values())
     if not has_data or not has_rows:
         freshness = "NO_DATA"
     elif stale:
@@ -287,14 +345,15 @@ def main(argv: Optional[Sequence[str]] = None, *, clock: Callable[[], int] = lam
     ap.add_argument("--backup-dir"); ap.add_argument("--receipts"); ap.add_argument("--seal-manifest")
     ap.add_argument("--skip-verify", action="store_true", help="do not re-hash history datasets (HEALTHY is then impossible)")
     ap.add_argument("--now-ms", type=int)
-    ap.add_argument("--history-max-age-ms", type=int, help="a history dataset whose requested window ended longer ago than this is STALE")
+    ap.add_argument("--history-max-age-ms", type=int, help="a history dataset whose requested window ended longer ago than this is STALE (default: 3 days)")
+    ap.add_argument("--ops-max-age-ms", type=int, help="the newest seal / backup receipt / restore-check older than this is STALE (default: 3 days, tightened by the collector's recorded cadence)")
     ap.add_argument("--require-ready", action="store_true")
     a = ap.parse_args(argv)
     try:
-        rep = audit(a.root, now_ms=a.now_ms, universe_file=a.research_universe, universe_capture=a.universe_capture, verify=not a.skip_verify, history_max_age_ms=a.history_max_age_ms, backup_dir=a.backup_dir,
+        rep = audit(a.root, now_ms=a.now_ms, universe_file=a.research_universe, universe_capture=a.universe_capture, verify=not a.skip_verify, history_max_age_ms=a.history_max_age_ms, ops_max_age_ms=a.ops_max_age_ms, backup_dir=a.backup_dir,
                     receipts=a.receipts, seal_manifest=a.seal_manifest, clock=clock)
-    except (ValueError, OSError) as exc:
-        print(f"data_freshness_audit: {type(exc).__name__}: {exc}", file=sys.stderr)
+    except Exception as exc:                          # noqa: BLE001 - damaged input is a clean message and a non-zero exit, never a traceback
+        print(f"data_freshness_audit: {type(exc).__name__}: {str(exc)[:300]}", file=sys.stderr)
         return 2
     print(json.dumps(rep, indent=2, sort_keys=True, default=str))
     rc = EXIT[rep["axes"]["data_freshness"]["verdict"]]

@@ -35,6 +35,20 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", boom)
 
 
+LONG_AGO_OK = 400 * 86_400_000        # the fixtures' history window ends ~11 days before their fake "now"; the audit's default (3 days) is exercised by its own tests
+
+
+def A(root, **kw):
+    kw.setdefault("history_max_age_ms", LONG_AGO_OK)
+    return DA.audit(root, **kw)
+
+
+def M(argv, **kw):
+    if "--history-max-age-ms" not in argv:
+        argv = list(argv) + ["--history-max-age-ms", str(LONG_AGO_OK)]
+    return DA.main(argv, **kw)
+
+
 def tree_hash(root):
     h = hashlib.sha256()
     for dp, dn, fn in os.walk(root):
@@ -62,6 +76,14 @@ def build(tmp_path, cycles=3, backup=True, restore=True, history=True):
     return root, ctx
 
 
+def live(ctx):
+    return {"backup_dir": ctx["bk"], "receipts": ctx["rec"], "seal_manifest": ctx["seal"]}
+
+
+def live_argv(ctx):
+    return ["--backup-dir", ctx["bk"], "--receipts", ctx["rec"], "--seal-manifest", ctx["seal"]]
+
+
 def verdicts(rep):
     return {k: v["verdict"] for k, v in rep["axes"].items()}
 
@@ -75,9 +97,9 @@ def codes(rep, axis="data_freshness"):
 def test_an_empty_root_is_no_data_and_exits_non_zero(tmp_path, capsys):
     r = tmp_path / "r"
     os.mkdir(r, 0o700)
-    rep = DA.audit(str(r), now_ms=TC.T0)
+    rep = A(str(r), now_ms=TC.T0)
     assert verdicts(rep) == {"code_correctness": "NOT_ASSESSED", "data_freshness": "NO_DATA", "research_readiness": "NO_DATA"}
-    assert DA.main(["--root", str(r), "--now-ms", str(TC.T0)]) == 4
+    assert M(["--root", str(r), "--now-ms", str(TC.T0)]) == 4
     assert json.loads(capsys.readouterr().out)["axes"]["data_freshness"]["verdict"] == "NO_DATA"
 
 
@@ -86,7 +108,7 @@ def test_a_passing_backup_and_restore_do_not_make_no_data_healthy(tmp_path):
     os.mkdir(r, 0o700)
     MC._write_health(str(r / MC.HEALTH_NAME), {"schema": MC.HEALTH_SCHEMA, "interval_ms": STEP, "status": "STOPPED", "consecutive_failures": 0,
                                                "last_backup": {"ok": True}, "last_restore_check": {"ok": True}, "last_seal": {"ok": True}})
-    rep = DA.audit(str(r), now_ms=TC.T0)
+    rep = A(str(r), now_ms=TC.T0)
     assert verdicts(rep)["data_freshness"] == "NO_DATA" and verdicts(rep)["research_readiness"] == "NO_DATA"
 
 
@@ -95,7 +117,7 @@ def test_an_empty_dataset_manifest_alone_is_not_data(tmp_path):
     os.mkdir(r, 0o700)
     specs = TH.funding_specs()
     MH.run_dataset(str(r), "funding", None, specs, fetch=TH.HV({}), clock=TH.Clock(), sleep=TT.sleep, mono=TT.mono, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
-    rep = DA.audit(str(r), now_ms=TH.SERVER0)
+    rep = A(str(r), now_ms=TH.SERVER0)
     assert verdicts(rep)["data_freshness"] == "NO_DATA"
 
 
@@ -104,26 +126,28 @@ def test_an_empty_dataset_manifest_alone_is_not_data(tmp_path):
 def test_real_complete_fresh_data_with_passing_backup_and_restore_is_healthy(tmp_path, capsys):
     root, ctx = build(tmp_path)
     before = tree_hash(root)
-    rep = DA.audit(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
+    rep = A(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
     assert verdicts(rep)["data_freshness"] == "HEALTHY", rep["axes"]["data_freshness"]["issues"]
     assert rep["cycles"]["latest_complete_cycle"]["status"] == "OK" and rep["cycles"]["cycles"] == 3 and rep["backups"]["source"] == "live_check"
     assert rep["history"]["funding"]["verify"] == "OK" and rep["history"]["funding"]["symbols"]["BTCUSDT"]["latest_observed_ts"] == TH.BASE
     assert rep["history"]["funding"]["symbols"]["BTCUSDT"]["expected_cadence_ms"] == TH.H8
     assert "tickers:*" in rep["cycles"]["fields"] and any(k.startswith("book:") for k in rep["cycles"]["fields"])
     assert tree_hash(root) == before                                                   # the audit writes nothing
-    assert DA.main(["--root", str(root), "--now-ms", str(ctx["now"]), "--backup-dir", ctx["bk"], "--receipts", ctx["rec"], "--seal-manifest", ctx["seal"]]) == 0
+    assert M(["--root", str(root), "--now-ms", str(ctx["now"]), "--backup-dir", ctx["bk"], "--receipts", ctx["rec"], "--seal-manifest", ctx["seal"]]) == 0
     capsys.readouterr()
 
 
-def test_healthy_from_the_collectors_own_health_report_without_live_checks(tmp_path):
+def test_the_collectors_own_health_report_alone_is_a_claim_not_proof_and_is_never_healthy(tmp_path):
     root, ctx = build(tmp_path)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
-    assert verdicts(rep)["data_freshness"] == "HEALTHY" and rep["backups"]["source"] == "health_report"
+    rep = A(str(root), now_ms=ctx["now"])
+    assert verdicts(rep)["data_freshness"] == "PARTIAL" and rep["backups"]["source"] == "health_report"
+    assert {"BACKUP_CLAIMED_NOT_VERIFIED", "RESTORE_CHECK_CLAIMED_NOT_VERIFIED", "SEAL_CLAIMED_NOT_VERIFIED"} <= codes(rep)
+    assert rep["backups"]["backup"]["verified"] is False
 
 
 def test_healthy_is_independent_of_research_readiness(tmp_path):
     root, ctx = build(tmp_path)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"], **live(ctx))
     assert verdicts(rep)["data_freshness"] == "HEALTHY" and verdicts(rep)["research_readiness"] == "NOT_READY"      # no research universe declared, v1 capture lacks partitions
     assert {"MISSING_STATUS_PARTITIONS"} <= codes(rep, "research_readiness")
 
@@ -131,9 +155,9 @@ def test_healthy_is_independent_of_research_readiness(tmp_path):
 @pytest.mark.parametrize("kw,code", [({"backup": False}, "BACKUP_NEVER_RAN"), ({"restore": False}, "RESTORE_CHECK_NEVER_RAN")])
 def test_no_backup_or_no_restore_check_is_partial_never_healthy(tmp_path, kw, code):
     root, ctx = build(tmp_path, **kw)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert verdicts(rep)["data_freshness"] == "PARTIAL" and code in codes(rep)
-    assert DA.main(["--root", str(root), "--now-ms", str(ctx["now"])]) == 1
+    assert M(["--root", str(root), "--now-ms", str(ctx["now"])]) == 1
 
 
 def test_a_failed_backup_in_the_health_report_is_partial(tmp_path):
@@ -141,7 +165,7 @@ def test_a_failed_backup_in_the_health_report_is_partial(tmp_path):
     h = json.load(open(root / MC.HEALTH_NAME))
     h["last_backup"] = {"at_ms": 1, "ok": False, "detail": {"failed": ["cycle-1: copy differs"]}}
     MC._write_health(str(root / MC.HEALTH_NAME), h)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert verdicts(rep)["data_freshness"] == "PARTIAL" and "BACKUP_FAILED" in codes(rep)
 
 
@@ -149,7 +173,7 @@ def test_a_failed_live_restore_check_is_partial(tmp_path):
     root, ctx = build(tmp_path)
     victim = os.path.join(ctx["bk"], MC.cycle_dirs(ctx["bk"])[0], "manifest.json")
     open(victim, "ab").write(b" ")
-    rep = DA.audit(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
+    rep = A(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
     assert verdicts(rep)["data_freshness"] == "PARTIAL" and "RESTORE_CHECK_FAILED" in codes(rep)
     assert rep["backups"]["restore_check"]["live"] is True
 
@@ -159,7 +183,7 @@ def test_a_seal_check_failure_is_partial(tmp_path):
     c = MC.cycle_dirs(str(root))[0]
     p = os.path.join(str(root), c, "tickers.jsonl")
     open(p, "ab").write(b"x")
-    rep = DA.audit(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
+    rep = A(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"])
     assert verdicts(rep)["data_freshness"] == "PARTIAL" and "SEAL_FAILED" in codes(rep)
 
 
@@ -167,9 +191,9 @@ def test_a_seal_check_failure_is_partial(tmp_path):
 
 def test_old_cycles_are_stale(tmp_path, capsys):
     root, ctx = build(tmp_path)
-    rep = DA.audit(str(root), now_ms=ctx["now"] + 10 * STEP)
+    rep = A(str(root), now_ms=ctx["now"] + 10 * STEP)
     assert verdicts(rep)["data_freshness"] == "STALE" and rep["cycles"]["stale"] is True and "STALE_DATA" in codes(rep)
-    assert DA.main(["--root", str(root), "--now-ms", str(ctx["now"] + 10 * STEP)]) == 3
+    assert M(["--root", str(root), "--now-ms", str(ctx["now"] + 10 * STEP)]) == 3
     capsys.readouterr()
 
 
@@ -183,7 +207,7 @@ def test_a_symbol_or_field_that_stopped_updating_is_reported_stale(tmp_path):
     os.chmod(newest, 0o600)
     json.dump(man, open(newest, "w"))
     # only the newest manifest was edited; older cycles still carry BTCUSDT, so its newest book is two cycles old
-    rep = DA.audit(str(root), now_ms=ctx["now"] + 2 * STEP)
+    rep = A(str(root), now_ms=ctx["now"] + 2 * STEP)
     assert any(k.startswith("book:") for k in rep["cycles"]["fields"]) and rep["cycles"]["fields"]["book:BTCUSDT"]["age_ms"] > 2 * STEP
     assert rep["cycles"].get("stale_fields") and verdicts(rep)["data_freshness"] == "STALE"
 
@@ -192,7 +216,7 @@ def test_recorded_gaps_between_cycles_are_partial(tmp_path):
     root, ctx = build(tmp_path, cycles=2, history=False)
     ctx["clk"].t += 20 * STEP
     TC.cont(root, clk=ctx["clk"], venue=ctx["venue"], max_cycles=1)
-    rep = DA.audit(str(root), now_ms=ctx["clk"].t + 1000)
+    rep = A(str(root), now_ms=ctx["clk"].t + 1000)
     assert rep["cycles"]["gaps"] and "CYCLE_GAPS" in codes(rep) and verdicts(rep)["data_freshness"] == "PARTIAL"
 
 
@@ -201,7 +225,7 @@ def test_a_collector_that_is_failing_or_refused_is_partial(tmp_path):
     h = json.load(open(root / MC.HEALTH_NAME))
     h.update(status="REFUSED", refusal={"code": "DISK_GUARD"}, consecutive_failures=4)
     MC._write_health(str(root / MC.HEALTH_NAME), h)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert {"COLLECTOR_REFUSED", "COLLECTOR_FAILING"} <= codes(rep) and verdicts(rep)["data_freshness"] == "PARTIAL"
 
 
@@ -211,7 +235,7 @@ def test_a_corrupt_dataset_page_is_partial_and_names_the_problem(tmp_path):
     data = bytearray(open(p, "rb").read())
     data[40] ^= 1
     open(p, "wb").write(bytes(data))
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert rep["history"]["funding"]["verify"] == "FAILED" and "DATASET_DOES_NOT_VERIFY" in codes(rep) and verdicts(rep)["data_freshness"] == "PARTIAL"
     assert verdicts(rep)["research_readiness"] == "NOT_READY"
 
@@ -222,13 +246,13 @@ def test_a_tampered_cycle_log_is_partial(tmp_path):
     lines = open(log).read().splitlines()
     os.chmod(log, 0o600)
     open(log, "w").write("\n".join(lines[:-1] + [lines[-1].replace('"OK"', '"PARTIAL"')]) + "\n")
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert "CYCLE_LOG_DOES_NOT_VERIFY" in codes(rep) and verdicts(rep)["data_freshness"] != "HEALTHY"
 
 
 def test_a_non_complete_dataset_is_partial_and_skip_verify_can_never_be_healthy(tmp_path):
     root, ctx = build(tmp_path)
-    rep = DA.audit(str(root), now_ms=ctx["now"], verify=False)
+    rep = A(str(root), now_ms=ctx["now"], verify=False)
     assert verdicts(rep)["data_freshness"] == "PARTIAL" and "VERIFICATION_SKIPPED" in codes(rep)
     r2 = tmp_path / "r2"
     os.mkdir(r2, 0o700)
@@ -236,13 +260,13 @@ def test_a_non_complete_dataset_is_partial_and_skip_verify_can_never_be_healthy(
     del ts[100]
     MH.run_dataset(str(r2), "funding", None, TH.funding_specs(), fetch=TH.HV({("funding", "BTCUSDT"): ts}), clock=TH.Clock(), sleep=TT.sleep, mono=TT.mono,
                    free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
-    rep2 = DA.audit(str(r2), now_ms=TH.SERVER0)
+    rep2 = A(str(r2), now_ms=TH.SERVER0)
     assert "DATASET_PARTIAL" in codes(rep2) and verdicts(rep2)["data_freshness"] != "HEALTHY"
 
 
 def test_a_history_window_that_ended_too_long_ago_is_stale_on_request(tmp_path):
     root, ctx = build(tmp_path)
-    rep = DA.audit(str(root), now_ms=ctx["now"] + 10 * TH.H8, history_max_age_ms=TH.H8)
+    rep = A(str(root), now_ms=ctx["now"] + 10 * TH.H8, history_max_age_ms=TH.H8)
     assert rep["history"]["funding"]["stale_symbols"] == ["BTCUSDT", "ETHUSDT"] or verdicts(rep)["data_freshness"] == "STALE"
     assert verdicts(rep)["data_freshness"] == "STALE"
 
@@ -258,7 +282,7 @@ def _universe_file(tmp_path, syms):
 def test_coverage_versus_a_declared_research_universe_and_missing_status_partitions(tmp_path):
     root, ctx = build(tmp_path)
     uf = _universe_file(tmp_path, ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
-    rep = DA.audit(str(root), now_ms=ctx["now"], universe_file=uf)
+    rep = A(str(root), now_ms=ctx["now"], universe_file=uf)
     ru = rep["history"]["funding"]["research_universe"]
     assert ru["declared"] == 3 and ru["complete"] == 2 and ru["missing"] == ["SOLUSDT"]
     assert verdicts(rep)["research_readiness"] == "NOT_READY" and {"UNIVERSE_NOT_COVERED", "MISSING_STATUS_PARTITIONS"} <= codes(rep, "research_readiness")
@@ -269,11 +293,11 @@ def test_ready_needs_a_covered_universe_and_every_status_partition_observed(tmp_
     root, ctx = build(tmp_path)
     d = TH._universe_dir(tmp_path, syms=("BTCUSDT", "ETHUSDT", "OLDUSDT"), statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": TH.BASE}, name="uni_ok")
     uf = _universe_file(tmp_path, ["BTCUSDT", "ETHUSDT"])
-    rep = DA.audit(str(root), now_ms=ctx["now"], universe_file=uf, universe_capture=str(d))
+    rep = A(str(root), now_ms=ctx["now"], universe_file=uf, universe_capture=str(d))
     assert rep["status_partitions"]["missing"] == [] and rep["status_partitions"]["present"] == ["Closed", "PreLaunch", "Trading"] or rep["status_partitions"]["missing"] == []
     assert verdicts(rep)["research_readiness"] == "READY", rep["axes"]["research_readiness"]["issues"]
     refused = TH._universe_dir(tmp_path, syms=("BTCUSDT", "OLDUSDT"), statuses={"OLDUSDT": "Closed"}, refuse_closed=True, name="uni_refused")
-    rep2 = DA.audit(str(root), now_ms=ctx["now"], universe_file=uf, universe_capture=str(refused))
+    rep2 = A(str(root), now_ms=ctx["now"], universe_file=uf, universe_capture=str(refused), **live(ctx))
     assert rep2["status_partitions"]["missing"] == ["Closed"] and verdicts(rep2)["research_readiness"] == "NOT_READY"
     assert "REFUSED_BY_VENUE" in rep2["status_partitions"]["outcomes"]["Closed"]
     assert verdicts(rep2)["data_freshness"] == "HEALTHY"                                              # the axes are separate
@@ -294,9 +318,9 @@ def test_the_research_universe_file_formats_and_bad_input(tmp_path):
 
 def test_require_ready_makes_a_not_ready_corpus_exit_non_zero(tmp_path, capsys):
     root, ctx = build(tmp_path)
-    argv = ["--root", str(root), "--now-ms", str(ctx["now"])]
-    assert DA.main(argv) == 0
-    assert DA.main(argv + ["--require-ready"]) == 1
+    argv = ["--root", str(root), "--now-ms", str(ctx["now"])] + live_argv(ctx)
+    assert M(argv) == 0
+    assert M(argv + ["--require-ready"]) == 1
     capsys.readouterr()
 
 
@@ -307,22 +331,22 @@ def test_a_root_inside_git_or_not_a_directory_is_refused(tmp_path, capsys):
     os.makedirs(repo / ".git")
     r = repo / "data"
     os.mkdir(r, 0o700)
-    assert DA.main(["--root", str(r)]) == 2
-    assert DA.main(["--root", str(tmp_path / "missing")]) == 2
+    assert M(["--root", str(r)]) == 2
+    assert M(["--root", str(tmp_path / "missing")]) == 2
     capsys.readouterr()
 
 
 def test_a_group_readable_root_is_reported(tmp_path):
     root, ctx = build(tmp_path)
     os.chmod(root, 0o755)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert "ROOT_PERMISSIONS" in codes(rep) and verdicts(rep)["data_freshness"] == "PARTIAL"
     os.chmod(root, 0o700)
 
 
 def test_the_three_axes_are_separate_and_code_correctness_is_not_assessed(tmp_path):
     root, ctx = build(tmp_path)
-    rep = DA.audit(str(root), now_ms=ctx["now"])
+    rep = A(str(root), now_ms=ctx["now"])
     assert set(rep["axes"]) == {"code_correctness", "data_freshness", "research_readiness"}
     assert rep["axes"]["code_correctness"]["verdict"] == "NOT_ASSESSED" and "CI" in rep["axes"]["code_correctness"]["note"]
     assert set(DA.EXIT) == {"HEALTHY", "PARTIAL", "STALE", "NO_DATA"} and DA.EXIT["HEALTHY"] == 0 and all(v != 0 for k, v in DA.EXIT.items() if k != "HEALTHY")
@@ -341,5 +365,92 @@ def test_the_docstring_says_it_is_not_the_carry_watch_and_the_marker_is_untouche
 def test_the_audit_never_writes(tmp_path):
     root, ctx = build(tmp_path)
     before = tree_hash(root)
-    DA.audit(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"], universe_file=_universe_file(tmp_path, ["BTCUSDT"]))
+    A(str(root), now_ms=ctx["now"], backup_dir=ctx["bk"], receipts=ctx["rec"], seal_manifest=ctx["seal"], universe_file=_universe_file(tmp_path, ["BTCUSDT"]))
     assert tree_hash(root) == before
+
+
+# ---------------------------------------------------------------- staleness of old data / old operations, and an unauthenticated health.json
+
+DAY = 86_400_000
+
+
+def _ancient_history_root(tmp_path):
+    """A history-only root whose window ended years ago, plus a hand-written health.json whose ok records are as old as the data."""
+    r = tmp_path / "old"
+    os.mkdir(r, 0o700)
+    MH.run_dataset(str(r), "funding", None, TH.funding_specs(), fetch=TH.funding_venue(), clock=TH.Clock(), sleep=TT.sleep, mono=TT.mono, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
+    ok = {"at_ms": TH.FIRST, "ok": True, "detail": {}}
+    MC._write_health(str(r / MC.HEALTH_NAME), {"schema": MC.HEALTH_SCHEMA, "status": "RUNNING", "consecutive_failures": 0, "last_backup": ok, "last_restore_check": ok, "last_seal": ok})
+    return r
+
+
+def test_a_window_that_ended_years_ago_with_forged_ancient_ok_records_is_never_healthy(tmp_path):
+    r = _ancient_history_root(tmp_path)
+    now = TH.END + 2200 * DAY
+    rep = DA.audit(str(r), now_ms=now)                                                   # DEFAULT history max age (3 days)
+    assert verdicts(rep)["data_freshness"] == "STALE" and "STALE_DATA" in codes(rep)
+    assert rep["history"]["funding"]["window_age_ms"] > 2000 * DAY
+    assert {"BACKUP_STALE", "RESTORE_CHECK_STALE", "SEAL_STALE"} <= codes(rep)
+    assert DA.main(["--root", str(r), "--now-ms", str(now)]) == 3
+    # even when the owner explicitly accepts old history, the claims alone (no live check) are not HEALTHY
+    rep2 = DA.audit(str(r), now_ms=now, history_max_age_ms=10_000 * DAY)
+    assert verdicts(rep2)["data_freshness"] != "HEALTHY" and "BACKUP_CLAIMED_NOT_VERIFIED" in codes(rep2)
+
+
+def test_the_default_history_max_age_is_three_days_and_an_explicit_value_overrides_it(tmp_path):
+    root, ctx = build(tmp_path)
+    end = TH.END
+    assert DA.DEFAULT_HISTORY_MAX_AGE_MS == 3 * DAY
+    stale = DA.audit(str(root), now_ms=end + 3 * DAY + 1, **live(ctx))
+    assert stale["history"]["funding"]["stale_symbols"] and "STALE_DATA" in codes(stale)
+    ok = DA.audit(str(root), now_ms=end + 3 * DAY - 1, **live(ctx))
+    assert not ok["history"]["funding"]["stale_symbols"]
+    ok2 = DA.audit(str(root), now_ms=end + 30 * DAY, history_max_age_ms=60 * DAY, **live(ctx))
+    assert not ok2["history"]["funding"]["stale_symbols"]
+
+
+def test_old_live_backup_and_seal_records_are_stale_and_the_age_limit_is_configurable(tmp_path):
+    root, ctx = build(tmp_path)
+    rep = A(str(root), now_ms=ctx["now"], **live(ctx))
+    assert verdicts(rep)["data_freshness"] == "HEALTHY" and rep["backups"]["backup"]["verified"] is True
+    tight = A(str(root), now_ms=ctx["now"], ops_max_age_ms=1, **live(ctx))
+    assert verdicts(tight)["data_freshness"] == "STALE" and {"BACKUP_STALE", "SEAL_STALE"} <= codes(tight)
+    far = A(str(root), now_ms=ctx["now"] + 30 * DAY, history_max_age_ms=60 * DAY, **live(ctx))
+    assert {"BACKUP_STALE", "SEAL_STALE"} <= codes(far) and verdicts(far)["data_freshness"] == "STALE"
+
+
+def test_a_future_dated_health_claim_is_a_data_problem_not_a_pass(tmp_path):
+    root, ctx = build(tmp_path)
+    h = json.load(open(root / MC.HEALTH_NAME))
+    h["last_backup"]["at_ms"] = ctx["now"] + 400 * DAY
+    MC._write_health(str(root / MC.HEALTH_NAME), h)
+    rep = A(str(root), now_ms=ctx["now"])
+    assert "BACKUP_BAD_TIMESTAMP" in codes(rep) and verdicts(rep)["data_freshness"] != "HEALTHY"
+
+
+def test_a_garbled_receipt_or_seal_row_with_backup_dir_is_reported_not_a_traceback(tmp_path, capsys):
+    d = tmp_path / "w"
+    d.mkdir()
+    root = tmp_path / "root"
+    os.mkdir(root, 0o700)
+    rec, man = str(d / "receipts.jsonl"), str(d / "seal.jsonl")
+    open(rec, "w").write('{"kind":"x"}\n')
+    open(man, "w").write("")
+    os.mkdir(str(d / "bk"))
+    rep = DA.audit(str(root), backup_dir=str(d / "bk"), receipts=rec, seal_manifest=man, now_ms=TC.T0)
+    assert verdicts(rep)["data_freshness"] == "NO_DATA" and "RESTORE_CHECK_FAILED" in codes(rep)
+    rc = DA.main(["--root", str(root), "--backup-dir", str(d / "bk"), "--receipts", rec, "--seal-manifest", man, "--now-ms", str(TC.T0)])
+    assert rc != 0
+    out = capsys.readouterr()
+    assert "Traceback" not in out.err
+
+
+def test_an_unexpected_internal_error_is_a_clean_message_and_a_non_zero_exit(tmp_path, capsys, monkeypatch):
+    root, ctx = build(tmp_path)
+
+    def boom(*_a, **_k):
+        raise KeyError("cycle")
+    monkeypatch.setattr(DA, "_cycle_section", boom)
+    assert DA.main(["--root", str(root), "--now-ms", str(ctx["now"])]) == 2
+    err = capsys.readouterr().err
+    assert "KeyError" in err and "Traceback" not in err

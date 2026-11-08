@@ -1349,6 +1349,38 @@ def test_a_failing_backup_or_restore_check_is_recorded_in_health_and_collection_
     assert h3["last_seal"]["ok"] is False and "outside memory" in h3["last_seal"]["detail"]["error"]
 
 
+@pytest.mark.parametrize("row", ['{"kind":"x"}', '{"cycle":5}', '{"cycle":"cycle-1","manifest_sha256":3,"tree_sha256":null}', '[1,2]', '{"cycle":"../x","manifest_sha256":"a","tree_sha256":"b"}'])
+def test_restore_check_reports_a_garbled_receipt_row_and_never_raises(tmp_path, row):
+    d = tmp_path / "w"
+    d.mkdir()
+    rec, man = str(d / "receipts.jsonl"), str(d / "seal.jsonl")
+    open(rec, "w").write(row + "\n")
+    open(man, "w").write("")
+    os.mkdir(str(d / "bk"))
+    r = MC.restore_check(str(d / "bk"), rec, man)
+    assert r["ok"] is False and r["problems"]
+
+
+def test_a_hook_that_raises_anything_is_recorded_and_collection_continues(root, tmp_path, monkeypatch):
+    def boom(*_a, **_k):
+        raise KeyError("cycle")
+    monkeypatch.setattr(MC, "restore_check", boom)
+    seal, rec, bk = tmp_path / "seal.jsonl", tmp_path / "receipts.jsonl", tmp_path / "backup"
+    h, *_ = cont(root, max_cycles=2, seal_manifest=str(seal), seal_every=2, backup_to=str(bk), receipts=str(rec), backup_every=2, restore_check_every=2)
+    assert h["cycles_run"] == 2 and h["status"] == "STOPPED" and h["last_restore_check"]["ok"] is False and "KeyError" in h["last_restore_check"]["detail"]["error"]
+    assert health(root)["last_restore_check"]["ok"] is False
+
+
+def test_an_unexpected_crash_of_the_loop_is_written_to_health_before_it_propagates(root):
+    clk = SimClock()
+
+    def dying(url):
+        raise RuntimeError("segfault-ish")
+    with pytest.raises(RuntimeError):
+        MC.run_continuous(str(root), interval_ms=STEP, max_cycles=3, fetch=dying, clock=clk, sleep=clk.sleep, max_symbols=1, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
+    doc = health(root)
+    assert doc["status"] == "CRASHED" and "RuntimeError" in doc["stop_reason"]
+
 def test_a_refused_log_stops_the_run_for_the_owner(root):
     clk = SimClock()
     v = LiveVenue(clk)
