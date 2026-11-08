@@ -110,8 +110,11 @@ class ReplayConfig:
 # ------------------------------------------------------------------ the local P&L ledger (contract-compatible; swap for ms_accounting via ledger_factory)
 
 class LocalLedger:
-    """record_fill / record_funding / mark / pnl. price_leg is AT MID (actual-fill price leg + taker slippage); slippage = taker slippage + adverse selection (both costs);
-    net = price_leg + funding - fees - slippage. realised/unrealised split price_leg by whether the group is flat."""
+    """record_fill / record_funding / mark / pnl. THE net definition (every ledger behind this contract must give the same one, build_report asserts it):
+        price_leg = actual-fill price leg + taker slippage          (AT MID: the fill prices already contain the taker walk, so it is added back here ...)
+        slippage  = taker slippage + adverse selection              (... and charged exactly once here; adverse selection is a post-fill markout that is NOT in any fill price)
+        net       = price_leg + funding - fees - slippage
+    realised/unrealised split price_leg by whether the group is flat."""
 
     def __init__(self) -> None:
         self.fills: List[T.Fill] = []
@@ -136,7 +139,7 @@ class LocalLedger:
             return
         self.funding_events.append((symbol, ts_ms, amount_usd, prov))
 
-    def record_slippage(self, usd: float, kind: str) -> None:
+    def record_slippage(self, usd: float, kind: str, symbol: Optional[str] = None) -> None:
         if kind == "adverse":
             self.adverse += usd
         else:
@@ -216,6 +219,29 @@ class World:
         i = bisect.bisect_right(self._fk[sym], t)
         return tuple(r for _, r in x.funding[max(0, i - n):i])
 
+    def last_print_ts(self, sym: str, t: int) -> int:
+        i = bisect.bisect_right(self._fk[sym], t)
+        return self._fk[sym][i - 1] if i else t
+
+    def print_interval_min(self, sym: str, ts: int) -> Optional[int]:
+        """The funding interval IN FORCE AT the print timestamp ``ts`` (never the decision-time interval): the manifest segment that contains the print; with no segments the series'
+        single known interval; None when that is unknown (a print outside every segment included)."""
+        x = self.s[sym]
+        if x.funding_intervals:
+            for a, b, iv in x.funding_intervals:
+                if a <= ts <= b:
+                    return iv
+            return None
+        return x.interval_min
+
+    def trailing_funding_intervals(self, sym: str, t: int, n: int = 12) -> Tuple[int, ...]:
+        """One interval per trailing print (same window as ``trailing_funding``). If ANY print's interval is unknown the tuple is EMPTY (the consumer then cannot normalise and must
+        exclude the symbol); it is never filled with the current interval."""
+        x = self.s[sym]
+        i = bisect.bisect_right(self._fk[sym], t)
+        ivs = [self.print_interval_min(sym, ts) for ts, _ in x.funding[max(0, i - n):i]]
+        return tuple(ivs) if ivs and all(isinstance(v, int) and v > 0 for v in ivs) else ()
+
     def next_funding(self, sym: str, t: int) -> Optional[int]:
         x = self.s[sym]
         i = bisect.bisect_right(self._fk[sym], t)
@@ -274,7 +300,7 @@ class ReplayTransport:
         self.pending: List[T.Fill] = []
         self.dones: List[Tuple[str, str]] = []
         self.cat: Dict[str, str] = {}                              # fill_id -> category
-        self.slip: List[Tuple[str, float, str]] = []              # ("adverse"|"taker", usd, group_id)
+        self.slip: List[Tuple[str, float, str, str]] = []         # ("adverse"|"taker", usd, group_id, symbol)
         self.halted: set = set()
         self.fault_next: List[str] = []
         self.stats = {"orders_placed": 0, "refused": {}, "maker_orders": 0, "taker_orders": 0}
@@ -327,9 +353,13 @@ class ReplayTransport:
             if link in self.venue.orders and r.fills:
                 sf = r.fills[0]
                 f = self.venue.execute(link, sf.fill.qty, sf.fill.price, self.now, liquidity="TAKER", fee_usd=sf.fill.fee_usd, fill_id=sf.fill.fill_id)
-                self.cat[f.fill_id] = leg.category
-                self.pending.append(f)
-                self.slip.append(("taker", sf.slippage_usd, req.group_id))
+                if f is None:                                      # the venue's own book had nothing to reduce: no execution exists (reduce-only never flips a position)
+                    self.stats["reduce_only_clamped_to_zero"] = self.stats.get("reduce_only_clamped_to_zero", 0) + 1
+                    self.dones.append((req.group_id, leg.leg_id))
+                else:
+                    self.cat[f.fill_id] = leg.category
+                    self.pending.append(f)
+                    self.slip.append(("taker", sf.slippage_usd * (f.qty / sf.fill.qty if sf.fill.qty > 0 else 1.0), req.group_id, leg.symbol))
             if link in self.venue.orders and r.unfilled_qty > 1e-12:
                 o = self.venue.orders[link]
                 o["status"] = "PartiallyFilledCanceled" if o["filled_qty"] > 0 else "Cancelled"
@@ -362,9 +392,12 @@ class ReplayTransport:
                     self.stats["micro_fills_dropped"] = self.stats.get("micro_fills_dropped", 0) + 1
                     continue
                 f = self.venue.execute(link, sf.fill.qty, sf.fill.price, sf.fill.ts_ms, liquidity="MAKER", fee_usd=sf.fill.fee_usd, fill_id=sf.fill.fill_id)
+                if f is None:
+                    self.stats["reduce_only_clamped_to_zero"] = self.stats.get("reduce_only_clamped_to_zero", 0) + 1
+                    continue
                 self.cat[f.fill_id] = o.category
                 self.pending.append(f)
-                self.slip.append(("adverse", sf.markout_usd, o.group_id))
+                self.slip.append(("adverse", sf.markout_usd * (f.qty / sf.fill.qty), o.group_id, o.symbol))
                 self.order_fills[link] = self.order_fills.get(link, 0) + 1
 
     def venue_state(self) -> Dict[str, Any]:
@@ -415,6 +448,17 @@ def _utc_year(ts_ms: int) -> int:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).year
 
 
+def halt_gate(eng: Any) -> Tuple[Optional[str], frozenset]:
+    """What the engine would REFUSE at submit, asked BEFORE allocating: (a reason when new exposure is halted globally -- a risk-breach halt, UNKNOWN_VENUE_POSITION, a position
+    mismatch ... -- else None, the symbols that are halted or blocked)."""
+    reason = ("ENGINE_HALTED:" + ",".join(sorted(eng.halts))) if eng.halts else None
+    return reason, frozenset(set(eng.halted_symbols) | set(eng.blocked_symbols))
+
+
+def _opp_symbols(o: T.Opportunity) -> set:
+    return {s[5:] if s.startswith("SPOT:") else s for s, _ in o.legs}
+
+
 @dataclass
 class WorldProbe:
     """Read-only accessors onto the CURRENT replay world, bound once per run to ``gates.bind``: what an authority's state / snapshot providers need (always the present step)."""
@@ -463,7 +507,8 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
     fault_log: List[Dict[str, Any]] = []
     equity_curve: List[Tuple[int, float]] = []
     stats: Dict[str, Any] = {"liquidations": 0, "max_gross_usd": 0.0, "gross_sum": 0.0, "gross_n": 0, "max_open_groups": 0, "depth_limited": 0, "dup_fills_injected": 0,
-                             "orders_unfilled": 0, "orders_partial": 0, "settlements": 0}
+                             "orders_unfilled": 0, "orders_partial": 0, "settlements": 0, "opportunities_withheld_by_halt": 0, "groups_submitted": 0, "groups_refused_at_approval": 0,
+                             "groups_refused_at_submit": 0, "groups_refused_at_submit_by_halt": 0}
     peak = cfg.equity0
     pending_faults = sorted(cfg.faults, key=lambda f: (f.ts_ms, f.kind))
     active_stale_book_until = -1
@@ -495,10 +540,13 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
                     dup_fill_next[0] = False
                     stats["dup_fills_injected"] += 1
                     eng.on_fill(f, t)
-            for kind, usd, gid in tr.slip:
+            for kind, usd, gid, sym in tr.slip:
                 rs = getattr(led, "record_slippage", None)
                 if rs is not None:
-                    rs(usd, kind)
+                    try:
+                        rs(usd, kind, sym)
+                    except TypeError:                              # a legacy ledger with the two-argument hook
+                        rs(usd, kind)
                 if kind == "adverse" and gid in recs:
                     recs[gid].adverse_usd += usd
                 elif gid in recs:
@@ -525,7 +573,9 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
             if t <= active_stale_book_until:
                 age = cfg.stale_book_age_ms
             tf = w.trailing_funding(sym, t)
-            out[sym] = T.MarketSnapshot(sym, t, m, m, bids, asks, age, tf[-1] if tf else None, tf, w.interval_min(sym, t), w.next_funding(sym, t), x.oi_usd, None, w.spot_mark(sym, t))
+            out[sym] = T.MarketSnapshot(symbol=sym, decision_ms=t, mark=m, index=m, bids=bids, asks=asks, book_age_ms=age, last_funding_bps_per_print=tf[-1] if tf else None,
+                                        trailing_funding_bps_per_print=tf, trailing_funding_intervals_min=w.trailing_funding_intervals(sym, t), funding_interval_min=w.interval_min(sym, t),
+                                        next_funding_ms=w.next_funding(sym, t), open_interest_usd=x.oi_usd, turnover24h_usd=None, spot_mark=w.spot_mark(sym, t))
         return out
 
     def portfolio_state(t: int, snaps: Mapping[str, T.MarketSnapshot], account_ts: Optional[int]) -> PF.PortfolioState:
@@ -659,7 +709,7 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
                 if rec.regime == "ALL" and g.plan.legs:
                     sym0 = g.plan.legs[0].symbol
                     tf = w.trailing_funding(sym0, now)
-                    per_day = T.funding_bps_per_day(tf[-1], w.interval_min(sym0, now)) if tf else None
+                    per_day = T.funding_bps_per_day(tf[-1], w.print_interval_min(sym0, w.last_print_ts(sym0, now))) if tf else None
                     rec.regime = "UNKNOWN" if per_day is None else ("LOW" if abs(per_day) < cfg.regime_low_bps_day else "HIGH" if abs(per_day) >= cfg.regime_high_bps_day else "MID")
                 reason = None
                 if now - hedged_ts[gid] >= cfg.hold_ms:
@@ -701,6 +751,17 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
             account_ts = now - cfg.exec_policy.max_account_age_ms - 1 if now <= stale_account_until else now
             st = portfolio_state(now, snaps, account_ts)
             opps = scan_fn(now, snaps, instruments)
+            halt_reason, blocked = halt_gate(eng)                  # the allocator is blind to engine halts: never plan a group the engine will only FAIL (wasted allocation, inflated counts)
+            if halt_reason is not None:
+                withheld = [o for o in opps if o.legs and not o.exclusions]
+                opps = []
+            else:
+                withheld = [o for o in opps if o.legs and not o.exclusions and _opp_symbols(o) & blocked]
+                opps = [o for o in opps if o not in withheld]
+            if withheld:
+                stats["opportunities_withheld_by_halt"] += len(withheld)
+                decisions.append({"ts_ms": now, "candidate_id": "*", "action": "WITHHELD_BY_HALT", "binding": "ENGINE_HALT", "notional_usd": 0.0, "n_opportunities": len(withheld),
+                                  "reasons": [halt_reason or ("SYMBOL_HALTED_OR_BLOCKED:" + ",".join(sorted(blocked & {s for o in withheld for s in _opp_symbols(o)})))]})
             alloc = PF.allocate(opps, state=st, policy=cfg.portfolio, instruments=instruments, snapshots=snaps, decision_ms=now, spot_instruments=spot_instruments,
                                 spot_depth_usd=spot_depth, risk_assess=risk_assess, risk_policy=risk_policy)
             for d in alloc.decisions:
@@ -713,8 +774,15 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
                 eng.plan_group(p, now)
                 eng.approve_group(p.group_id, verdict, now)
                 if not getattr(verdict, "approved", False):
+                    stats["groups_refused_at_approval"] += 1
                     continue
-                eng.submit_group(p.group_id, now, market_ts_ms=now, account_ts_ms=account_ts)
+                pre_halt = halt_gate(eng)
+                if eng.submit_group(p.group_id, now, market_ts_ms=now, account_ts_ms=account_ts) == G.FAILED and all(l.attempts == 0 for l in eng.groups[p.group_id].legs.values()):
+                    stats["groups_refused_at_submit"] += 1                          # never sent: the engine's own gate (halt, stale data, blocked symbol) refused it
+                    if pre_halt[0] is not None or (pre_halt[1] & {l.symbol for l in p.legs}):
+                        stats["groups_refused_at_submit_by_halt"] += 1
+                else:
+                    stats["groups_submitted"] += 1
                 flush(now)
                 if dup_ack_next[0]:
                     dup_ack_next[0] = False
@@ -841,10 +909,31 @@ def _ci(values: Sequence[float], trials: int) -> Dict[str, Any]:
             "reliable": n >= MIN_INDEPENDENT_FOR_ANY_CLAIM, "adjusted_for_trials": max(1, trials)}
 
 
+class ReportIdentityError(AssertionError):
+    """The reported net is not gross - fees - slippage (taker + adverse selection): the ledger behind the run states a different net definition."""
+
+
+IDENTITY_TOL = 1e-6
+
+
+def assert_net_identity(pnl: Mapping[str, Any], label: str = "") -> None:
+    """THE net identity: net == (price_leg at mid + funding) - fees - slippage, slippage == taker slippage + adverse selection, within 1e-6 USD."""
+    g = float(pnl["price_leg"]) + float(pnl["funding"])
+    slip = float(pnl["taker_slippage"]) + float(pnl["adverse_selection"])
+    tol = IDENTITY_TOL + 1e-12 * abs(g)
+    if abs(float(pnl["slippage"]) - slip) > tol:
+        raise ReportIdentityError(f"{label}slippage {pnl['slippage']!r} != taker {pnl['taker_slippage']!r} + adverse {pnl['adverse_selection']!r}")
+    want = g - float(pnl["fees"]) - float(pnl["slippage"])
+    if abs(float(pnl["net"]) - want) > tol:
+        raise ReportIdentityError(f"{label}net {pnl['net']!r} != gross {g!r} - fees {pnl['fees']!r} - slippage {pnl['slippage']!r} (= {want!r})")
+
+
 def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int] = None, trials_this_run: int = 1, persistent_trials: bool = False,
                  variants: Optional[Mapping[str, Any]] = None, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Machine-readable ReplayReport (a JSON-safe dict) over one or several (walk-forward test) replays."""
     cfg0 = results[0].cfg
+    for i, r in enumerate(results):
+        assert_net_identity(r.pnl, f"window {i}: ")
     tot = {"price_leg": 0.0, "funding": 0.0, "fees": 0.0, "slippage": 0.0, "adverse_selection": 0.0, "taker_slippage": 0.0, "net": 0.0}
     for r in results:
         for k in tot:
@@ -909,11 +998,19 @@ def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int]
         "window": {"start_ms": min(r.cfg.start_ms for r in results), "end_ms": max(r.cfg.end_ms for r in results), "step_ms": cfg0.step_ms, "n_windows": len(results)},
         "pnl": {"gross_usd": tot["price_leg"] + tot["funding"], "net_usd": tot["net"], "fees_usd": tot["fees"], "funding_usd": tot["funding"], "price_leg_usd": tot["price_leg"],
                 "slippage_usd": tot["slippage"], "taker_slippage_usd": tot["taker_slippage"], "adverse_selection_usd": tot["adverse_selection"],
-                "note": "price_leg is at mid; slippage (taker walk + adverse selection) and fees are subtracted; funding is credited/debited at the actual settlement timestamp"},
+                "note": "ONE net definition: net = gross - fees - slippage with gross = price leg AT MID + funding; slippage = taker walk + adverse selection, each charged exactly once. The "
+                        "taker walk is already inside the fill prices (the price leg adds it back to reach mid, then it is subtracted as slippage); adverse selection is a modelled post-fill "
+                        "markout that is in NO fill price, so it is subtracted here and only here. Fees are subtracted once. Funding is credited/debited at the actual settlement timestamp"},
         "execution_mix": {"maker_fills": len(mk), "taker_fills": len(tk), "maker_notional_usd": mk_n, "taker_notional_usd": tk_n,
                           "maker_share_notional": mk_n / (mk_n + tk_n) if (mk_n + tk_n) > 0 else None},
         "fills": {"orders_placed": sum(s["transport"]["orders_placed"] for s in stats), "orders_unfilled": ssum("orders_unfilled"), "orders_partially_filled": ssum("orders_partial"),
-                  "groups_planned": len(groups), "groups_with_no_fill": no_fill_groups, "placement_refused": refused, "queue_bases": {kk: sum(s["queue_bases"].get(kk, 0) for s in stats) for kk in sorted({q for s in stats for q in s["queue_bases"]})}},
+                  "groups_planned": len(groups), "groups_submitted": ssum("groups_submitted"), "groups_refused_at_approval": ssum("groups_refused_at_approval"),
+                  "groups_refused_at_submit": ssum("groups_refused_at_submit"),
+                  "groups_refused_by_halt": ssum("opportunities_withheld_by_halt") + ssum("groups_refused_at_submit_by_halt"),
+                  "opportunities_withheld_by_halt": ssum("opportunities_withheld_by_halt"),
+                  "groups_note": "groups_planned = plans the allocator produced = submitted + refused_at_approval + refused_at_submit; groups_refused_by_halt counts opportunities WITHHELD before "
+                                 "allocation while the engine was halted / the symbol halted or blocked (never planned) plus plans the engine refused at submit because of a halt",
+                  "groups_with_no_fill": no_fill_groups, "placement_refused": refused, "queue_bases": {kk: sum(s["queue_bases"].get(kk, 0) for s in stats) for kk in sorted({q for s in stats for q in s["queue_bases"]})}},
         "capacity": {"max_gross_usd": max(s["max_gross_usd"] for s in stats), "mean_gross_usd": (sum(s["gross_sum"] for s in stats) / max(1, sum(s["gross_n"] for s in stats))),
                      "max_open_groups": max(s["max_open_groups"] for s in stats), "allocation_skips_size_or_depth": ssum("depth_limited")},
         "risk": {"max_drawdown_usd": max_dd, "max_drawdown_frac": max_dd_frac, "expected_shortfall_5pct_step_usd": es5, "time_under_water_frac": (under / nsteps) if nsteps else None,

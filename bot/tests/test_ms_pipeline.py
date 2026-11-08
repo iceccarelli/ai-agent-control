@@ -82,6 +82,10 @@ def cfg(**kw):
 
 
 def go(tmp_path, series=None, c=None, name="art", spec=SPEC, **kw):
+    params = dict(kw.pop("scan_params", None) or {})
+    if "persistence" in MP.SC.DEFAULT_PARAMS:                    # the scanner's modelled funding-persistence haircut is a separate knob: these proofs plant EXACT funding and check the arithmetic, so it is off (1.0)
+        params.setdefault("persistence", 1.0)
+    kw["scan_params"] = params
     return MP.run(series if series is not None else world(), spec=spec, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c or cfg(), artifacts_dir=str(tmp_path / name), **kw)
 
 
@@ -147,6 +151,48 @@ def check_fees(pr):
     return fees
 
 
+def check_net_identity(pr):
+    """ONE net definition everywhere: net = gross price leg AT MID + funding - fees - taker slippage - adverse selection, each modelled cost exactly once. Re-derived here from the
+    FILLS, the series' funding and the groups' own adverse selection (never from the ledger), then compared with every place a net is stated."""
+    res, led = pr.result, pr.ledger
+    fills = [(f, res.fills_cat.get(f.fill_id, "linear")) for f in res.fills]
+    cash = sum((-1.0 if f.side == "Buy" else 1.0) * f.qty * f.price for f, _c in fills)
+    openq = collections.defaultdict(float)
+    for f, c in fills:
+        openq[(f.symbol, c)] += f.qty if f.side == "Buy" else -f.qty
+    mtm = sum(q * led.marks[k] for k, q in openq.items() if abs(q) > 1e-12)
+    funding = led.pnl()["funding"]
+    fees = sum(f.fee_usd for f, _c in fills)
+    adverse = sum(g.adverse_usd for g in res.groups.values())
+    taker = sum(g.taker_slip_usd for g in res.groups.values())
+    net = cash + mtm + funding - fees - adverse                                              # taker slippage is already inside the fill prices: subtracted ONCE, there
+    assert adverse > 0 and fees > 0
+    p = led.pnl()
+    rr, lp = art(pr, "replay_report.json"), art(pr, "ledger_pnl.json")
+    tol = dict(rel=1e-9, abs=1e-6)
+    assert p["net"] == pytest.approx(net, **tol)
+    assert res.pnl["net"] == pytest.approx(net, **tol)
+    assert rr["net_pnl_usd"] == pytest.approx(net, **tol)
+    assert lp["realised_net_usd"] + lp["unrealised_usd"] == pytest.approx(net, **tol)
+    assert pr.report["pnl"]["net_usd"] == pytest.approx(net, **tol)
+    assert pr.summary["ledger"]["net"] == pytest.approx(net, **tol)
+    assert res.equity_curve[-1][1] - res.cfg.equity0 == pytest.approx(net, **tol)             # the equity curve (and so the drawdown) is on the same net
+    assert sum(r["net_pnl_usd"] for r in rr["symbols"]) == pytest.approx(net, **tol)
+    # gross is AT MID: net = gross - fees - taker slippage - adverse selection
+    assert rr["gross_pnl_usd"] - rr["fees_usd"] - rr["slippage_usd"] == pytest.approx(rr["net_pnl_usd"], **tol)
+    assert rr["slippage_usd"] == pytest.approx(taker + adverse, **tol) and rr["adverse_selection_usd"] == pytest.approx(adverse, **tol)
+    pp = pr.report["pnl"]
+    assert pp["gross_usd"] - pp["fees_usd"] - pp["slippage_usd"] == pytest.approx(pp["net_usd"], **tol)
+    # per group: the per-trade observation net is the same definition; ledger net == sum over EVERY group == closed observations + the groups still open / never closed
+    gnet = {gid: g.price_usd + g.funding_usd - g.fees_usd - g.adverse_usd for gid, g in res.groups.items()}
+    assert sum(gnet.values()) == pytest.approx(net, **tol)
+    obs = RP.observations(res)
+    assert obs and all(o.net_usd == pytest.approx(gnet[o.group_id], **tol) for o in obs)
+    rest = sum(v for gid, v in gnet.items() if gid not in {o.group_id for o in obs})
+    assert sum(o.net_usd for o in obs) + rest == pytest.approx(lp["realised_net_usd"] + lp["unrealised_usd"], **tol)
+    return net
+
+
 def check_consistent(pr, *, allow_open=True):
     """The invariants that must hold after ANY run, faulted or not."""
     res, led = pr.result, pr.ledger
@@ -172,9 +218,11 @@ def check_consistent(pr, *, allow_open=True):
     # the artifacts state the ledger's own numbers; per-symbol rows add up to the total
     rr, lp = art(pr, "replay_report.json"), art(pr, "ledger_pnl.json")
     if p["net"] is not None:
-        assert rr["net_pnl_usd"] == pytest.approx(p["net"]) == pytest.approx(res.pnl["net"])
-        assert lp["realised_net_usd"] + lp["unrealised_usd"] == pytest.approx(p["net"])
-        assert sum(r["net_pnl_usd"] for r in rr["symbols"]) == pytest.approx(p["net"])
+        net = led.pnl()["net"]                                                               # the ONE net: the raw ledger's net minus the modelled adverse selection
+        assert rr["net_pnl_usd"] == pytest.approx(net) == pytest.approx(res.pnl["net"])
+        assert lp["realised_net_usd"] + lp["unrealised_usd"] == pytest.approx(net)
+        assert sum(r["net_pnl_usd"] for r in rr["symbols"]) == pytest.approx(net)
+        assert net == pytest.approx(p["net"] - led.pnl()["adverse_selection"])
     # no unreconciled leg is ever a claimable profit
     open_legs = [k for k, leg in p["per_leg"].items() if abs(leg["qty"]) > 1e-9]
     if open_legs:
@@ -277,13 +325,37 @@ def test_the_replay_actually_trades_several_symbols_and_the_numbers_add_up(happy
     rr = art(pr, "replay_report.json")
     assert rr["n_groups"] >= 10 and {r["symbol"] for r in rr["symbols"]} >= {"AAAUSDT", "BBBUSDT", "CCCUSDT", "EEEUSDT"}
     assert rr["groups_by_state"].get("CLOSED", 0) >= 5
-    assert rr["gross_pnl_usd"] - rr["fees_usd"] == pytest.approx(rr["net_pnl_usd"])        # gross and net are different fields: net = gross - fees
+    assert rr["gross_pnl_usd"] - rr["fees_usd"] - rr["slippage_usd"] == pytest.approx(rr["net_pnl_usd"])        # gross is AT MID: net = gross - fees - slippage (taker + adverse)
     lp = art(pr, "ledger_pnl.json")
     assert lp["funding_usd"] > 0 and lp["fees_usd"] > 0
     assert lp["realised_net_usd"] + lp["unrealised_usd"] == pytest.approx(rr["net_pnl_usd"])      # ledger net == replay net
     assert pr.result.pnl["net"] == pytest.approx(rr["net_pnl_usd"])
     assert all(f.qty >= 1e-9 for f in pr.result.fills)                                      # no zero-quantity float residue was ever booked
     assert all(f.prov in ("SIMULATED", "MODELLED") for f in pr.result.fills)
+
+
+def test_one_net_definition_includes_the_modelled_adverse_selection_everywhere(happy):
+    series, pr = happy
+    net = check_net_identity(pr)
+    assert pr.result.pnl["adverse_selection"] > 0
+    assert net < pr.ledger.pnl()["ledger"]["net"] - 0.99 * pr.result.pnl["adverse_selection"]      # ms_accounting's own net omits it: the displayed net must not
+    note = pr.report["pnl"]["note"]
+    assert "adverse" in note and "once" in note
+
+
+def test_mutation_dropping_adverse_selection_from_the_ledger_net_is_caught(tmp_path, monkeypatch):
+    check_net_identity(go(tmp_path, world(), name="ok"))
+    real = MP.LedgerAdapter.record_slippage
+    monkeypatch.setattr(MP.LedgerAdapter, "record_slippage", lambda self, usd, kind, symbol=None: real(self, 0.0 if kind == "adverse" else usd, kind, symbol))
+    fails(check_net_identity, go(tmp_path, world(), name="bad"))
+
+
+def test_mutation_the_report_identity_assertion_refuses_a_ledger_that_does_not_add_up(tmp_path):
+    pr = go(tmp_path, world(), name="ok")
+    RP.build_report([pr.result])                                                             # the positive control: it adds up
+    bad = replace(pr.result, pnl={**pr.result.pnl, "net": pr.result.pnl["net"] + 5.0})
+    with pytest.raises(RP.ReportIdentityError):
+        RP.build_report([bad])
 
 
 def test_funding_is_credited_at_each_symbols_own_settlement_times_with_the_sign_of_the_position(happy):
@@ -425,6 +497,39 @@ def test_fault_runs_keep_ledger_lifecycle_and_artifacts_consistent(tmp_path, nam
         plan_ts = {e["group_id"]: e["ts_ms"] for e in res.engine.journal.entries if e["type"] == "PLAN"}
         ccc = [g for g in res.groups.values() if "CCCUSDT" in g.symbols]
         assert not [g for g in ccc if plan_ts[g.group_id] > T0 + 1 * D and plan_ts[g.group_id] <= T0 + 2 * D and g.entry_ts is not None]     # nothing planned during the halt ever traded
+
+
+BREACH = T0 + 2 * D
+
+
+def check_allocator_respects_halts(pr):
+    res = pr.result
+    plan_ts = {e["group_id"]: e["ts_ms"] for e in res.engine.journal.entries if e["type"] == "PLAN"}
+    assert plan_ts and not [g for g, ts in plan_ts.items() if ts >= BREACH]                  # nothing was planned once the engine was halted (the breach never lifts)
+    failed_unsent = [gid for gid, st in res.states.items() if getattr(st, "value", st) == "FAILED" and not any(f.group_id == gid for f in res.fills)]
+    assert failed_unsent == [], failed_unsent                                                # no wasted allocation: no group planned only to be failed by the halt
+    fl = pr.report["fills"]
+    assert fl["groups_planned"] == len(res.groups) == len(plan_ts)
+    assert fl["groups_planned"] == fl["groups_submitted"] + fl["groups_refused_at_approval"] + fl["groups_refused_at_submit"]
+    assert fl["groups_refused_at_submit"] == 0                                               # the halt was consulted BEFORE allocating, so no plan met a halted engine at submit
+    assert fl["groups_refused_by_halt"] > 0 and fl["opportunities_withheld_by_halt"] > 0     # the withheld candidates are reported separately, not as planned groups
+    assert any(d["action"] == "WITHHELD_BY_HALT" for d in res.decisions)
+
+
+def test_the_allocator_does_not_allocate_while_the_engine_is_halted_and_the_counts_are_separate(tmp_path):
+    base = go(tmp_path, world(), cfg(end_ms=T0 + 8 * D), name="base")
+    fl0 = base.report["fills"]
+    assert fl0["groups_refused_by_halt"] == 0 and fl0["groups_planned"] == fl0["groups_submitted"] + fl0["groups_refused_at_approval"] + fl0["groups_refused_at_submit"]       # positive control: no halt, nothing withheld
+    assert fl0["groups_submitted"] > 0
+    pr = go(tmp_path, world(), cfg(end_ms=T0 + 8 * D, faults=FAULTS["risk_breach"]))
+    check_allocator_respects_halts(pr)
+    check_consistent(pr)
+
+
+def test_mutation_an_allocator_blind_to_halts_is_caught(tmp_path, monkeypatch):
+    monkeypatch.setattr(RP, "halt_gate", lambda eng: (None, frozenset()))
+    pr = go(tmp_path, world(), cfg(end_ms=T0 + 8 * D, faults=FAULTS["risk_breach"]))
+    fails(check_allocator_respects_halts, pr)
 
 
 def one_leg_world():
@@ -704,6 +809,36 @@ def test_an_unknown_funding_interval_is_never_defaulted_to_480(tmp_path):
     assert rr.interval_min is None                                                          # the adapter from the loader's series does not invent 480 either
 
 
+SCANNER_NORMALISES_PER_PRINT = "FUNDING_INTERVAL_PER_PRINT_UNKNOWN" in open(os.path.join(BOT, "tools", "ms_scanner.py"), encoding="utf-8").read()
+PER_PRINT = pytest.mark.skipif(not SCANNER_NORMALISES_PER_PRINT, reason="activates with the scanner's per-print interval normalisation (FUNDING_INTERVAL_PER_PRINT_UNKNOWN)")
+
+
+def changing_interval_series(sym, *, only_new_segment=False, change_day=4):
+    """True flat 15 bps/day funding; the interval changes 480 -> 240 at ``change_day``."""
+    chg = T0 + change_day * D
+    marks = tuple((T0 + i * H, 100.0 + 0.05 * math.sin(1.1 * i)) for i in range(0, 14 * 24 + 1))
+    old = tuple((T0 + k * 480 * 60_000, 5.0) for k in range(1, change_day * 3 + 1))
+    new = tuple((chg + k * 240 * 60_000, 2.5) for k in range(1, (14 - change_day) * 6 + 1))
+    segs = ((new[0][0], new[-1][0], 240),) if only_new_segment else ((old[0][0], old[-1][0], 480), (new[0][0], new[-1][0], 240))
+    return RP.ReplaySeries(sym, old + new, marks, 240, sym[:-4], funding_intervals=segs, spot_listed=True)
+
+
+@PER_PRINT
+def test_the_scanner_sees_a_flat_15_bps_per_day_across_an_interval_change_inside_the_trailing_window(tmp_path):
+    pr = go(tmp_path, [changing_interval_series("AAAUSDT")], cfg(end_ms=T0 + 8 * D))
+    at = [(ms, o) for ms, ops in pr.recorder.scans for o in ops if not o.exclusions and ms == T0 + 5 * D]          # 6 prints at 240 and 6 at 480 in the window
+    assert at, [(ms, [o.exclusions for o in ops]) for ms, ops in pr.recorder.scans]
+    assert at[0][1].expected_funding_bps_horizon == pytest.approx(15.0 * (4 * D / D))               # hold 4 days x 15 bps/day, whatever the mix of intervals in the window
+
+
+@PER_PRINT
+def test_a_symbol_whose_window_has_an_unknown_print_interval_is_excluded_and_never_allocated(tmp_path):
+    pr = go(tmp_path, [changing_interval_series("AAAUSDT"), changing_interval_series("BBBUSDT", only_new_segment=True)], cfg(end_ms=T0 + 6 * D))
+    unknown_scan = [o for ms, ops in pr.recorder.scans if T0 + 4 * D < ms < T0 + 6 * D for o in ops if o.legs and o.legs[-1][0].replace("SPOT:", "") == "BBBUSDT"]
+    assert unknown_scan and all(o.exclusions for o in unknown_scan)
+    assert not [g for g in pr.result.groups.values() if "BBBUSDT" in g.symbols and g.entry_ts is not None and g.entry_ts < T0 + 6 * D]
+
+
 def test_an_unknown_account_timestamp_blocks_allocation_and_the_authority_with_reason_codes(tmp_path, monkeypatch):
     real = PF.PortfolioState.to_risk_state
 
@@ -779,7 +914,11 @@ def test_the_ledger_adapter_books_exits_on_the_entry_position_translates_spot_ma
     assert q["net_complete"] is False and q["ledger"]["net"] is None and isinstance(q["net"], float)
     led.record_slippage(2.0, "adverse")
     led.record_slippage(1.0, "taker")
-    assert led.pnl()["slippage"] == 3.0 and led.pnl()["net"] == q["net"]                      # slippage is an attribution, nothing is deducted twice
+    p2 = led.pnl()
+    assert p2["slippage"] == 3.0 and p2["taker_slippage"] == 1.0 and p2["adverse_selection"] == 2.0
+    assert p2["net"] == pytest.approx(q["net"] - 2.0)                                        # adverse selection is a modelled cost NOT in the fill prices: deducted once
+    assert p2["price_leg"] == pytest.approx(q["price_leg"] + 1.0)                            # the price leg is AT MID: the taker walk is added back, then deducted as slippage
+    assert p2["net"] == pytest.approx(p2["price_leg"] + p2["funding"] - p2["fees"] - p2["slippage"])
     with pytest.raises(ValueError):
         MP.LedgerAdapter("NOPE")
 

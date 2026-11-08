@@ -484,3 +484,121 @@ def test_folding_a_journal_that_holds_the_same_fill_twice_counts_it_once():
     h.e.journal.append("FILL", GID, 3_500, {"fill": last["body"]["fill"]})            # a duplicate that reached the journal (e.g. a double write)
     e2 = EX.ExecutionEngine(h.store, send_order=h.v.send_order, cancel_order=h.v.cancel_order, venue_state=h.v.venue_state)
     assert e2.groups[GID].legs[PERP].filled == 4 and e2.positions() == {"linear:XUSDT": "-4"}
+
+
+# ---------------------------------------------------------------- reduce-only is enforced by the venue; flat is the venue's own read for EVERY leg key (spot included)
+
+def _ro(venue, lid, side, qty, cat="linear", sym="XUSDT", ro=True):
+    req = EX.OrderRequest("gRO", "cand1", "spec1", T.LegPlan(lid, sym, cat, side, str(qty), "Market", None, False, ro and cat == "linear", "IOC"), f"gRO-{lid}")
+    ack = venue.send_order(req)
+    return ack, req
+
+
+def check_reduce_only_never_flips():
+    v = EX.SimVenue()
+    ack, _ = _ro(v, "e1", "Sell", 10, ro=False)                                       # open a short of 10 (not reduce-only)
+    v.execute("gRO-e1", 10, 100.0, 1_000)
+    assert v.positions()["linear:XUSDT"] == -10
+    ack, _ = _ro(v, "x1", "Buy", 25)                                                  # an exit of 2.5x the position
+    assert ack.status == "ACCEPTED"
+    f = v.execute("gRO-x1", 25, 100.0, 2_000, liquidity="TAKER")
+    assert f is not None and f.qty == pytest.approx(10.0)                              # clamped to what is held
+    assert v.positions()["linear:XUSDT"] == pytest.approx(0.0)                        # it did not flip long
+    ack2, _ = _ro(v, "x2", "Buy", 5)                                                   # nothing left to reduce: refused, never a new long
+    assert ack2.status == "REJECTED" and "REDUCE_ONLY" in (ack2.reason or "")
+    assert v.positions()["linear:XUSDT"] == pytest.approx(0.0)
+    # cumulative across exits: two exits that together exceed the position
+    ack, _ = _ro(v, "e2", "Sell", 10, ro=False)
+    v.execute("gRO-e2", 10, 100.0, 3_000)
+    _ro(v, "x3", "Buy", 6)
+    _ro(v, "x4", "Buy", 6)
+    a = v.execute("gRO-x3", 6, 100.0, 4_000, liquidity="TAKER")
+    b = v.execute("gRO-x4", 6, 100.0, 4_001, liquidity="TAKER")
+    assert a.qty == pytest.approx(6.0) and b is not None and b.qty == pytest.approx(4.0)
+    assert v.positions()["linear:XUSDT"] == pytest.approx(0.0)
+    # a reduce-only SELL cannot flip a long short either
+    _ro(v, "e3", "Buy", 3, ro=False)
+    v.execute("gRO-e3", 3, 100.0, 5_000)
+    _ro(v, "x5", "Sell", 9)
+    c = v.execute("gRO-x5", 9, 100.0, 5_100, liquidity="TAKER")
+    assert c.qty == pytest.approx(3.0) and v.positions()["linear:XUSDT"] == pytest.approx(0.0)
+
+
+def test_simvenue_clamps_and_refuses_reduce_only_orders_so_a_position_never_flips():
+    check_reduce_only_never_flips()
+
+
+def test_mutation_a_venue_that_ignores_reduce_only_is_caught(monkeypatch):
+    monkeypatch.setattr(EX.SimVenue, "_reducible", lambda self, category, symbol, side: 1e18)
+    with pytest.raises(AssertionError):
+        check_reduce_only_never_flips()
+
+
+def test_the_simvenue_spot_balance_is_its_own_ledger_updated_by_matching_and_a_spot_sell_cannot_go_short():
+    v = EX.SimVenue()
+    _ro(v, "b1", "Buy", 4, cat="spot")
+    v.execute("gRO-b1", 4, 100.0, 1_000)
+    v.hidden_executions.add("gRO-b1:0")                                                # the executions READ hides it; the balance does not depend on that read's rows
+    assert v.venue_state()["executions"] == [] and v.positions()["spot:XUSDT"] == pytest.approx(4.0)
+    _ro(v, "s1", "Sell", 9, cat="spot")
+    f = v.execute("gRO-s1", 9, 100.0, 2_000, liquidity="TAKER")
+    assert f.qty == pytest.approx(4.0) and v.positions().get("spot:XUSDT", 0.0) == pytest.approx(0.0)       # spot has no short: only the held balance can be sold
+
+
+def check_closed_needs_the_spot_leg_flat_on_the_venue_too():
+    h = hedged(H())
+    h.e.request_exit(GID, 5_000)
+    h.v.position_override["spot:XUSDT"] = 4.0                                          # the venue's spot balance still shows 4 the fills say are gone
+    for k, o in list(h.v.orders.items()):
+        if "-x" in k:
+            h.fill(k, o["qty"], 100.0, 5_100, liq="TAKER")
+    h.e.step(6_000)
+    assert h.state() != G.CLOSED
+    assert any(r.startswith("POSITION_MISMATCH:spot:XUSDT") for r in h.e.halts) or any(a.get("code") == "NOT_FLAT_ON_VENUE" for a in h.e.anomalies)
+
+
+def test_closed_requires_the_venue_to_read_the_spot_leg_flat_not_only_the_perp():
+    check_closed_needs_the_spot_leg_flat_on_the_venue_too()
+
+
+def test_mutation_skipping_spot_keys_in_the_flat_verification_is_caught(monkeypatch):
+    real = EX.ExecutionEngine._read_venue
+
+    def no_spot(self):
+        v = real(self)
+        if v and v.get("positions") is not None:
+            v = dict(v)
+            v["positions"] = {k: x for k, x in v["positions"].items() if not k.startswith("spot:")}
+        return v
+    monkeypatch.setattr(EX.ExecutionEngine, "_read_venue", no_spot)
+    with pytest.raises(AssertionError):
+        check_closed_needs_the_spot_leg_flat_on_the_venue_too()
+
+
+def check_closed_needs_a_complete_read():
+    h = hedged(H())
+    h.e.request_exit(GID, 5_000)
+    h.v.incomplete_view = True
+    for k, o in list(h.v.orders.items()):
+        if "-x" in k:
+            h.fill(k, o["qty"], 100.0, 5_100, liq="TAKER")
+    h.e.step(6_000)
+    assert h.state() != G.CLOSED and not h.e.groups[GID].flat_verified               # an incomplete read cannot show a leg's key as flat
+    h.v.incomplete_view = False
+    h.e.step(7_000)
+    assert h.state() == G.CLOSED                                                        # positive control: the complete read closes it
+
+
+def test_closed_requires_a_complete_venue_read_for_every_leg_key():
+    check_closed_needs_a_complete_read()
+
+
+def test_mutation_ignoring_the_completeness_of_the_read_is_caught(monkeypatch):
+    real = EX.ExecutionEngine._read_venue
+
+    def always_complete(self):
+        v = real(self)
+        return dict(v, complete=True) if v else v
+    monkeypatch.setattr(EX.ExecutionEngine, "_read_venue", always_complete)
+    with pytest.raises(AssertionError):
+        check_closed_needs_a_complete_read()

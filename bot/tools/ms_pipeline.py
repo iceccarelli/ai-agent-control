@@ -75,7 +75,11 @@ class LedgerAdapter:
         unknown; a recorded print always takes precedence over the declaration;
       * returns ``net`` as a float for the replay's equity (the sum of the KNOWN components) together with ``net_complete`` / ``flags``. The artifacts write ``null`` whenever ``net_complete``
         is False: an unknown component is never presented as a number there;
-      * keeps slippage as an ATTRIBUTION (taker walk vs mid, adverse-selection markout): the fill prices are already inside ``price_leg``, so nothing is deducted a second time.
+      * states THE net definition (the same as ``ms_replay.LocalLedger`` and ``ms_replay.build_report``, which asserts it):
+            price_leg = ms_accounting's price leg (actual fill prices) + taker slippage     (AT MID: the taker walk is inside the fill prices, it is added back here ...)
+            net       = price_leg + funding - fees - taker slippage - adverse selection      (... and charged once as slippage; adverse selection is a post-fill markout that is in NO
+                                                                                              fill price, so ms_accounting's own net omits it and it is deducted here, once)
+        ``ledger`` (the raw ms_accounting dict) is passed through untouched: ITS net is not the displayed net.
     """
 
     def __init__(self, mark_prov: str = "MEASURED") -> None:
@@ -84,6 +88,7 @@ class LedgerAdapter:
         self.ledger = MACC.Ledger()
         self.mark_prov = mark_prov
         self.slip = {"adverse": 0.0, "taker": 0.0}
+        self.slip_by_symbol: Dict[str, Dict[str, float]] = {}
         self.marks: Dict[Tuple[str, str], float] = {}
         self._declared: set = set()
 
@@ -100,8 +105,11 @@ class LedgerAdapter:
     def record_funding(self, symbol: str, ts_ms: int, amount_usd: Optional[float], prov: str) -> bool:
         return self.ledger.record_funding(symbol, int(ts_ms), amount_usd, prov)
 
-    def record_slippage(self, usd: float, kind: str) -> None:
-        self.slip["adverse" if kind == "adverse" else "taker"] += float(usd)
+    def record_slippage(self, usd: float, kind: str, symbol: Optional[str] = None) -> None:
+        k = "adverse" if kind == "adverse" else "taker"
+        self.slip[k] += float(usd)
+        d = self.slip_by_symbol.setdefault(symbol or "", {"adverse": 0.0, "taker": 0.0})
+        d[k] += float(usd)
 
     def mark(self, symbol: str, ts_ms: int, price: float) -> None:
         if symbol.startswith("SPOT:"):
@@ -111,14 +119,29 @@ class LedgerAdapter:
             self.ledger.mark(symbol, int(ts_ms), price, category="linear", prov=self.mark_prov)
             self.marks[(symbol, "linear")] = float(price)
 
+    def symbol_pnl(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """One symbol's rollup on the SAME definition (gross at mid, minus fees, taker slippage and adverse selection); None when the symbol has no ledger leg."""
+        r = self.ledger.pnl()["per_symbol"].get(symbol)
+        if r is None:
+            return None
+        sl = self.slip_by_symbol.get(symbol, {"adverse": 0.0, "taker": 0.0})
+        pl = None if r["price_leg"] is None else r["price_leg"] + sl["taker"]
+        gross = None if pl is None or r["funding"] is None else pl + r["funding"]
+        net = None if gross is None or r["fees"] is None else gross - r["fees"] - sl["taker"] - sl["adverse"]
+        return {"price_leg": pl, "gross": gross, "fees": r["fees"], "taker_slippage": sl["taker"], "adverse_selection": sl["adverse"], "net": net}
+
     def pnl(self) -> Dict[str, Any]:
         p = self.ledger.pnl()
         known = lambda k: p[k] if p[k] is not None else 0.0                      # noqa: E731 - only for the replay's equity number; net_complete tells the truth
-        price_leg = p["price_leg"] if p["price_leg"] is not None else (p["realised_price"] or 0.0)
-        net = p["net"] if p["net"] is not None else price_leg + known("funding") - known("fees")
-        return {"price_leg": price_leg, "funding": known("funding"), "fees": known("fees"), "slippage": self.slip["adverse"] + self.slip["taker"],
-                "adverse_selection": self.slip["adverse"], "taker_slippage": self.slip["taker"], "realised": p["realised"], "unrealised": p["unrealised_price"],
-                "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]), "status": p["status"], "prov": p["prov"], "ledger": p}
+        taker, adverse = self.slip["taker"], self.slip["adverse"]
+        price_actual = p["price_leg"] if p["price_leg"] is not None else (p["realised_price"] or 0.0)
+        price_leg = price_actual + taker                                          # AT MID
+        funding, fees = known("funding"), known("fees")
+        net = price_leg + funding - fees - taker - adverse
+        unreal = p["unrealised_price"]
+        return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": taker + adverse, "adverse_selection": adverse, "taker_slippage": taker,
+                "realised": net - (unreal or 0.0), "unrealised": unreal, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]), "status": p["status"],
+                "prov": p["prov"], "ledger": p}
 
 
 # ======================================================================== risk policy (ms_risk's CLOSED schema, derived from the symbols actually in the series)
@@ -451,30 +474,34 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     common = {"generated_ms": int(generated_ms), "data_label": label}
 
     # ---- replay_report
-    gross = _sum(L["price_leg"], L["funding"])
+    gross = p["price_leg"] + p["funding"] if complete else None             # AT MID: net = gross - fees - slippage (taker walk + adverse selection)
     fees = L["fees"]
-    net = L["net"]
+    net = p["net"] if complete else None
     sym_rows = []
     sym_groups: Dict[str, List[str]] = {}
     for gid, g in sorted(res.groups.items()):
         for s in g.symbols:
             sym_groups.setdefault(s, []).append(gid)
     for sym in sorted(sym_groups):
-        r = L["per_symbol"].get(sym)
+        r = led.symbol_pnl(sym)
         kind = kinds.get(sym_groups[sym][0], kind_default)
         sym_rows.append({"symbol": sym, "kind": kind, "spot_hedge": hedge_of.get(sym, "HEDGE_UNKNOWN"), "n_groups": len(sym_groups[sym]),
-                         "gross_pnl_usd": _sum(r["price_leg"], r["funding"]) if r else 0.0, "fees_usd": r["fees"] if r else 0.0, "net_pnl_usd": r["net"] if r else 0.0})     # no ledger leg = no fill: a stated zero
+                         "gross_pnl_usd": r["gross"] if r else 0.0, "fees_usd": r["fees"] if r else 0.0, "net_pnl_usd": r["net"] if r else 0.0})     # no ledger leg = no fill: a stated zero
     states: Dict[str, int] = {}
     for st in res.states.values():
         k = st.value if hasattr(st, "value") else str(st)
         states[k] = states.get(k, 0) + 1
     replay_report = {"schema": "replay_report/v1", "basis": "SIMULATED", **common, "universe_scope": universe_scope, "period_start_ms": cfg.start_ms, "period_end_ms": cfg.end_ms,
-                     "n_groups": len(res.states), "groups_by_state": dict(sorted(states.items())), "gross_pnl_usd": gross, "fees_usd": fees, "net_pnl_usd": net, "symbols": sym_rows}
+                     "n_groups": len(res.states), "groups_by_state": dict(sorted(states.items())), "gross_pnl_usd": gross, "fees_usd": fees, "net_pnl_usd": net, "symbols": sym_rows,
+                     "slippage_usd": p["slippage"] if complete else None, "taker_slippage_usd": p["taker_slippage"] if complete else None,
+                     "adverse_selection_usd": p["adverse_selection"] if complete else None,
+                     "net_definition": "net = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection), each modelled cost once"}
 
     # ---- ledger_pnl (realised / unrealised split; a simulated ledger is never realised cash)
-    rg = _sum(L["realised_price"], L["funding"])
+    rg = (p["realised"] + p["fees"] + p["slippage"]) if complete else None     # realised price leg AT MID + funding
     ledger_pnl = {"schema": "ledger_pnl/v1", "basis": "SIMULATED", **common, "period_start_ms": cfg.start_ms, "period_end_ms": cfg.end_ms, "realised_gross_usd": rg,
-                  "fees_usd": fees, "funding_usd": L["funding"], "realised_net_usd": L["realised"], "unrealised_usd": L["unrealised_price"],
+                  "fees_usd": fees, "funding_usd": L["funding"], "slippage_usd": p["slippage"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": L["unrealised_price"],
+                  "net_definition": "realised_net + unrealised = net = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection); ms_accounting's own net omits adverse selection",
                   "ledger_status": L["status"], "ledger_flags": [_short(f, 120) for f in L["flags"][:20]]}
 
     # ---- portfolio_state (end of window)
@@ -686,8 +713,9 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
                "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
                "ledger": {"net": led.pnl()["net"], "net_complete": led.pnl()["net_complete"], "flags": led.pnl()["flags"][:20], "status": led.pnl()["status"]},
                "journal_head": res.journal_head, "promotion_eligible": False, "report": report,
-               "note": "REPLAY/PAPER on a simulated transport; the ledger net is ms_accounting's: slippage is an attribution inside the price leg, not deducted again (the replay report's "
-                       "per-observation net still subtracts adverse selection separately)"}
+               "note": "REPLAY/PAPER on a simulated transport. ONE net everywhere (artifacts, equity curve, observations, this summary): net = gross (price leg AT MID + funding) - fees - "
+                       "taker slippage - adverse selection. The taker walk is inside the fill prices (added back to reach mid, then charged once); adverse selection is a modelled "
+                       "post-fill markout that is in no fill price, so ms_accounting's own net (the 'ledger' dict) omits it and the pipeline deducts it once"}
     files[SUMMARY_FILE] = os.path.join(artifacts_dir, SUMMARY_FILE)
     _write_json(files[SUMMARY_FILE], summary)
     return PipelineResult(mode, label, res, report, summary, files, led, recorder, gates, policy, arts)

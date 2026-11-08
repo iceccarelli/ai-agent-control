@@ -152,8 +152,43 @@ def test_bars_without_volume_fill_nothing_unless_the_explicit_assumed_knob_is_on
     t_only = FM.bar_ticks(FM.Bar(5_000, 100.0, 101.0), o, assume)          # low == price: touched, not through
     _, g = FM.advance(o, t_only, 6_000, assume)
     assert g == []
-    vol = FM.bar_ticks(FM.Bar(5_000, 98.0, 101.0, volume_base=1000.0), o, P)
-    assert vol and vol[0].qty == pytest.approx(100.0)
+    assert FM.bar_ticks(FM.Bar(5_000, 98.0, 101.0, volume_base=1000.0), o, P) == []         # NO_FILL fills nothing from a bar, volume or not
+    vol = FM.bar_ticks(FM.Bar(5_000, 98.0, 101.0, volume_base=1000.0), o, assume)
+    assert vol and vol[0].qty == pytest.approx(1000.0 * 0.1 * (100.0 - 98.0) / (101.0 - 98.0))     # positive control: only the part of the range BELOW the buy price counts
+
+
+def check_bar_volume_is_gated_and_scaled():
+    o, _ = mk(qty=2.0)                                                       # a Buy at 100.0
+    no_fill = FM.FillParams(bar_policy="NO_FILL")
+    assume = FM.FillParams(bar_policy="ASSUME_THROUGH_MULT", bar_volume_frac=0.1)
+    bar = FM.Bar(5_000, 98.0, 101.0, volume_base=1000.0)
+    assert FM.bar_ticks(bar, o, no_fill) == []
+    _, f = FM.advance(o, FM.bar_ticks(bar, o, no_fill), 6_000, no_fill)
+    assert f == []
+    t = FM.bar_ticks(bar, o, assume)
+    assert len(t) == 1 and t[0].qty == pytest.approx(1000.0 * 0.1 * 2.0 / 3.0) and t[0].price == 98.0
+    assert FM.bar_ticks(FM.Bar(5_000, 100.5, 101.0, volume_base=1000.0), o, assume) == []      # the bar never traded below the price: no through-volume at all
+    s_o, _ = mk(side="Sell", price=100.1, qty=2.0)
+    ts = FM.bar_ticks(FM.Bar(5_000, 99.0, 101.1, volume_base=1000.0), s_o, assume)
+    assert ts and ts[0].qty == pytest.approx(1000.0 * 0.1 * (101.1 - 100.1) / (101.1 - 99.0)) and ts[0].price == 101.1       # a sell: the part ABOVE its price
+
+
+def test_bar_volume_is_gated_on_the_policy_and_scaled_by_the_portion_traded_through():
+    check_bar_volume_is_gated_and_scaled()
+
+
+def test_mutation_ignoring_the_policy_or_the_portion_for_bar_volume_is_caught(monkeypatch):
+    real = FM.bar_ticks
+
+    def ungated(bar, order, p):                                              # the old behaviour: volume branch regardless of policy, full fraction of the volume
+        q = bar.volume_base * p.bar_volume_frac
+        px = bar.low if order.side == "Buy" else bar.high
+        return [FM.Tick(bar.ts_ms, px, q)]
+    monkeypatch.setattr(FM, "bar_ticks", ungated)
+    with pytest.raises(AssertionError):
+        check_bar_volume_is_gated_and_scaled()
+    monkeypatch.setattr(FM, "bar_ticks", real)
+    check_bar_volume_is_gated_and_scaled()
 
 
 def test_no_state_leaks_between_calls_and_replay_of_the_same_ticks_is_identical():

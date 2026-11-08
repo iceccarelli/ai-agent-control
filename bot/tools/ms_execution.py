@@ -797,10 +797,10 @@ class ExecutionEngine:
         if pos is None:
             self.halt_new_exposure("UNKNOWN_VENUE_POSITION", ts)
             return False
-        for l in g.entry_legs():
+        if not bool(view.get("complete", False)):                                  # a read that may be missing rows cannot show a leg's key as flat: wait for a complete one
+            return False
+        for l in g.entry_legs():                                                   # EVERY leg key, spot included: flat is the venue's own read, never fill arithmetic
             k = _poskey(l.plan.category, l.plan.symbol)
-            if k.startswith("spot:"):
-                continue
             if abs(_D(pos.get(k, 0)) - self.positions_exp.get(k, Decimal(0))) > EPS:
                 self._emit("ANOMALY", g.plan.group_id, ts, {"code": "NOT_FLAT_ON_VENUE", "key": k, "venue": str(pos.get(k, 0)), "expected": str(self.positions_exp.get(k, 0))})
                 self.halt_new_exposure(f"POSITION_MISMATCH:{k}", ts)
@@ -840,6 +840,12 @@ class SimVenue:
         self.fail_state_read = False
         self.hidden_executions: set = set()      # executions the read does not show (delayed)
         self.position_override: Dict[str, float] = {}
+        self.book: Dict[str, float] = {}         # the venue's OWN position / balance book (category:symbol -> signed qty): updated by matching in execute / force_close, never re-derived from the executions list
+
+    def _reducible(self, category: str, symbol: str, side: str) -> float:
+        """The quantity an order on ``side`` can REDUCE right now: a Buy reduces a short perp, a Sell reduces a long perp or a spot balance (spot has no short)."""
+        pos = self.book.get(f"{category}:{symbol}", 0.0)
+        return max(0.0, -pos) if side == "Buy" else max(0.0, pos)
 
     def send_order(self, req: OrderRequest) -> Ack:
         link = req.link_id
@@ -848,6 +854,8 @@ class SimVenue:
             raise TimeoutError("request lost")
         if link in self.reject:
             return Ack(link, "REJECTED", None, self.reject[link])
+        if link not in self.orders and req.leg.reduce_only and self._reducible(req.leg.category, req.leg.symbol, req.leg.side) <= 1e-12:
+            return Ack(link, "REJECTED", None, "REDUCE_ONLY_NO_POSITION_TO_REDUCE")          # a reduce-only order never opens or flips a position
         if link not in self.orders:                                     # idempotent on the link id
             self.seq += 1
             self.orders[link] = {"order_id": f"V{self.seq}", "link_id": link, "symbol": req.leg.symbol, "category": req.leg.category, "side": req.leg.side,
@@ -870,12 +878,23 @@ class SimVenue:
         o["status"] = "PartiallyFilledCanceled" if o["filled_qty"] > 0 else "Cancelled"
         return "CANCELLED"
 
-    def execute(self, link: str, qty: float, price: float, ts_ms: int, *, liquidity: str = "MAKER", fee_usd: Optional[float] = None, fill_id: Optional[str] = None) -> T.Fill:
+    def execute(self, link: str, qty: float, price: float, ts_ms: int, *, liquidity: str = "MAKER", fee_usd: Optional[float] = None, fill_id: Optional[str] = None) -> Optional[T.Fill]:
+        """Match ``qty`` of the order. A reduce-only order (and any spot sell) is CLAMPED to what the book holds on the reducing side, cumulatively across orders; with nothing left to
+        reduce the order is cancelled and None is returned (no execution exists). The rest of a clamped order is cancelled too, as on a real venue."""
         o = self.orders[link]
-        q = round(min(qty, o["qty"] - o["filled_qty"]), 10)
+        q = min(qty, o["qty"] - o["filled_qty"])
+        clamped = False
+        if o["reduce_only"] or (o["category"] == "spot" and o["side"] == "Sell"):
+            cap = self._reducible(o["category"], o["symbol"], o["side"])
+            if q > cap + 1e-12:
+                q, clamped = cap, True
+        q = round(q, 10)
+        if q <= 1e-12:
+            o["status"] = "PartiallyFilledCanceled" if o["filled_qty"] > 0 else "Cancelled"
+            return None
         n = len([x for x in self.executions if x["link_id"] == link])
         fid = fill_id or f"{link}:{n}"
-        fee = fee_usd if fee_usd is not None else q * price * (2.0 if liquidity == "MAKER" else 5.5) / 1e4
+        fee = (fee_usd * (q / qty) if qty > 0 else fee_usd) if fee_usd is not None else q * price * (2.0 if liquidity == "MAKER" else 5.5) / 1e4
         prev = o["filled_qty"] * o["avg_price"]
         o["filled_qty"] += q
         o["avg_price"] = (prev + q * price) / o["filled_qty"] if o["filled_qty"] else 0.0
@@ -883,6 +902,10 @@ class SimVenue:
             o["status"] = "Filled"
         elif o["status"] == "New":
             o["status"] = "PartiallyFilled"
+        if clamped:
+            o["status"] = "PartiallyFilledCanceled"
+        k = f"{o['category']}:{o['symbol']}"
+        self.book[k] = self.book.get(k, 0.0) + (q if o["side"] == "Buy" else -q)
         x = {"fill_id": fid, "link_id": link, "qty": q, "price": price, "fee_usd": fee, "liquidity": liquidity, "ts_ms": ts_ms, "symbol": o["symbol"], "category": o["category"], "side": o["side"]}
         self.executions.append(x)
         return T.Fill(fid, o["group_id"], o["leg_id"], o["symbol"], o["side"], q, price, fee, "USDT", liquidity, ts_ms, "SIMULATED")
@@ -891,12 +914,11 @@ class SimVenue:
         """The venue itself closes part of a position (liquidation): it shows in executions and positions, under no engine link id."""
         self.executions.append({"fill_id": f"FORCED:{len(self.executions)}", "link_id": "FORCED", "qty": qty, "price": price, "fee_usd": 0.0, "liquidity": "TAKER", "ts_ms": ts_ms,
                                 "symbol": symbol, "category": category, "side": side})
+        k = f"{category}:{symbol}"
+        self.book[k] = self.book.get(k, 0.0) + (qty if side == "Buy" else -qty)
 
     def positions(self) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for x in self.executions:
-            k = f"{x['category']}:{x['symbol']}"
-            out[k] = out.get(k, 0.0) + (x["qty"] if x["side"] == "Buy" else -x["qty"])
+        out: Dict[str, float] = dict(self.book)
         out.update(self.position_override)
         return out
 

@@ -342,3 +342,91 @@ def test_paper_mode_injects_a_clock_and_still_labels_fills_modelled():
     ticks = iter(range(T0, T0 + 20 * D, H))
     r = RP.run_replay([series()], cfg(end_ms=T0 + 6 * D), scan_fn=scan, risk_assess=Risk(), clock=lambda: next(ticks))
     assert r.fills and all(f.prov in ("MODELLED", "SIMULATED") for f in r.fills)
+
+
+# ---------------------------------------------------------------- per-print funding intervals in the snapshot (contract with the scanner)
+
+CHANGE = T0 + 4 * D                       # 480 -> 240 minute prints; the funding is a TRUE flat 15 bps/day throughout
+
+
+def changing_series(sym="AAAUSDT", segments=True, interval_min=240, only_new_segment=False):
+    marks = tuple((T0 + i * H, 100.0 + 0.3 * math.sin(1.1 * i)) for i in range(0, 14 * 24 + 1))
+    old = tuple((T0 + k * 480 * 60_000, 5.0) for k in range(1, 4 * 3 + 1))                       # 3 prints/day x 5 bps = 15 bps/day
+    new = tuple((CHANGE + k * 240 * 60_000, 2.5) for k in range(1, 10 * 6 + 1))                  # 6 prints/day x 2.5 bps = 15 bps/day
+    segs = ((new[0][0], new[-1][0], 240),) if only_new_segment else ((old[0][0], old[-1][0], 480), (new[0][0], new[-1][0], 240))
+    return RP.ReplaySeries(sym, old + new, marks, interval_min, sym[:-4], funding_intervals=segs if segments else None)
+
+
+def record_snaps():
+    seen = {}
+
+    def scan_fn(now, snaps, instruments):
+        seen[now] = dict(snaps)
+        return []
+    return seen, scan_fn
+
+
+def check_snapshot_carries_the_interval_of_each_print(snap):
+    ivs = snap.trailing_funding_intervals_min
+    assert len(ivs) == len(snap.trailing_funding_bps_per_print) > 0
+    assert 480 in ivs and 240 in ivs and ivs == tuple(sorted(ivs, reverse=True))                # the change is INSIDE the trailing window, oldest -> newest
+    per_day = [T.funding_bps_per_day(r, iv) for r, iv in zip(snap.trailing_funding_bps_per_print, ivs)]
+    assert per_day == pytest.approx([15.0] * len(ivs))                                           # each print normalised by ITS interval: a true flat 15 bps/day
+    assert snap.funding_interval_min == 240                                                      # the interval in force at the decision is a different field
+    wrong = [T.funding_bps_per_day(r, snap.funding_interval_min) for r in snap.trailing_funding_bps_per_print]
+    assert wrong != pytest.approx([15.0] * len(wrong))                                          # normalising every print by the CURRENT interval would NOT give 15
+
+
+def test_the_snapshot_carries_the_funding_interval_in_force_at_each_trailing_print():
+    seen, fn = record_snaps()
+    go([changing_series()], c=cfg(end_ms=CHANGE + 2 * D), scan_fn=fn)
+    t = CHANGE + D                                                                                # 6 prints at 240 and 6 at 480 in the 12-print window
+    check_snapshot_carries_the_interval_of_each_print(seen[t]["AAAUSDT"])
+
+
+def test_mutation_filling_the_intervals_with_the_current_one_is_caught(monkeypatch):
+    monkeypatch.setattr(RP.World, "trailing_funding_intervals", lambda self, sym, t, n=12: tuple(self.interval_min(sym, t) for _ in self.trailing_funding(sym, t, n)))
+    seen, fn = record_snaps()
+    go([changing_series()], c=cfg(end_ms=CHANGE + 2 * D), scan_fn=fn)
+    t = CHANGE + D
+    with pytest.raises(AssertionError):
+        check_snapshot_carries_the_interval_of_each_print(seen[t]["AAAUSDT"])
+
+
+def test_a_series_with_one_known_interval_and_no_segments_uses_that_interval_for_every_print():
+    s = series(interval=240)
+    seen, fn = record_snaps()
+    go([s], c=cfg(end_ms=T0 + 3 * D), scan_fn=fn)
+    snap = seen[T0 + 2 * D]["AAAUSDT"]
+    assert snap.trailing_funding_intervals_min == (240,) * len(snap.trailing_funding_bps_per_print) and len(snap.trailing_funding_bps_per_print) > 0
+
+
+@pytest.mark.parametrize("kind", ["no_interval_no_segments", "prints_before_the_first_segment"])
+def test_an_unknown_print_interval_leaves_the_tuple_empty_never_the_current_interval(kind):
+    s = replace(series(), interval_min=None) if kind == "no_interval_no_segments" else changing_series(only_new_segment=True)
+    seen, fn = record_snaps()
+    go([s], c=cfg(end_ms=CHANGE + 2 * D), scan_fn=fn)
+    window = [seen[k]["AAAUSDT"] for k in sorted(seen) if CHANGE + 8 * H <= k < CHANGE + 2 * D] if kind != "no_interval_no_segments" else [seen[k]["AAAUSDT"] for k in sorted(seen) if k > T0 + 2 * D]
+    assert window and all(s_.trailing_funding_bps_per_print and s_.trailing_funding_intervals_min == () for s_ in window)
+    # once every print in the window is inside a known segment the intervals are back
+    if kind != "no_interval_no_segments":
+        late = seen[max(seen)]["AAAUSDT"]
+        assert late.trailing_funding_intervals_min == (240,) * len(late.trailing_funding_bps_per_print)
+
+
+def test_an_unknown_interval_symbol_is_not_allocated_by_a_scan_that_honours_the_contract():
+    def contract_scan(now, snaps, instruments):
+        out = []
+        for sym, s in sorted(snaps.items()):
+            if not s.trailing_funding_intervals_min or len(s.trailing_funding_intervals_min) != len(s.trailing_funding_bps_per_print):
+                continue                                                                          # FUNDING_INTERVAL_PER_PRINT_UNKNOWN: excluded, never normalised with the current interval
+            out.append(T.Opportunity(f"c-{sym}", "spec1", "SPOT_PERP_CARRY", now, ((sym, "Sell"), ("SPOT:" + sym, "Buy")), 3.0, 30.0, 0.0, (), 20.0, 1e6, 1.0,
+                                     s.last_funding_bps_per_print, "MEASURED"))
+        return out
+    known, unknown = changing_series("AAAUSDT"), changing_series("BBBUSDT", only_new_segment=True)
+    r = go([known, unknown], c=cfg(end_ms=CHANGE + 6 * D), scan_fn=contract_scan)
+    traded = {s for g in r.groups.values() for s in g.symbols}
+    assert "AAAUSDT" in traded
+    early = [g for g in r.groups.values() if "BBBUSDT" in g.symbols and g.entry_ts is not None and g.entry_ts < CHANGE + 2 * D]
+    assert early == []                                                                         # not allocated while ANY print in its window has an unknown interval
+    assert any("BBBUSDT" in g.symbols for g in r.groups.values())                              # positive control: allocated once every print in the window is known

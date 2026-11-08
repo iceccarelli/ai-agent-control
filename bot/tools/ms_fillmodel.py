@@ -174,14 +174,22 @@ def request_cancel(order: SimOrder, now_ms: int) -> SimOrder:
 
 
 def bar_ticks(bar: Bar, order: SimOrder, p: FillParams) -> List[Tick]:
-    """What a bar can say about trades through the order's price. NO volume => nothing unless the explicit ASSUMED knob is on."""
+    """What a bar can say about trades through the order's price. ``bar_policy="NO_FILL"`` => NOTHING, whatever the bar's volume. Under the explicit ASSUMED knob: with a volume the
+    through-volume is ``volume * bar_volume_frac`` scaled by the portion of the bar's range that lies THROUGH the order's price (uniform volume over [low, high], the portion below a
+    buy / above a sell: a bar that never went through the price has none); with no volume it is ``bar_through_mult * (queue ahead + qty)``."""
+    if p.bar_policy != "ASSUME_THROUGH_MULT":
+        return []
+    buy = order.side == "Buy"
+    px = bar.low if buy else bar.high
+    if not (px < order.price - EPS if buy else px > order.price + EPS):
+        return []                                                                # the bar never traded strictly through the limit
     if bar.volume_base is not None and bar.volume_base > 0:
-        q = bar.volume_base * p.bar_volume_frac
-    elif p.bar_policy == "ASSUME_THROUGH_MULT":
-        q = p.bar_through_mult * (order.queue_ahead + order.qty)
+        span = bar.high - bar.low
+        through = (order.price - bar.low) if buy else (bar.high - order.price)
+        portion = 1.0 if span <= EPS else min(1.0, max(0.0, through / span))
+        q = bar.volume_base * p.bar_volume_frac * portion
     else:
-        q = 0.0
-    px = bar.low if order.side == "Buy" else bar.high
+        q = p.bar_through_mult * (order.queue_ahead + order.qty)
     return [Tick(bar.ts_ms, px, q)] if q > 0 else []
 
 
