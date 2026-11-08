@@ -116,6 +116,7 @@ class _Leg:
     provs: List[str] = field(default_factory=list)
     n_fills: int = 0
     dust: Decimal = ZERO
+    order_legs: Set[str] = field(default_factory=set)      # the ORDER leg ids whose fills were booked into this position leg (acknowledged individually)
 
     @property
     def avg(self) -> Decimal:
@@ -152,9 +153,11 @@ class Ledger:
         self._cache = None
 
     # ------------------------------------------------------------ booking
-    def record_fill(self, fill: Fill, *, category: str = "linear", ref_price: Optional[float] = None) -> bool:
+    def record_fill(self, fill: Fill, *, category: str = "linear", ref_price: Optional[float] = None, position_leg: Optional[str] = None) -> bool:
         """Book a fill. False if its ``fill_id`` was already booked (ignored). ``category`` 'linear' | 'spot' (spot has no funding). ``ref_price`` is the price the plan
-        expected (for the slippage attribution). Arrival order is irrelevant (see the module docstring)."""
+        expected (for the slippage attribution). ``position_leg`` (optional) books the fill into the POSITION leg of that name instead of its order leg: exit orders carry NEW
+        leg ids, and booked under their own id they would sit as a second open leg (the pair would never be flat); ``acknowledge`` still applies to the ORDER leg id. Arrival
+        order is irrelevant (see the module docstring)."""
         if category not in ("linear", "spot"):
             raise LedgerError(f"category {category!r}")
         if not (isinstance(fill.fill_id, str) and fill.fill_id.strip()):
@@ -174,7 +177,9 @@ class Ledger:
                 self._flags.add(f"DUPLICATE_FILL_CONFLICT:{fill.fill_id}")
                 self._bump()
             return False
-        self._fills[fill.fill_id] = {"sig": sig, "fill": fill, "category": category, "qty": qty, "px": px, "fee": fee, "ref": to_decimal(ref_price)}
+        if position_leg is not None and not (isinstance(position_leg, str) and position_leg):
+            raise LedgerError("position_leg must be a non-empty string")
+        self._fills[fill.fill_id] = {"pos_leg": position_leg, "sig": sig, "fill": fill, "category": category, "qty": qty, "px": px, "fee": fee, "ref": to_decimal(ref_price)}
         self._bump()
         return True
 
@@ -291,9 +296,11 @@ class Ledger:
         for fid in sorted(self._fills, key=lambda i: (self._fills[i]["fill"].ts_ms, i)):
             r = self._fills[fid]
             fill, category, qty, px = r["fill"], r["category"], r["qty"], r["px"]
-            leg = legs.setdefault((fill.group_id, fill.leg_id), _Leg(fill.group_id, fill.leg_id, fill.symbol, category))
+            pleg = r["pos_leg"] or fill.leg_id
+            leg = legs.setdefault((fill.group_id, pleg), _Leg(fill.group_id, pleg, fill.symbol, category))
+            leg.order_legs.add(fill.leg_id)
             if (leg.symbol, leg.category) != (fill.symbol, category):
-                self._flags.add(f"LEG_IDENTITY_CONFLICT:{fill.group_id}:{fill.leg_id}")
+                self._flags.add(f"LEG_IDENTITY_CONFLICT:{fill.group_id}:{pleg}")
             leg.n_fills += 1
             leg.provs.append(_FILL_PROV_MAP.get(fill.prov, "UNKNOWN"))
             fee = r["fee"]                                                   # a fee is never defaulted
@@ -376,7 +383,7 @@ class Ledger:
     def _orphans(self) -> List[str]:
         if not self.track_acks:
             return []
-        return sorted(f"ORPHAN_FILL:{g}:{l}" for (g, l) in self._legs() if (g, l) not in self._acks)
+        return sorted(f"ORPHAN_FILL:{l.group_id}:{o}" for l in self._legs().values() for o in l.order_legs if (l.group_id, o) not in self._acks)
 
     # ------------------------------------------------------------ reporting
     def _leg_report(self, leg: _Leg) -> Dict[str, Any]:
@@ -393,8 +400,8 @@ class Ledger:
                 unreal = m[1] * abs(leg.qty) - leg.cost if leg.qty > 0 else leg.cost - m[1] * abs(leg.qty)
                 prov = weakest(prov, m[2], "MODELLED")                         # a mark-to-market is at best modelled
             flags.append(f"OPEN_LEG:{leg.group_id}:{leg.leg_id}")
-        if self.track_acks and (leg.group_id, leg.leg_id) not in self._acks:
-            flags.append(f"ORPHAN_FILL:{leg.group_id}:{leg.leg_id}")
+        if self.track_acks:
+            flags += [f"ORPHAN_FILL:{leg.group_id}:{o}" for o in sorted(leg.order_legs) if (leg.group_id, o) not in self._acks]
         return {"group_id": leg.group_id, "leg_id": leg.leg_id, "symbol": leg.symbol, "category": leg.category, "open": open_, "qty": leg.qty,
                 "realised_price": leg.realised_price, "unrealised_price": unreal, "fees": leg.fees, "slippage": leg.slippage, "prov": prov, "flags": flags, "dust_qty": leg.dust}
 
@@ -520,17 +527,20 @@ class Ledger:
         adverse = sum((d["adverse"] for d in self._slip.values()), ZERO)
         flags = list(p["flags"])
         adj, missing_exit = ZERO, False
-        for l in self._legs().values():
-            if l.qty == 0:
+        net_qty: Dict[Tuple[str, str], Decimal] = {}
+        for l in self._legs().values():                                         # the exit value belongs to the NET position of a (symbol, category), not to each booking leg
+            net_qty[(l.symbol, l.category)] = net_qty.get((l.symbol, l.category), ZERO) + l.qty
+        for (sym, cat), q in sorted(net_qty.items()):
+            if q == 0:
                 continue
-            m = self._marks.get((l.symbol, l.category))
+            m = self._marks.get((sym, cat))
             if m is None:
                 continue
             if m[3] is None or m[4] is None:
                 missing_exit = True
                 continue
-            px = m[3] if l.qty > 0 else m[4]
-            adj += (px - m[1]) * l.qty - abs(l.qty) * px * self._exit_fee_bps[l.category] / Decimal(10000)
+            px = m[3] if q > 0 else m[4]
+            adj += (px - m[1]) * q - abs(q) * px * self._exit_fee_bps[cat] / Decimal(10000)
         if missing_exit:
             flags.append("EXIT_PRICE_MISSING")
         price_leg = None if p["price_leg"] is None else p["price_leg"] + taker + adj
@@ -682,7 +692,7 @@ class Ledger:
         """JSON-able record of every input (strings for numbers). ``Ledger.from_inputs`` rebuilds an identical ledger in any order (restart)."""
         return {"track_acks": self.track_acks,
                 "fills": [{"fill_id": f["fill_id"], "group_id": f["group_id"], "leg_id": f["leg_id"], "symbol": f["symbol"], "category": f["category"], "side": f["side"], "qty": str(f["qty"]),
-                           "price": str(f["price"]), "fee": None if f["fee"] is None else str(f["fee"]), "ts_ms": f["ts_ms"], "prov": self._fills[f["fill_id"]]["fill"].prov,
+                           "price": str(f["price"]), "fee": None if f["fee"] is None else str(f["fee"]), "ts_ms": f["ts_ms"], "prov": self._fills[f["fill_id"]]["fill"].prov, "pos_leg": self._fills[f["fill_id"]]["pos_leg"],
                            "ref": None if self._fills[f["fill_id"]]["ref"] is None else str(self._fills[f["fill_id"]]["ref"])} for f in self.fills()],
                 "funding": [[s, ts, None if a is None else str(a), self._fund[s][ts][1]] for (s, ts), a in self.funding_events().items()],
                 "no_funding": {s: list(v) for s, v in sorted(self._fund_none.items())},
@@ -693,7 +703,7 @@ class Ledger:
         L = cls(track_acks=bool(d.get("track_acks")))
         for f in d.get("fills", []):
             L.record_fill(Fill(f["fill_id"], f["group_id"], f["leg_id"], f["symbol"], f["side"], f["qty"], f["price"], f["fee"], "USDT", "TAKER", f["ts_ms"], f["prov"]),
-                          category=f["category"], ref_price=f.get("ref"))
+                          category=f["category"], ref_price=f.get("ref"), position_leg=f.get("pos_leg"))
         for s, ts, a, prov in d.get("funding", []):
             L.record_funding(s, ts, a, prov)
         for s, (reason, prov) in d.get("no_funding", {}).items():

@@ -537,3 +537,9 @@ def test_missing_hard_limit_inputs_never_block_a_reduce_only_exit():
     exit_ = plan(leg("BTCUSDT", "linear", "Buy", "10", "X", ro=True))
     assert ok_decision(p=exit_, pol=hard(), st=st).approved
     assert "DAILY_LOSS_INPUT_UNKNOWN" in ok_decision(pol=hard(), st=st).reasons
+
+
+def test_drawdown_boundary_exactly_at_the_limit_is_a_breach():
+    pol = policy(max_drawdown_frac=0.05)
+    assert "DRAWDOWN_LIMIT_BREACHED" in ok_decision(pol=pol, st=state(equity_usd=9500.0, peak_equity_usd=10000.0)).reasons
+    assert ok_decision(pol=pol, st=state(equity_usd=9500.01, peak_equity_usd=10000.0)).approved
