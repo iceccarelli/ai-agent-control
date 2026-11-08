@@ -193,6 +193,7 @@ jobs:
           tests/test_market_history.py
           tests/test_data_freshness_audit.py
           tests/test_backfill_plan.py
+          tests/test_funnel_contracts.py
           tests/test_economic_model.py
           tests/test_economic_faults.py
           tests/test_ms_microstructure.py
