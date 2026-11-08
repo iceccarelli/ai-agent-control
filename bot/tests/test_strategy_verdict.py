@@ -465,7 +465,7 @@ def test_rt2_2_the_owner_figure_is_the_economic_total_and_a_none_or_nonpositive_
     ok, why = counted(forced, spec(), REG)
     assert ok is False and "OWNER_ECONOMIC_TOTAL_NOT_POSITIVE" in why
     # a withheld (None) / stale / unavailable total
-    for bad_status, bad_net in (("STALE", None), ("UNAVAILABLE", None), ("ESTIMATED", None), ("STALE", 500.0)):
+    for bad_status, bad_net in (("STALE", None), ("UNAVAILABLE", None), ("ESTIMATED", None)):
         rep = import_report()
         rep["layers"]["economic_total"].update(status=bad_status, net_economic_pnl_usd=bad_net)
         rep = _reseal(rep)
@@ -474,6 +474,10 @@ def test_rt2_2_the_owner_figure_is_the_economic_total_and_a_none_or_nonpositive_
         f2 = SV.EvidenceItem(stage=item.stage, result="PASS", provenance=item.provenance, status="RECONCILED", candidate_id=item.candidate_id, spec_digest=item.spec_digest,
                              metrics=dict(item.metrics, net_usd_after_all_costs=500.0), attachment=item.attachment)
         assert counted(f2, spec(), REG)[0] is False, (bad_status, bad_net)
+    forged_stale = import_report()
+    forged_stale["layers"]["economic_total"].update(status="STALE", net_economic_pnl_usd=500.0)
+    with pytest.raises(SV.SpecError):                                                          # a non-null figure under STALE is not something the importer emits
+        SV.evidence_from_import_report(_reseal(forged_stale), spec())
 
 
 def _reseal(rep):
@@ -612,9 +616,10 @@ def test_rt3_1_the_owner_report_needs_its_own_attestation_and_a_forged_report_is
     assert evaluate(spec(), base + [no_rep]).verdict == SV.QUALIFIED                                                       # capped one rung down, said out loud
     # poc1: forged economic total, correctly resealed (keyless digests all verify) and the item built honestly from it: still not attested
     f = import_report(); f["layers"]["economic_total"]["net_economic_pnl_usd"] = 1e9
-    forged = owner_item(_reseal(f), attest=False)
-    assert SV._verify_owner_report(_reseal(f)) == [] and counted(forged, spec(), REG)[1].startswith("OWNER_ATTESTATION_UNVERIFIABLE")
-    assert evaluate(spec(), base + [forged], key_provider=lambda: None).verdict in (SV.PROMISING, SV.PROSPECTIVE)
+    assert any("net_is_not_the_sum" in p for p in SV._verify_owner_report(_reseal(f)))       # an edited-then-resealed figure is refused by the arithmetic itself
+    unsigned = owner_item(import_report(), attest=False)                                         # a COHERENT report nobody signed: consistent, not authenticated
+    assert SV._verify_owner_report(import_report()) == [] and counted(unsigned, spec(), REG)[1].startswith("OWNER_ATTESTATION_UNVERIFIABLE")
+    assert evaluate(spec(), base + [unsigned], key_provider=lambda: None).verdict in (SV.PROMISING, SV.PROSPECTIVE)
 
 
 def test_rt3_1_owner_attest_is_a_constant_time_hmac_and_the_key_is_never_stored():
