@@ -1319,7 +1319,7 @@ def test_a_schema_2_capture_whose_rederived_status_is_not_acceptable_is_refused(
     d = _universe_dir(tmp_path)
     real = UC.verify_capture_dir
     for bad in ("UNVERIFIED", "CONFLICTED", "STALE"):
-        monkeypatch.setattr(UC, "verify_capture_dir", lambda p, bad=bad: dict(real(p), coverage=dict(real(p)["coverage"], dataset_status=bad)))
+        monkeypatch.setattr(UC, "verify_capture_dir", lambda p, bad=bad, **kw: dict(real(p, **kw), coverage=dict(real(p, **kw)["coverage"], dataset_status=bad)))
         with pytest.raises(MH.HistoryError, match=bad):
             MH.load_universe_dir(str(d))
     monkeypatch.setattr(UC, "verify_capture_dir", lambda p, **kw: dict(real(p, **kw), ok=False, problems=["x"]))
