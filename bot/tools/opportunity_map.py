@@ -683,7 +683,8 @@ def hold_cost_matrix(rows: Sequence[Settle], holds: Sequence[int],
 
 def funding_persistence(rows: Sequence[Settle], hold: int,
                         cost_levels: Sequence[float] = (costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED,
-                                                        costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY, 13.0)
+                                                        costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY,
+                                                        costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY + 2.0)   # fee + ASSUMED 1 bp/leg slippage (the map's default)
                         ) -> Dict[str, Any]:
     """How well does the gate's smoothed rate predict the funding actually
     collected over the hold? OLS of realised hold-funding on the EWMA at entry."""

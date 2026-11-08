@@ -61,33 +61,23 @@ PARTICIPATION_CAP = 0.01                  # ASSUMED share of open interest one p
 
 # ---------------------------------------------------------------- authoritative costs (adapter: sub-agent 4 owns the single definition)
 def cost_constants() -> Dict[str, Any]:
-    """The cost constants as carry_costs exposes them. Preference: the single authoritative ROUND_TRIP_* names; otherwise the parts this tree has, with what is missing said."""
-    fee_rt = getattr(CC, "ROUND_TRIP_FEE_BPS", None)
-    spread = getattr(CC, "ASSUMED_ROUND_TRIP_SPREAD_BPS", None)
-    total = getattr(CC, "ROUND_TRIP_TOTAL_COST_BPS", None)
-    basis = "carry_costs authoritative ROUND_TRIP_* constants"
-    if fee_rt is None:
-        fee_rt, basis = 2.0 * CC.TAKER_BPS_PERP, "carry_costs.TAKER_BPS_PERP x 2 (the authoritative ROUND_TRIP_FEE_BPS is not present in this tree)"
-    if total is None:
-        total = fee_rt + spread if spread is not None else None
-    return {"perp_taker_bps": CC.TAKER_BPS_PERP, "spot_taker_bps": CC.TAKER_BPS_SPOT, "perp_round_trip_fee_bps": float(fee_rt),
-            "assumed_round_trip_spread_bps": None if spread is None else float(spread),
-            "perp_round_trip_total_bps": None if total is None else float(total),
-            "spot_round_trip_fee_bps": 2.0 * CC.TAKER_BPS_SPOT, "basis": basis,
-            "spread_included": spread is not None,
-            "note": None if spread is not None else "spread not available as an authoritative constant here: every net figure below is FEES ONLY, i.e. an UPPER bound on net"}
+    """The cost constants exactly as carry_costs defines them (the single authority). The 0.4 bps spread is ASSUMED (unmeasured); the fee is venue_stated (base tier)."""
+    ov = CC.position_class_costs("overlay_owned_spot")
+    acq = CC.position_class_costs("acquire_spot_perp")
+    return {"perp_taker_bps": CC.TAKER_BPS_PERP, "spot_taker_bps": CC.TAKER_BPS_SPOT,
+            "perp_round_trip_fee_bps": float(CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY), "assumed_round_trip_spread_bps": float(CC.ASSUMED_ROUND_TRIP_SPREAD_BPS),
+            "perp_round_trip_total_bps": float(CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY), "spot_perp_round_trip_fee_bps": float(CC.ROUND_TRIP_FEE_BPS_SPOT_PERP),
+            "spot_perp_round_trip_total_bps": acq["total_bps"], "overlay_provenance": ov["provenance"], "maker_modelled_round_trip_bps": float(CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED),
+            "basis": "carry_costs authoritative constants (fee venue_stated base tier; spread ASSUMED, unmeasured; maker MODELLED)", "spread_included": True,
+            "note": "the 0.4 bps spread is an ASSUMPTION: the net figures carry it, they do not measure it"}
 
 
 def scenarios(c: Mapping[str, Any]) -> Dict[str, float]:
-    """Round-trip bps of the PERP legs for an overlay on owned BTC (no spot trades). MAKER_FIRST_* are MODELLED, not measured."""
-    perp_taker = float(CC.TAKER_BPS_PERP)
-    out = {"TAKER_FEES_ONLY": c["perp_round_trip_fee_bps"]}
-    if c["perp_round_trip_total_bps"] is not None:
-        out["TAKER_FEES_PLUS_SPREAD"] = c["perp_round_trip_total_bps"]
-    out["TAKER_FEES_PLUS_ASSUMED_SLIPPAGE_1BPS_PER_LEG"] = c["perp_round_trip_fee_bps"] + 2.0
-    out["MAKER_FIRST_MODELLED_entry_maker_exit_taker"] = float(OM.PERP_MAKER_BPS) + perp_taker       # config: exits are taker under maker_first
-    out["ALL_MAKER_MODELLED_best_case_unreachable"] = 2.0 * float(OM.PERP_MAKER_BPS)
-    return out
+    """Round-trip bps of the PERP legs for an overlay on owned BTC (no spot trades). MAKER_* are MODELLED (zero adverse selection, zero missed fills), not measured."""
+    return {"TAKER_FEES_ONLY": c["perp_round_trip_fee_bps"], "TAKER_FEES_PLUS_SPREAD": c["perp_round_trip_total_bps"],
+            "TAKER_FEES_PLUS_ASSUMED_SLIPPAGE_1BPS_PER_LEG": c["perp_round_trip_fee_bps"] + 2.0,
+            "MAKER_FIRST_MODELLED_entry_maker_exit_taker": float(CC.MAKER_BPS_PERP_MODELLED) + float(CC.TAKER_BPS_PERP),
+            "ALL_MAKER_MODELLED_best_case_unreachable": c["maker_modelled_round_trip_bps"]}
 
 
 # ---------------------------------------------------------------- candidates
@@ -172,7 +162,7 @@ def btc_carry_economics(repo: str = os.path.dirname(BOT)) -> Dict[str, Any]:
     sc = scenarios(c)
     mat = OM.hold_cost_matrix(rows, HOLDS_PRINTS, sc)
     gate_rt = 2.0 * CC.TAKER_BPS_PERP
-    tk = sc.get("TAKER_FEES_PLUS_SPREAD", sc["TAKER_FEES_ONLY"])
+    tk = sc["TAKER_FEES_PLUS_SPREAD"]
     seq = OM.gated_sequence(rows, OM.HOLD_PRINTS, rt_gate_bps=gate_rt, cost_bps=tk)
     nets = [t["net_bps"] for t in seq["trades"]]
     year_ms = 365 * 86_400_000
@@ -207,7 +197,7 @@ def _carry_verdict(econ: Mapping[str, Any]) -> Tuple[str, List[str], Dict[str, A
     cost the engine pays); the gated policy is marginal in-sample and negative in the trailing year, which is INSUFFICIENT_DATA, never a pass."""
     reasons: List[str] = []
     mat = econ["unconditional_forced_hold"]
-    taker = "TAKER_FEES_PLUS_SPREAD" if "TAKER_FEES_PLUS_SPREAD" in econ["scenarios_round_trip_bps"] else "TAKER_FEES_ONLY"
+    taker = "TAKER_FEES_PLUS_SPREAD"
     one = next(m for m in mat if m["hold_prints"] == 1 and m["scenario"] == taker)
     s1 = one["summary"]
     ci = one["mean_block_ci90"]
@@ -295,13 +285,13 @@ def candidate_row(name: str, spec: Mapping[str, Any], scan: Mapping[str, Any], e
                                 "policies": policies, "label": LABEL_CORPUS, "see": "economics.btc_carry_corpus"}
         row["readiness_verdict"], row["readiness_reasons"] = verdict, reasons
     else:
-        be = (costs["perp_round_trip_total_bps"] if costs["perp_round_trip_total_bps"] is not None else costs["perp_round_trip_fee_bps"]) / 7.0
+        be = costs["perp_round_trip_total_bps"] / 7.0
         assumed = [f"{m}.{k}" for m in ("fee_model", "slippage_model", "funding_model") for k, e in (spec.get(m) or {}).items()
                    if isinstance(e, dict) and e.get("provenance") in ("assumed", "unknown")]
         row["edge_vs_costs"] = {"value": UNKNOWN, "label": LABEL_ARITH,
                                 "reason": f"no committed data measures this edge; inputs still 'assumed': {assumed[:6]}",
                                 "breakeven_requirement": f"{be:.2f} bps/day of funding+price edge over a 7-day hold just repays a perp round trip ("
-                                                         f"{'fees+spread' if costs['spread_included'] else 'fees only'}); per 8h print {be * 480 / 1440:.2f}, per 4h print {be * 240 / 1440:.2f}, per 1h print {be * 60 / 1440:.2f}"}
+                                                         f"fees + ASSUMED spread); per 8h print {be * 480 / 1440:.2f}, per 4h print {be * 240 / 1440:.2f}, per 1h print {be * 60 / 1440:.2f}"}
         if not row["required_data"]["spec_declares_missing"] and uni["status"] in ("NOT_APPLICABLE_SINGLE_INSTRUMENT",):
             row["readiness_verdict"] = "INSUFFICIENT_DATA"
         else:
@@ -425,7 +415,7 @@ def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_day
             leg = {"symbol": s.symbol, "interval_min": s.interval_min, "hedgeability": hed, "formation_bps_per_day": sc, "funding_bps": fund, "prints": nprints,
                    "price_leg_bps": price_bps, "directional_total_bps": fund + price_bps - round_trip_bps, "closed_during_hold": s.delivery_ms is not None and s.delivery_ms <= t + h_ms}
             if hed == "HEDGEABLE_ON_BYBIT":
-                leg["hedged_carry_funding_net_of_cost_bps"] = fund - round_trip_bps - 2.0 * float(CC.TAKER_BPS_SPOT)
+                leg["hedged_carry_funding_net_of_cost_bps"] = fund - float(CC.position_class_costs("acquire_spot_perp")["total_bps"])      # spot + perp round trip
                 leg["basis_residual"] = "UNMEASURED"
             if s.oi_usd:
                 leg["max_notional_usd_assumed_1pct_of_oi"] = s.oi_usd * PARTICIPATION_CAP
@@ -445,9 +435,9 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     out-of-sample is non-positive). The trailing same-window observation is reported separately and labelled; it is not an expectation."""
     spec = spec if spec is not None else dict(load_candidates()[[n for n, _ in load_candidates()].index("cross_sectional_funding")][1])
     c = cost_constants()
-    cost = float(round_trip_bps) if round_trip_bps is not None else (c["perp_round_trip_total_bps"] if c["perp_round_trip_total_bps"] is not None else c["perp_round_trip_fee_bps"])
+    cost = float(round_trip_bps) if round_trip_bps is not None else c["perp_round_trip_total_bps"]
     unknown_iv = sorted(s.symbol for s in series if s.interval_min is None)
-    out: Dict[str, Any] = {"schema": SCHEMA + "/ranked_funding", "round_trip_bps_used": cost, "cost_basis": c["basis"] + ("" if c["spread_included"] else "; FEES ONLY (spread unavailable)"),
+    out: Dict[str, Any] = {"schema": SCHEMA + "/ranked_funding", "round_trip_bps_used": cost, "cost_basis": c["basis"],
                            "symbols": len(series), "hedgeability_counts": {}, "intervals_min_counts": {}, "symbols_without_interval": unknown_iv, "closed_contracts": sum(1 for s in series if s.delivery_ms),
                            "ranking_rule_variants": list(formation_days_grid), "hold_days": hold_days, "top_k": top_k, "ceiling": "INSUFFICIENT_DATA"}
     for s in series:

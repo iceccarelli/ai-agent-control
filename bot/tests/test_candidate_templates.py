@@ -207,9 +207,12 @@ def test_venue_stated_is_used_only_for_numbers_the_repos_published_schedule_stat
             for k, e in s[comp].items():
                 if e["provenance"] == "venue_stated":
                     saw += 1
-                    assert (comp, k) == ("fee_model", "taker_bps") and e["value"] == CC.TAKER_BPS_PERP and "BASE-tier" in e["note"], (name, comp, k, e)
+                    want = {"taker_bps": CC.TAKER_BPS_PERP, "spot_taker_bps": CC.TAKER_BPS_SPOT}.get(k)
+                    assert comp == "fee_model" and want is not None and e["value"] == want and "base-tier" in e["note"].lower(), (name, comp, k, e)
     assert saw >= 6
-    assert load("spot_perp_basis")["fee_model"]["taker_bps"] == {"provenance": "assumed", "value": 6.0}       # 6.0 is in no published schedule here: stays assumed
+    f = load("spot_perp_basis")["fee_model"]                                                                  # the stray 6.0 is gone: per-leg published numbers, so spot+perp prices at 31.0
+    assert f["taker_bps"]["value"] == CC.TAKER_BPS_PERP and f["spot_taker_bps"]["value"] == CC.TAKER_BPS_SPOT
+    assert 2 * (f["taker_bps"]["value"] + f["spot_taker_bps"]["value"]) == CC.ROUND_TRIP_FEE_BPS_SPOT_PERP == 31.0
     for name in MECHANISMS:                                                                                    # nothing was upgraded to measured/modelled without a data basis
         for comp in ("fee_model", "slippage_model"):
             assert all(e["provenance"] in ("assumed", "venue_stated") for e in load(name)[comp].values()), name

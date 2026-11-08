@@ -665,3 +665,11 @@ def test_the_real_universe_capture_verifier_feeds_the_harness(tmp_path):
         f.write(b" ")
     t = RH.PointInTimeUniverse.from_capture_dirs([d], study_from_ms=1_700_000_000_000, study_to_ms=1_700_000_000_000 + 86_400_000)
     assert not t.point_in_time and any(p.startswith("VERIFY_CAPTURE_DIR_FAILED") for p in t.survivorship_problems())
+
+
+def test_harness_and_carry_costs_normalise_funding_identically():
+    import carry_costs as CC
+    for rate, iv, days in ((1.0, 480, 7), (0.5, 240, 3), (0.125, 60, 1.5)):
+        assert RH.funding_bps_per_day(rate, iv) == pytest.approx(CC.funding_bps_per_day(rate, iv))
+        assert RH.funding_bps_over_horizon(rate, iv, days) == pytest.approx(CC.funding_bps_over_horizon(rate, iv, days))
+    assert CC.funding_bps_per_day(1.0, 7) is None                                          # carry_costs says None; the harness raises: neither guesses a grid

@@ -78,8 +78,8 @@ def test_btc_carry_numbers_come_from_the_committed_corpus_and_say_so(report):
     e = report["economics"]["btc_carry_corpus"]
     assert e["label"] == "COMMITTED_CORPUS_IN_SAMPLE" and "8h" in e["basis"] and "NO_DATA" in e["non_8h_intervals"]["btc_bybit"]
     sc = e["scenarios_round_trip_bps"]
-    assert sc["TAKER_FEES_ONLY"] == 11.0 and sc["MAKER_FIRST_MODELLED_entry_maker_exit_taker"] == 7.5
-    one = next(m for m in e["unconditional_forced_hold"] if m["hold_prints"] == 1 and m["scenario"] == "TAKER_FEES_ONLY")
+    assert sc["TAKER_FEES_ONLY"] == 11.0 and sc["MAKER_FIRST_MODELLED_entry_maker_exit_taker"] == 7.5 and sc["TAKER_FEES_PLUS_SPREAD"] == pytest.approx(11.4)
+    one = next(m for m in e["unconditional_forced_hold"] if m["hold_prints"] == 1 and m["scenario"] == "TAKER_FEES_PLUS_SPREAD")
     assert one["summary"]["mean"] < -9.0 and one["mean_funding_bps"] < 1.0                     # a single 8h print cannot repay an 11 bp round trip
     short = [m for m in e["unconditional_forced_hold"] if m["hold_prints"] <= 3 and m["scenario"] == "TAKER_FEES_ONLY"]
     assert all(m["summary"]["mean"] < 0 for m in short)
@@ -88,14 +88,13 @@ def test_btc_carry_numbers_come_from_the_committed_corpus_and_say_so(report):
     assert any("out-of-sample" in x for x in r["readiness_reasons"])
 
 
-def test_cost_constants_prefer_the_authoritative_names_when_they_exist(monkeypatch):
-    base = CR.cost_constants()
-    assert base["spread_included"] is False and "FEES ONLY" in base["note"]
-    monkeypatch.setattr(CR.CC, "ROUND_TRIP_FEE_BPS", 11.0, raising=False)
-    monkeypatch.setattr(CR.CC, "ASSUMED_ROUND_TRIP_SPREAD_BPS", 0.4, raising=False)
-    monkeypatch.setattr(CR.CC, "ROUND_TRIP_TOTAL_COST_BPS", 11.4, raising=False)
+def test_cost_constants_are_the_authoritative_carry_costs_names():
     c = CR.cost_constants()
-    assert c["perp_round_trip_total_bps"] == 11.4 and c["spread_included"] and CR.scenarios(c)["TAKER_FEES_PLUS_SPREAD"] == 11.4
+    assert c["perp_round_trip_fee_bps"] == CR.CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY == 11.0
+    assert c["assumed_round_trip_spread_bps"] == CR.CC.ASSUMED_ROUND_TRIP_SPREAD_BPS and c["perp_round_trip_total_bps"] == CR.CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY
+    assert c["spot_perp_round_trip_fee_bps"] == CR.CC.ROUND_TRIP_FEE_BPS_SPOT_PERP == 31.0 and "ASSUMPTION" in c["note"]
+    sc = CR.scenarios(c)
+    assert sc["TAKER_FEES_PLUS_SPREAD"] == c["perp_round_trip_total_bps"] and sc["ALL_MAKER_MODELLED_best_case_unreachable"] == CR.CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED
 
 
 def test_data_root_scan_reads_real_manifests_and_misses_nothing_it_cannot_see(tmp_path):
@@ -168,7 +167,7 @@ def test_perp_only_symbols_are_never_reported_as_carry():
     leg = CR.run_variant([only], formation_days=3, hold_days=7, top_k=1, round_trip_bps=11.0, t_start=10 * DAY, t_end=30 * DAY)["rows"][0]["legs"][0]
     assert leg["hedgeability"] == "PERP_ONLY" and "hedged_carry_funding_net_of_cost_bps" not in leg and "directional_total_bps" in leg
     h = CR.run_variant([hedged], formation_days=3, hold_days=7, top_k=1, round_trip_bps=11.0, t_start=10 * DAY, t_end=30 * DAY)["rows"][0]["legs"][0]
-    assert h["hedgeability"] == "HEDGEABLE_ON_BYBIT" and h["basis_residual"] == "UNMEASURED" and h["hedged_carry_funding_net_of_cost_bps"] == pytest.approx(21 * 2.0 - 11.0 - 20.0)
+    assert h["hedgeability"] == "HEDGEABLE_ON_BYBIT" and h["basis_residual"] == "UNMEASURED" and h["hedged_carry_funding_net_of_cost_bps"] == pytest.approx(21 * 2.0 - CR.CC.position_class_costs("acquire_spot_perp")["total_bps"])
     assert CR.hedgeability(unknown) == "HEDGE_UNKNOWN"
     out = CR.evaluate_ranked_funding([only, hedged, unknown], spec=spec(), formation_days_grid=(3,), hold_days=7)
     assert out["hedgeability_counts"] == {"PERP_ONLY": 1, "HEDGEABLE_ON_BYBIT": 1, "HEDGE_UNKNOWN": 1}

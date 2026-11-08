@@ -36,9 +36,15 @@
       "provenance": "assumed",
       "value": 2.0
     },
+    "spot_taker_bps": {
+      "note": "carry_costs.TAKER_BPS_SPOT: the SPOT leg's base-tier taker fee (published schedule)",
+      "provenance": "venue_stated",
+      "value": 10.0
+    },
     "taker_bps": {
-      "provenance": "assumed",
-      "value": 6.0
+      "note": "carry_costs.TAKER_BPS_PERP: the PERP leg's base-tier taker fee (published schedule); the spot leg is spot_taker_bps. A spot+perp round trip is 2 x (taker_bps + spot_taker_bps) = 31.0 bps",
+      "provenance": "venue_stated",
+      "value": 5.5
     }
   },
   "funding_interval_handling": {
