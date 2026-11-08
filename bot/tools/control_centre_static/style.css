@@ -30,12 +30,13 @@ p { margin: 0 0 8px; }
 .btn { font: inherit; padding: 6px 12px; min-height: 36px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); color: var(--text); cursor: pointer; }
 .btn:hover { border-color: var(--accent); }
 
-.rail { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 8px var(--gap); background: var(--surface); border-bottom: 1px solid var(--line); }
-.rail a { display: block; text-align: center; padding: 10px 6px; border: 1px solid var(--line); border-radius: var(--r); color: var(--text); text-decoration: none; background: var(--surface-2); min-height: 44px; }
+.rail { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; padding: 8px var(--gap); background: var(--surface); border-bottom: 1px solid var(--line); }
+.rail a { display: flex; align-items: center; justify-content: center; text-align: center; padding: 8px 2px; font-size: .8125rem; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: var(--r); color: var(--text); text-decoration: none; background: var(--surface-2); min-height: 44px; }
 .rail a[aria-current="page"] { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .rail a[aria-current="page"] { color: #0e1116; } }
 main { padding: var(--gap); min-width: 0; outline: none; }
 @media (min-width: 860px) {
+  .rail a { justify-content: flex-start; padding: 10px 12px; font-size: 1rem; text-align: left; }
   .shell { grid-template-columns: 200px minmax(0, 1fr); grid-template-areas: "top top" "rail main"; }
   .top { grid-area: top; } .rail { grid-area: rail; display: flex; flex-direction: column; border-bottom: 0; border-right: 1px solid var(--line); }
   main { grid-area: main; }
@@ -87,3 +88,8 @@ th { font-size: .8125rem; color: var(--muted); background: var(--surface-2); }
 .kv > div { border: 1px solid var(--line); border-radius: var(--r); padding: 10px; background: var(--surface); min-width: 0; }
 dl { margin: 6px 0; } dt { margin-top: 6px; } dd { margin: 2px 0 0 0; color: var(--muted); }
 caption { display: block; width: 100%; text-align: left; padding: 6px 0; }
+.hidden { display: none; }
+main, .banner, .card, .kv > div, td, th, .val, dd { overflow-wrap: anywhere; min-width: 0; }
+.qa { margin: 8px 0; } .qa dt { font-weight: 700; margin-top: 10px; color: var(--text); } .qa dd { color: var(--text); margin: 2px 0 0 0; }
+ol.plain { margin: 0; padding-left: 22px; } ol.plain li { margin-bottom: 6px; }
+.topright .pill { max-width: 100%; }
