@@ -478,6 +478,9 @@ class FundingRecon:
     rows: int
     symbol: Optional[str] = None                                   # what the rows are about ...
     positions: Tuple[Tuple[int, Decimal], ...] = ()                # ... and the (ts_ms, signed position_qty) each row claims, for a cross-check against fills
+    window: Optional[Tuple[int, int]] = None                       # the (start_ms, end_ms] this reconciliation covers ...
+    settlement_ts: Tuple[int, ...] = ()                            # ... and the settlement timestamps it actually holds, so realised_result can tell what it does NOT cover
+    interval_ms: Optional[int] = None                              # the instrument's own settlement grid
 
 
 def expected_settlement_times(perp: Instrument, start_ms: int, end_ms: int) -> List[int]:
@@ -527,8 +530,9 @@ def reconcile_funding(perp: Instrument, rows: Sequence[Settlement], start_ms: in
     flags_t = tuple(sorted(set(flags)))
     pos = tuple((r.ts_ms, r.position_qty) for r in sorted(rows, key=lambda x: x.ts_ms))
     if flags_t:
-        return FundingRecon(unknown("usd"), flags_t, missing, len(rows), perp.symbol, pos)
-    return FundingRecon(Quantity(sum((r.cash_usd for r in rows), Decimal(0)), "measured", "usd"), (), (), len(rows), perp.symbol, pos)
+        return FundingRecon(unknown("usd"), flags_t, missing, len(rows), perp.symbol, pos, (start_ms, end_ms), tuple(sorted(seen)), perp.interval_ms)
+    return FundingRecon(Quantity(sum((r.cash_usd for r in rows), Decimal(0)), "measured", "usd"), (), (), len(rows), perp.symbol, pos,
+                        (start_ms, end_ms), tuple(sorted(seen)), perp.interval_ms)
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -809,8 +813,11 @@ class Fill:
     fee: Decimal                   # >= 0 cost (negative = rebate), in fee_ccy
     fee_ccy: str                   # quote coin or the symbol's base coin (anything else is refused in realised_result)
     ts_ms: int
+    category: str = "linear"       # 'spot' | 'linear': the SAME symbol string is two different positions on two legs; never netted together
 
     def __post_init__(self) -> None:
+        if self.category not in ("spot", "linear"):
+            raise EconomicModelError(f"fill category must be 'spot' or 'linear', got {self.category!r}")
         if not isinstance(self.fill_id, str) or not self.fill_id or not isinstance(self.symbol, str) or not self.symbol:
             raise EconomicModelError("a fill needs a fill_id and a symbol")
         if self.side not in ("buy", "sell"):
@@ -922,6 +929,31 @@ class RealisedResult:
     open_inventory: Mapping[str, Decimal] = field(default_factory=dict)
 
 
+def _held_settlements(perp_fills: Sequence[Fill], funding: FundingRecon, as_of_ms: Optional[int]) -> set:
+    """Every settlement timestamp (on the instrument's own grid) at which the fill-derived linear position was non-zero. A position open at the end of the
+    fills is held up to the latest of the reconciled window's end and ``as_of_ms``."""
+    iv = funding.interval_ms
+    assert iv
+    pos = Decimal(0)
+    spans: List[Tuple[int, Optional[int]]] = []
+    start: Optional[int] = None
+    for f in perp_fills:
+        pos += (Decimal(1) if f.side == "buy" else Decimal(-1)) * f.qty
+        if pos != 0 and start is None:
+            start = f.ts_ms
+        elif pos == 0 and start is not None:
+            spans.append((start, f.ts_ms))
+            start = None
+    if start is not None:
+        spans.append((start, None))
+    end_open = max([funding.window[1] if funding.window else 0] + ([as_of_ms] if as_of_ms is not None else []))
+    held = set()
+    for s, e in spans:
+        hi = end_open if e is None else e - 1               # position is zero AT the closing fill's timestamp (same rule as the position cross-check)
+        held.update(range(((s + iv - 1) // iv) * iv, hi + 1, iv))
+    return held
+
+
 def realised_result(*, fills: Sequence[Fill], expected_fill_ids: Sequence[str], funding: FundingRecon,
                     venue_net_qty: Mapping[str, Optional[Decimal]], marks: Mapping[str, Any],
                     export: Optional[ExportCheck] = None, quote_coin: str = "USDT", base_coins: Optional[Mapping[str, str]] = None,
@@ -953,13 +985,29 @@ def realised_result(*, fills: Sequence[Fill], expected_fill_ids: Sequence[str], 
             fees += f.fee * f.price
         else:
             flags.append(f"FEE_CCY_UNSUPPORTED:{f.symbol}:{f.fee_ccy}")
-    # average-cost accounting per symbol: only the CLOSED part of a position is realised
-    net: Dict[str, Decimal] = {}
-    cost: Dict[str, Decimal] = {}              # signed cost basis of the open position (position * average price)
+    # average-cost accounting per (symbol, category): a spot BTCUSDT leg and a linear BTCUSDT leg are different positions and never net against each other
+    cats: Dict[str, set] = {}
+    for f in fills:
+        cats.setdefault(f.symbol, set()).add(f.category)
+
+    def keyof(sym: str, cat: str):
+        return sym if len(cats[sym]) == 1 else (sym, cat)
+
+    def label(k) -> str:
+        return k if isinstance(k, str) else f"{k[0]}:{k[1]}"
+
+    def lookup(m: Mapping[Any, Any], k):
+        if isinstance(k, tuple):
+            return m.get(k)
+        return m.get(k) if k in m else m.get((k, next(iter(cats[k]))))
+
+    net: Dict[Any, Decimal] = {}
+    cost: Dict[Any, Decimal] = {}              # signed cost basis of the open position (position * average price)
     realised_trading = Decimal(0)
     for f in sorted(fills, key=lambda x: x.ts_ms):
+        k = keyof(f.symbol, f.category)
         sgn = Decimal(1) if f.side == "buy" else Decimal(-1)
-        pos, basis = net.get(f.symbol, Decimal(0)), cost.get(f.symbol, Decimal(0))
+        pos, basis = net.get(k, Decimal(0)), cost.get(k, Decimal(0))
         if pos == 0 or (pos > 0) == (sgn > 0):
             pos, basis = pos + sgn * f.qty, basis + sgn * f.qty * f.price
         else:
@@ -972,49 +1020,62 @@ def realised_result(*, fills: Sequence[Fill], expected_fill_ids: Sequence[str], 
             pos = pos2
             if rest > 0:
                 pos, basis = sgn * rest, sgn * rest * f.price
-        net[f.symbol], cost[f.symbol] = pos, basis
-    # funding must be backed by fills
+        net[k], cost[k] = pos, basis
+    for sym, cs in cats.items():
+        if len(cs) > 1 and sum(1 for c in cs if net.get((sym, c), Decimal(0)) != 0) > 1:
+            flags.append(f"OPEN_LEGS_NOT_REALISED:{sym}")              # two open legs are open inventory (unrealised, per leg), never a realised hedge profit
+    # funding must be backed by fills, and must cover every settlement while the (linear) position was open
     if funding.rows > 0:
         if not fills:
             flags.append("FUNDING_WITHOUT_FILLS")
         elif funding.symbol is None or len(funding.positions) != funding.rows:
             flags.append("FUNDING_POSITIONS_UNVERIFIED")
         else:
+            perp_fills = sorted((f for f in fills if f.symbol == funding.symbol and f.category == "linear"), key=lambda x: x.ts_ms)
             for ts, claimed in funding.positions:
-                derived = sum((((Decimal(1) if f.side == "buy" else Decimal(-1)) * f.qty) for f in fills if f.symbol == funding.symbol and f.ts_ms <= ts), Decimal(0))
+                derived = sum((((Decimal(1) if f.side == "buy" else Decimal(-1)) * f.qty) for f in perp_fills if f.ts_ms <= ts), Decimal(0))
                 if derived != claimed:
                     flags.append(f"FUNDING_POSITION_MISMATCH:{funding.symbol}")
                     break
-    # inventory is the venue's read; every open lot is marked with a stamped, fresh mark
-    open_inv: Dict[str, Decimal] = {}
+            if funding.window is None or funding.interval_ms is None:
+                flags.append("FUNDING_WINDOW_UNVERIFIED")
+            else:
+                held = _held_settlements(perp_fills, funding, as_of_ms)
+                have = set(funding.settlement_ts)
+                if any(t not in have for t in held):
+                    flags.append("FUNDING_SETTLEMENT_UNCOVERED")
+                if any(t not in held for t in have):
+                    flags.append("FUNDING_ROW_OUTSIDE_POSITION")
+    # inventory is the venue's read PER (symbol, category); every open lot is marked with a stamped, fresh mark
+    open_inv: Dict[Any, Decimal] = {}
     unreal = Decimal(0)
     unreal_prov = "measured"
-    for sym, pos in net.items():
-        venue = venue_net_qty.get(sym)
+    for k, pos in net.items():
+        venue = lookup(venue_net_qty, k)
         if venue is None:
-            flags.append(f"VENUE_POSITION_READ_MISSING:{sym}")
+            flags.append(f"VENUE_POSITION_READ_MISSING:{label(k)}")
             continue
         if venue != pos:
-            flags.append(f"INVENTORY_MISMATCH:{sym}")
+            flags.append(f"INVENTORY_MISMATCH:{label(k)}")
             continue
         if venue == 0:
             continue
-        open_inv[sym] = venue
-        mk = marks.get(sym)
+        open_inv[k] = venue
+        mk = lookup(marks, k)
         if isinstance(mk, Mark):
             if as_of_ms is None:
                 unreal_prov = weakest(unreal_prov, "modelled")           # stamped, but nothing to judge its age against
             elif mk.ts_ms > as_of_ms or as_of_ms - mk.ts_ms > max_mark_age_ms:
-                flags.append(f"STALE_MARK:{sym}")
+                flags.append(f"STALE_MARK:{label(k)}")
                 continue
             price = mk.price
         elif mk is not None and mk > 0:
             price = mk
             unreal_prov = weakest(unreal_prov, "assumed")                # an unstamped number: no time, no source
         else:
-            flags.append(f"UNPRICED_INVENTORY:{sym}")
+            flags.append(f"UNPRICED_INVENTORY:{label(k)}")
             continue
-        unreal += venue * price - cost[sym]
+        unreal += venue * price - cost[k]
     comps = {"realised_trading": Quantity(realised_trading, "derived", "usd"), "fees": Quantity(fees, "measured", "usd"), "funding": funding.total}
     if flags:
         return RealisedResult(unknown("usd"), tuple(sorted(set(flags))), comps, unknown("usd"), open_inv)
@@ -1090,6 +1151,18 @@ def _stamp(spec: Mapping[str, Any]) -> Dict[str, str]:
     return {"candidate_id": spec["candidate_id"], "spec_digest": sv.spec_digest(spec)}
 
 
+COST_CHAIN_SPEC_KEYS = ("fee_model", "slippage_model", "funding_model", "capacity_model", "execution_model", "holding_period")
+
+
+def cost_chain_digest(spec: Mapping[str, Any]) -> str:
+    """PUBLIC, STABLE: the SHA-256 of the spec's cost-chain declarations (``COST_CHAIN_SPEC_KEYS``, canonical JSON; an absent key counts as null). Both
+    ``cost_model_evidence`` and ``capacity_evidence`` stamp it as ``metrics['chain_digest']``; the verdict engine recomputes it from the spec it holds and
+    refuses evidence whose digest differs, so evidence cannot be carried over to a spec whose costs were edited. Prose fields do not move it."""
+    if not isinstance(spec, Mapping):
+        raise EconomicModelError("cost_chain_digest needs a candidate spec mapping")
+    return digest({k: spec.get(k) for k in COST_CHAIN_SPEC_KEYS})
+
+
 def cost_model_evidence(chain: ChainResult, *, spec: Mapping[str, Any], data_sha256: Optional[str] = None, recorded_ms: int = 0):
     """PASS only with zero unknown and zero ASSUMED cost inputs and a positive net edge (an assumed input is ALWAYS unknown for a PASS: its number is in
     the metrics, never in the result). Unknowns -> INCONCLUSIVE; a fully known non-positive edge -> FAIL (killing is easy).
@@ -1113,7 +1186,7 @@ def cost_model_evidence(chain: ChainResult, *, spec: Mapping[str, Any], data_sha
         result, count, edge_v = sv.INCONCLUSIVE, len(assumed), float(edge.value)
     else:
         result, count, edge_v = sv.PASS, 0, float(edge.value)
-    metrics = {"unknown_cost_inputs": count, "net_edge_bps_after_costs": edge_v,
+    metrics = {"chain_digest": cost_chain_digest(spec), "scenario_digest": chain.digest, "unknown_cost_inputs": count, "net_edge_bps_after_costs": edge_v,
                "unknown_names": unk, "assumed_names": assumed, "executable": chain.executable, "blockers": list(chain.blockers),
                "components_bps": {k: (None if not q.known else str(q.value)) for k, q in chain.components.items()}}
     return sv.EvidenceItem(stage="cost_model", result=result, provenance=_prov_label(list(chain.components.values())),
@@ -1126,7 +1199,7 @@ def capacity_evidence(capacity: Quantity, *, spec: Mapping[str, Any], floor_bps:
     stamp = _stamp(spec)
     sv = _sv()
     need = to_decimal(min_viable_capacity_usd)
-    metrics: Dict[str, Any] = {"capacity_usd": as_float(capacity), "edge_floor_bps": float(to_decimal(floor_bps)),
+    metrics: Dict[str, Any] = {"chain_digest": cost_chain_digest(spec), "capacity_usd": as_float(capacity), "edge_floor_bps": float(to_decimal(floor_bps)),
                                "min_viable_capacity_usd": float(need)}
     if not capacity.known:
         result = sv.INCONCLUSIVE

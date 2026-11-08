@@ -88,7 +88,7 @@
       "declaration_keys": [
         "fills_modelled_against_real_depth"
       ],
-      "gap": "none",
+      "gap": "no L2 depth history for either venue's perp book in the repo (spot BTC/ETH L2 only, coarse); the second venue is unqualified",
       "name": "per-venue depth",
       "point_in_time": true,
       "repo_has": false

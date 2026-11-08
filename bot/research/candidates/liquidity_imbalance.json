@@ -10,7 +10,7 @@
   },
   "bias_declarations": {
     "fills_modelled_against_real_depth": false,
-    "hedge_completeness_modelled": true,
+    "hedge_completeness_modelled": false,
     "no_future_funding_knowledge": true,
     "no_look_ahead": false,
     "point_in_time_universe": true
@@ -80,7 +80,7 @@
       "declaration_keys": [
         "fills_modelled_against_real_depth"
       ],
-      "gap": "none",
+      "gap": "not collected: the repo has no trade tape for realised mid moves",
       "name": "trade tape for realised mid moves",
       "point_in_time": true,
       "repo_has": false
@@ -89,8 +89,17 @@
       "declaration_keys": [
         "no_look_ahead"
       ],
-      "gap": "none",
+      "gap": "not collected: the repo has no measured order latency",
       "name": "measured order latency",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
+      "gap": "no hedge-leg price or fill history exists in the repo for this mechanism",
+      "name": "hedge-leg prices/fills used to neutralise any inventory this mechanism builds",
       "point_in_time": true,
       "repo_has": false
     }

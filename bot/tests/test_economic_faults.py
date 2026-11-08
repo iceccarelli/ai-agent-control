@@ -493,3 +493,74 @@ def test_funding_position_must_match_the_fill_derived_position():
     manual = EM.FundingRecon(EM.Quantity(D("15"), "measured", "usd"), (), (), 3)           # a hand-built recon carries no positions to check
     r2 = EM.realised_result(fills=open_short, expected_fill_ids="s", funding=manual, venue_net_qty={"BTCUSDT": D(-1)}, marks={"BTCUSDT": D("50000")})
     assert "FUNDING_POSITIONS_UNVERIFIED" in r2.flags and r2.pnl_usd.value is None
+
+
+# ---- G) round 3: spot and linear legs of the same symbol are different positions; funding must cover the whole open interval
+def _leg(i, cat, side, qty, px, ts):
+    return EM.Fill(i, "BTCUSDT", side, D(qty), D(px), D(0), "USDT", ts, category=cat)
+
+
+def _nofunding():
+    return EM.FundingRecon(EM.Quantity(D(0), "measured", "usd"), (), (), 0)
+
+
+def test_open_spot_and_perp_legs_are_not_netted_into_realised_profit():
+    open_hedge = [_leg("s1", "spot", "buy", "1", "50000", 1), _leg("p1", "linear", "sell", "1", "50100", 2)]
+    kw = dict(fills=open_hedge, expected_fill_ids=["s1", "p1"], funding=_nofunding(), marks={})
+    r = EM.realised_result(venue_net_qty={"BTCUSDT": D(0)}, **kw)                               # the PoC: one symbol key, both legs open
+    assert r.pnl_usd.value is None and r.flags                                                   # never +100 realised
+    r2 = EM.realised_result(venue_net_qty={("BTCUSDT", "spot"): D(1), ("BTCUSDT", "linear"): D(-1)},
+                            **dict(kw, marks={("BTCUSDT", "spot"): D(50000), ("BTCUSDT", "linear"): D(50100)}))
+    assert r2.pnl_usd.value is None and "OPEN_LEGS_NOT_REALISED:BTCUSDT" in r2.flags
+    assert r2.components["realised_trading"].value == D(0)                                       # open basis is not in the realised component either
+    assert r2.open_inventory == {("BTCUSDT", "spot"): D(1), ("BTCUSDT", "linear"): D(-1)}
+
+
+def test_per_category_venue_read_is_required_and_closed_legs_realise_per_leg():
+    closed = [_leg("s1", "spot", "buy", "1", "50000", 1), _leg("p1", "linear", "sell", "1", "50100", 2),
+              _leg("s2", "spot", "sell", "1", "50010", 3), _leg("p2", "linear", "buy", "1", "50090", 4)]
+    kw = dict(fills=closed, expected_fill_ids=["s1", "p1", "s2", "p2"], funding=_nofunding(), marks={})
+    ok = EM.realised_result(venue_net_qty={("BTCUSDT", "spot"): D(0), ("BTCUSDT", "linear"): D(0)}, **kw)       # control: both legs round-tripped
+    assert ok.flags == () and ok.pnl_usd.value == D("10") + D("10")                              # spot +10, perp short 50100 -> 50090 = +10
+    amb = EM.realised_result(venue_net_qty={"BTCUSDT": D(0)}, **kw)                              # one read cannot speak for two categories
+    assert any(f.startswith("VENUE_POSITION_READ_MISSING:BTCUSDT") for f in amb.flags) and amb.pnl_usd.value is None
+    one = EM.realised_result(venue_net_qty={("BTCUSDT", "spot"): D(0)}, **kw)
+    assert "VENUE_POSITION_READ_MISSING:BTCUSDT:linear" in one.flags
+
+
+def test_funding_must_cover_every_settlement_while_the_position_is_open():
+    fills = [EM.Fill("a", "BTCUSDT", "sell", D(2), D(50000), D(0), "USDT", 1), EM.Fill("b", "BTCUSDT", "buy", D(2), D(50000), D(0), "USDT", 25 * H)]
+    real = [settle(8 * H), settle(16 * H, rate="-0.0001", cash="-10"), settle(24 * H, rate="-0.0001", cash="-10")]
+    kw = dict(fills=fills, expected_fill_ids="ab", venue_net_qty={"BTCUSDT": D(0)}, marks={})
+    full = EM.realised_result(funding=EM.reconcile_funding(P, real, 0, 24 * H), **kw)           # control: the whole interval, funding -10
+    assert full.flags == () and full.pnl_usd.value == D("-10")
+    cher = EM.realised_result(funding=EM.reconcile_funding(P, real[:1], 0, 8 * H), **kw)         # only the first (positive) window
+    assert "FUNDING:" not in "".join(cher.flags) and "FUNDING_SETTLEMENT_UNCOVERED" in cher.flags and cher.pnl_usd.value is None
+    late = EM.realised_result(funding=EM.reconcile_funding(P, real[1:], 8 * H, 24 * H), **kw)    # a window that starts after the position opened
+    assert "FUNDING_SETTLEMENT_UNCOVERED" in late.flags and late.pnl_usd.value is None
+
+
+def test_funding_rows_outside_any_open_interval_are_flagged():
+    fills = [EM.Fill("a", "BTCUSDT", "sell", D(2), D(50000), D(0), "USDT", 1), EM.Fill("b", "BTCUSDT", "buy", D(2), D(50000), D(0), "USDT", 9 * H)]
+    rows = [settle(8 * H), settle(16 * H), settle(24 * H)]                                       # position closed at 9H: 16H and 24H rows are invented
+    r = EM.realised_result(fills=fills, expected_fill_ids="ab", funding=EM.reconcile_funding(P, rows, 0, 24 * H), venue_net_qty={"BTCUSDT": D(0)}, marks={})
+    assert "FUNDING_ROW_OUTSIDE_POSITION" in r.flags and r.pnl_usd.value is None
+    ok = EM.realised_result(fills=fills, expected_fill_ids="ab", funding=EM.reconcile_funding(P, rows[:1], 0, 8 * H), venue_net_qty={"BTCUSDT": D(0)}, marks={})
+    assert ok.flags == () and ok.pnl_usd.value == D("10")                                        # control: only the settlement inside the interval
+
+
+def test_funding_recon_records_its_window_and_settlements():
+    fr = EM.reconcile_funding(P, three(), 0, 24 * H)
+    assert fr.window == (0, 24 * H) and fr.settlement_ts == (8 * H, 16 * H, 24 * H) and fr.interval_ms == 8 * H
+
+
+# ---- H) round 3: the chain digest the verdict engine recomputes
+def test_cost_chain_digest_is_stamped_on_both_evidence_items_and_binds_the_cost_declarations():
+    d = EM.cost_chain_digest(SPEC)
+    assert len(d) == 64 and EM.cost_model_evidence(EM.evaluate_chain(overlay()), spec=SPEC, data_sha256=SHA_IN).metrics["chain_digest"] == d
+    assert EM.capacity_evidence(q("100000", "modelled", "usd"), spec=SPEC, floor_bps=1, min_viable_capacity_usd=1, data_sha256=SHA_IN).metrics["chain_digest"] == d
+    import copy
+    other = copy.deepcopy(SPEC); other["fee_model"]["taker_bps"]["value"] = 1.0
+    assert EM.cost_chain_digest(other) != d                                                      # a different cost chain is a different digest
+    same = copy.deepcopy(SPEC); same["hypothesis"] = "reworded"
+    assert EM.cost_chain_digest(same) == d                                                       # prose does not move it

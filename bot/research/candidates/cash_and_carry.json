@@ -10,7 +10,7 @@
   },
   "bias_declarations": {
     "fills_modelled_against_real_depth": false,
-    "hedge_completeness_modelled": true,
+    "hedge_completeness_modelled": false,
     "no_future_funding_knowledge": true,
     "no_look_ahead": true,
     "point_in_time_universe": true
@@ -21,7 +21,7 @@
     "note": "tiny owner scale; capacity is not the binding constraint, funding level is"
   },
   "counterparty": "perpetual longs paying funding",
-  "drawdown_model": "funding-only 130.5 bps whole sample (measured, in-sample)",
+  "drawdown_model": "funding-only 130.5 bps whole sample (in-sample statistic of past data; not a forecast)",
   "economic_mechanism": "Counterparty: perpetual longs pay funding to the short. Persists while net long leverage demand exists; disappears when funding falls toward zero/negative or the hurdle (financing, fees) exceeds it. The frozen BTC experiment is the registered instance; this spec is a generalisation and must not touch it.",
   "eligibility_rules": [
     "owner already holds the spot (no spot purchase cost counted) or purchase cost is counted",
@@ -43,7 +43,8 @@
   },
   "funding_model": {
     "expected_bps_per_settlement": {
-      "provenance": "measured",
+      "note": "in-sample historical mean of BTC funding (last-365d), used here as a FORECAST; a measured past mean is not a measured future rate",
+      "provenance": "derived",
       "value": 0.259
     }
   },
@@ -79,10 +80,10 @@
       "declaration_keys": [
         "hedge_completeness_modelled"
       ],
-      "gap": "spot BTC OHLCV exists; basis at settlement partial (tools/basis_at_settlement)",
+      "gap": "spot BTC OHLCV exists, but basis at settlement is only partial (tools/basis_at_settlement): hedge-leg basis at entry/exit is not whole",
       "name": "spot price history and hedge-leg basis at entry/exit",
       "point_in_time": true,
-      "repo_has": true
+      "repo_has": false
     },
     {
       "declaration_keys": [],

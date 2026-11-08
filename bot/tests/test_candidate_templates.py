@@ -64,7 +64,7 @@ def test_template_is_a_specification_whose_declarations_are_truthful(name):
     assert s["candidate_id"].startswith(name + "@")
     for comp in ("fee_model", "slippage_model", "funding_model"):
         for k, e in s[comp].items():
-            assert e["provenance"] in ("assumed", "measured") and e["value"] > 0, (name, comp, k, e)
+            assert e["provenance"] in ("assumed", "derived", "measured") and e["value"] > 0, (name, comp, k, e)
     assert len(s["rejection_conditions"]) >= 4
     assert "who pays" not in s["counterparty"] and len(s["counterparty"]) > 15 and "Counterparty" in s["economic_mechanism"]
     assert "SPECIFICATION ONLY" in s["status_note"]
@@ -74,12 +74,37 @@ def test_no_template_claims_to_have_ruled_out_a_bias_its_own_required_data_says_
     for name in MECHANISMS:
         s = load(name)
         assert declared_without_data(s) == [], name
-        if name != "cash_and_carry":
-            assert missing_declarations(s), f"{name}: needs data the repo lacks, so at least one declaration must be False"
+        assert missing_declarations(s), f"{name}: needs data the repo lacks, so at least one declaration must be False"
     # the point-in-time universe is only declared where the universe data exists: none of the shipped candidates has it
     assert load("cross_sectional_funding")["bias_declarations"]["point_in_time_universe"] is False
     assert load("market_neutral_relative_value")["bias_declarations"]["point_in_time_universe"] is False
     assert load("cash_and_carry")["bias_declarations"]["fills_modelled_against_real_depth"] is False       # its own L2 depth item says repo_has False
+
+
+@pytest.mark.parametrize("name", MECHANISMS)
+def test_hedge_declaration_true_only_if_a_hedge_data_item_exists_and_is_whole(name):
+    """Round 3: cash_and_carry declared hedge completeness while its own data row says the basis is partial; three others declared it with no hedge row at all."""
+    s = load(name)
+    if s["bias_declarations"]["hedge_completeness_modelled"] is True:
+        rows = [d for d in s["required_data"] if "hedge_completeness_modelled" in d["declaration_keys"]]
+        assert rows and all(d["repo_has"] is True and "partial" not in d["gap"].lower() for d in rows), name
+    else:
+        assert any("hedge_completeness_modelled" in d["declaration_keys"] and d["repo_has"] is False for d in s["required_data"]), name
+
+
+@pytest.mark.parametrize("name", MECHANISMS)
+def test_every_missing_data_row_has_a_real_gap_description(name):
+    for d in load(name)["required_data"]:
+        if d["repo_has"] is False:
+            assert d["gap"].strip().lower() not in ("", "none", "assumed", "n/a") and len(d["gap"]) >= 10, (name, d)
+
+
+def test_in_sample_mean_is_not_labelled_measured_as_a_forecast():
+    f = load("cash_and_carry")["funding_model"]["expected_bps_per_settlement"]
+    assert f["provenance"] == "derived" and "forecast" in f["note"].lower()
+    for name in MECHANISMS:
+        for e in load(name)["funding_model"].values():
+            assert not (e["provenance"] == "measured" and "note" not in e), (name, e)
 
 
 @pytest.mark.parametrize("name", MECHANISMS)
