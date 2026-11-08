@@ -101,6 +101,39 @@ def count_new_closed(timestamps_us, *, t1_ms: int, checked_ms: int,
     return {"closed_after_t1": closed, "open_or_future": open_or_future}
 
 
+def corpus_freshness(linear_start_ms, funding_ms, *, checked_ms: int, last_closed_ms: int) -> dict:
+    """Corpus status from the newest CLOSED daily bar and the newest funding print, both judged against ``checked_ms``.
+
+    * lag is ``last_closed_ms`` minus the newest CLOSED bar (an open bar, or a row dated in the future, never shortens it);
+    * a row dated after ``checked_ms`` (a bar that has not even opened / a print from the future) is a DATA PROBLEM: the status becomes ``DATA_PROBLEM``, never CURRENT;
+    * CURRENT also needs a funding print no older than one day: a corpus whose funding stopped months ago is not current.
+    """
+    linear = list(linear_start_ms)
+    funding = list(funding_ms)
+    closed = [t for t in linear if t + DAY_MS <= checked_ms]
+    newest_closed = max(closed, default=None)
+    lag_days = None if newest_closed is None else max(0, (last_closed_ms - newest_closed) // DAY_MS)
+    fut_linear = sum(1 for t in linear if t > checked_ms)
+    fut_funding = sum(1 for t in funding if t > checked_ms)
+    past_funding = [t for t in funding if t <= checked_ms]
+    funding_lag = None if not past_funding else max(0, (checked_ms - max(past_funding)) // DAY_MS)
+    problems = []
+    if fut_linear:
+        problems.append(f"{fut_linear} linear row(s) dated in the future")
+    if fut_funding:
+        problems.append(f"{fut_funding} funding row(s) dated in the future")
+    if lag_days is None:
+        status = "UNKNOWN_EMPTY"
+    elif problems:
+        status = "DATA_PROBLEM"
+    elif lag_days != 0 or funding_lag is None or funding_lag > 1:
+        status = "STALE"
+    else:
+        status = "CURRENT"
+    return {"corpus_lag_days_behind_last_closed_bar": lag_days, "funding_lag_days": funding_lag, "corpus_is_current": status == "CURRENT", "corpus_status": status,
+            "newest_closed_linear_ms": newest_closed, "future_dated_rows": {"linear": fut_linear, "funding": fut_funding}, "data_problems": problems}
+
+
 def _attempt_fetch(symbol: str, after_ms: int) -> dict:
     """Try the project's sanctioned fetcher. Record whatever happens.
 
@@ -188,22 +221,22 @@ def main(argv=None) -> int:
     # DATA FRESHNESS, stated apart from everything else. "No new bars" is not
     # "the corpus is current": a corpus that stopped growing months ago also has
     # zero new bars. The lag is the clock minus the newest CLOSED row held.
-    newest_linear_ms = max((md.parse_timestamp(r["time_period_start"]) // 1000
-                            for r in _rows(LINEAR_FILE)), default=None)
-    newest_closed_linear_ms = None
-    if newest_linear_ms is not None:
-        newest_closed_linear_ms = newest_linear_ms \
-            if newest_linear_ms + DAY_MS <= checked_ms else None
-    lag_days = None if newest_linear_ms is None else \
-        max(0, (last_closed_ms - newest_linear_ms) // DAY_MS)
+    fresh = corpus_freshness(
+        (md.parse_timestamp(r["time_period_start"]) // 1000 for r in _rows(LINEAR_FILE)),
+        (md.parse_timestamp(r["funding_time"]) // 1000 for r in _rows(FUNDING_FILE)),
+        checked_ms=checked_ms, last_closed_ms=last_closed_ms)
+    lag_days = fresh["corpus_lag_days_behind_last_closed_bar"]
     data_freshness = {
         "scope": ("DATA FRESHNESS ONLY: how far the committed corpus is behind "
                   "the clock. Says nothing about whether the code is correct; "
                   "that signal is `pytest -m \"not data_freshness\"`."),
         "corpus_lag_days_behind_last_closed_bar": lag_days,
-        "corpus_is_current": lag_days == 0,
-        "corpus_status": ("UNKNOWN_EMPTY" if lag_days is None else
-                          "CURRENT" if lag_days == 0 else "STALE"),
+        "funding_lag_days": fresh["funding_lag_days"],
+        "corpus_is_current": fresh["corpus_is_current"],
+        "corpus_status": fresh["corpus_status"],
+        "newest_closed_linear_ms": fresh["newest_closed_linear_ms"],
+        "future_dated_rows": fresh["future_dated_rows"],
+        "data_problems": fresh["data_problems"],
         "open_or_future_rows": {"linear": linear_count["open_or_future"],
                                 "funding": funding_count["open_or_future"]},
         "manifest_synthetic_false": {"linear": linear_real,
