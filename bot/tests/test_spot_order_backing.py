@@ -242,6 +242,9 @@ def test_the_modules_that_construct_a_bybit_client_are_pinned():
         "tools/drill.py", "tools/carry_preflight.py",
         # testnet-only order-identity experiment: refuses any non-testnet host
         "tools/close_testnet_experiment.py",
+        # multi-symbol Testnet executor client: built ONLY over ms_testnet_transport.TestnetTransport (registry testnet host, no redirects, dedicated
+        # BYBIT_TESTNET_API_* credentials, TESTNET_EXECUTOR capability) and reachable only through ms_testnet_session's owner gates + MultiSymbolAuthority
+        "tools/ms_testnet_transport.py",
     }, found
 
 
