@@ -47,6 +47,7 @@ if BOT not in sys.path:
 import anchor_archive as AA       # noqa: E402
 import capital_survival as CAP    # noqa: E402
 import capacity_schema as CS      # noqa: E402
+import carry_costs as CC          # noqa: E402
 import evidence_chain as EC       # noqa: E402
 import evidence_stats as ES       # noqa: E402
 import funding_eval as FE         # noqa: E402
@@ -128,8 +129,8 @@ def _power_section(fe: Optional[Dict[str, Any]], notional_usd: float, hold_days:
     n_settle = max(1.0, hold_days * 3.0)
     lowest = min(TE.SCREENING_HURDLES_PCT)
     # mean funding per settlement (bps of hedged notional) at which an ILLUSTRATIVE position (inventory = notional, 10 % reserve)
-    # earns the lowest screen after an ASSUMED 11.4 bps round trip: reserve-inclusive capital x hurdle x hold / 365, plus the cost
-    threshold = (1.1 * lowest / 100.0 * hold_days / 365.0 * 1e4 + 11.4) / n_settle
+    # earns the lowest screen after an ASSUMED round trip (carry_costs: 11.0 fee + 0.4 assumed spread): reserve-inclusive capital x hurdle x hold / 365, plus the cost
+    threshold = (1.1 * lowest / 100.0 * hold_days / 365.0 * 1e4 + CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY) / n_settle
     rows = []
     for edge in (0.1, 0.25, 0.5):
         r = SP.required_observations(rb["sd"], edge, alpha=0.05, power=0.8, n_hypotheses=OE.FAMILY_TRIALS, adjust="holm",
@@ -141,7 +142,7 @@ def _power_section(fe: Optional[Dict[str, Any]], notional_usd: float, hold_days:
     return {"status": "OK", "threshold_bps_per_settlement": threshold, "observed_sd_bps": rb["sd"], "ess_ratio": rb["ess_ratio"],
             "alpha": 0.05, "power": 0.8, "n_hypotheses": OE.FAMILY_TRIALS, "adjust": "holm", "two_sided": True, "method": "t", "table": rows,
             "reading": (f"to show mean funding exceeds {threshold:.2f} bps/settlement (what the illustrative position needs to earn the lowest "
-                        f"{TE.PROVISIONAL} screen after an ASSUMED 11.4 bps round trip) by the edge in each row, at the family-wise level and 80% power, "
+                        f"{TE.PROVISIONAL} screen after an ASSUMED {CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY:g} bps round trip) by the edge in each row, at the family-wise level and 80% power, "
                         "given the variance and dependence OBSERVED so far; only as good as that sd and ESS ratio"),
             "classes": {"threshold": "ASSUMED (illustrative position and cost)", "sd_and_ess_ratio": "ESTIMATED", "counts": "CALCULATED"}}
 

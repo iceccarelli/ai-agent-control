@@ -74,6 +74,179 @@ TAKER_BPS_SPOT = 10.0
 TAKER_BPS_PERP = 5.5
 ROUND_TRIP_BPS = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP   # 31.0
 
+# ---------------------------------------------------------------------------
+# THE ONE AUTHORITATIVE COST VOCABULARY (units: bps of hedged notional, per
+# ROUND TRIP = entry + exit; never per leg, per settlement or per day).
+#
+# Four different "round trips" circulated in this tree as bare numbers (11.0,
+# 11.4, 31.0, 4.0). They are DIFFERENT QUANTITIES, not rival estimates:
+#
+#   ROUND_TRIP_FEE_BPS_PERP_OVERLAY          11.0  2 perp taker legs. FEE ONLY.
+#                                                  What the entry gate prices
+#                                                  (carry_core overlay,
+#                                                  mainnet_public.GATE_ROUND_TRIP_BPS,
+#                                                  CarryEngine.round_trip_bps()).
+#   ROUND_TRIP_FEE_BPS_SPOT_PERP             31.0  2 spot + 2 perp taker legs
+#                                                  (acquire mode) == ROUND_TRIP_BPS.
+#   ASSUMED_ROUND_TRIP_SPREAD_BPS             0.4  spread/slippage allowance.
+#   ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY   11.4  fee + that allowance. What the
+#                                                  teardown, the profitability
+#                                                  report and the FROZEN
+#                                                  prospective plan (1.131
+#                                                  bps/settlement hurdle) price.
+#
+# The 0.4 is ASSUMED. Nothing in the repository measured it: the first place
+# 11.4 appears (tools/carry_teardown.py, ee9dd07) states it as "two perpetual
+# taker legs, plus spread and slippage" with no derivation, and the engine's
+# own note (carry_engine.py, EXECUTION_STYLES) measures the BTCUSDT touch at
+# ~0.013 bps, so 0.4 is a deliberately conservative allowance, not an
+# observation. It has no measurement behind it yet.
+#
+# The gate (11.0) and the hurdle (11.4) therefore differ ON PURPOSE: the gate is
+# fee-only and the hurdle also carries the spread allowance. Neither may be
+# edited without the other being re-read. tests/test_cost_contracts.py pins
+# every relationship, and that CP.ROUND_TRIP_BPS (frozen) equals the total.
+#
+# Provenance of each (economic_model vocabulary, strongest -> weakest):
+#   taker fees: venue_stated (Bybit's published base tier; the owner's account
+#   tier is NOT verified); spread allowance: assumed; total: assumed (a derived
+#   sum that contains an assumed term is as weak as that term).
+# ---------------------------------------------------------------------------
+ROUND_TRIP_FEE_BPS_PERP_OVERLAY = 2 * TAKER_BPS_PERP                      # 11.0
+ROUND_TRIP_FEE_BPS_SPOT_PERP = 2 * (TAKER_BPS_SPOT + TAKER_BPS_PERP)      # 31.0
+ASSUMED_ROUND_TRIP_SPREAD_BPS = 0.4
+#: rounded only to strip float dust; 11.0 + 0.4 == 11.4 exactly in IEEE-754.
+ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY = round(
+    ROUND_TRIP_FEE_BPS_PERP_OVERLAY + ASSUMED_ROUND_TRIP_SPREAD_BPS, 10)  # 11.4
+
+#: Maker fee per perp leg. A MODELLED SCENARIO input, not an observation: it is
+#: config.py's linear default, the account tier is unverified, and no fill
+#: probability has ever been measured (carry_engine.py MAKER_FIRST note,
+#: tools/execution_economics.py). 4.0 is the best case "every leg rests and fills".
+MAKER_BPS_PERP_MODELLED = 2.0
+ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED = 2 * MAKER_BPS_PERP_MODELLED   # 4.0
+
+# ---------------------------------------------------------------------------
+# FUNDING INTERVAL CONVERSIONS (the ONE place a per-print rate becomes a per-day
+# or per-horizon number). Funding intervals are PER SYMBOL (Bybit fundingInterval
+# is stated in MINUTES: 480 / 240 / 60 ...) and the venue scales the base
+# interest component by interval, so the SAME economic claim reads 1.00 bps per
+# print at 480m, 0.50 at 240m and 0.125 at 60m: 3.00 bps/day each. Never assume
+# 8h; an interval that is missing, <= 0, boolean, non-finite or does not divide
+# 1440 is UNKNOWN (None), never defaulted.
+# ---------------------------------------------------------------------------
+MINUTES_PER_DAY = 1440
+
+
+def interval_minutes_or_none(interval_minutes: Any) -> Optional[int]:
+    """The funding interval in whole minutes if it is a positive divisor of 1440, else None (UNKNOWN)."""
+    if isinstance(interval_minutes, bool) or not isinstance(interval_minutes, (int, float)):
+        return None
+    if not math.isfinite(interval_minutes) or interval_minutes <= 0 or interval_minutes != int(interval_minutes):
+        return None
+    m = int(interval_minutes)
+    return m if MINUTES_PER_DAY % m == 0 else None
+
+
+def settlements_per_day(interval_minutes: Any) -> Optional[float]:
+    """1440 / interval_minutes; None (UNKNOWN) for an unusable interval."""
+    m = interval_minutes_or_none(interval_minutes)
+    return None if m is None else MINUTES_PER_DAY / m
+
+
+def funding_bps_per_day(bps_per_print: Any, interval_minutes: Any) -> Optional[float]:
+    """bps/day = bps_per_print * 1440 / interval_minutes. None if either input is unusable."""
+    n = settlements_per_day(interval_minutes)
+    r = None if isinstance(bps_per_print, bool) else _usable(bps_per_print)
+    return None if n is None or r is None else r * n
+
+
+def funding_bps_over_horizon(bps_per_print: Any, interval_minutes: Any, hold_days: Any) -> Optional[float]:
+    """Funding collected over ``hold_days`` (bps of notional): bps_per_day * hold_days."""
+    d, h = funding_bps_per_day(bps_per_print, interval_minutes), _positive_finite(hold_days)
+    return None if d is None or h is None else d * h
+
+
+def equivalent_hurdle_bps_per_print(hurdle_bps_per_print: Any, from_interval_minutes: Any, to_interval_minutes: Any) -> Optional[float]:
+    """A per-print hurdle stated at one interval, restated at another with the same bps/day.
+    The FROZEN 8h hurdle (1.131 bps/print at 480m) is HALF that per print at 240m. None if unusable."""
+    day = funding_bps_per_day(hurdle_bps_per_print, from_interval_minutes)
+    n = settlements_per_day(to_interval_minutes)
+    return None if day is None or n is None else day / n
+
+
+# ---------------------------------------------------------------------------
+# WHICH COST APPLIES TO WHICH POSITION (hedged vs unhedged). Costs are per ROUND
+# TRIP (entry + exit), charged ONCE per trade whatever the funding interval.
+#
+#   overlay_owned_spot          short perp vs BTC already owned: 2 perp legs, no spot
+#                               trade. HEDGED. 11.0 fee. Holding the BTC has an
+#                               opportunity cost that is NOT in this number.
+#   acquire_spot_perp           buy spot + short perp: 2 spot + 2 perp legs. HEDGED. 31.0.
+#   perp_only_hedged_elsewhere  a perp with NO Bybit spot pair, hedged by some other
+#                               instrument. The 11.0 is the PERP leg only; the hedge
+#                               instrument's own cost is UNKNOWN here, never zero.
+#   perp_only_unhedged          one perp leg in and out: 5.5 + 5.5 = 11.0 as well, but
+#                               there is NO hedge. The price leg is open directional
+#                               risk, so funding is not "carry" and 11.0 understates
+#                               the cost of being wrong. Not delta-neutral.
+#
+# The fee is identical (11.0) for three of the four; the CLASS is what differs,
+# so a net quoted without its class is not comparable.
+# ---------------------------------------------------------------------------
+POSITION_CLASSES = ("overlay_owned_spot", "acquire_spot_perp", "perp_only_hedged_elsewhere", "perp_only_unhedged")
+
+
+def position_class_costs(position_class: str, style: str = "taker") -> Dict[str, Any]:
+    """Round-trip cost (bps of notional) for a position class, with provenance and whether a hedge exists. ``style`` 'taker' | 'maker'.
+    maker = every perp leg rests and fills at MAKER_BPS_PERP_MODELLED with zero adverse selection and zero missed fills: MODELLED, an upper
+    bound on savings, never an observation; no maker figure exists for the spot legs here (None)."""
+    if position_class not in POSITION_CLASSES:
+        raise ValueError(f"unknown position class {position_class!r}")
+    if style not in ("taker", "maker"):
+        raise ValueError(f"unknown style {style!r}")
+    acquire = position_class == "acquire_spot_perp"
+    hedged = position_class != "perp_only_unhedged"
+    if style == "taker":
+        fee = ROUND_TRIP_FEE_BPS_SPOT_PERP if acquire else ROUND_TRIP_FEE_BPS_PERP_OVERLAY
+        spread, fee_prov = ASSUMED_ROUND_TRIP_SPREAD_BPS, "venue_stated"
+    else:
+        if acquire:
+            return {"position_class": position_class, "style": style, "fee_bps": None, "spread_bps": None, "total_bps": None,
+                    "provenance": "unknown", "hedged": hedged, "hedge_leg_cost_included": True, "note": "no maker figure for the spot legs"}
+        fee, spread, fee_prov = ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED, 0.0, "modelled"
+    return {"position_class": position_class, "style": style, "fee_bps": fee, "spread_bps": spread,
+            "total_bps": round(fee + spread, 10), "fee_provenance": fee_prov,
+            "provenance": "modelled" if style == "maker" else "assumed",   # taker total carries the ASSUMED 0.4; maker is a MODELLED scenario
+            "hedged": hedged,
+            "hedge_leg_cost_included": position_class in ("overlay_owned_spot", "acquire_spot_perp"),
+            "open_directional_risk": not hedged,
+            "note": {"perp_only_hedged_elsewhere": "perp leg only; the hedge instrument's cost is UNKNOWN, not zero",
+                     "perp_only_unhedged": "no hedge: the price leg is open risk, funding is not carry"}.get(position_class, "")}
+
+
+def annualise_bps_from_window(net_bps: Any, window_days: Any) -> Optional[Dict[str, Any]]:
+    """net_bps * 365 / window_days as a LABELLED EXTRAPOLATION. It assumes the window repeats for a year, which nothing measured, so the result
+    carries ``extrapolated_from_window`` True, provenance 'assumed' (an assumed input can never yield a verdict PASS) and ``may_feed_verdict``
+    False. Use it for display only. None for an unusable net or window."""
+    net, days = _usable(net_bps), _positive_finite(window_days)
+    if net is None or days is None or isinstance(net_bps, bool):
+        return None
+    return {"value_bps_per_year": net * 365.0 / days, "extrapolated_from_window": True, "window_days": days,
+            "provenance": "assumed", "may_feed_verdict": False,
+            "label": f"EXTRAPOLATION of a {days:g}-day window x {365.0 / days:.3f}; not an observed annual figure"}
+
+
+COST_PROVENANCE = {
+    "TAKER_BPS_PERP": "venue_stated", "TAKER_BPS_SPOT": "venue_stated",
+    "ROUND_TRIP_FEE_BPS_PERP_OVERLAY": "venue_stated",
+    "ROUND_TRIP_FEE_BPS_SPOT_PERP": "venue_stated",
+    "ASSUMED_ROUND_TRIP_SPREAD_BPS": "assumed",
+    "ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY": "assumed",
+    "MAKER_BPS_PERP_MODELLED": "modelled",
+    "ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED": "modelled",
+}
+
 #: 0036: `evaluate_entry` takes the round trip as a REQUIRED argument instead
 #: of reading the constant above. An overlay on BTC the client already owns
 #: never trades the spot leg, so its round trip is two perp legs — 11 bps at

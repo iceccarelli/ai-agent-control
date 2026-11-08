@@ -724,10 +724,25 @@ def round_trip_fee_bps(rates: Sequence[Quantity]) -> Quantity:
 
 def required_funding_bps_per_settlement(hurdle_pct: Any, hold_days: Any, round_trip_bps: Any, reserve: Any,
                                         settlements_per_day: Any) -> Decimal:
-    """Average funding (bps per settlement) at which the annualised return on FULLY ALLOCATED capital equals the hurdle."""
+    """Average funding (bps per settlement) at which the annualised return on FULLY ALLOCATED capital equals the hurdle. PER SETTLEMENT AT THE GIVEN ``settlements_per_day`` (an 8h-print number only when that is 3; see required_funding_at_interval)."""
     h, d, c, r, s = (to_decimal(x) for x in (hurdle_pct, hold_days, round_trip_bps, reserve, settlements_per_day))
     need_net = h / Decimal(100) * (Decimal(1) + r) * d / Decimal(365) * BPS
     return (c + need_net) / (s * d)
+
+
+def required_funding_at_interval(hurdle_pct: Any, hold_days: Any, round_trip_bps: Any, reserve: Any, interval_minutes: Any) -> Quantity:
+    """The hurdle's required funding PER PRINT AT A STATED INTERVAL (minutes). The frozen 8h figure (1.131 bps/print at 480m) is a per-8h-print
+    number and is NOT reusable for another cadence: at 240m the equivalent is half, at 60m an eighth (same bps/day). An interval that is missing,
+    <= 0, fractional or not a divisor of 1440 minutes is UNKNOWN, never defaulted to 8h."""
+    if isinstance(interval_minutes, (bool, str)) or interval_minutes is None:
+        return unknown("bps")
+    try:
+        m = to_decimal(interval_minutes)
+    except EconomicModelError:
+        return unknown("bps")
+    if m <= 0 or m != m.to_integral_value() or Decimal(1440) % m != 0:
+        return unknown("bps")
+    return Quantity(required_funding_bps_per_settlement(hurdle_pct, hold_days, round_trip_bps, reserve, Decimal(1440) / m), "derived", "bps")
 
 
 def breakeven_funding_bps(settlements: Any, round_trip_bps: Any, borrow_bps_per_day: Any = 0,

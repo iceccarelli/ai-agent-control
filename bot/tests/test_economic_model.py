@@ -280,9 +280,13 @@ def test_agrees_with_required_funding_1_131():
     assert float(got) == pytest.approx(CP.required_bps(10.0), abs=1e-12)
     assert float(got) == pytest.approx(CT.required_funding(10.0, 30.0, 11.4, 0.10), abs=1e-12)
     assert round(float(got), 3) == 1.131
-    # DISAGREEMENT (documented): the 11 bps overlay round trip (2*5.5) gives 1.1268, not 1.131; 1.131 needs the repo's 11.4 round trip.
+    # RESOLVED (not an open disagreement): 11.0 and 11.4 are different QUANTITIES, see carry_costs. 11.0 = 2 x 5.5 perp taker FEE only
+    # (what the entry gate prices); 11.4 = that fee + 0.4 bps ASSUMED spread allowance (what the frozen hurdle prices). Fee alone gives
+    # 1.126788; fee + spread gives the registered 1.131. The 0.4 has no measurement behind it yet (tests/test_cost_contracts.py).
     assert EM.required_funding_bps_per_settlement(10, 30, "11", "0.10", 3).quantize(D("0.000001")) == D("1.126788")
-    assert CP.ROUND_TRIP_BPS == 11.4 != 2 * CC.TAKER_BPS_PERP
+    assert CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY == 2 * CC.TAKER_BPS_PERP == 11.0
+    assert CP.ROUND_TRIP_BPS == CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY == 11.4
+    assert CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY == pytest.approx(CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY + CC.ASSUMED_ROUND_TRIP_SPREAD_BPS)
 
 
 def test_agrees_with_carry_costs_breakeven_and_basis():

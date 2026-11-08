@@ -574,3 +574,16 @@ if __name__ == "__main__":      # `python tests/test_order_path_inventory.py` pr
     print("--- http")
     for k, v in sorted(_h.items()):
         print(k, sorted(v))
+
+
+# ---- history ingestion + corpus audit (market_history, data_freshness_audit) ---------------------------------------------------------------------------------
+def test_market_history_and_the_corpus_audit_add_no_order_site_and_no_connection_of_their_own():
+    """Reason for this pin: ``tools/market_history.py`` pages five PUBLIC history paths (funding, kline, mark-price-kline, index-price-kline, open-interest) and
+    ``tools/data_freshness_audit.py`` only reads files. Neither may open a connection (the one primitive is ``market_collector.http_request_to`` behind the public_collector
+    role, so they are NOT new members of EXPECTED_HTTP_FILES) and neither may be an order site, so EXPECTED_SITES / EXPECTED_HTTP_FILES stay exactly as they were."""
+    sites, http = _inventory()
+    for rel in ("tools/market_history.py", "tools/data_freshness_audit.py"):
+        assert rel not in http, f"{rel} opens its own connection"
+        assert not {s for s in sites if s.startswith(rel + ":")}, f"{rel} became an order-capable or process-spawning site"
+    assert "tools/market_collector.py" in EXPECTED_HTTP_FILES                      # the single transport the history tool reuses
+    assert "tools/market_history.py" not in EXPECTED_HTTP_FILES and "tools/data_freshness_audit.py" not in EXPECTED_HTTP_FILES

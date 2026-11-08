@@ -64,7 +64,7 @@ def test_template_is_a_specification_whose_declarations_are_truthful(name):
     assert s["candidate_id"].startswith(name + "@")
     for comp in ("fee_model", "slippage_model", "funding_model"):
         for k, e in s[comp].items():
-            assert e["provenance"] in ("assumed", "derived", "measured") and e["value"] > 0, (name, comp, k, e)
+            assert e["provenance"] in ("assumed", "derived", "measured", "venue_stated") and e["value"] > 0, (name, comp, k, e)
     assert len(s["rejection_conditions"]) >= 4
     assert "who pays" not in s["counterparty"] and len(s["counterparty"]) > 15 and "Counterparty" in s["economic_mechanism"]
     assert "SPECIFICATION ONLY" in s["status_note"]
@@ -195,3 +195,35 @@ def test_rt4_cross_venue_funding_history_is_not_claimed_as_in_the_repo():
     assert row["repo_has"] is False and "interval" in row["gap"] and "transfer" in row["gap"]       # its own gap names what is missing
     assert s["bias_declarations"]["no_future_funding_knowledge"] is False                           # declaration consistent with the missing data
     assert "no_future_funding_knowledge" in missing_declarations(s)
+
+
+# ---- provenance labels follow the published fee schedule; funding-interval heterogeneity is declared (the interval facts are OWNER-OBSERVED)
+def test_venue_stated_is_used_only_for_numbers_the_repos_published_schedule_states():
+    import carry_costs as CC
+    saw = 0
+    for name in MECHANISMS:
+        s = load(name)
+        for comp in ("fee_model", "slippage_model", "funding_model"):
+            for k, e in s[comp].items():
+                if e["provenance"] == "venue_stated":
+                    saw += 1
+                    want = {"taker_bps": CC.TAKER_BPS_PERP, "spot_taker_bps": CC.TAKER_BPS_SPOT}.get(k)
+                    assert comp == "fee_model" and want is not None and e["value"] == want and "base-tier" in e["note"].lower(), (name, comp, k, e)
+    assert saw >= 6
+    f = load("spot_perp_basis")["fee_model"]                                                                  # the stray 6.0 is gone: per-leg published numbers, so spot+perp prices at 31.0
+    assert f["taker_bps"]["value"] == CC.TAKER_BPS_PERP and f["spot_taker_bps"]["value"] == CC.TAKER_BPS_SPOT
+    assert 2 * (f["taker_bps"]["value"] + f["spot_taker_bps"]["value"]) == CC.ROUND_TRIP_FEE_BPS_SPOT_PERP == 31.0
+    for name in MECHANISMS:                                                                                    # nothing was upgraded to measured/modelled without a data basis
+        for comp in ("fee_model", "slippage_model"):
+            assert all(e["provenance"] in ("assumed", "venue_stated") for e in load(name)[comp].values()), name
+
+
+def test_cross_sectional_says_plainly_that_an_8h_only_filter_drops_most_high_funding_perps():
+    s = load("cross_sectional_funding")
+    txt = json.dumps(s)
+    assert "8h funding interval only" not in txt and "OWNER-OBSERVED" in s["economic_mechanism"] and "8h-only filter would exclude the majority" in s["economic_mechanism"]
+    h = s["funding_interval_handling"]
+    assert "1440 / fundingInterval_min" in h["method"] and "per-interval cohorts" in h["method"] and "deliveryTime" in h["method"] and "cannot pass" in h["unknown_interval"]
+    assert any("fundingInterval" in r and "never on raw per-print" in r for r in s["eligibility_rules"])
+    for name in ("market_neutral_relative_value", "cross_venue_funding", "cash_and_carry", "spot_perp_basis"):
+        assert "funding_interval_handling" in load(name), name

@@ -281,7 +281,7 @@ def _engine_symbols() -> Sequence[str]:
 #: taker figures are `carry_costs`' own constants; the maker figures are the
 #: `config.py` linear/spot defaults (a test pins both to `config.load({})`).
 #: The live account's tier is read from the venue at run time and may differ.
-PERP_MAKER_BPS = 2.0
+PERP_MAKER_BPS = costs.MAKER_BPS_PERP_MODELLED
 SPOT_MAKER_BPS = 10.0
 
 
@@ -663,8 +663,28 @@ def single_print_ceiling(rows: Sequence[Settle], cost_levels: Sequence[float]
     return out
 
 
+def hold_cost_matrix(rows: Sequence[Settle], holds: Sequence[int],
+                     scenarios: Dict[str, float]) -> List[Dict[str, Any]]:
+    """Net bps of a forced hold of `hold` prints entered after EVERY print (unconditional: no gate, no foresight), for each cost scenario (name -> round-trip
+    bps). One print = one 8h settlement in this corpus. Overlapping windows are serially dependent: the interval is a moving-block bootstrap (block >= 2 holds),
+    and n counts overlapping entries, not independent trials. IN-SAMPLE, funding + the basis shed, price legs hedged by construction (spot owned)."""
+    out: List[Dict[str, Any]] = []
+    for h in holds:
+        for name, cost in scenarios.items():
+            t = all_forced(rows, h, cost_bps=cost)
+            net = [e["net_bps"] for e in t]
+            s = summarise(net)
+            out.append({"hold_prints": h, "hold_days": h / PRINTS_PER_DAY, "scenario": name, "round_trip_cost_bps": cost, "summary": s,
+                        "mean_block_ci90": block_bootstrap_mean(net, block=max(2 * h, 2)) if len(net) >= 4 * max(h, 1) else None,
+                        "mean_funding_bps": statistics.fmean(e["funding_bps"] for e in t) if t else None,
+                        "mean_basis_pnl_bps": statistics.fmean(e["basis_pnl_bps"] for e in t) if t else None})
+    return out
+
+
 def funding_persistence(rows: Sequence[Settle], hold: int,
-                        cost_levels: Sequence[float] = (4.0, 11.0, 13.0)
+                        cost_levels: Sequence[float] = (costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED,
+                                                        costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY,
+                                                        costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY + 2.0)   # fee + ASSUMED 1 bp/leg slippage (the map's default)
                         ) -> Dict[str, Any]:
     """How well does the gate's smoothed rate predict the funding actually
     collected over the hold? OLS of realised hold-funding on the EWMA at entry."""
@@ -1034,7 +1054,7 @@ def build_report(repo: str, *, discovery_start: float, discovery_end: float,
                          "share_at_or_above_1bp": (
                              sum(1 for r in rows if _year(r.ms) == 2026 and r.rate_bps >= 1.0)
                              / max(1, len([r for r in rows if _year(r.ms) == 2026])))},
-        "single_print_harvest_ceiling": single_print_ceiling(rows, (cost_maker, 11.0, cost_taker)),
+        "single_print_harvest_ceiling": single_print_ceiling(rows, (cost_maker, costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY, cost_taker)),
         "funding_persistence": funding_persistence(rows, hold),
         "funding_formula_check": funding_formula_check(rows),
         "window_timing_bybit": window_timing(rows),

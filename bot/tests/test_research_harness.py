@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 sys.path.insert(0, BOT)
 sys.path.insert(0, os.path.join(BOT, "tools"))
+sys.path.insert(0, HERE)
 
 import research_harness as RH  # noqa: E402
 import statistical_power as SP  # noqa: E402
@@ -46,9 +47,18 @@ def spec_for(ledger, name="cross_sectional_funding"):
     return spec(name, family=ledger.family)
 
 
+_PIT_CACHE = {}
+
+
 def pit_universe():
-    return RH.PointInTimeUniverse({"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}, "CCC": {"listed_ms": 1_000, "delisted_ms": 9_000}},
-                                  membership_source=PIT_SRC, includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000)
+    """A point-in-time universe rebuilt from SYNTHETIC capture directories (tests/pit_fixtures.py) through the harness's own verification; not an exchange observation."""
+    if "u" not in _PIT_CACHE:
+        import tempfile
+        import pit_fixtures as PF
+        _PIT_CACHE["dir"] = tempfile.mkdtemp(prefix="pit_synth_")
+        _PIT_CACHE["u"] = RH.PointInTimeUniverse.from_capture_dirs(PF.standard_captures(_PIT_CACHE["dir"]), study_from_ms=0, study_to_ms=10_000, verify=PF.ok_verifier)
+    assert _PIT_CACHE["u"].point_in_time
+    return _PIT_CACHE["u"]
 
 
 def survivors():
@@ -105,7 +115,8 @@ def test_symbol_list_without_dates_is_refused():
 
 
 def test_symbol_queried_outside_membership_is_an_error():
-    u = pit_universe()
+    u = RH.PointInTimeUniverse({"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}, "CCC": {"listed_ms": 1_000, "delisted_ms": 9_000}},
+                               membership_source=PIT_SRC, includes_delisted=True)         # a DESCRIBED universe still answers dated queries; it is just never point in time
     u.require_active("AAA", 0)
     u.require_active("AAA", 4_999)
     with pytest.raises(RH.UniverseError):
@@ -567,37 +578,15 @@ def test_evidence_takes_n_variants_from_the_ledger_not_a_free_integer():
 FAKE_DELIST = {"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}}
 
 
-def test_arbitrary_membership_source_is_not_point_in_time():
-    for src in ("trust_me", "exchange_listing_records", "survivors_but_with_delistings", PIT_SRC.upper(), PIT_SRC + "x"):
+def test_a_membership_source_name_never_makes_a_universe_point_in_time():
+    for src in ("trust_me", "exchange_listing_records", "survivors_but_with_delistings", PIT_SRC.upper(), PIT_SRC + "x") + tuple(RH.PIT_SOURCE_KINDS):
         u = RH.PointInTimeUniverse(FAKE_DELIST, membership_source=src, includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000)
-        assert not u.point_in_time and any("NOT_ALLOWLISTED" in p for p in u.survivorship_problems()), src
-    for src in RH.PIT_SOURCE_KINDS:
-        assert RH.PointInTimeUniverse(FAKE_DELIST, membership_source=src, includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000).point_in_time
+        assert not u.point_in_time and u.pit_basis == "ASSERTED" and any(p.startswith("PIT_NEEDS_VERIFIED_RAW_CAPTURES") for p in u.survivorship_problems()), src
     assert set(RH.PIT_SOURCE_KINDS) >= {"exchange_instruments_info_snapshots_with_status_history", "recorded_universe_snapshots"}
-
-
-def test_pit_needs_an_observed_window_and_a_delisting_inside_it_or_an_attestation():
-    def mk(members, **kw):
-        return RH.PointInTimeUniverse(members, membership_source=PIT_SRC, includes_delisted=True, **kw)
-    assert "OBSERVED_WINDOW_MISSING" in mk(FAKE_DELIST).survivorship_problems()
-    assert mk(FAKE_DELIST, observed_from_ms=0, observed_to_ms=10_000).point_in_time                       # control
-    # the one delisting is dated OUTSIDE the observed window: not evidence the source records delistings in it
-    out = mk(FAKE_DELIST, observed_from_ms=6_000, observed_to_ms=10_000)
-    assert not out.point_in_time and any("NO_DELISTING_EVENT_IN_OBSERVED_WINDOW" in p for p in out.survivorship_problems())
-    nobody = {"AAA": {"listed_ms": 0}, "BBB": {"listed_ms": 0}}
-    assert not mk(nobody, observed_from_ms=0, observed_to_ms=10_000).point_in_time
-    h1, h2 = hashlib.sha256(b"s1").hexdigest(), hashlib.sha256(b"s2").hexdigest()
-    att = {"no_delistings_observed_in_window": True, "window_from_ms": 0, "window_to_ms": 10_000, "snapshot_sha256": [h1, h2]}
-    assert mk(nobody, observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=att).point_in_time
-    for bad in (dict(att, snapshot_sha256=[]), {"no_delistings_observed_in_window": True}, dict(att, snapshot_sha256=["nothex", h2]),
-                dict(att, no_delistings_observed_in_window=False), dict(att, no_delistings_observed_in_window="yes")):
-        assert not mk(nobody, observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=bad).point_in_time, bad
-    # an attestation that contradicts a delisting present in the window is not accepted
-    assert not mk(FAKE_DELIST, observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=att).point_in_time
     with pytest.raises(RH.HarnessError):
-        mk(FAKE_DELIST, observed_from_ms=10, observed_to_ms=10)
+        RH.PointInTimeUniverse(FAKE_DELIST, membership_source=PIT_SRC, includes_delisted=True, observed_from_ms=10, observed_to_ms=10)
     with pytest.raises(RH.HarnessError):
-        mk(FAKE_DELIST, observed_from_ms=0)
+        RH.PointInTimeUniverse(FAKE_DELIST, membership_source=PIT_SRC, includes_delisted=True, observed_from_ms=0)
 
 
 def test_fake_delisted_symbol_with_arbitrary_source_cannot_make_a_pit_pass():
@@ -797,37 +786,12 @@ def test_oos_requires_a_declared_horizon_for_every_variant():
             L.record("x", {"n": "x"}, vr["w"], horizon=bad)
 
 
-# ---- K) PIT attestation: what can be checked offline is checked, and the limit is stated
-_ATT_H1, _ATT_H2 = hashlib.sha256(b"snapshot-1").hexdigest(), hashlib.sha256(b"snapshot-2").hexdigest()
-
-
-def _attested(**over):
-    att = {"no_delistings_observed_in_window": True, "window_from_ms": 0, "window_to_ms": 10_000, "snapshot_sha256": [_ATT_H1, _ATT_H2]}
-    att.update(over)
-    return RH.PointInTimeUniverse({"AAA": {"listed_ms": 0}, "BBB": {"listed_ms": 0}}, membership_source=PIT_SRC, includes_delisted=True,
-                                  observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=att)
-
-
-def test_attestation_is_bound_to_the_observed_window_and_distinct_real_looking_hashes():
-    u = _attested()
-    assert u.point_in_time and u.pit_basis == "attested_no_delistings_unverified"          # control
-    for bad in ({"window_from_ms": 1}, {"window_to_ms": 9_999}, {"window_from_ms": None}, {"window_to_ms": "10000"},
-                {"snapshot_sha256": [_ATT_H1]},                                             # one snapshot cannot span a window
-                {"snapshot_sha256": [_ATT_H1, _ATT_H1]},                                    # not distinct
-                {"snapshot_sha256": [_ATT_H1, "0" * 64]},                                   # placeholder-shaped
-                {"snapshot_sha256": [_ATT_H1, "cd" * 32]},
-                {"snapshot_sha256": [_ATT_H1, _ATT_H2.upper()]}):
-        assert not _attested(**bad).point_in_time, bad
-    assert not _attested(snapshot_sha256=[_ATT_H1, _ATT_H1]).point_in_time and any("ATTESTATION" in p or "NO_DELISTING" in p for p in _attested(window_from_ms=1).survivorship_problems())
-
-
+# ---- K) the PIT claim and its limits are stated in the evidence (the provenance tests are in test_pit_provenance.py)
 def test_pit_limits_are_stated_in_gaps_and_in_the_evidence():
-    assert any("attest" in g and "not verified" in g for g in RH.GAPS), RH.GAPS
+    assert any("who produced" in g for g in RH.GAPS), RH.GAPS
     L = RH.VariantLedger(fam())
-    st, _ = _rec(L)
-    ev = RH.historical_evidence(spec=spec_for(L), stats=st, ledger=L, universe=_attested(), leak=CLEAN, data_sha256=SHA)
-    assert ev.metrics["universe_pit_basis"] == "attested_no_delistings_unverified" and ev.metrics["universe_pit_verified_against_exchange"] is False
-    ev2 = RH.historical_evidence(spec=spec_for(L), stats=st, ledger=L, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
-    assert ev2.metrics["universe_pit_basis"] == "self_declared_delisting_event_in_window" and ev2.metrics["universe_pit_verified_against_exchange"] is False
+    st = L.record("v", {"k": 1}, planted_edge())
+    ev = RH.historical_evidence(spec=spec_for(L), stats=st, ledger=L, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
+    assert ev.metrics["universe_pit_basis"] == "RAW_RESPONSES_VERIFIED" and ev.metrics["universe_pit_verified_against_exchange"] is False
     ev3 = RH.historical_evidence(spec=spec_for(L), stats=st, ledger=L, universe=survivors(), leak=CLEAN, data_sha256=SHA)
-    assert ev3.metrics["universe_pit_basis"] == "not_point_in_time"
+    assert ev3.metrics["universe_pit_basis"] == "ASSERTED" and ev3.metrics["universe_pit_source_assertion"] == "hand_picked_survivors"

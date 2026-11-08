@@ -287,7 +287,11 @@ PROVENANCE_RE = re.compile(r"^[A-Za-z0-9_.:/# -]{1,120}\Z")
 #: binding words, the owner's figure and its labels (no second financial truth), and the two HMAC attestations ``strategy_verdict.record_evidence`` writes (``attestation``,
 #: ``report_attestation``): they are keyed MACs over the evidence, verified where the registry lives, and a MAC is hash-shaped material that must never reach a database.
 EVIDENCE_DROPPED_DETAILS = ("attachment", "candidate_id", "spec_digest", "attestation", "report_attestation", "recorded_ms")
-EVIDENCE_DROPPED_METRICS = ("net_usd_after_all_costs", "owner_figure_basis", "import_status", "candidate_id", "spec_digest")
+EVIDENCE_DROPPED_METRICS = ("net_usd_after_all_costs", "owner_figure_basis", "import_status", "candidate_id", "spec_digest",
+                            # point-in-time / research-integrity metrics emitted by research_harness evidence builders: they live in the hashed local evidence, not in Supabase
+                            "universe_pit_basis", "universe_pit_independently_verified", "universe_pit_source_assertion", "universe_pit_unverified_segments",
+                            "universe_capture_manifest_sha256", "universe_funding_normalisation_known", "universe_pit_verified_against_exchange",
+                            "multiple_testing_family", "multiple_testing_correction", "deflated_sharpe")
 OBJ_SCHEMAS: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("experiment_evidence", "details"): {**{m: "metric" for m in EVIDENCE_METRICS}, "metrics": {**{m: "metric" for m in EVIDENCE_METRICS}, **{h: "hex64" for h in EVIDENCE_BINDING_HASHES}},
                                          "data_sha256": "hex64", "status": "status", **{h: "hex64" for h in EVIDENCE_BINDING_HASHES}},

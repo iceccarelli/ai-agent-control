@@ -47,7 +47,10 @@ def ev(stage, result="PASS", spec_=None, **kw):
     base = {"provenance": "run#1 offline harness", "data_sha256": H, "candidate_id": "cand1", "spec_digest": SV.spec_digest(spec_ if spec_ is not None else spec())}
     m = {}
     if stage in ("historical_test", "oos_test"):
-        m = {"independent_observations": 500, "n_variants_tested": 3, "multiple_testing_adjusted": True, "uses_future_information": False, "universe_point_in_time": True}
+        m = {"independent_observations": 500, "n_variants_tested": 3, "multiple_testing_adjusted": True, "uses_future_information": False, "universe_point_in_time": True, "universe_pit_basis": "RAW_RESPONSES_VERIFIED",
+             # pinned explicitly since counted() requires `is True` for a funding-type spec: an ABSENT / None flag used to count (the check was `is False`), which let a
+             # universe that never stated its per-symbol funding interval pass
+             "universe_funding_normalisation_known": True}
     elif stage == "cost_model":
         m = {"unknown_cost_inputs": 0, "net_edge_bps_after_costs": 2.5, "chain_digest": SV.cost_chain_digest(spec_ if spec_ is not None else spec())}
     elif stage == "capacity_test":
@@ -239,6 +242,10 @@ def test_the_verdict_is_deterministic_and_order_of_evidence_does_not_matter():
     ("historical_test", {"uses_future_information": True}, "LOOK_AHEAD"),
     ("historical_test", {"uses_future_information": None}, "LOOK_AHEAD"),
     ("historical_test", {"universe_point_in_time": False}, "UNIVERSE_NOT_POINT_IN_TIME"),
+    ("historical_test", {"universe_funding_normalisation_known": None}, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"),
+    ("historical_test", {"universe_funding_normalisation_known": False}, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"),
+    ("oos_test", {"universe_funding_normalisation_known": "yes"}, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"),
+    ("oos_test", {"universe_funding_normalisation_known": 1}, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"),
     ("oos_test", {"independent_observations": 49}, "TOO_FEW_INDEPENDENT"),
     ("cost_model", {"unknown_cost_inputs": 1}, "UNKNOWN_COST_INPUTS"),
     ("cost_model", {"unknown_cost_inputs": None}, "UNKNOWN_COST_INPUTS"),
@@ -260,6 +267,16 @@ def test_a_pass_that_does_not_carry_what_it_needs_does_not_count(stage, mutation
     ok, reason = counted(item, spec(), REG)
     assert ok is False and why in reason
     assert counted(ev(stage), spec(), REG) == (True, None)                    # positive control
+
+
+@pytest.mark.parametrize("stage", ["historical_test", "oos_test"])
+def test_an_absent_funding_normalisation_flag_does_not_count_for_a_funding_spec(stage):
+    item = ev(stage)
+    assert counted(item, spec(), REG) == (True, None)                         # positive control: the flag is stated True
+    m = {k: v for k, v in item.metrics.items() if k != "universe_funding_normalisation_known"}
+    import dataclasses
+    ok, reason = counted(dataclasses.replace(item, metrics=m), spec(), REG)
+    assert ok is False and reason == "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"
 
 
 def test_provenance_hash_and_status_are_required_for_a_pass():

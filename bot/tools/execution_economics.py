@@ -73,7 +73,9 @@ LABEL = ("SENSITIVITY UNDER STATED ASSUMPTIONS - NOT A MEASUREMENT. No measured 
 #: Placeholder maker fee, bps per leg. Bybit's base-tier linear maker fee, the
 #: figure the 0040 maker-first upper bound used. An ASSUMPTION here: the live
 #: engine reads the account's actual tier from the venue.
-ASSUMED_MAKER_BPS = 2.0
+import carry_costs as _carry_costs  # noqa: E402
+
+ASSUMED_MAKER_BPS = _carry_costs.MAKER_BPS_PERP_MODELLED
 
 
 @dataclass(frozen=True)

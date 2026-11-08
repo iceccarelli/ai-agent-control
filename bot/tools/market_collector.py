@@ -174,17 +174,23 @@ def _transport() -> "RC.CapabilityTransport":
     return RC.CapabilityTransport(_UrllibTransport(), RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="mainnet"))
 
 
-def http_request(method: Any, url: Any, *, headers: Any = None, body: Any = None) -> bytes:
-    """The only network primitive. The role refuses (BEFORE a connection is opened) any POST, signed/credential-carrying or unparseable header, body,
-    credential-looking query parameter, control character, other host or non-allow-listed path; the pinned-path check below is a second, stricter fence."""
+def http_request_to(method: Any, url: Any, allowed_paths: Sequence[str], *, headers: Any = None, body: Any = None) -> bytes:
+    """The only network primitive, for a caller (``market_history``) that pages other PUBLIC paths. ``allowed_paths`` is the caller's pinned set; the ``public_collector``
+    role independently refuses (BEFORE a connection is opened) any POST, signed/credential-carrying or unparseable header, body, credential-looking query parameter,
+    control character, other host or path outside ``runtime_capability.PUBLIC_MARKET_PATHS``; the pinned-path check below is a second, stricter fence."""
     base = _base()
-    if not isinstance(url, str) or not any(url.startswith(base + p + "?") for p in PUBLIC_PATHS):
+    if not isinstance(url, str) or not any(url.startswith(base + p + "?") for p in allowed_paths):
         raise CollectorError("refusing a URL that is not the registry host and a pinned public market path")
     hdrs = {"Accept": "application/json", "User-Agent": "market-collector/1"} if headers is None else headers
     try:
         return _transport().request(method, url, headers=hdrs, body=body, timeout=TIMEOUT_S)
     except RC.CapabilityRefused as exc:
         raise CollectorError(f"refused by the public_collector role: {exc.code}") from exc
+
+
+def http_request(method: Any, url: Any, *, headers: Any = None, body: Any = None) -> bytes:
+    """The collector's own pinned paths (instruments, tickers, order book, recent trades) through ``http_request_to``."""
+    return http_request_to(method, url, PUBLIC_PATHS, headers=headers, body=body)
 
 
 def http_fetch(url: str) -> bytes:
@@ -549,6 +555,16 @@ def _log_rows(log: str) -> List[Dict[str, Any]]:
     return [r for r in EC.rows_of(EC.read_lines(log)[0]) if isinstance(r, dict)]
 
 
+def _safe_cycle_name(name: Any) -> bool:
+    return isinstance(name, str) and bool(name) and name not in (".", "..") and name == os.path.basename(name) and "\\" not in name and "\0" not in name
+
+
+def _cycle_rows(log: str) -> List[Dict[str, Any]]:
+    """Log/receipt rows whose ``cycle`` is a plain non-empty name. A hash-chained row can still carry a hand-made body (``cycle`` a list, a dict, an int, a path): such a row is
+    skipped here and reported as MALFORMED_LOG_ROW by ``check_cycles``; it must never reach a hash, a set or a path join as a traceback."""
+    return [r for r in _log_rows(log) if _safe_cycle_name(r.get("cycle"))]
+
+
 def _symlinks(cycle_dir: str) -> List[str]:
     """Every symbolic link in (or being) the cycle directory. A link is never followed: it could make a 'verified' file be somebody else's bytes."""
     out: List[str] = []
@@ -760,7 +776,7 @@ def _run_locked(root: str, now_ms: int, fetch: Callable[[str], bytes], clock: Ca
     # collector: self-consistent is not enough (a fabricated dir with a far-future cycle_ms wedged the log), so it must also carry its own name, a cycle_ms strictly
     # after everything already recorded and not after this run's clock, and agree with its file listing. Anything else is set aside (numbered, never deleted).
     set_aside: List[Dict[str, str]] = []
-    recorded = {r.get("cycle") for r in rows}
+    recorded = {r["cycle"] for r in _cycle_rows(log)}
     max_ms = max((r["cycle_ms"] for r in rows if _is_uint(r.get("cycle_ms"))), default=0)
     for name in sorted(cycle_dirs(root, complete_only=False), key=lambda n: int(n[len("cycle-"):])):
         path = os.path.join(root, name)
@@ -952,8 +968,8 @@ def _seal_locked(root: str, manifest: str, now: int, accept_problems: bool) -> D
     already: Set[str] = set()
     if os.path.isfile(manifest):
         for r in EC.rows_of(EC.read_lines(manifest)[0]):
-            if isinstance(r, dict):
-                already |= {c["cycle"] for c in r.get("cycles", [])}
+            if isinstance(r, dict) and isinstance(r.get("cycles"), list):
+                already |= {c["cycle"] for c in r["cycles"] if _cycle_entry_problem(c) is None}
     names = cycle_dirs(root)
     bad = [n for n in names if n not in already and verify_cycle_dir(os.path.join(root, n))]
     if bad and not accept_problems:
@@ -961,9 +977,37 @@ def _seal_locked(root: str, manifest: str, now: int, accept_problems: bool) -> D
     new = [_describe_cycle(root, n) for n in names if n not in already]
     if not names:
         raise SealError("no COMPLETE cycles to seal")
-    log_ids = [r["cycle"] for r in _log_rows(os.path.join(root, LOG_NAME))]
+    log_path = os.path.join(root, LOG_NAME)
+    if len(_cycle_rows(log_path)) != len(_log_rows(log_path)):
+        raise SealError(f"refusing to seal: {LOG_NAME} has a row with a bad cycle name (MALFORMED_LOG_ROW)")
+    log_ids = [r["cycle"] for r in _cycle_rows(log_path)]
     n, head = EC.append(manifest, {"at_ms": now, "cycles": new, "log_cycles": log_ids})
     return {"manifest_rows": n, "head": head, "sealed_new": len(new), "cycles_total": len(names)}
+
+
+def _cycle_entry_problem(c: Any) -> Optional[str]:
+    """Why a sealed-cycle entry is malformed (a hash-chained row can still carry a hand-made body), else None."""
+    if not isinstance(c, dict):
+        return "a cycles entry is not an object"
+    name = c.get("cycle")
+    if not isinstance(name, str) or not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
+        return f"a cycles entry has a bad cycle name {str(name)[:40]!r}"
+    if not isinstance(c.get("manifest_sha256"), str):
+        return f"{name}: no manifest_sha256"
+    files = c.get("files")
+    if not isinstance(files, dict):
+        return f"{name}: files is not an object"
+    for rel, f in files.items():
+        if not isinstance(rel, str) or not isinstance(f, dict) or not isinstance(f.get("sha256"), str) or not isinstance(f.get("bytes"), int) or isinstance(f.get("bytes"), bool):
+            return f"{name}: file entry {str(rel)[:60]!r} lacks bytes/sha256"
+    return None
+
+
+def _row_log_cycles(row: Mapping[str, Any]) -> Optional[Set[str]]:
+    lc = row.get("log_cycles", [])
+    if not isinstance(lc, list) or not all(isinstance(x, str) for x in lc):
+        return None
+    return set(lc)
 
 
 def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
@@ -976,9 +1020,21 @@ def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
         problems.append(f"the seal manifest's own chain does not verify: {ver.get('problems') or ver.get('state') or ver}")
     rows = [r for r in EC.rows_of(EC.read_lines(manifest)[0]) if isinstance(r, dict)]
     sealed_log: Set[str] = set()
-    for row in rows:
-        sealed_log |= set(row.get("log_cycles", []))
-        for c in row.get("cycles", []):
+    for idx, row in enumerate(rows):
+        lc = _row_log_cycles(row)
+        if lc is None:
+            problems.append(f"MALFORMED_SEAL_ROW: row {idx} log_cycles is not a list of strings")
+        else:
+            sealed_log |= lc
+        cyc = row.get("cycles", [])
+        if not isinstance(cyc, list):
+            problems.append(f"MALFORMED_SEAL_ROW: row {idx} cycles is not a list")
+            continue
+        for c in cyc:
+            bad = _cycle_entry_problem(c)
+            if bad:
+                problems.append(f"MALFORMED_SEAL_ROW: row {idx}: {bad}")
+                continue
             name, path = c["cycle"], os.path.join(root, c["cycle"])
             if not os.path.isdir(path):
                 problems.append(f"{name}: MISSING (it was sealed with {len(c['files'])} files)")
@@ -1008,12 +1064,15 @@ def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
             lv = EC.verify(log)
             if not lv.get("ok", False):
                 problems.append(f"{LOG_NAME}: its own chain does not verify")
-            have_ids = {r.get("cycle") for r in _log_rows(log)}
+            have_ids = {r["cycle"] for r in _cycle_rows(log)}
             for cid in sorted(sealed_log - have_ids):
                 problems.append(f"{LOG_NAME}: TRUNCATED (the row for {cid} is gone)")
     if os.path.isfile(log):
         for r in _log_rows(log):
-            p = os.path.join(root, r.get("cycle", ""), "manifest.json")
+            if not _safe_cycle_name(r.get("cycle")):
+                problems.append(f"MALFORMED_LOG_ROW: a {LOG_NAME} row has a bad cycle name {str(r.get('cycle'))[:40]!r}")
+                continue
+            p = os.path.join(root, r["cycle"], "manifest.json")
             if os.path.isfile(p) and _file_sha(p) != r.get("manifest_sha256"):
                 problems.append(f"{r['cycle']}: ALTERED (manifest.json differs from its {LOG_NAME} row)")
             elif not os.path.isfile(p):
@@ -1038,9 +1097,9 @@ def _sealed_cycles(manifest: str) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     if os.path.isfile(manifest):
         for r in EC.rows_of(EC.read_lines(manifest)[0]):
-            if isinstance(r, dict):
-                for c in r.get("cycles", []):
-                    if isinstance(c, dict) and isinstance(c.get("cycle"), str):
+            if isinstance(r, dict) and isinstance(r.get("cycles"), list):
+                for c in r["cycles"]:
+                    if _cycle_entry_problem(c) is None:
                         out.setdefault(c["cycle"], c)
     return out
 
@@ -1070,8 +1129,8 @@ def _backup_locked(src: str, dest: str, receipts: str, copy_fn: Callable[[str, s
     os.makedirs(dest, exist_ok=True)
     have: Set[str] = set()
     if os.path.isfile(receipts):
-        have = {r.get("cycle") for r in _log_rows(receipts)}
-    recorded = {r.get("cycle") for r in _log_rows(log)}
+        have = {r["cycle"] for r in _cycle_rows(receipts)}
+    recorded = {r["cycle"] for r in _cycle_rows(log)}
     done: List[Dict[str, Any]] = []
     skipped: List[str] = []
     failed: List[str] = []
@@ -1119,6 +1178,14 @@ def _backup_locked(src: str, dest: str, receipts: str, copy_fn: Callable[[str, s
 
 
 def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, Any]:
+    """See ``_restore_check``. Any unexpected error while reading damaged input is REPORTED as a failed check, never raised."""
+    try:
+        return _restore_check(backup_dir, receipts, manifest)
+    except (KeyError, ValueError, TypeError, AttributeError, OSError, EC.ChainDesync) as exc:
+        return {"ok": False, "problems": [f"restore check could not complete: {type(exc).__name__}: {str(exc)[:200]}"], "checked": 0}
+
+
+def _restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, Any]:
     """A backup is not proven until this passes: every receipted copy exists, is self-consistent and hashes as receipted, AND every cycle the seal ``manifest`` holds has
     a receipt whose manifest and tree hashes equal the sealed ones (mirrors ``md_seal.restore_check``: a backup that silently omits a sealed cycle proves nothing)."""
     problems: List[str] = []
@@ -1131,7 +1198,7 @@ def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, An
     else:
         if not EC.verify(manifest).get("ok", False):
             problems.append("the seal manifest's own chain does not verify")
-        latest = {r.get("cycle"): r for r in _log_rows(receipts)}
+        latest = {r["cycle"]: r for r in _cycle_rows(receipts)}
         for name, want in sorted(_sealed_cycles(manifest).items()):
             got = latest.get(name)
             if got is None:
@@ -1142,9 +1209,13 @@ def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, An
                     problems.append(f"{name}: the receipt's {k} differs from the sealed value")
     n = 0
     for r in _log_rows(receipts):
-        name = r["cycle"]
-        path = os.path.join(backup_dir, name)
+        name = r.get("cycle")
         n += 1
+        if (not isinstance(name, str) or not name or name != os.path.basename(name) or name in (".", "..")
+                or not isinstance(r.get("manifest_sha256"), str) or not isinstance(r.get("tree_sha256"), str)):
+            problems.append(f"receipt row {n}: malformed (needs a plain cycle name and manifest_sha256/tree_sha256 text); a garbled receipt proves nothing")
+            continue
+        path = os.path.join(backup_dir, name)
         if not os.path.isdir(path):
             problems.append(f"{name}: receipted but missing from the backup")
             continue
@@ -1184,6 +1255,200 @@ def _repair_locked(root: str) -> Dict[str, Any]:
     return {"ok": bool(res.get("appendable")) and bool(after.get("ok")), **res, "resealed_indices": after.get("resealed_indices", []), "verify_ok": bool(after.get("ok"))}
 
 
+# ---------------------------------------------------------------- data-root guard (shared with market_history)
+
+def _in_git_tree(path: str) -> bool:
+    """True when ``path`` (or its nearest existing ancestor, symlinks resolved) is inside a git work tree: a ``.git`` entry in it or any parent."""
+    d = os.path.realpath(path)
+    while not os.path.exists(d) and os.path.dirname(d) != d:
+        d = os.path.dirname(d)
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def root_guard(root: str, reserve_bytes: int, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free) -> List[str]:
+    """Reasons a data root may NOT be written (empty = fine): inside a git work tree (data would be committable), a link, group/world accessible, or free space under
+    the reserve. Checked before every cycle / dataset so a filling disk stops the run instead of corrupting a cycle."""
+    problems: List[str] = []
+    r = os.path.abspath(root)
+    if _in_git_tree(r):
+        problems.append("the data root is inside a git work tree: market data must live outside Git")
+    if os.path.islink(r):
+        problems.append("the data root is a symbolic link")
+    if os.path.isdir(r) and os.stat(r).st_mode & 0o077:
+        problems.append(f"the data root mode is {oct(os.stat(r).st_mode & 0o777)}: it must be 0700")
+    probe = r
+    while not os.path.exists(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    try:
+        free = int(free_bytes_fn(probe))
+    except OSError as exc:
+        problems.append(f"free space cannot be read ({exc.strerror})")
+    else:
+        if free < reserve_bytes:
+            problems.append(f"free space {free} bytes is below the reserve {reserve_bytes}")
+    return problems
+
+
+# ---------------------------------------------------------------- continuous collection (run-continuous) and its health report
+
+HEALTH_NAME = "health.json"
+HEALTH_SCHEMA = "market_collector_health/v1"
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
+STOP_SLICE_S = 5.0
+
+
+def _write_health(path: str, doc: Mapping[str, Any]) -> None:
+    """Atomic replace, 0600. The health file is overwritten by design (a status, not evidence); it holds no credential material."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.write(fd, (json.dumps(doc, indent=2, sort_keys=True, default=str, allow_nan=False) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, duration_ms: Optional[int] = None, until_ms: Optional[int] = None, stop_file: Optional[str] = None,
+                   max_cycles: Optional[int] = None, fetch: Callable[[str], bytes] = http_fetch, clock: Callable[[], int] = lambda: int(time.time() * 1000),
+                   sleep: Callable[[float], None] = time.sleep, max_symbols: int = DEFAULT_MAX_SYMBOLS, depth: int = DEFAULT_DEPTH, trades_limit: int = DEFAULT_TRADES,
+                   reserve_bytes: int = DEFAULT_RESERVE_BYTES, max_bytes: int = DEFAULT_MAX_BYTES, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free,
+                   seal_manifest: Optional[str] = None, backup_to: Optional[str] = None, receipts: Optional[str] = None, seal_every: int = 60, backup_every: int = 60,
+                   restore_check_every: int = 0, max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES, health_path: Optional[str] = None,
+                   max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S) -> Dict[str, Any]:
+    """Repeat ``run_once`` every ``interval_ms`` until a duration/``until_ms``/``max_cycles`` limit, an explicit ``stop_file``, the disk guard, a refusal that needs the owner
+    (broken log, held lock, storage budget) or ``max_consecutive_failures``. Restart-safe: every cycle is a new directory and ``run_once`` itself sets aside an interrupted one and
+    adopts a COMPLETE-but-unrecorded one, so killing and restarting this loop loses at most the cycle in flight. Seal / backup / restore-check hooks run every N cycles when
+    configured (through ``seal_cycles`` / ``backup_cycles`` / ``restore_check``); a failing hook is RECORDED in the health report, never swallowed and never fatal to collection.
+    The health report (``health.json``, rewritten after every step) is machine readable; ``tools/data_freshness_audit.py`` reads it."""
+    _check_ms("interval_ms", interval_ms)
+    if not (duration_ms is None or _check_ms("duration_ms", duration_ms)) or not (until_ms is None or _check_ms("until_ms", until_ms)):
+        raise CollectorError("bad duration/until")
+    if max_cycles is not None and (isinstance(max_cycles, bool) or not isinstance(max_cycles, int) or max_cycles < 1):
+        raise CollectorError("max_cycles must be a positive whole number")
+    if duration_ms is None and until_ms is None and max_cycles is None and not stop_file:
+        raise CollectorError("an unbounded run needs --stop-file (an explicit way to stop), or a duration/until/max-cycles")
+    if (backup_to is None) != (receipts is None) or (backup_to is not None and seal_manifest is None):
+        raise CollectorError("backup needs --backup-to, --receipts and --seal-manifest together")
+    if restore_check_every and backup_to is None:
+        raise CollectorError("restore-check needs the backup configured")
+    root = os.path.abspath(out_root)
+    hp = health_path or os.path.join(root, HEALTH_NAME)
+    t0 = int(clock())
+    end_ms = min(x for x in (until_ms, t0 + duration_ms if duration_ms else None) if x is not None) if (until_ms or duration_ms) else None
+    h: Dict[str, Any] = {"schema": HEALTH_SCHEMA, "root": root, "interval_ms": interval_ms, "started_ms": t0, "status": "RUNNING", "stop_reason": None, "cycles_run": 0,
+                         "cycles_ok": 0, "cycles_partial": 0, "last_cycle": None, "gaps": {"missed_expected_cycles_total": 0, "last": None}, "consecutive_failures": 0,
+                         "max_consecutive_failures": max_consecutive_failures, "rate_limit_events_total": 0, "disk": None, "last_seal": None, "last_backup": None,
+                         "last_restore_check": None, "refusal": None,
+                         "hook_cadence_ms": {k: n * interval_ms for k, n in (("last_seal", seal_every if seal_manifest else 0), ("last_backup", backup_every if backup_to else 0),
+                                                                         ("last_restore_check", restore_check_every if backup_to else 0)) if n and n > 0}}
+
+    def _flush() -> None:
+        h["written_ms"] = int(clock())
+        if os.path.isdir(root):
+            _write_health(hp, h)
+
+    def _flush_quiet() -> None:
+        try:
+            _flush()
+        except Exception:                             # the original error is the one to surface
+            pass
+
+    def _disk() -> List[str]:
+        probs = root_guard(root, reserve_bytes, free_bytes_fn)
+        h["disk"] = {"free_bytes": int(free_bytes_fn(root if os.path.isdir(root) else os.path.dirname(root))), "reserve_bytes": reserve_bytes,
+                     "root_bytes": _tree_bytes(root) if os.path.isdir(root) else 0, "max_bytes": max_bytes, "in_git_tree": _in_git_tree(root), "problems": probs}
+        return probs
+
+    def _hook(name: str, fn: Callable[[], Dict[str, Any]]) -> None:
+        try:
+            res = fn()
+            h[name] = {"at_ms": int(clock()), "ok": bool(res.get("ok", True)), "detail": {k: res[k] for k in res if k in ("ok", "problems", "sealed_new", "cycles_total", "backed_up",
+                                                                                                                     "failed", "rejected", "checked")}}
+        except Exception as exc:                          # ANY failure of a hook is recorded (a KeyError on damaged input must not end collection)
+            h[name] = {"at_ms": int(clock()), "ok": False, "detail": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
+
+    def _stop(reason: str, status: str = "STOPPED") -> Dict[str, Any]:
+        h["status"], h["stop_reason"] = status, reason
+        _flush()
+        return h
+
+    def _loop() -> Dict[str, Any]:
+        cycles = 0
+        while True:
+            if stop_file and os.path.lexists(stop_file):
+                return _stop("stop_file")
+            if max_cycles is not None and cycles >= max_cycles:
+                return _stop("max_cycles")
+            now = int(clock())
+            if end_ms is not None and now >= end_ms:
+                return _stop("duration")
+            probs = _disk()
+            if probs:
+                h["refusal"] = {"code": "DISK_GUARD", "problems": probs}
+                return _stop("disk_guard", "REFUSED")
+            t_cycle = now
+            try:
+                res = run_once(root, t_cycle, fetch, clock, sleep=sleep, max_symbols=max_symbols, depth=depth, trades_limit=trades_limit, interval_ms=interval_ms,
+                               reserve_bytes=reserve_bytes, max_bytes=max_bytes, free_bytes_fn=free_bytes_fn, max_retries=max_retries, backoff_s=backoff_s)
+            except CollectorError as exc:
+                res = {"status": "ABORTED", "reason": f"{type(exc).__name__}: {exc}"}
+            cycles += 1
+            h["cycles_run"] = cycles
+            st = res.get("status")
+            if st in ("REFUSED_STORAGE", "REFUSED_LOG", "REFUSED_LOCKED"):
+                h["refusal"] = {"code": st, "reason": res.get("reason"), "detail": res.get("detail")}
+                return _stop(st.lower(), "REFUSED")
+            if st in ("OK", "PARTIAL"):
+                h["cycles_ok" if st == "OK" else "cycles_partial"] += 1
+                h["last_cycle"] = {"cycle": res["cycle"], "cycle_ms": t_cycle, "status": st, "counts": res["counts"], "partial_reasons": res["partial_reasons"],
+                                   "finished_ms": int(clock())}
+                h["rate_limit_events_total"] += int(res["counts"].get("rate_limit_events", 0))
+                if res["gaps"]:
+                    h["gaps"]["missed_expected_cycles_total"] += sum(int(g.get("missed_expected_cycles", 0)) for g in res["gaps"])
+                    h["gaps"]["last"] = res["gaps"][-1]
+                h["consecutive_failures"] = 0 if st == "OK" else h["consecutive_failures"] + 1
+            else:                                            # ABORTED / REFUSED_CLOCK: nothing was recorded for this slot
+                h["consecutive_failures"] += 1
+                h["last_cycle"] = {"cycle": res.get("cycle"), "cycle_ms": t_cycle, "status": st, "reason": res.get("reason"), "finished_ms": int(clock())}
+            if h["consecutive_failures"] >= max_consecutive_failures:
+                h["refusal"] = {"code": "CONSECUTIVE_FAILURES", "count": h["consecutive_failures"]}
+                return _stop("consecutive_failures", "REFUSED")
+            if seal_manifest and seal_every > 0 and cycles % seal_every == 0:
+                _hook("last_seal", lambda: seal_cycles(root, seal_manifest, now_ms=int(clock())))
+            if backup_to and backup_every > 0 and cycles % backup_every == 0:
+                _hook("last_backup", lambda: backup_cycles(root, backup_to, receipts, manifest=seal_manifest, now_ms=int(clock())))
+            if backup_to and restore_check_every > 0 and cycles % restore_check_every == 0:
+                _hook("last_restore_check", lambda: restore_check(backup_to, receipts, seal_manifest))
+            _flush()
+            # wait for the next slot (rate-limit-aware: a throttled cycle waits longer, capped), checking the stop file between short sleeps
+            extra = min(BACKOFF_CAP_S, backoff_s * (2 ** min(h["consecutive_failures"], 5))) if (h["consecutive_failures"] or res.get("counts", {}).get("rate_limit_events")) else 0.0
+            due = t_cycle + interval_ms + int(extra * 1000)
+            while int(clock()) < due:
+                if stop_file and os.path.lexists(stop_file):
+                    break
+                if end_ms is not None and int(clock()) >= end_ms:
+                    break
+                sleep(min(STOP_SLICE_S, max(0.0, (due - int(clock())) / 1000.0)) or 0.001)
+
+    try:
+        return _loop()
+    except KeyboardInterrupt:
+        h["status"], h["stop_reason"] = "STOPPED", "interrupted"
+        _flush_quiet()
+        raise
+    except BaseException as exc:                      # the final health state is never left at RUNNING after an abnormal exit
+        h["status"], h["stop_reason"] = "CRASHED", f"{type(exc).__name__}: {exc}"[:300]
+        _flush_quiet()
+        raise
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1197,6 +1462,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     r.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
     r.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES)
     r.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    cn = sub.add_parser("run-continuous", help="repeat run-once on an interval until a limit or an explicit stop file; health.json is rewritten every step")
+    cn.add_argument("--out-root", required=True, help="data root OUTSIDE the git work tree (created 0700)")
+    cn.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
+    cn.add_argument("--duration-s", type=int, help="stop after this many seconds")
+    cn.add_argument("--until-ms", type=int, help="stop at this epoch ms")
+    cn.add_argument("--stop-file", help="the run stops cleanly when this path exists (touch it)")
+    cn.add_argument("--max-cycles", type=int)
+    cn.add_argument("--max-symbols", type=int, default=DEFAULT_MAX_SYMBOLS)
+    cn.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
+    cn.add_argument("--trades-limit", type=int, default=DEFAULT_TRADES)
+    cn.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES)
+    cn.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    cn.add_argument("--seal-manifest"); cn.add_argument("--seal-every", type=int, default=60)
+    cn.add_argument("--backup-to"); cn.add_argument("--receipts"); cn.add_argument("--backup-every", type=int, default=60)
+    cn.add_argument("--restore-check-every", type=int, default=0)
+    cn.add_argument("--max-consecutive-failures", type=int, default=DEFAULT_MAX_CONSECUTIVE_FAILURES)
+    cn.add_argument("--health", help="health report path (default <out-root>/health.json)")
     s = sub.add_parser("seal"); s.add_argument("--root", required=True); s.add_argument("--manifest", required=True)
     s.add_argument("--accept-problems", action="store_true")
     c = sub.add_parser("check"); c.add_argument("--root", required=True); c.add_argument("--manifest", required=True)
@@ -1213,6 +1495,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                            interval_ms=a.interval_ms, reserve_bytes=a.reserve_bytes, max_bytes=a.max_bytes)
             ok = res["status"] in ("OK", "PARTIAL")
             res = {**res, "ok": ok}
+        elif a.cmd == "run-continuous":
+            res = run_continuous(a.out_root, interval_ms=a.interval_ms, duration_ms=a.duration_s * 1000 if a.duration_s else None, until_ms=a.until_ms, stop_file=a.stop_file,
+                                 max_cycles=a.max_cycles, max_symbols=a.max_symbols, depth=a.depth, trades_limit=a.trades_limit, reserve_bytes=a.reserve_bytes,
+                                 max_bytes=a.max_bytes, seal_manifest=a.seal_manifest, seal_every=a.seal_every, backup_to=a.backup_to, receipts=a.receipts,
+                                 backup_every=a.backup_every, restore_check_every=a.restore_check_every, max_consecutive_failures=a.max_consecutive_failures,
+                                 health_path=a.health)
+            res = {**res, "ok": res["status"] == "STOPPED"}
         elif a.cmd == "seal":
             res = seal_cycles(a.root, a.manifest, accept_problems=a.accept_problems)
         elif a.cmd == "check":
@@ -1225,6 +1514,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             res = restore_check(a.backup, a.receipts, a.manifest)
     except (CollectorError, UC.CaptureError, UC.AR.RecordError, OSError, EC.ChainDesync) as exc:
         print(f"market_collector: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # a hand-made or damaged input must end as a clean refusal, never a traceback
+        print(f"market_collector: unexpected {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
         return 2
     print(json.dumps(res, indent=2, sort_keys=True, default=str))
     return 0 if res.get("ok", True) else 1
