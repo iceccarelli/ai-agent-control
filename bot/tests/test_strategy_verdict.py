@@ -537,3 +537,11 @@ def test_the_cli_prints_the_verdict_and_refuses_unreadable_input(tmp_path, capsy
     assert SV.main(["--candidate", str(tmp_path / "nope.json")]) == 2
     evf.write_text('{"stage": "nonsense", "result": "PASS"}\n')
     assert SV.main(["--candidate", str(cand), "--evidence", str(evf)]) == 2
+
+
+def test_a_bias_declaration_cannot_out_claim_data_the_spec_says_is_missing():
+    spec = json.loads(json.dumps(SV.btc_carry_candidate()))
+    spec["required_data"][0]["repo_has"] = False
+    spec["required_data"][0]["declaration_keys"] = ["point_in_time_universe"]
+    assert not any(p.startswith("BIAS_DECLARED_WITHOUT_DATA") for p in SV.spec_problems(json.loads(json.dumps(SV.btc_carry_candidate()))))
+    assert any(p.startswith("BIAS_DECLARED_WITHOUT_DATA:point_in_time_universe") for p in SV.spec_problems(spec))

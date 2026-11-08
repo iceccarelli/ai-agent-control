@@ -77,13 +77,18 @@ def spec_problems(spec: Mapping[str, Any]) -> List[str]:
     if not isinstance(spec.get("rejection_conditions"), list) or not all(isinstance(c, str) and c.strip() for c in spec.get("rejection_conditions") or []):
         problems.append("REJECTION_CONDITIONS_MUST_BE_A_LIST_OF_FALSIFIABLE_STATEMENTS")
     rd = spec.get("required_data")
+    bias = spec.get("bias_declarations") if isinstance(spec.get("bias_declarations"), dict) else {}
     if isinstance(rd, list):
         for i, item in enumerate(rd):
             if not isinstance(item, dict) or not item.get("name") or item.get("point_in_time") is not True:
                 problems.append(f"REQUIRED_DATA[{i}]_NOT_DECLARED_POINT_IN_TIME")
+            elif item.get("repo_has") is False:                            # a declaration cannot out-claim the data the spec itself says is missing
+                keys = item.get("declaration_keys", [])
+                for k in (keys if isinstance(keys, list) else []):
+                    if bias.get(k) is True:
+                        problems.append(f"BIAS_DECLARED_WITHOUT_DATA:{k}:REQUIRED_DATA[{i}]")
     elif _nonempty(rd):
         problems.append("REQUIRED_DATA_MUST_BE_A_LIST_OF_{name,point_in_time}")
-    bias = spec.get("bias_declarations") if isinstance(spec.get("bias_declarations"), dict) else {}
     for k in BIAS_DECLARATIONS:
         if bias.get(k) is not True:
             problems.append(f"BIAS_NOT_RULED_OUT:{k}")

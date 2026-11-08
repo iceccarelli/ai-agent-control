@@ -34,6 +34,9 @@ def spec(name="cross_sectional_funding", family=None):
     with open(os.path.join(CAND, name + ".json"), encoding="utf-8") as f:
         sp = json.load(f)
     sp["bias_declarations"] = {k: True for k in SV.BIAS_DECLARATIONS}
+    for item in sp.get("required_data", []):
+        if isinstance(item, dict):
+            item["repo_has"] = True                                         # the COPY pretends the data exists, to exercise the evidence machinery only
     if family is not None:
         sp["multiple_testing_family"] = family
     return sp

@@ -128,4 +128,4 @@ def test_the_console_lists_every_candidate_with_a_verdict_and_none_is_promoted()
     s = OC.build({}, now_ms=LATER)["strategies"]
     assert s["status"] in OC.STATUSES and len(s["candidates"]) >= 9                       # the frozen BTC description + the 8 mechanism templates
     assert "btcusdt_funding_carry_overlay@prospective-1" in s["candidates"]
-    assert set(s["verdict_counts"]) == {"UNTESTED"} and all(c["spec_problems"] == 0 for c in s["candidates"].values())
+    assert set(s["verdict_counts"]) == {"UNTESTED"} and s["candidates"]["btcusdt_funding_carry_overlay@prospective-1"]["spec_problems"] == 0 and all(c["spec_problems"] > 0 for k, c in s["candidates"].items() if not k.startswith("btcusdt_"))   # templates lack the data they name: truthfully not registrable
