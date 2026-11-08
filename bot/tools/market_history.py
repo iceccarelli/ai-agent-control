@@ -414,6 +414,39 @@ def _write_atomic(path: str, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _ledger_row_problem(r: Mapping[str, Any], line: int, before: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    """Shape of one ledger row, so a hand-edited or garbled line is REPORTED (and quarantined by resume) instead of raising KeyError/ValueError/TypeError later."""
+    t = r.get("type")
+    if t == "begin":
+        return None if line == 1 else "is a second begin row"
+    if line == 1:
+        return "is not a begin row"
+    if t == "stop":
+        return None if isinstance(r.get("reason"), str) else "has a non-text stop reason"
+    prev_n = max((x["n"] for x in before if x.get("type") == "page"), default=0)
+    if not _is_int(r.get("n")) or r["n"] != prev_n + 1:
+        return "has a page number out of sequence"
+    if not isinstance(r.get("file"), str) or not isinstance(r.get("sha256"), str) or not _is_int(r.get("bytes")):
+        return "has a malformed file/sha256/bytes"
+    req = r.get("request", {})
+    if not isinstance(req, dict) or not isinstance(req.get("params", {}), dict):
+        return "has a malformed request"
+    if not (r.get("next_end") is None or _is_int(r.get("next_end"))):
+        return "has a non-integer next_end"
+    params = req.get("params", {})
+    for d in DATASETS.values():
+        if d["end"] in params:
+            try:
+                int(params[d["end"]])
+            except (TypeError, ValueError):
+                return "has a non-integer end parameter"
+    return None
+
+
 def read_ledger(sdir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     """(rows up to the first undecodable line, problems). A torn final line (a crash mid-write) is a problem the resume repairs; it never raises."""
     path = os.path.join(sdir, "pages.jsonl")
@@ -437,6 +470,10 @@ def read_ledger(sdir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
             break
         if not isinstance(r, dict) or r.get("type") not in ("begin", "page", "stop"):
             problems.append(f"LEDGER_BAD_LINE: line {i} is not a ledger row")
+            break
+        why = _ledger_row_problem(r, i, rows)
+        if why:
+            problems.append(f"LEDGER_BAD_LINE: line {i} {why}; later lines are not trusted")
             break
         rows.append(r)
     return rows, problems
@@ -491,6 +528,26 @@ def grid_report(ts_sorted: Sequence[int], interval_ms: Optional[int]) -> Dict[st
 MIN_REGIME_RUN = 3
 
 
+_DAY_MS = 86_400_000
+
+
+def _accepted_regime_runs(runs: Sequence[Sequence[int]], declared_ms: Optional[int]) -> List[int]:
+    """Indices of the runs that may be a REGIME. A run of >= MIN_REGIME_RUN equal spacings is only a candidate: its interval must divide a day (funding settles on a day grid:
+    960 minutes never does), and a run whose spacing is a WHOLE MULTIPLE (> 1) of the interval before it is a run of missing prints (3 x 16h or 3 x 24h inside an 8h grid), not a
+    new regime, UNLESS the instrument record itself declares that interval.
+    Rejected runs are judged as gaps / off-grid steps by the caller."""
+    acc: List[int] = []
+    prev: Optional[int] = None
+    for k, (v, cnt, _i0) in enumerate(runs):
+        if cnt < MIN_REGIME_RUN or v <= 0 or _DAY_MS % v:
+            continue
+        if prev is not None and v > prev and v % prev == 0 and v != declared_ms:
+            continue
+        acc.append(k)
+        prev = v
+    return acc
+
+
 def funding_regimes(ts_sorted: Sequence[int], declared_ms: Optional[int]) -> Dict[str, Any]:
     """Funding grid with REGIME CHANGES. A funding interval is per symbol and can change inside a symbol's history (480 -> 240 -> 60 minutes). Consecutive print spacings are run-length
     encoded; a run of >= MIN_REGIME_RUN equal spacings is a REGIME (segment) with its own interval_ms. A shorter run is judged against the nearest regime before it (else after,
@@ -504,7 +561,7 @@ def funding_regimes(ts_sorted: Sequence[int], declared_ms: Optional[int]) -> Dic
             runs[-1][1] += 1
         else:
             runs.append([d, 1, i])
-    longs = [k for k, r in enumerate(runs) if r[1] >= MIN_REGIME_RUN]
+    longs = _accepted_regime_runs(runs, declared_ms)
     segs: List[Dict[str, Any]] = []
     for k in longs:
         v, cnt, i0 = runs[k]
@@ -736,7 +793,8 @@ def _resume_state(sdir: str, spec: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def collect_symbol(spec: Mapping[str, Any], sdir: str, fetch: Callable[[str], bytes], clock: Callable[[], int], sleep: Callable[[float], None], bucket: TokenBucket,
-                   max_pages: int, max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S) -> Dict[str, Any]:
+                   max_pages: int, max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S,
+                   disk_check: Optional[Callable[[], Optional[str]]] = None) -> Dict[str, Any]:
     """Fetch (or resume) one symbol until the window start, an empty page, a guard stop or an error. Returns run-level facts; the status comes from ``analyze_symbol``."""
     dataset, symbol, interval = spec["dataset"], spec["symbol"], spec.get("interval")
     os.makedirs(sdir, mode=0o700, exist_ok=True)
@@ -762,6 +820,11 @@ def collect_symbol(spec: Mapping[str, Any], sdir: str, fetch: Callable[[str], by
         if fetched >= max_pages:
             errors.append(f"page_cap: {max_pages} pages fetched in this run, window not exhausted (rerun resumes)")
             break
+        if disk_check is not None:                                      # per PAGE, not only per symbol: one deep symbol can fill the disk
+            why = disk_check()
+            if why:
+                errors.append(why)
+                break
         url = request_url(dataset, symbol, interval, spec["start_ms"], cursor_end)
         ev0 = len(fx.events)
         try:
@@ -953,7 +1016,10 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
             if free < reserve_bytes:
                 return spec["symbol"], {"errors": [f"disk_floor: {free} bytes free is below the reserve {reserve_bytes}; stopped before this symbol"], "stop_reason": None,
                                         "pages_fetched": 0, "pages_resumed": 0, "quarantined": [], "rate_limit_events": 0, "requests": 0}
-            return spec["symbol"], collect_symbol(spec, sdir, fetch, clock, sleep, bucket, max_pages, max_retries, backoff_s)
+            def disk_check() -> Optional[str]:
+                f = int(free_bytes_fn(root))
+                return f"disk_floor: {f} bytes free is below the reserve {reserve_bytes}; stopped before the next page (rerun resumes)" if f < reserve_bytes else None
+            return spec["symbol"], collect_symbol(spec, sdir, fetch, clock, sleep, bucket, max_pages, max_retries, backoff_s, disk_check)
         except HistoryError as exc:
             return spec["symbol"], {"errors": [str(exc)], "stop_reason": None, "fatal": True, "pages_fetched": 0, "pages_resumed": 0, "quarantined": [], "rate_limit_events": 0, "requests": 0}
         except (OSError, UC.CaptureError, MC.CollectorError) as exc:
@@ -973,7 +1039,12 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
             if run.get("fatal") or not os.path.isdir(sdir):
                 symbols[sym] = {"status": "UNVERIFIED", "reasons": ["symbol_not_collected"], "run": run, "spec": dict(spec)}
                 continue
-            summ, rows_bytes = analyze_symbol(sdir, spec, norm)
+            try:
+                summ, rows_bytes = analyze_symbol(sdir, spec, norm)
+            except (KeyError, ValueError, TypeError, AttributeError, OSError) as exc:
+                symbols[sym] = {"status": "UNVERIFIED", "reasons": ["analysis_failed"], "run": {**run, "errors": list(run["errors"]) + [f"analysis: {type(exc).__name__}: {exc}"]},
+                                "spec": dict(spec)}
+                continue
             rp = os.path.join(sdir, "rows.jsonl")
             _write_atomic(rp, rows_bytes)
             if run["errors"] and summ["status"] in ("COMPLETE", "STALE"):
@@ -1019,7 +1090,11 @@ def verify_dataset(ddir: str) -> Dict[str, Any]:
         if not os.path.isdir(sdir):
             problems.append(f"{sym}: directory missing")
             continue
-        summ, rows_bytes = analyze_symbol(sdir, spec, rec["normalized_ms"])
+        try:
+            summ, rows_bytes = analyze_symbol(sdir, spec, rec["normalized_ms"])
+        except (KeyError, ValueError, TypeError, AttributeError, OSError) as exc:
+            problems.append(f"{sym}: cannot be re-derived from its raw pages ({type(exc).__name__}: {exc})")
+            continue
         pages += summ["pages"] + summ["pages_failed"]
         for p in summ["problems"]:
             problems.append(f"{sym}: {p}")

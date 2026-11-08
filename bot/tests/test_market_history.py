@@ -398,6 +398,43 @@ def test_a_longer_interval_after_a_shorter_one_is_a_regime_but_a_lone_long_step_
     assert s2["status"] == "PARTIAL" and s2["gap_count"] == 1 and s2["coverage"]["missing"] == 1 and len(s2["segments"]) == 1 and s2["regime_changes"] == []
 
 
+def _hidden_gap_series(mid_hours, reps=3):
+    ts = grid(FIRST, 40, H8)
+    for _ in range(reps):
+        ts.append(ts[-1] + mid_hours * 3_600_000)
+    ts += grid(ts[-1] + H8, 40, H8)
+    return ts
+
+
+@pytest.mark.parametrize("mid_hours,missing", [(16, 3), (24, 6)])
+def test_three_equal_multi_interval_steps_are_hidden_gaps_never_a_regime(root, mid_hours, missing):
+    ts = _hidden_gap_series(mid_hours)
+    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 480, "snapshot_ms": 1}})
+    s = sym_of(run(root, specs, HV({("funding", "BTCUSDT"): ts})))
+    assert s["status"] == "PARTIAL" and s["regime_changes"] == [] and len(s["segments"]) == 1
+    assert s["gap_count"] == 3 and s["coverage"]["missing"] == missing and "gaps" in s["reasons"]
+    assert MH.verify_dataset(ddir(root))["ok"]                                          # the evidence is intact; the verdict is PARTIAL, not COMPLETE
+
+
+def test_a_regime_interval_must_divide_a_day_and_may_not_be_a_multiple_of_the_declared_one():
+    D = 86_400_000
+    ts = [i * H8 for i in range(10)]
+    for _ in range(4):
+        ts.append(ts[-1] + 16 * 3_600_000)                                              # 960 minutes does not divide 1440
+    r = MH.funding_regimes(ts, H8)
+    assert r["regime_changes"] == [] and [g["interval_ms"] for g in r["segments"]] == [H8] and r["gap_count"] == 4 and r["missing"] == 4
+    ts = [i * H8 for i in range(10)]
+    for _ in range(4):
+        ts.append(ts[-1] + 10 * 3_600_000)                                              # 600 minutes: neither a multiple nor a divisor of a day
+    r = MH.funding_regimes(ts, H8)
+    assert r["regime_changes"] == [] and r["off_grid_count"] == 4
+    ts = [i * H8 for i in range(10)]
+    for _ in range(4):
+        ts.append(ts[-1] + D)                                                           # divides a day but is 3x the declared interval
+    r = MH.funding_regimes(ts, H8)
+    assert r["regime_changes"] == [] and r["missing"] >= 8 and r["gap_count"] == 4
+
+
 def test_a_lone_off_grid_step_is_not_a_regime_and_is_never_filled(root):
     ts = grid(FIRST, 100, H8) + [FIRST + 99 * H8 + H4]
     s = sym_of(run(root, funding_specs(), HV({("funding", "BTCUSDT"): ts})))
@@ -815,6 +852,37 @@ def test_disk_full_guard_refuses_before_any_write_and_stops_a_run_whose_disk_fil
     b = sym_of(man, "BBBUSDT")
     assert b["status"] == "UNVERIFIED" and b["reasons"] == ["symbol_not_collected"] and any("disk_floor" in e for e in b["run"]["errors"])
     assert man["dataset_status"] != "COMPLETE" and not os.path.exists(os.path.join(ddir(root), "BBBUSDT"))
+
+
+def test_the_disk_floor_is_checked_before_every_page_not_only_every_symbol(root):
+    free = {"v": 1 << 40}
+    v = funding_venue()
+
+    def fetch(url):
+        free["v"] = 10                                                                 # the disk fills while ONE symbol is being paged
+        return v(url)
+    man = run(root, funding_specs(), fetch, free_bytes_fn=lambda _p: free["v"], reserve_bytes=1000, workers=1)
+    s = sym_of(man)
+    assert len(v.urls) <= 1 and any("disk_floor" in e for e in s["run"]["errors"]) and s["status"] != "COMPLETE"
+
+
+@pytest.mark.parametrize("garbage", [{"type": "page", "n": "x"}, {"type": "page", "n": 1}, {"type": "page", "n": 2, "file": "page-000002.json", "sha256": 5, "bytes": "a"},
+                                     {"type": "page", "n": 2, "file": "page-000002.json", "sha256": "ab", "bytes": 1, "request": "oops", "ok": True},
+                                     {"type": "stop", "reason": {"a": 1}}, {"type": "begin", "schema": [1]}])
+def test_a_garbled_ledger_row_is_reported_by_verify_and_quarantined_by_resume_never_raised(root, garbage):
+    v = funding_venue(n=60)
+    specs = funding_specs(launch=BASE - 59 * H8 - 1)
+    run(root, specs, v)
+    lp = os.path.join(ddir(root), "BTCUSDT", "pages.jsonl")
+    lines = open(lp).read().splitlines()
+    lines.insert(1, json.dumps(garbage))
+    open(lp, "w").write("\n".join(lines) + "\n")
+    r = MH.verify_dataset(ddir(root))                                                # reports, does not raise
+    assert r["ok"] is False and r["problems"]
+    man = run(root, specs, v)                                                        # resume quarantines the bad tail (never deletes it) and re-collects
+    assert os.path.isdir(os.path.join(ddir(root), "BTCUSDT", "quarantine", "1"))
+    assert os.path.exists(os.path.join(ddir(root), "BTCUSDT", "quarantine", "1", "pages.jsonl"))
+    assert MH.verify_dataset(ddir(root))["ok"] and sym_of(man)["status"] == "COMPLETE"
 
 
 def test_a_concurrent_second_run_on_the_same_dataset_is_refused(root):
