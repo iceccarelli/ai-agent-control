@@ -51,7 +51,7 @@ import ms_risk as MR  # noqa: E402
 import ms_scanner as SC  # noqa: E402
 import ms_types as T  # noqa: E402
 
-SCHEMA = "ms_pipeline/v1"
+SCHEMA = "pipeline_summary/v1"
 DATA_INJECTED = "INJECTED_TEST_DATA"
 DATA_HISTORY = "VERIFIED_HISTORY_ROOT"
 MODES = ("REPLAY", "PAPER")                   # what this pipeline (and its CLI) runs; TESTNET is a separate, owner-invoked session tool and is refused here; there is NO mainnet mode anywhere

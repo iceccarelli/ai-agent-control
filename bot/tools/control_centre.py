@@ -354,7 +354,8 @@ def _scalar_map(o: Mapping[str, Any], k: str, *, maxn: int = 40) -> Dict[str, An
 
 
 def _v_pipeline(o: Mapping[str, Any]) -> Dict[str, Any]:
-    code = o.get("outcome", o.get("outcome_code"))
+    st = o.get("status")
+    code = o.get("outcome", o.get("outcome_code", st.get("primary") if isinstance(st, dict) else None))      # ms_pipeline writes status.primary
     if isinstance(code, dict):
         code = code.get("code")
     if code not in OUTCOME_CODES:
@@ -362,16 +363,18 @@ def _v_pipeline(o: Mapping[str, Any]) -> Dict[str, Any]:
     reason = o.get("reason")
     if reason is not None and (not isinstance(reason, str) or len(reason) > MAX_STR or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", reason)):
         raise _bad("'reason' must be a short plain string or null")
-    return {"outcome": code, "reason": reason, "required_span": _scalar_map(o, "required_span"), "data_digest_parts": _scalar_map(o, "data_digest_parts"),
+    return {"outcome": code, "reason": reason, "required_span": _scalar_map(o, "required_span") or _scalar_map(o, "history"), "data_digest_parts": _scalar_map(o, "data_digest_parts") or _scalar_map(o, "data_parts"),
             "evidence_basis": _scalar_map(o, "evidence_basis")}
 
 
 def _v_reconcile(o: Mapping[str, Any]) -> Dict[str, Any]:
     fnd = []
     for r in _dicts(o, "findings"):
-        sev = _str(r, "severity")
+        sev = _str(r, "severity") if "severity" in r else "ERROR"          # ms_reconcile findings carry no severity: any finding is a disagreement (active)
         fnd.append({"code": _str(r, "code"), "detail": _str(r, "detail", nonempty=False), "severity": str(sev).upper()[:24]})
-    return {"findings": fnd, "halt_new_exposure": _bool(o, "halt_new_exposure"), "views_compared": _strs(o, "views_compared")}
+    comp = o.get("compared")
+    views = _strs(o, "views_compared") if "views_compared" in o else (sorted(str(k)[:64] for k in comp) if isinstance(comp, dict) else [])
+    return {"findings": fnd, "halt_new_exposure": _bool(o, "halt_new_exposure"), "views_compared": views}
 
 
 def _v_scope(o: Mapping[str, Any]) -> Dict[str, Any]:

@@ -209,7 +209,9 @@ def check_consistent(pr, *, allow_open=True):
     for sec in ("portfolio", "execution", "risk"):
         assert st[sec]["state"] == "OK", (sec, st[sec].get("error"))
     assert st["portfolio"]["pnl"]["state"] == "OK" and st["research"]["opportunities"]["state"] == "OK" and st["research"]["competition"]["state"] == "OK"
-    assert all(s["state"] == "OK" for s in st["evidence"]["sources"]), st["evidence"]["sources"]
+    # the pipeline writes eight files; universe_scope / funnel / testnet_session come from other tools, so NO_DATA is correct for them, ERROR never is
+    _other = {"universe_scope.json", "funnel.json", "testnet_session.json"}
+    assert all(s["state"] == "OK" or (s["file"] in _other and s["state"] == "NO_DATA") for s in st["evidence"]["sources"]), [(s["file"], s["state"], s["error"]) for s in st["evidence"]["sources"] if s["state"] != "OK"]
     states = {gid: (s.value if hasattr(s, "value") else s) for gid, s in res.states.items()}
     assert set(states.values()) <= GROUP_STATES
     assert art(pr, "replay_report.json")["groups_by_state"] == dict(sorted(collections.Counter(states.values()).items()))
@@ -310,13 +312,13 @@ def assert_interval_used(pr):
 
 def test_artifacts_are_written_in_the_control_centre_schema_and_read_back_without_error(happy):
     series, pr = happy
-    assert sorted(MP.ARTIFACT_FILES) == sorted(CCE.ARTIFACTS)
+    assert set(MP.ARTIFACT_FILES) | {MP.SUMMARY_FILE, MP.RECONCILE_FILE} <= set(CCE.ARTIFACTS)
     for name in MP.ARTIFACT_FILES:
         assert os.path.isfile(pr.files[name]) and os.path.getsize(pr.files[name]) < CCE.MAX_ARTIFACT_BYTES
         assert art(pr, name)["data_label"] == "INJECTED_TEST_DATA" and art(pr, name)["generated_ms"] == pr.result.cfg.end_ms
     check_consistent(pr)
     st = cc_state(pr)
-    assert [s["state"] for s in st["evidence"]["sources"]] == ["OK"] * 6
+    assert [s["state"] for s in st["evidence"]["sources"] if s["state"] != "NO_DATA"] == ["OK"] * 8 and {s["file"] for s in st["evidence"]["sources"] if s["state"] == "NO_DATA"} <= {"universe_scope.json", "funnel.json", "testnet_session.json"}
     # basis labels: simulated results, estimated opportunities, simulated competition numbers; the file bases are inside each file's allowed set
     assert {n: art(pr, n)["basis"] for n in MP.ARTIFACT_FILES} == {"replay_report.json": "SIMULATED", "portfolio_state.json": "SIMULATED", "risk_state.json": "SIMULATED",
                                                                    "ledger_pnl.json": "SIMULATED", "competition.json": "SIMULATED", "opportunities.json": "ESTIMATED"}

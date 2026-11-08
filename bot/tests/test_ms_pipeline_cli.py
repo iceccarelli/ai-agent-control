@@ -329,7 +329,9 @@ def test_the_real_cli_run_writes_seven_files_one_identity_and_the_control_centre
     st = CCE.build_state(data_root=None, universe_dir=None, artifacts_dir=d, env={}, now_ms=END + 1000)
     for sec in ("portfolio", "execution", "risk"):
         assert st[sec]["state"] == "OK", (sec, st[sec].get("error"))
-    assert all(s["state"] == "OK" for s in st["evidence"]["sources"]), st["evidence"]["sources"]
+    # the pipeline writes eight files; universe_scope / funnel / testnet_session come from other tools, so NO_DATA is correct for them, ERROR never is
+    _other = {"universe_scope.json", "funnel.json", "testnet_session.json"}
+    assert all(s["state"] == "OK" or (s["file"] in _other and s["state"] == "NO_DATA") for s in st["evidence"]["sources"]), [(s["file"], s["state"], s["error"]) for s in st["evidence"]["sources"] if s["state"] != "OK"]
     assert st["research"]["opportunities"]["state"] == "OK" and st["research"]["competition"]["state"] == "OK"
 
 
@@ -391,7 +393,7 @@ def test_a_cli_run_that_is_allowed_to_allocate_trades_on_the_real_fixture_with_o
     ident = check_identity(d)
     assert ident["mode"] == "REPLAY"
     st = CCE.build_state(data_root=None, universe_dir=None, artifacts_dir=d, env={}, now_ms=END + 21 * H8 + 1000)
-    assert all(s_["state"] == "OK" for s_ in st["evidence"]["sources"]), st["evidence"]["sources"]
+    assert all(s_["state"] == "OK" or (s_["file"] in {"universe_scope.json", "funnel.json", "testnet_session.json"} and s_["state"] == "NO_DATA") for s_ in st["evidence"]["sources"]), [(s_["file"], s_["state"], s_["error"]) for s_ in st["evidence"]["sources"] if s_["state"] != "OK"]
     assert "INADEQUATE_HISTORY" in s["status"]["codes"] and s["history"]["required_days"] > s["history"]["available_days"]          # the exact required span is stated
 
 
