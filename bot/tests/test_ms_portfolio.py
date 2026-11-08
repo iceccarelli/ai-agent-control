@@ -276,7 +276,7 @@ def test_risk_is_consulted_with_the_contract_shape_and_a_rejection_blocks_withou
     a = run([opp()], risk_assess=risk, risk_policy={"x": 1})
     assert a.plans == () and a.decisions[0].reasons[:2] == ("RISK_REJECTED", "LIQ") and a.state.open_groups == 0 and a.state.cash_usd == 100_000.0
     plan, st, pol, snaps = calls[0]
-    assert set(st) == {"equity_usd", "positions", "open_groups", "market_ts_ms", "account_ts_ms"} and pol == {"x": 1} and "AAAUSDT" in snaps
+    assert set(st) == {"equity_usd", "positions", "open_groups", "market_ts_ms", "account_ts_ms", "peak_equity_usd"} and pol == {"x": 1} and "AAAUSDT" in snaps
     assert len(run([opp()], risk_assess=lambda *a: D(True)).plans) == 1
 
 

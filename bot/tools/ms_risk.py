@@ -15,6 +15,13 @@ Exposure vocabulary (USD, signed: long > 0, short < 0), per BASE symbol (``SPOT:
   net         = |sum of signed positions|              (limit ``max_net_exposure_usd``)
   unhedged    = the worst |net| the book can sit at if only ONE leg of the plan fills (paired-order failure), limit ``max_unhedged_usd``
   leverage    = gross / equity                         (limit ``max_leverage``)
+
+Optional HARD loss limits (policy keys ``max_daily_loss_usd`` / ``max_drawdown_frac``; state keys ``equity_usd``, ``day_start_equity_usd``, ``peak_equity_usd``):
+  daily loss  = day_start_equity_usd - equity_usd      breach when >= max_daily_loss_usd          (``DAILY_LOSS_LIMIT_BREACHED``)
+  drawdown    = (peak_equity_usd - equity_usd) / peak  breach when >= max_drawdown_frac           (``DRAWDOWN_LIMIT_BREACHED``)
+  FAIL-CLOSED: when a limit is set and an input it needs is missing / None / non-finite / non-positive (or the peak is below the equity: an inconsistent read), every plan that is not a pure
+  exit is rejected (``DAILY_LOSS_INPUT_UNKNOWN`` / ``DRAWDOWN_INPUT_UNKNOWN``). A breach rejects entries and sets ``limits["halt_new_exposure"]`` (the caller halts new exposure,
+  e.g. ``ExecutionEngine.on_risk_breach``); reduce-only exits are NEVER blocked by these limits (refusing to reduce risk is the unsafe choice), like every other ceiling.
 """
 from __future__ import annotations
 
@@ -35,6 +42,8 @@ from ms_types import MarketSnapshot, OrderGroupPlan  # noqa: E402
 POLICY_KEYS = ("policy_version", "candidate_id", "spec_digest", "venue", "allowed_symbols", "allowed_sides", "allowed_order_types", "max_notional_per_symbol_usd",
                "max_aggregate_notional_usd", "max_gross_exposure_usd", "max_net_exposure_usd", "max_active_groups", "max_unhedged_usd", "max_leverage",
                "max_market_age_ms", "max_account_age_ms", "execution_styles")
+#: OPTIONAL hard limits (absent = not enforced; present = fail-closed on missing inputs). They are NOT in ``POLICY_KEYS`` (a derived policy that lacks them is still complete).
+OPTIONAL_POLICY_KEYS = ("max_daily_loss_usd", "max_drawdown_frac")
 _USD_LIMITS = ("max_notional_per_symbol_usd", "max_aggregate_notional_usd", "max_gross_exposure_usd", "max_net_exposure_usd", "max_unhedged_usd")
 _CATEGORIES = ("linear", "spot")
 _SIDES = ("Buy", "Sell")
@@ -80,7 +89,7 @@ def policy_refusals(policy: Any) -> List[str]:
     if not isinstance(policy, Mapping):
         return ["POLICY_NOT_A_MAPPING"]
     out: List[str] = []
-    extra, missing = sorted(str(k) for k in set(policy) - set(POLICY_KEYS)), sorted(set(POLICY_KEYS) - set(policy))
+    extra, missing = sorted(str(k) for k in set(policy) - set(POLICY_KEYS) - set(OPTIONAL_POLICY_KEYS)), sorted(set(POLICY_KEYS) - set(policy))
     if extra:
         out.append("POLICY_UNKNOWN_KEYS:" + ",".join(extra)[:80])
     if missing:
@@ -121,6 +130,10 @@ def policy_refusals(policy: Any) -> List[str]:
     for k in ("max_active_groups", "max_market_age_ms", "max_account_age_ms"):
         if not _is_pos_int(policy[k]):
             out.append(f"POLICY_LIMIT_INVALID:{k}")
+    if "max_daily_loss_usd" in policy and _pos(policy["max_daily_loss_usd"]) is None:
+        out.append("POLICY_LIMIT_INVALID:max_daily_loss_usd")
+    if "max_drawdown_frac" in policy and not (_pos(policy["max_drawdown_frac"]) is not None and policy["max_drawdown_frac"] <= 1):
+        out.append("POLICY_LIMIT_INVALID:max_drawdown_frac")
     return out
 
 
@@ -308,6 +321,26 @@ def risk_assess(plan: OrderGroupPlan, state: Mapping[str, Any], policy: Mapping[
                 R.append(f"BOOK_AGE_UNKNOWN:{leg.symbol}")
             elif snap.book_age_ms > policy["max_market_age_ms"]:
                 R.append(f"BOOK_STALE:{leg.symbol}")
+
+    # ---- HARD loss limits (entries only; optional; fail-closed on a missing input)
+    if "max_daily_loss_usd" in policy:
+        day0 = _pos(state.get("day_start_equity_usd"))
+        if equity is None or day0 is None:
+            R.append("DAILY_LOSS_INPUT_UNKNOWN")
+        else:
+            limits["daily_loss_usd"] = day0 - equity
+            if day0 - equity >= policy["max_daily_loss_usd"]:
+                R.append("DAILY_LOSS_LIMIT_BREACHED")
+                limits["halt_new_exposure"] = True
+    if "max_drawdown_frac" in policy:
+        peak = _pos(state.get("peak_equity_usd"))
+        if equity is None or peak is None or peak < equity:
+            R.append("DRAWDOWN_INPUT_UNKNOWN")
+        else:
+            limits["drawdown_frac"] = (peak - equity) / peak
+            if (peak - equity) / peak >= policy["max_drawdown_frac"]:
+                R.append("DRAWDOWN_LIMIT_BREACHED")
+                limits["halt_new_exposure"] = True
 
     # ---- post-trade exposure
     if equity is not None and len(legs_info) == len(plan.legs) and "POSITIONS_UNKNOWN" not in R and not any(r.startswith("POSITION_UNKNOWN") for r in R):

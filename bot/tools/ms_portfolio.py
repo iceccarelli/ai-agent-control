@@ -50,6 +50,7 @@ class PortfolioState:
     margin_used_usd: Optional[float] = None
     market_ts_ms: Optional[int] = None
     account_ts_ms: Optional[int] = None
+    day_start_equity_usd: Optional[float] = None          # optional input: only REQUIRED (fail-closed) when the policy sets ``max_daily_loss_usd``
 
     def missing(self) -> List[str]:
         out = []
@@ -68,9 +69,12 @@ class PortfolioState:
         return sum(p.notional_usd for p in (self.positions or {}).values())
 
     def to_risk_state(self) -> Dict[str, Any]:
-        """The ms_risk contract shape."""
-        return {"equity_usd": self.equity_usd, "positions": {k: {"category": p.category, "notional_usd": p.notional_usd} for k, p in (self.positions or {}).items()},
-                "open_groups": self.open_groups, "market_ts_ms": self.market_ts_ms, "account_ts_ms": self.account_ts_ms}
+        """The ms_risk contract shape. ``peak_equity_usd`` is always given (None = unknown -> ms_risk fails closed on a drawdown limit); ``day_start_equity_usd`` only when known."""
+        out = {"equity_usd": self.equity_usd, "positions": {k: {"category": p.category, "notional_usd": p.notional_usd} for k, p in (self.positions or {}).items()},
+               "open_groups": self.open_groups, "market_ts_ms": self.market_ts_ms, "account_ts_ms": self.account_ts_ms, "peak_equity_usd": self.peak_equity_usd}
+        if self.day_start_equity_usd is not None:
+            out["day_start_equity_usd"] = self.day_start_equity_usd
+        return out
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,7 @@ class PortfolioPolicy:
     max_stable_frac: float = 1.0
     max_funding_bucket_frac: float = 0.60
     max_drawdown_frac: float = 0.10
+    max_daily_loss_usd: Optional[float] = None                                 # optional HARD daily-loss limit (fail-closed when the state has no day_start_equity_usd)
     max_book_age_ms: int = 5_000
     max_account_age_ms: int = 60_000
     max_market_age_ms: int = 60_000
@@ -215,6 +220,12 @@ def allocate(opps: Sequence[T.Opportunity], *, state: PortfolioState, policy: Po
         peak, eq = state.peak_equity_usd, state.equity_usd
         if peak and peak > 0 and (peak - eq) / peak >= policy.max_drawdown_frac:
             global_block.append("DRAWDOWN_HALT")
+        if policy.max_daily_loss_usd is not None:
+            d0 = state.day_start_equity_usd
+            if d0 is None or isinstance(d0, bool) or not math.isfinite(d0) or d0 <= 0:
+                global_block.append("DAILY_LOSS_INPUT_UNKNOWN")
+            elif d0 - eq >= policy.max_daily_loss_usd:
+                global_block.append("DAILY_LOSS_HALT")
     cur = state
     plans: List[T.OrderGroupPlan] = []
     decisions: List[AllocDecision] = []

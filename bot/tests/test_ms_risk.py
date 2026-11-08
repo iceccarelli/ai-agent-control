@@ -391,3 +391,149 @@ def test_position_key_and_category_must_agree(key, cat):
     assert not d.approved and any(r.startswith("POSITION_KEY_CATEGORY_MISMATCH") for r in d.reasons)
     good = state(positions={"SPOT:ETHUSDT": {"category": "spot", "notional_usd": 100.0}, "ETHUSDT": {"category": "linear", "notional_usd": -100.0}})
     assert ok_decision(st=good).approved                                                    # positive control
+
+
+# =============================================================================================== portfolio-level bypass attempts (splitting) and HARD loss limits
+HELD_PERP = {"category": "linear", "notional_usd": -1000.0}
+HELD_SPOT = {"category": "spot", "notional_usd": 1000.0}
+
+
+def test_splitting_one_symbol_over_two_groups_is_counted_by_the_book():
+    pol = policy(max_notional_per_symbol_usd=2500.0, max_aggregate_notional_usd=1e9, max_gross_exposure_usd=1e9)
+    first = pair("BTCUSDT", "10")                                                    # 1000 + 1000 = 2000 <= 2500
+    assert ok_decision(p=first, pol=pol).approved
+    st = state(positions={"BTCUSDT": HELD_PERP, "SPOT:BTCUSDT": HELD_SPOT}, open_groups=1)
+    second = pair("BTCUSDT", "10")
+    d = ok_decision(p=second, st=st, pol=pol)
+    assert not d.approved and "PER_SYMBOL_NOTIONAL_ABOVE_CAP:BTCUSDT" in d.reasons
+
+
+@pytest.mark.parametrize("held_key", ["BTCUSDT#g1", "BTCUSDT#pending:abc", "BTCUSDT#"])
+def test_a_tag_suffix_does_not_hide_the_symbol(held_key):
+    pol = policy(max_notional_per_symbol_usd=2500.0, max_aggregate_notional_usd=1e9, max_gross_exposure_usd=1e9)
+    st = state(positions={held_key: HELD_PERP, "SPOT:BTCUSDT#t": HELD_SPOT})
+    d = ok_decision(p=pair("BTCUSDT", "10"), st=st, pol=pol)
+    assert not d.approved and "PER_SYMBOL_NOTIONAL_ABOVE_CAP:BTCUSDT" in d.reasons and d.limits["per_symbol"]["BTCUSDT"] == 4000.0
+
+
+def test_spot_and_perp_keys_of_one_symbol_share_one_base_and_a_mislabelled_key_is_refused():
+    st = state(positions={"SPOT:BTCUSDT": {"category": "linear", "notional_usd": 1000.0}})
+    assert "POSITION_KEY_CATEGORY_MISMATCH:SPOT:BTCUSDT" in ok_decision(st=st).reasons
+    st = state(positions={"BTCUSDT": {"category": "spot", "notional_usd": 1000.0}})
+    assert "POSITION_KEY_CATEGORY_MISMATCH:BTCUSDT" in ok_decision(st=st).reasons
+
+
+def test_many_symbols_each_under_its_cap_still_hit_the_aggregate_gross_and_net_limits():
+    pol = policy(max_aggregate_notional_usd=2500.0, max_gross_exposure_usd=4500.0, max_net_exposure_usd=900.0, max_unhedged_usd=1e9, max_leverage=100.0)
+    held = {}
+    for s in ("ETHUSDT", "SOLUSDT"):
+        held[s] = {"category": "linear", "notional_usd": -800.0}
+        held["SPOT:" + s] = {"category": "spot", "notional_usd": 800.0}
+    d = R.risk_assess(pair("BTCUSDT", "10"), state(positions=held), pol, snaps("BTCUSDT"))
+    assert not d.approved and "AGGREGATE_NOTIONAL_ABOVE_CAP" in d.reasons and not any(r.startswith("PER_SYMBOL") for r in d.reasons)
+    pol = policy(max_aggregate_notional_usd=1e9, max_gross_exposure_usd=3500.0, max_net_exposure_usd=1e9, max_unhedged_usd=1e9, max_leverage=100.0)
+    assert "GROSS_EXPOSURE_ABOVE_CAP" in R.risk_assess(pair("BTCUSDT", "10"), state(positions=held), pol, snaps("BTCUSDT")).reasons
+
+
+def test_the_unhedged_limit_cannot_be_split_across_symbols_it_is_the_book_net():
+    pol = policy(max_unhedged_usd=1200.0, max_net_exposure_usd=1e9, max_aggregate_notional_usd=1e9, max_gross_exposure_usd=1e9, max_leverage=100.0)
+    st = state(positions={"ETHUSDT": {"category": "linear", "notional_usd": -900.0}})
+    one_leg = plan(leg("BTCUSDT", "linear", "Sell", "5", "A"))                         # -500 more -> book net -1400
+    assert "UNHEDGED_EXPOSURE_ABOVE_CAP" in R.risk_assess(one_leg, st, pol, snaps("BTCUSDT")).reasons
+
+
+@pytest.mark.parametrize("mutate,code", [
+    (lambda s: s.pop("equity_usd"), "EQUITY_UNKNOWN"), (lambda s: s.update(equity_usd=None), "EQUITY_UNKNOWN"), (lambda s: s.update(equity_usd=float("nan")), "EQUITY_UNKNOWN"),
+    (lambda s: s.pop("positions"), "POSITIONS_UNKNOWN"), (lambda s: s.update(positions=None), "POSITIONS_UNKNOWN"),
+    (lambda s: s.update(positions={"BTCUSDT": {"category": "linear", "notional_usd": None}}), "POSITION_UNKNOWN:BTCUSDT"),
+    (lambda s: s.update(positions={"BTCUSDT#x": {"category": "linear", "notional_usd": float("inf")}}), "POSITION_UNKNOWN:BTCUSDT#x"),
+    (lambda s: s.pop("open_groups"), "OPEN_GROUPS_UNKNOWN"), (lambda s: s.update(open_groups=-1), "OPEN_GROUPS_UNKNOWN"),
+])
+def test_a_missing_exposure_or_risk_input_blocks_and_is_never_read_as_zero(mutate, code):
+    st = state()
+    mutate(st)
+    d = ok_decision(st=st)
+    assert not d.approved and code in d.reasons
+    assert "gross" not in d.limits or code.startswith("OPEN_GROUPS") or code == "EQUITY_UNKNOWN"      # no exposure number is invented from a missing input
+
+
+# ---- HARD daily-loss and drawdown limits
+def hard(**kw):
+    return policy(max_daily_loss_usd=200.0, max_drawdown_frac=0.05, **kw)
+
+
+def hstate(**kw):
+    return state(**{"equity_usd": 10000.0, "peak_equity_usd": 10100.0, "day_start_equity_usd": 10100.0, **kw})
+
+
+def test_hard_limits_positive_control_inside_both_limits_is_approved():
+    d = ok_decision(pol=hard(), st=hstate())
+    assert d.approved and d.limits["daily_loss_usd"] == 100.0 and round(d.limits["drawdown_frac"], 6) == round(100 / 10100, 6)
+
+
+def test_policy_schema_accepts_the_optional_keys_only_when_valid_and_stays_closed():
+    assert R.policy_refusals(hard()) == [] and R.policy_refusals(policy()) == []
+    for k, bad in (("max_daily_loss_usd", 0), ("max_daily_loss_usd", -5.0), ("max_daily_loss_usd", float("nan")), ("max_daily_loss_usd", True), ("max_daily_loss_usd", "200"),
+                   ("max_drawdown_frac", 0), ("max_drawdown_frac", 1.5), ("max_drawdown_frac", -0.1), ("max_drawdown_frac", float("inf")), ("max_drawdown_frac", None)):
+        assert f"POLICY_LIMIT_INVALID:{k}" in R.policy_refusals(policy(**{k: bad})), (k, bad)
+    assert any(r.startswith("POLICY_UNKNOWN_KEYS") for r in R.policy_refusals(policy(max_weekly_loss_usd=1.0)))
+    assert set(R.POLICY_KEYS).isdisjoint(R.OPTIONAL_POLICY_KEYS) and set(R.OPTIONAL_POLICY_KEYS) == {"max_daily_loss_usd", "max_drawdown_frac"}
+
+
+@pytest.mark.parametrize("drop", ["equity_usd", "day_start_equity_usd"])
+def test_daily_loss_inputs_missing_fail_closed_for_entries(drop):
+    st = hstate()
+    st.pop(drop)
+    d = ok_decision(pol=policy(max_daily_loss_usd=200.0), st=st)
+    assert not d.approved and ("DAILY_LOSS_INPUT_UNKNOWN" in d.reasons or "EQUITY_UNKNOWN" in d.reasons)
+    if drop == "day_start_equity_usd":
+        assert "DAILY_LOSS_INPUT_UNKNOWN" in d.reasons
+
+
+@pytest.mark.parametrize("bad", [None, 0, -1.0, float("nan"), True, "10100"])
+def test_daily_and_drawdown_inputs_must_be_positive_finite_numbers(bad):
+    assert "DAILY_LOSS_INPUT_UNKNOWN" in ok_decision(pol=hard(), st=hstate(day_start_equity_usd=bad)).reasons
+    assert "DRAWDOWN_INPUT_UNKNOWN" in ok_decision(pol=hard(), st=hstate(peak_equity_usd=bad)).reasons
+
+
+def test_daily_loss_breach_blocks_entries_and_boundary_is_a_breach():
+    d = ok_decision(pol=hard(), st=hstate(equity_usd=9900.0, peak_equity_usd=9900.0))             # loss exactly 200 = the limit
+    assert not d.approved and "DAILY_LOSS_LIMIT_BREACHED" in d.reasons and d.limits["halt_new_exposure"] is True
+    assert ok_decision(pol=hard(), st=hstate(equity_usd=9900.01, peak_equity_usd=9900.01)).approved
+
+
+def test_drawdown_breach_blocks_entries_even_with_the_daily_limit_unset():
+    pol = policy(max_drawdown_frac=0.05)
+    d = ok_decision(pol=pol, st=state(equity_usd=9400.0, peak_equity_usd=10000.0))                # 6% > 5%
+    assert not d.approved and "DRAWDOWN_LIMIT_BREACHED" in d.reasons and d.limits["halt_new_exposure"] is True
+    assert ok_decision(pol=pol, st=state(equity_usd=9600.0, peak_equity_usd=10000.0)).approved
+    assert "DAILY_LOSS_LIMIT_BREACHED" not in d.reasons and "DAILY_LOSS_INPUT_UNKNOWN" not in d.reasons       # an unset limit needs no input
+
+
+def test_peak_below_equity_is_an_inconsistent_input_not_a_zero_drawdown():
+    d = ok_decision(pol=policy(max_drawdown_frac=0.05), st=state(equity_usd=10000.0, peak_equity_usd=9000.0))
+    assert not d.approved and "DRAWDOWN_INPUT_UNKNOWN" in d.reasons
+
+
+def test_without_the_optional_keys_nothing_changes_and_no_inputs_are_needed():
+    assert ok_decision(pol=policy(), st=state()).approved
+    assert "halt_new_exposure" not in ok_decision(pol=policy(), st=state()).limits
+
+
+def test_reduce_only_exits_are_allowed_during_a_breach_and_entries_are_not():
+    st = hstate(equity_usd=9000.0, peak_equity_usd=10100.0, positions={"BTCUSDT": {"category": "linear", "notional_usd": -1000.0, "qty": 10.0}})
+    exit_ = plan(leg("BTCUSDT", "linear", "Buy", "10", "X", ro=True))
+    d = ok_decision(p=exit_, pol=hard(), st=st)
+    assert d.approved and d.limits["exit_only"] is True
+    entry = pair("ETHUSDT", "1")
+    assert not ok_decision(p=entry, pol=hard(), st=st, sn=snaps("ETHUSDT")).approved
+    mixed = plan(leg("BTCUSDT", "linear", "Buy", "10", "X", ro=True), leg("ETHUSDT", "linear", "Sell", "1", "Y"))
+    dm = ok_decision(p=mixed, pol=hard(), st=st, sn=snaps("BTCUSDT", "ETHUSDT"))
+    assert not dm.approved and "DAILY_LOSS_LIMIT_BREACHED" in dm.reasons
+
+
+def test_missing_hard_limit_inputs_never_block_a_reduce_only_exit():
+    st = state(positions={"BTCUSDT": {"category": "linear", "notional_usd": -1000.0, "qty": 10.0}})        # no peak, no day start
+    exit_ = plan(leg("BTCUSDT", "linear", "Buy", "10", "X", ro=True))
+    assert ok_decision(p=exit_, pol=hard(), st=st).approved
+    assert "DAILY_LOSS_INPUT_UNKNOWN" in ok_decision(pol=hard(), st=st).reasons
