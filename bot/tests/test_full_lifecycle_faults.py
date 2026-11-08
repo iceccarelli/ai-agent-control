@@ -200,7 +200,7 @@ def test_the_clean_cycle_reaches_a_reconciled_owner_pnl_equal_to_the_venues_own_
     assert cash["figures"]["perp_realised_usd"] == pytest.approx(-2.0)
     assert cash["figures"]["perp_fees_usd"] == pytest.approx(-0.1111)
     assert cash["figures"]["funding_net_usd"] == pytest.approx(0.03)
-    assert rep["headline_profit_usd"] == pytest.approx(-2.0 - 0.1111 + 0.03) == pytest.approx(-2.0811)
+    assert rep["headline_realised_cash_usd"] == pytest.approx(-2.0 - 0.1111 + 0.03) == pytest.approx(-2.0811)
     assert rep["layers"]["economic_total"]["net_economic_pnl_usd"] == pytest.approx(-2.0811 + 50.0)
     assert abs(rep["ledger"]["residuals"]["usdt"]) < 1e-6                      # the venue's closing wallet is explained to the cent
     # and every figure of that owner report carries lineage down to the venue's rows
@@ -341,11 +341,11 @@ def test_wrong_funding_leaves_reconciliation_provisional_and_the_owner_headline_
     assert lc["state"] == "PROVISIONAL" and reason in lc["reasons"]
     # the owner P&L over the same rows: the contradiction is found independently, no headline
     rep = owner_pnl(w, tmp_path)
-    assert rep["status"] == "DISPUTED" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "DISPUTED" and rep["headline_realised_cash_usd"] is None
     assert rep["layers"]["realised_cash"]["status"] == "DISPUTED" and rep["layers"]["economic_total"]["net_economic_pnl_usd"] is None
     hard = {f["code"] for f in rep["flags"] if f["severity"] == "HARD"}
     assert ("FUNDING_SIGN_CONTRADICTION" if how == "sign_flipped" else "FUNDING_MAGNITUDE_IMPLAUSIBLE") in hard
-    assert rep["lineage"]["figures"]["headline_profit_usd"]["value"] is None and rep["lineage"]["figures"]["headline_profit_usd"]["why"]
+    assert rep["lineage"]["figures"]["headline_realised_cash_usd"]["value"] is None and rep["lineage"]["figures"]["headline_realised_cash_usd"]["why"]
 
 
 def test_a_correct_cycle_is_the_control_for_the_wrong_funding_cases(world, tmp_path):
@@ -353,7 +353,7 @@ def test_a_correct_cycle_is_the_control_for_the_wrong_funding_cases(world, tmp_p
     run_cycle(w, tmp_path)
     st = w.journal.statement()
     assert st["funding_reconciled"] is True and st["funding_venue_usd"] == pytest.approx(0.06 - 0.03)
-    assert owner_pnl(w, tmp_path)["headline_profit_usd"] == pytest.approx(-2.0811)
+    assert owner_pnl(w, tmp_path)["headline_realised_cash_usd"] == pytest.approx(-2.0811)
 
 
 # ================================================================================================

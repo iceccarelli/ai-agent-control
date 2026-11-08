@@ -65,7 +65,7 @@ def fig(rep, path):
 
 
 def no_headline(rep):
-    assert rep["headline_profit_usd"] is None
+    assert rep["headline_realised_cash_usd"] is None
     assert rep["status"] not in ("RECONCILED", "VERIFIED")
     for layer in rep["layers"].values():
         assert layer["status"] not in ("RECONCILED", "VERIFIED")
@@ -106,7 +106,7 @@ def test_every_figure_lists_its_source_rows_and_the_sum_over_them_is_the_figure(
     close(net["value"], 500.0 - 32.725 + 9.0 - 1.25 + 0.0)                              # 475.025
     close(net["source_sum"], 475.025)
     assert net["source_check"] == "MATCH" and {s["record_id"] for s in net["sources"]} >= {s["record_id"] for s in p["sources"] + f["sources"] + i["sources"]}
-    h = fig(rep, "headline_profit_usd")
+    h = fig(rep, "headline_realised_cash_usd")
     close(h["value"], 475.025)
     assert h["derived_from"] == ["layers.realised_cash.net_realised_cash_usd"] and h["source_ids"] == net["source_ids"]
     for path, e in rep["lineage"]["figures"].items():
@@ -184,7 +184,7 @@ def test_altering_deleting_or_adding_one_input_row_changes_the_lineage_digest_an
     assert d2 != d0 and f2[pfund] != f0[pfund]
     assert len(fig(gone, "layers.realised_cash.figures." + "funding_net_usd")["sources"]) == 2
     close(fig(gone, "layers.realised_cash.figures.funding_net_usd")["value"], 2 * 3.0)
-    assert gone["status"] != "RECONCILED" and gone["headline_profit_usd"] is None
+    assert gone["status"] != "RECONCILED" and gone["headline_realised_cash_usd"] is None
 
     # ADD one execution at the end of the file
     extra = t.executions() + [F.exec_row(9, "Buy", 0.1, 59_000.0, 0.1 * 59_000.0 * 0.00055, F.CLOSE_TS + 9000)]
@@ -228,7 +228,7 @@ def test_a_figure_without_a_lineage_entry_cannot_be_sealed(tmp_path):
         OI._seal(hollow)
     # a basis label outside the vocabulary
     labelled = copy.deepcopy(rep)
-    labelled["lineage"]["figures"]["headline_profit_usd"]["basis"] = "trust-me"
+    labelled["lineage"]["figures"]["headline_realised_cash_usd"]["basis"] = "trust-me"
     with pytest.raises(AssertionError):
         OI._seal(labelled)
     assert OI._seal(copy.deepcopy(rep))["lineage"]["digest"] == rep["lineage"]["digest"]      # the honest report seals to itself
@@ -237,10 +237,10 @@ def test_a_figure_without_a_lineage_entry_cannot_be_sealed(tmp_path):
 def test_a_withheld_figure_is_an_explicit_null_with_a_reason_never_zero(tmp_path):
     t = Trip()
     rep, _ = go(tmp_path, t, with_wallets=False)
-    assert rep["status"] == "PROVISIONAL" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "PROVISIONAL" and rep["headline_realised_cash_usd"] is None
     i = fig(rep, "layers.realised_cash.figures.interest_usd")
     assert i["value"] is None and i["why"].startswith("UNKNOWN, not zero") and i["sources"] == []
-    h = fig(rep, "headline_profit_usd")
+    h = fig(rep, "headline_realised_cash_usd")
     assert h["value"] is None and h["why"]
     # what IS known is still sourced, and labelled provisional: 500 - 32.725 + 9 = 476.275 is a partial, not the net
     pn = fig(rep, "layers.realised_cash.partial_net_of_known_components_usd")
@@ -277,7 +277,7 @@ def test_basis_labels_separate_realized_unrealized_estimated_provisional_reconci
     inc, _ = go(d, t, w1=wallet(F.W1_TS, cu + 250.0, cb))
     assert inc["status"] in ("INCOMPLETE", "DISPUTED")
     assert fig(inc, "layers.realised_cash.figures.perp_fees_usd")["basis"] == "incomplete"
-    assert fig(inc, "headline_profit_usd")["value"] is None
+    assert fig(inc, "headline_realised_cash_usd")["value"] is None
     assert set(OI.BASES) == {"realized", "unrealized", "estimated", "provisional", "reconciled", "incomplete"}
 
 
@@ -290,10 +290,10 @@ def test_a_disputed_report_still_carries_lineage_and_a_null_headline_with_its_re
     ex2[0]["execValue"] = repr(0.4 * 60_000.0)
     second = write_jsonl(tmp_path / "exec_other.jsonl", ex2)
     rep = OI.run_import(pairs + [("linear_execution", second)], marks=marks())
-    assert rep["status"] == "DISPUTED" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "DISPUTED" and rep["headline_realised_cash_usd"] is None
     assert rep["lineage"]["stages"]["conflicting"]["count"] == 1 and rep["lineage"]["stages"]["conflicting"]["ids"] == ["x1"]
     assert rep["lineage"]["stages"]["reconciled"]["count"] == 0
-    h = fig(rep, "headline_profit_usd")
+    h = fig(rep, "headline_realised_cash_usd")
     assert h["value"] is None and h["why"] and len(rep["lineage"]["digest"]) == 64
 
 
@@ -306,7 +306,7 @@ def test_hostile_truncated_export_missing_its_last_page(tmp_path):
     a = tmp_path / "a"
     a.mkdir()
     rep, _ = go(a, t, txlog=tx[:-1])
-    assert rep["status"] == "DISPUTED" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "DISPUTED" and rep["headline_realised_cash_usd"] is None
     codes = {f["code"] for f in rep["flags"]}
     assert {"POSITION_MISMATCH", "FEE_TOTALS_DIFFER"} <= codes
     no_headline(rep)
@@ -323,7 +323,7 @@ def test_hostile_truncated_export_missing_its_last_page(tmp_path):
     c = tmp_path / "c"
     c.mkdir()
     rep, _ = go(c, t, txlog=tx[:-1], execs=ex[:-1])
-    assert rep["status"] != "RECONCILED" and rep["headline_profit_usd"] is None
+    assert rep["status"] != "RECONCILED" and rep["headline_realised_cash_usd"] is None
     assert {"INVENTORY_UNVALUED"} <= {f["code"] for f in rep["flags"]}
     # (d) a statement cut mid-row is refused whole
     d = tmp_path / "d"
@@ -341,7 +341,7 @@ def test_hostile_missing_interest_rows(tmp_path):
     cu, cb = t.closing()
     # the wallet is after 1.25 USDT of interest, the statement export dropped the interest line
     rep, _ = go(tmp_path, t, w1=wallet(F.W1_TS, cu - 1.25, cb))
-    assert rep["status"] == "INCOMPLETE" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "INCOMPLETE" and rep["headline_realised_cash_usd"] is None
     assert "STATEMENT_NOT_ANCHORED" in {f["code"] for f in rep["flags"]}
     assert rep["ledger"]["residuals"]["usdt"] == pytest.approx(-1.25)       # the 1.25 shows up as a residual, in the open
     no_headline(rep)
@@ -350,14 +350,14 @@ def test_hostile_missing_interest_rows(tmp_path):
     d.mkdir()
     ok, _ = go(d, t, txlog=with_interest(t.txlog(), F.T0 + 10 * F.HOUR, -1.25), w1=wallet(F.W1_TS, cu - 1.25, cb))
     assert ok["status"] == "RECONCILED"
-    close(ok["headline_profit_usd"], 476.275 - 1.25)
+    close(ok["headline_realised_cash_usd"], 476.275 - 1.25)
 
 
 def test_hostile_duplicated_page_inside_one_file_lowers_the_status(tmp_path):
     t = Trip()
     tx = t.txlog()
     rep, _ = go(tmp_path, t, txlog=tx + tx[:2])                # the first page appears twice in the same file
-    assert rep["status"] == "INCOMPLETE" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "INCOMPLETE" and rep["headline_realised_cash_usd"] is None
     assert "DUPLICATE_PAGE_IN_FILE" in {f["code"] for f in rep["flags"]}
     assert rep["lineage"]["stages"]["duplicate_dropped"]["identical_within_one_file"] == 2
     # counted once, so the figures are NOT doubled
@@ -367,7 +367,7 @@ def test_hostile_duplicated_page_inside_one_file_lowers_the_status(tmp_path):
     d.mkdir()
     ex = t.executions()
     rep, _ = go(d, t, execs=ex + ex)
-    assert rep["status"] == "INCOMPLETE" and rep["headline_profit_usd"] is None
+    assert rep["status"] == "INCOMPLETE" and rep["headline_realised_cash_usd"] is None
     close(rep["layers"]["realised_cash"]["figures"]["perp_realised_usd"], 500.0)
 
 
@@ -402,7 +402,7 @@ def test_hostile_funding_row_times_ten_is_disputed_with_no_headline(tmp_path):
     e = fig(rep, "layers.realised_cash.figures.funding_net_usd")
     close(e["value"], 90.0)
     assert e["basis"] == "incomplete" and len(e["sources"]) == 3
-    assert fig(rep, "headline_profit_usd")["value"] is None
+    assert fig(rep, "headline_realised_cash_usd")["value"] is None
 
 
 def test_hostile_fee_in_the_wrong_currency_is_refused_by_name(tmp_path):
@@ -437,7 +437,7 @@ def test_every_hostile_variant_leaves_no_headline_and_a_sealed_lineage(tmp_path)
             rep, _ = go(d, t, **kw)
         except OI.ImportRefused:
             continue
-        assert rep["status"] != "RECONCILED" and rep["headline_profit_usd"] is None, name
+        assert rep["status"] != "RECONCILED" and rep["headline_realised_cash_usd"] is None, name
         assert len(rep["lineage"]["digest"]) == 64, name
         for path, e in rep["lineage"]["figures"].items():
             assert e["value"] is None and e.get("why") or e["sources"] or e.get("empty_set"), (name, path)
@@ -453,7 +453,7 @@ def test_a_change_that_leaves_every_figure_value_alone_still_moves_the_row_and_f
     ex = t.executions()
     ex[1]["orderId"] = "edited-after-export"
     alt, _ = go(b, t, execs=ex)
-    assert alt["status"] == base["status"] == "RECONCILED" and alt["headline_profit_usd"] == base["headline_profit_usd"]
+    assert alt["status"] == base["status"] == "RECONCILED" and alt["headline_realised_cash_usd"] == base["headline_realised_cash_usd"]
     pf = "layers.realised_cash.figures.perp_fees_usd"
     assert fig(alt, pf)["value"] == fig(base, pf)["value"]
     assert fig(alt, pf)["provenance_digest"] != fig(base, pf)["provenance_digest"]

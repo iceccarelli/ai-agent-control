@@ -174,7 +174,8 @@ def section_strategies() -> Dict[str, Any]:
 
 
 def section_pnl() -> Dict[str, Any]:
-    return {"actual_realised": {"status": UNAVAILABLE, "why": "no owner-account export is supplied to this read-out; run tools/owner_ledger.py on an export you hold"},
+    return {"actual_realised": {"status": UNAVAILABLE, "why": "no owner-account export is supplied to this read-out; run tools/owner_ledger.py on an export you hold",
+                        "basis_note": "an importer's headline_realised_cash_usd is perp realised cash only, not total profit: read layers.economic_total.net_economic_pnl_usd beside it"},
             "modelled": {"status": ESTIMATED, "why": "any carry figure from the research tools is a model, never a result; keep it apart from the actual line above"}}
 
 

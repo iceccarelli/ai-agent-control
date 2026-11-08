@@ -30,7 +30,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -118,8 +120,15 @@ class EvidenceItem:
     status: Optional[str] = None            # for reconciled_owner_result: the importer's status word
     candidate_id: Optional[str] = None      # which candidate this evidence is ABOUT
     spec_digest: Optional[str] = None       # the exact specification it was gathered against (a spec edited afterwards invalidates it)
+    attachment: Optional[Mapping[str, Any]] = None   # reconciled_owner_result only: the sealed owner_import report the figure is read from (re-verified by counted())
 
     def __post_init__(self) -> None:
+        if self.attachment is not None:
+            try:
+                att = json.loads(json.dumps(dict(self.attachment), allow_nan=False))
+            except (TypeError, ValueError) as exc:
+                raise SpecError(f"evidence attachment is not plain finite JSON: {type(exc).__name__}") from exc
+            object.__setattr__(self, "attachment", att)
         # Metrics are normalised ONCE into a plain JSON dict: a dict/Mapping subclass whose .get lies, or a NaN/inf/non-JSON value, cannot reach the verdict logic.
         try:
             plain = json.loads(json.dumps(dict(self.metrics), allow_nan=False))
@@ -135,7 +144,7 @@ def evidence_from_dict(d: Mapping[str, Any]) -> EvidenceItem:
         raise SpecError(f"not an evidence item: {d!r}")
     return EvidenceItem(stage=d["stage"], result=d["result"], provenance=str(d.get("provenance") or ""), metrics=dict(d.get("metrics") or {}),
                         data_sha256=d.get("data_sha256"), recorded_ms=int(d.get("recorded_ms") or 0), status=d.get("status"),
-                        candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest"))
+                        candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest"), attachment=d.get("attachment"))
 
 
 def _is_hex64(x: Any) -> bool:
@@ -145,6 +154,12 @@ def _is_hex64(x: Any) -> bool:
 WEAK_PROVENANCE = frozenset({"unknown", "assumed", "modelled", "modeled", "estimated", "n/a", "none", "todo", "tbd", "x"})
 MAX_PLAUSIBLE_EDGE_BPS = 500.0          # a per-round-trip NET edge above this after real costs is a unit slip or a forgery until proven otherwise
 OBSERVED_STAGES = ("prospective_observation", "execution_validation", "reconciled_owner_result")
+#: Floors for observed evidence. A candidate's registered protocol can RAISE them, never lower them.
+MIN_PROSPECTIVE_SETTLEMENTS = 30
+MIN_PROSPECTIVE_COVERAGE = 0.90
+MIN_EXECUTION_FILLS = 20
+#: Statuses an owner-import economic layer may carry for its figure to be read at all (STALE / UNAVAILABLE / DISPUTED / INCOMPLETE are never a figure).
+OWNER_FIGURE_OK_STATUSES = ("ESTIMATED", "PROVISIONAL", "RECONCILED", "VERIFIED")
 
 
 def _finite_pos(x: Any) -> bool:
@@ -160,24 +175,162 @@ def _registry_entry(registry: Optional[Mapping[str, Any]], cid: str) -> Optional
     return None
 
 
-def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapping[str, Any]] = None) -> Tuple[bool, Optional[str]]:
+def _verified_entry(registry: Optional[Mapping[str, Any]], spec: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """The candidate's registry entry, but only from a registry that passes its own integrity check (else nothing can be bound to it)."""
+    entry = _registry_entry(registry, str(spec.get("candidate_id")))
+    if registry is None or entry is None:
+        return None
+    import hypothesis_registry as hr
+    return None if hr.verify(registry) else entry
+
+
+def _anchored_variants(registry: Mapping[str, Any], entry: Mapping[str, Any]) -> int:
+    """The least number of variants a registered candidate can honestly have tried: every registered trial in its multiple-testing family, and every cell of its registered grid."""
+    fam = entry.get("multiple_testing_family")
+    n_family = sum(1 for t in registry.get("trials", []) if fam is not None and t.get("multiple_testing_family") == fam)
+    grid = entry.get("parameter_grid")
+    n_grid = 1
+    if isinstance(grid, Mapping):
+        for v in grid.values():
+            if isinstance(v, list) and v:
+                n_grid *= len(v)
+    return max(1, n_family, n_grid)
+
+
+def _implied_variants(m: Mapping[str, Any]) -> int:
+    """The number of variants the evidence's OWN metrics show were tried (named variants listed, or an explicit attempted count)."""
+    out = 0
+    for k in ("variant_names", "variant_p_values", "variants_tested_names"):
+        v = m.get(k)
+        if isinstance(v, list):
+            out = max(out, len(v))
+    for k in ("n_variants_attempted", "n_variants_registered", "n_variants_carried"):
+        v = m.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out = max(out, v)
+    return out
+
+
+def _prospective_floors(entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The machine-readable prospective window the candidate REGISTERED: {min_duration_ms, min_settlements, min_coverage}, or None when the registered protocol is free text."""
+    pp = entry.get("prospective_period")
+    dur: Optional[int] = None
+    ms, mc = MIN_PROSPECTIVE_SETTLEMENTS, MIN_PROSPECTIVE_COVERAGE
+    if isinstance(pp, Mapping):
+        d = pp.get("min_duration_ms")
+        if isinstance(d, int) and not isinstance(d, bool) and d > 0:
+            dur = d
+        v = pp.get("min_settlements")
+        if isinstance(v, int) and not isinstance(v, bool):
+            ms = max(ms, v)
+        v = pp.get("min_coverage")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v <= 1:
+            mc = max(mc, float(v))
+    elif isinstance(pp, str):
+        mt = re.match(r"^\s*(\d{10,})\.\.(\d{10,})", pp)
+        if mt and int(mt.group(2)) > int(mt.group(1)):
+            dur = int(mt.group(2)) - int(mt.group(1))
+    return None if dur is None else {"min_duration_ms": dur, "min_settlements": ms, "min_coverage": mc}
+
+
+def _candidate_binding(item: EvidenceItem, spec: Mapping[str, Any]) -> Optional[str]:
+    if item.candidate_id != spec.get("candidate_id"):
+        return "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"
+    if item.spec_digest != spec_digest(spec):
+        return "EVIDENCE_GATHERED_AGAINST_A_DIFFERENT_SPEC"
+    return None
+
+
+def _registry_binding(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """For an OBSERVED stage: a registry that verifies, holds the candidate, and PRE-DATES the observation. The one place this is decided: counted() and the
+    pending-prospective check both use it, and neither reads 'registered_before_observation' from metrics."""
+    entry = _registry_entry(registry, str(spec.get("candidate_id")))
+    if registry is None or entry is None:
+        return "NEEDS_A_REGISTERED_CANDIDATE(registry not supplied or candidate not in it)"
+    import hypothesis_registry as hr
+    if hr.verify(registry):
+        return "REGISTRY_FAILS_ITS_INTEGRITY_CHECK"
+    reg_ms = _utc_ms(entry.get("registered_utc"))
+    start = item.metrics.get("observation_started_ms")
+    if reg_ms is None or isinstance(start, bool) or not isinstance(start, int) or start <= reg_ms:
+        return "OBSERVATION_DID_NOT_START_AFTER_REGISTRATION"
+    return None
+
+
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _verify_owner_report(report: Any) -> List[str]:
+    import supabase_sync as SS
+    return SS.verify_import_report(report)
+
+
+def owner_verdict_figure(report: Mapping[str, Any]) -> Tuple[Optional[float], Optional[str]]:
+    """The ONE figure an owner result is allowed to carry: ``layers.economic_total.net_economic_pnl_usd`` (realised cash + owned-BTC economic P&L + change in perp unrealised),
+    never ``headline_realised_cash_usd``. (value, None) or (None, why): a missing layer, a STALE/UNAVAILABLE/DISPUTED/INCOMPLETE layer, or a None figure yields no figure."""
+    layers = report.get("layers") if isinstance(report.get("layers"), Mapping) else {}
+    econ = layers.get("economic_total") if isinstance(layers.get("economic_total"), Mapping) else None
+    if econ is None:
+        return None, "ECONOMIC_TOTAL_LAYER_MISSING"
+    if econ.get("status") not in OWNER_FIGURE_OK_STATUSES:
+        return None, f"ECONOMIC_TOTAL_{econ.get('status')}"
+    net = econ.get("net_economic_pnl_usd")
+    if not _num(net):
+        return None, "ECONOMIC_TOTAL_NONE"
+    return float(net), None
+
+
+def evidence_from_import_report(report: Mapping[str, Any], spec: Mapping[str, Any]) -> EvidenceItem:
+    """The ONLY way to build ``reconciled_owner_result`` evidence. The report must be a valid, sealed ``owner_import`` report (``report_sha256`` and the lineage digests are RECOMPUTED
+    by ``supabase_sync.verify_import_report``); the figure, status, hash and window start are READ FROM THE REPORT, never supplied by the caller. The figure is the ECONOMIC total.
+    PASS only if the report is RECONCILED and the economic total is a positive number on a usable layer; a RECONCILED report with a non-positive total is a FAIL (a real result);
+    anything else is INCONCLUSIVE. The report is attached so ``counted`` re-verifies it every time."""
+    problems = _verify_owner_report(report)
+    if problems:
+        raise SpecError("the owner import report fails verification: " + ", ".join(problems[:4]))
+    fig, why = owner_verdict_figure(report)
+    win = (report.get("ledger") or {}).get("window") or {}
+    start = win.get("opening_ts_ms") if isinstance(win, Mapping) else None
+    status = report["status"]
+    if status != "RECONCILED" or fig is None:
+        result = INCONCLUSIVE
+    else:
+        result = PASS if fig > 0 else FAIL
+    metrics = {"net_usd_after_all_costs": fig, "owner_figure_basis": "economic_total", "import_report_sha256": report["report_sha256"], "import_status": status,
+               "observation_started_ms": start if _int(start) else None}
+    return EvidenceItem(stage="reconciled_owner_result", result=result, provenance=f"owner_import report {report.get('import_id')}", metrics=metrics, status=status,
+                        candidate_id=spec.get("candidate_id"), spec_digest=spec_digest(spec), attachment=report)
+
+
+def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapping[str, Any]] = None, *, now_ms: Optional[int] = None) -> Tuple[bool, Optional[str]]:
     """Does this item count as a PASS/FAIL at its stage? (ok, why_not). A FAIL always counts (killing is easy); a PASS must earn it: it must be about THIS candidate and THIS spec,
-    carry real provenance, and (for the observed stages) be backed by a registration that verifies and PRE-DATES the observation."""
+    carry real provenance, and (for the observed stages) be backed by a registration that verifies and PRE-DATES the observation. ``now_ms`` (default: the clock) bounds the end of
+    any observation: an observation cannot end in the future."""
     if item.result == FAIL:
         return True, None
     if item.result == INCONCLUSIVE:
         return False, "INCONCLUSIVE"
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     prov = item.provenance.strip()
     if len(prov) < 6 or prov.lower() in WEAK_PROVENANCE:
         return False, "PASS_WITHOUT_REAL_PROVENANCE"
-    if item.candidate_id != spec.get("candidate_id"):
-        return False, "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"
-    if item.spec_digest != spec_digest(spec):
-        return False, "EVIDENCE_GATHERED_AGAINST_A_DIFFERENT_SPEC"
+    bad = _candidate_binding(item, spec)
+    if bad:
+        return False, bad
     m = item.metrics
     s = item.stage
+    entry = _verified_entry(registry, spec)
     if s in OFFLINE_STAGES and (not _is_hex64(item.data_sha256) or len(set(item.data_sha256)) < 8):
         return False, "OFFLINE_PASS_WITHOUT_REAL_DATA_HASH"
+    if s in OFFLINE_STAGES and entry is not None:
+        registered = entry.get("input_data_sha256")
+        if not isinstance(registered, Mapping) or item.data_sha256 not in {str(v) for v in registered.values()}:
+            return False, "OFFLINE_DATA_HASH_NOT_IN_REGISTERED_INPUTS"
     if s in ("historical_test", "oos_test"):
         n = m.get("independent_observations")
         if isinstance(n, bool) or not isinstance(n, int) or n < MIN_OBSERVATIONS[s]:
@@ -185,6 +338,10 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapp
         nv = m.get("n_variants_tested")
         if isinstance(nv, bool) or not isinstance(nv, int) or nv < 1 or m.get("multiple_testing_adjusted") is not True:
             return False, "NO_MULTIPLE_TESTING_ACCOUNTING"
+        if nv < _implied_variants(m):
+            return False, "N_VARIANTS_BELOW_WHAT_THE_EVIDENCE_IMPLIES"
+        if entry is not None and nv < _anchored_variants(registry, entry):
+            return False, "N_VARIANTS_BELOW_REGISTERED_COUNT"
         if m.get("uses_future_information") is not False:
             return False, "LOOK_AHEAD_NOT_RULED_OUT"
         if m.get("universe_point_in_time") is not True:
@@ -203,28 +360,52 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapp
         if not _finite_pos(cap) or not _finite_pos(need) or cap < need:
             return False, "CAPACITY_BELOW_MINIMUM_VIABLE"
     if s in OBSERVED_STAGES:
+        bad = _registry_binding(item, spec, registry)
+        if bad:
+            return False, bad
         entry = _registry_entry(registry, str(spec.get("candidate_id")))
-        if registry is None or entry is None:
-            return False, "NEEDS_A_REGISTERED_CANDIDATE(registry not supplied or candidate not in it)"
-        import hypothesis_registry as hr
-        if hr.verify(registry):
-            return False, "REGISTRY_FAILS_ITS_INTEGRITY_CHECK"
-        reg_ms = _utc_ms(entry.get("registered_utc"))
-        start = m.get("observation_started_ms")
-        if reg_ms is None or isinstance(start, bool) or not isinstance(start, int) or start <= reg_ms:
-            return False, "OBSERVATION_DID_NOT_START_AFTER_REGISTRATION"
     if s == "prospective_observation":
         if m.get("complete") is not True:
             return False, "PROSPECTIVE_NOT_COMPLETE"
+        win = _prospective_floors(entry or {})
+        if win is None:
+            return False, "PROSPECTIVE_WINDOW_NOT_MACHINE_READABLE"
+        start, end = m.get("observation_started_ms"), m.get("observation_ended_ms")
+        if not _int(end) or end <= start or end > now:
+            return False, "OBSERVATION_END_INVALID_OR_IN_THE_FUTURE"
+        if end - start < win["min_duration_ms"]:
+            return False, "PROSPECTIVE_DURATION_SHORTER_THAN_REGISTERED_WINDOW"
+        n_obs = m.get("observed_settlements")
+        if not _int(n_obs) or n_obs < win["min_settlements"]:
+            return False, f"TOO_FEW_OBSERVED_SETTLEMENTS(need {win['min_settlements']})"
+        cov = m.get("coverage")
+        if not _num(cov) or not (win["min_coverage"] <= cov <= 1.0):
+            return False, f"COVERAGE_BELOW_FLOOR(need {win['min_coverage']})"
     if s == "execution_validation":
         if m.get("venue") not in ("testnet", "mainnet") or m.get("fills_measured") is not True or m.get("fees_measured") is not True:
             return False, "EXECUTION_NOT_MEASURED_AT_A_VENUE"
+        h = m.get("execution_log_sha256")
+        if (not _int(m.get("fills_count")) or m["fills_count"] < MIN_EXECUTION_FILLS or not _int(m.get("fee_observations_count")) or m["fee_observations_count"] < 1
+                or not _is_hex64(h) or len(set(h)) < 8 or m.get("candidate_id") != spec.get("candidate_id") or m.get("spec_digest") != spec_digest(spec)):
+            return False, "EXECUTION_NOT_MEASURED_COUNTS_AND_LOG_HASH_NOT_TIED_TO_THE_CANDIDATE"
     if s == "reconciled_owner_result":
-        net = m.get("net_usd_after_all_costs")
-        if item.status != "RECONCILED" or not isinstance(net, (int, float)) or isinstance(net, bool) or not math.isfinite(net) or net <= 0:
+        if item.status != "RECONCILED":
             return False, "OWNER_RESULT_NOT_RECONCILED_OR_NOT_POSITIVE"
-        if not _is_hex64(m.get("import_report_sha256")):
-            return False, "OWNER_RESULT_NOT_TIED_TO_AN_IMPORT_REPORT_HASH"
+        rep = item.attachment
+        if not isinstance(rep, Mapping):
+            return False, "OWNER_RESULT_HAS_NO_ATTACHED_IMPORT_REPORT"
+        problems = _verify_owner_report(rep)
+        if problems:
+            return False, "OWNER_REPORT_FAILS_VERIFICATION:" + ",".join(problems[:3])
+        if rep.get("status") != "RECONCILED":
+            return False, "OWNER_RESULT_NOT_RECONCILED_OR_NOT_POSITIVE"
+        if m.get("import_report_sha256") != rep.get("report_sha256"):
+            return False, "OWNER_HASH_NOT_RECOMPUTED_FROM_THE_ATTACHED_REPORT"
+        fig, why = owner_verdict_figure(rep)
+        if fig is None or fig <= 0:
+            return False, "OWNER_ECONOMIC_TOTAL_NOT_POSITIVE" + (f"({why})" if why else "")
+        if m.get("net_usd_after_all_costs") != fig:
+            return False, "OWNER_FIGURE_NOT_THE_REPORTS_ECONOMIC_TOTAL"
     return True, None
 
 
@@ -250,7 +431,7 @@ class VerdictResult:
                 "spec_problems": self.spec_problems}
 
 
-def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem], *, registry: Optional[Mapping[str, Any]] = None) -> VerdictResult:
+def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem], *, registry: Optional[Mapping[str, Any]] = None, now_ms: Optional[int] = None) -> VerdictResult:
     """The verdict for a candidate given ALL its evidence. Deterministic; the same inputs give the same answer; later evidence never rescues an earlier FAIL."""
     problems = spec_problems(spec)
     stages: Dict[str, str] = {s: "MISSING" for s in LADDER}
@@ -273,7 +454,7 @@ def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem], *, regis
         verdicts = []
         notes = []
         for e in by_stage[stage]:
-            ok, why = counted(e, spec, registry)
+            ok, why = counted(e, spec, registry, now_ms=now_ms)
             if ok:
                 verdicts.append(e.result)
             else:
@@ -306,9 +487,13 @@ def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem], *, regis
         missing = next(s for s in ("historical_test", "oos_test", "cost_model", "capacity_test") if s not in have)
         return VerdictResult(INSUFFICIENT_DATA, ["a backtest alone never promotes: the offline ladder (historical, OOS, cost, capacity) is incomplete"] + reasons, missing, stages, ignored, problems)
     if "prospective_observation" not in have:
-        pend = any(e.stage == "prospective_observation" and e.metrics.get("registered_before_observation") is True and e.metrics.get("complete") is False for e in evidence)
+        # 'pending' needs the same candidate / spec-digest / registered-before-start binding as counted(); the metric's own 'registered_before_observation' claim is never read.
+        pend = any(e.stage == "prospective_observation" and e.result == INCONCLUSIVE and e.metrics.get("complete") is False and _candidate_binding(e, spec) is None
+                   and _registry_binding(e, spec, registry) is None for e in evidence)
         return VerdictResult(PROSPECTIVE if pend else PROMISING,
-                             ["offline evidence is complete; the live market has not confirmed anything" if not pend else "a registered prospective observation is under way"] + reasons,
+                             ["offline evidence is complete; the live market has not confirmed anything" if not pend else "a registered prospective observation is under way"]
+                             + (["UNBOUND_OFFLINE_EVIDENCE: no verifying registry holds this candidate, so the data hashes and variant counts are unverified; nothing above PROMISING can count"]
+                                if _verified_entry(registry, spec) is None else []) + reasons,
                              "prospective_observation", stages, ignored, problems)
     if "execution_validation" not in have:
         return VerdictResult(PROSPECTIVE, ["prospective observation passed; execution at a venue is not yet validated"] + reasons, "execution_validation", stages, ignored, problems)
@@ -342,7 +527,7 @@ def record_evidence(registry: Dict[str, Any], candidate_id: str, item: EvidenceI
     import hypothesis_registry as hr
     hr.add_evidence(registry, candidate_id, STAGE_TO_REGISTRY_LEVEL[item.stage], result=f"{item.stage}:{item.result}", provenance=item.provenance or "none",
                     details={"metrics": dict(item.metrics), "data_sha256": item.data_sha256, "status": item.status, "candidate_id": item.candidate_id or candidate_id,
-                             "spec_digest": item.spec_digest})
+                             "spec_digest": item.spec_digest, "attachment": item.attachment})
 
 
 def evidence_from_registry(registry: Mapping[str, Any], candidate_id: str) -> List[EvidenceItem]:
@@ -358,17 +543,17 @@ def evidence_from_registry(registry: Mapping[str, Any], candidate_id: str) -> Li
         if stage not in LADDER or result not in (PASS, FAIL, INCONCLUSIVE):
             continue
         out.append(EvidenceItem(stage=stage, result=result, provenance=str(ev.get("provenance") or ""), metrics=d.get("metrics") or {}, data_sha256=d.get("data_sha256"),
-                                status=d.get("status"), candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest")))
+                                status=d.get("status"), candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest"), attachment=d.get("attachment")))
     return out
 
 
-def evaluate_registered(registry: Mapping[str, Any], spec: Mapping[str, Any]) -> VerdictResult:
+def evaluate_registered(registry: Mapping[str, Any], spec: Mapping[str, Any], *, now_ms: Optional[int] = None) -> VerdictResult:
     """The verdict from the REGISTRY's evidence only. Refuses a registry that fails its integrity check."""
     import hypothesis_registry as hr
     bad = hr.verify(registry)
     if bad:
         raise SpecError("the registry fails its integrity check: " + "; ".join(bad[:3]))
-    return evaluate(spec, evidence_from_registry(registry, str(spec["candidate_id"])), registry=registry)
+    return evaluate(spec, evidence_from_registry(registry, str(spec["candidate_id"])), registry=registry, now_ms=now_ms)
 
 
 def spec_digest(spec: Mapping[str, Any]) -> str:

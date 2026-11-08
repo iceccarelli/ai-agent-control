@@ -48,6 +48,11 @@ STATUSES = ("VERIFIED", "RECONCILED", "ESTIMATED", "PROVISIONAL", "STALE", "DISP
 _RANK = ("DISPUTED", "UNAVAILABLE", "INCOMPLETE", "STALE", "PROVISIONAL", "ESTIMATED", "RECONCILED", "VERIFIED")
 #: statuses that may carry a headline profit number
 _PROFIT_OK = ("RECONCILED", "PROVISIONAL", "ESTIMATED")
+#: What the headline number IS. It is the perp-side realised cash only (fills, fees, funding, interest, statement lines). It EXCLUDES the value change of the owned BTC and the
+#: perp's unrealised P&L, so it can be positive while the economic total is negative. It is not "profit"; the economic total is layers.economic_total.net_economic_pnl_usd.
+HEADLINE_BASIS = "realised_cash_only"
+HEADLINE_CAVEAT = ("realised perp cash only: excludes the value change of the owned BTC and perp unrealised P&L. It is NOT total profit and can be positive while the economic total "
+                   "(layers.economic_total.net_economic_pnl_usd) is negative.")
 
 ROLES = ("linear_execution", "spot_execution", "transaction_log", "wallet_opening", "wallet_closing")
 ROLE_TYPE = {"linear_execution": "execution", "spot_execution": "execution", "transaction_log": "transaction_log",
@@ -452,7 +457,7 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
             "lineage": {"files": lineage, "marks": mk, "formats_refused_by_name": list(UNVERIFIED_FORMAT), "chain": list(CHAIN), "stages": stages},
             "duplicates": duplicates, "parameters": {k: v for k, v in params.items() if k != "marks"}}
     if disputes:
-        return _seal(dict(base, status="DISPUTED", headline_profit_usd=None, layers={}, flags=[{"code": "CONFLICTING_DUPLICATE", "severity": "HARD", "detail":
+        return _seal(dict(base, status="DISPUTED", headline_realised_cash_usd=None, headline_basis=HEADLINE_BASIS, headline_caveat=HEADLINE_CAVEAT, layers={}, flags=[{"code": "CONFLICTING_DUPLICATE", "severity": "HARD", "detail":
                      f"{len(disputes)} record id(s) appear twice with different content: which is the record is not decidable; nothing is computed",
                      "examples": [d["id"] for d in disputes[:5]]}], reading="records contradict each other; no result is stated"))
 
@@ -658,13 +663,13 @@ def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, an
         econ_net = net + b["btc_economic_pnl_usd"] + b["change_in_perp_unrealised_usd"]
     if econ_net is None and econ_status in ("RECONCILED", "ESTIMATED", "PROVISIONAL"):
         econ_status = "UNAVAILABLE"
-    economic = {"status": econ_status, "net_economic_pnl_usd": econ_net,
+    economic = {"status": econ_status, "net_economic_pnl_usd": econ_net, "basis": "economic_total: the figure a strategy verdict binds to (not headline_realised_cash_usd)",
                 "reading": "withheld (null) while a mark is stale or missing. realised cash P&L + BTC economic P&L at the supplied marks + change in perpetual unrealised P&L; withheld while any part is not computable"}
     status = realised_status
     unchecked = list(ledger_unrun) + ["no exchange authentication: files are the owner's, a digest proves bytes, not origin"]
     if prov is not None:
         base = _complete_lineage(base, lin_figs, prov, realised_status, inv, b, flags, rep, unvalued, stale, unchecked, economic)
-    return dict(base, status=status, headline_profit_usd=(net if status in _PROFIT_OK else None),
+    return dict(base, status=status, headline_realised_cash_usd=(net if status in _PROFIT_OK else None), headline_basis=HEADLINE_BASIS, headline_caveat=HEADLINE_CAVEAT,
                 partial_figures=(fig if status not in _PROFIT_OK else None), layers={"realised_cash": realised, "inventory_valuation": inv, "economic_total": economic},
                 ledger={"verdict": rep["verdict"], "residuals": rep["residuals"], "window": rep["window"], "records": rep["records"]},
                 flags=sorted(flags + [dict(f) for f in rep["flags"] if f["severity"] != "INFO"], key=lambda f: (f["severity"], f["code"])),
@@ -677,7 +682,7 @@ def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, an
 CHAIN = ("raw record", "normalized record", "validation", "dedup", "reconciliation", "uncertainty", "ledger", "owner P&L")
 BASES = ("realized", "unrealized", "estimated", "provisional", "reconciled", "incomplete")
 #: numeric leaves under these roots are FIGURES: each needs a lineage entry (or an explicit null with its reason). Counts / timestamps / the marks themselves are inputs, not figures
-_FIGURE_ROOTS = ("headline_profit_usd", "partial_figures", "layers", "ledger.residuals")
+_FIGURE_ROOTS = ("headline_realised_cash_usd", "partial_figures", "layers", "ledger.residuals")
 _NOT_FIGURES = ("layers.realised_cash.settlements", "layers.inventory_valuation.marks_used")
 _LIN_TOL = dict(rel_tol=1e-9, abs_tol=1e-6)
 
@@ -788,7 +793,7 @@ def _figure_sources(fig, b, prov, anchored) -> Tuple[Dict[str, Any], List[Dict[s
     out["layers.realised_cash.net_realised_cash_usd"] = {"nature": "realized", "basis": "@conf", "formula": "sum of the five realised-cash components", "derived_from": comps}
     out["layers.realised_cash.partial_net_of_known_components_usd"] = {"nature": "realized", "basis": "incomplete", "formula": "sum of the components that ARE known (a labelled partial, never the net)",
                                                                        "derived_from": [c for c, k in zip(comps, fig) if fig[k] is not None]}
-    out["headline_profit_usd"] = {"nature": "realized", "basis": "@conf", "formula": "equals net_realised_cash_usd, and only under RECONCILED / PROVISIONAL / ESTIMATED",
+    out["headline_realised_cash_usd"] = {"nature": "realized", "basis": "@conf", "formula": "REALISED CASH ONLY (not total profit; see layers.economic_total). Equals net_realised_cash_usd, and only under RECONCILED / PROVISIONAL / ESTIMATED",
                                   "derived_from": ["layers.realised_cash.net_realised_cash_usd"]}
     return out, flags
 
@@ -949,7 +954,7 @@ def _seal(rep: Dict[str, Any]) -> Dict[str, Any]:
     account's own status when the account is incomplete or disputed; a content digest of the body."""
     assert rep["status"] in STATUSES, rep["status"]
     if rep["status"] not in _PROFIT_OK:
-        rep["headline_profit_usd"] = None
+        rep["headline_realised_cash_usd"] = None
         for layer in rep.get("layers", {}).values():
             if layer.get("status") in ("VERIFIED", "RECONCILED"):
                 layer["status"] = rep["status"]

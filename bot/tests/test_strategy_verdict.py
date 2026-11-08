@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.join(BOT, "tools"))
 import strategy_verdict as SV  # noqa: E402
 
 H = "0123456789abcdef" * 4
+H2 = "fedcba9876543210" * 4
+DAY = 86_400_000
+REG_UTC = "2026-01-01T00:00:00Z"      # every registry here is registered at this fixed instant (patched), so observations can be placed deterministically after it
 FUTURE_MS = 4_000_000_000_000        # an observation that starts after any registration made while these tests run
+NOW_MS = FUTURE_MS + 90 * DAY         # the clock handed to the engine: after every observation window built below
 
 
 def lab(v, p="assumed"):
@@ -29,7 +33,7 @@ def spec(**over):
         "required_data": [{"name": "funding", "point_in_time": True}], "eligibility_rules": ["listed >= 30d"], "entry": "e", "exit": "x", "holding_period": "30d",
         "execution_model": "taker", "fee_model": {"maker_bps": lab(2.0), "taker_bps": lab(5.5)}, "funding_model": {"expected_bps_per_settlement": lab(0.3, "modelled")},
         "slippage_model": {"entry_bps": lab(1.0), "exit_bps": lab(1.0)}, "capacity_model": {"min_viable_capacity_usd": 1000.0}, "risk_model": "r", "drawdown_model": "d",
-        "OOS_protocol": {"train_test_boundary": "2024-01-01", "data_window": "2022..2026"}, "prospective_protocol": "p",
+        "OOS_protocol": {"train_test_boundary": "2024-01-01", "data_window": "2022..2026"}, "prospective_protocol": {"description": "p", "min_duration_ms": 30 * DAY},
         "rejection_conditions": ["net edge after costs <= 0 out of sample"], "bias_declarations": {k: True for k in SV.BIAS_DECLARATIONS},
     }
     s.update(over)
@@ -46,11 +50,14 @@ def ev(stage, result="PASS", spec_=None, **kw):
     elif stage == "capacity_test":
         m = {"capacity_usd": 5000.0}
     elif stage == "prospective_observation":
-        m = {"complete": True, "observation_started_ms": FUTURE_MS}
+        m = {"complete": True, "observation_started_ms": FUTURE_MS, "observation_ended_ms": FUTURE_MS + 30 * DAY, "observed_settlements": 90, "coverage": 0.97}
     elif stage == "execution_validation":
-        m = {"venue": "testnet", "fills_measured": True, "fees_measured": True, "observation_started_ms": FUTURE_MS}
+        m = {"venue": "testnet", "fills_measured": True, "fees_measured": True, "observation_started_ms": FUTURE_MS, "fills_count": 25, "fee_observations_count": 25,
+             "execution_log_sha256": H2, "candidate_id": "cand1", "spec_digest": SV.spec_digest(spec_ if spec_ is not None else spec())}
         base.update({"provenance": "testnet session 1", "data_sha256": None})
     elif stage == "reconciled_owner_result":
+        if result == "PASS" and not kw and spec_ is None:
+            return owner_item()                                                      # the ONLY way to build an owner result: from a sealed importer report
         m = {"net_usd_after_all_costs": 12.5, "observation_started_ms": FUTURE_MS, "import_report_sha256": H}
         base.update({"provenance": "owner_import report", "status": "RECONCILED", "data_sha256": None})
     metrics = dict(m, **kw.pop("metrics", {}))
@@ -61,19 +68,47 @@ def ev(stage, result="PASS", spec_=None, **kw):
 OFFLINE = ["historical_test", "oos_test", "cost_model", "capacity_test"]
 
 
-def _registry():
+def _registry(s_=None, **kw):
     import hypothesis_registry as hr
+    from unittest import mock
     reg = {"trials": []}
-    SV.register_candidate(reg, spec(), code_sha="abc123", input_data_sha256={"funding": H})
+    with mock.patch.object(hr, "_now", lambda: REG_UTC):
+        SV.register_candidate(reg, s_ if s_ is not None else spec(), code_sha="abc123", input_data_sha256=kw.get("hashes", {"funding": H}))
+        for other in kw.get("others", ()):
+            SV.register_candidate(reg, other, code_sha="abc123", input_data_sha256={"funding": H})
     hr.seal(reg)
     return reg
+
+
+_OWNER = {}
+
+
+def import_report(spot_close=61_000.0, **kw):
+    """A genuinely importer-sealed report from synthetic fixtures (BTC +1000 over the window by default: economic total positive)."""
+    import tempfile, pathlib
+    key = (spot_close, tuple(sorted(kw.items())))
+    if key not in _OWNER:
+        sys.path.insert(0, os.path.join(BOT, "tests"))
+        import owner_import as OI, fixtures_owner_import as F
+        import account_review as AR
+        d = pathlib.Path(tempfile.mkdtemp())
+        _OWNER[key] = OI.run_import(F.lay_out(d, F.Trip(), **kw), marks=F.marks(spot_close=spot_close))
+    return copy.deepcopy(_OWNER[key])
+
+
+def owner_item(report=None, s_=None):
+    return SV.evidence_from_import_report(report if report is not None else import_report(), s_ if s_ is not None else spec())
 
 
 REG = _registry()
 
 
 def evaluate(s, items, registry=REG):
-    return SV.evaluate(s, items, registry=registry)
+    return SV.evaluate(s, items, registry=registry, now_ms=NOW_MS)
+
+
+def counted(item, s, registry=None):
+    return SV.counted(item, s, registry, now_ms=NOW_MS)
 
 
 def verdict(s, *items):
@@ -203,21 +238,19 @@ def test_the_verdict_is_deterministic_and_order_of_evidence_does_not_matter():
     ("prospective_observation", {"observation_started_ms": 1}, "OBSERVATION_DID_NOT_START_AFTER_REGISTRATION"),
     ("prospective_observation", {"observation_started_ms": True}, "OBSERVATION_DID_NOT_START_AFTER_REGISTRATION"),
     ("prospective_observation", {"complete": False}, "PROSPECTIVE_NOT_COMPLETE"),
-    ("reconciled_owner_result", {"import_report_sha256": "nothex"}, "NOT_TIED_TO_AN_IMPORT_REPORT_HASH"),
+    ("prospective_observation", {"observation_ended_ms": FUTURE_MS + 29 * DAY}, "PROSPECTIVE_DURATION_SHORTER"),
     ("execution_validation", {"venue": "paper"}, "EXECUTION_NOT_MEASURED"),
     ("execution_validation", {"fees_measured": False}, "EXECUTION_NOT_MEASURED"),
-    ("reconciled_owner_result", {"net_usd_after_all_costs": -1.0}, "OWNER_RESULT_NOT_RECONCILED"),
-    ("reconciled_owner_result", {"net_usd_after_all_costs": 0.0}, "OWNER_RESULT_NOT_RECONCILED"),
 ])
 def test_a_pass_that_does_not_carry_what_it_needs_does_not_count(stage, mutation, why):
     item = ev(stage, metrics=mutation)
-    ok, reason = SV.counted(item, spec(), REG)
+    ok, reason = counted(item, spec(), REG)
     assert ok is False and why in reason
-    assert SV.counted(ev(stage), spec(), REG) == (True, None)                    # positive control
+    assert counted(ev(stage), spec(), REG) == (True, None)                    # positive control
 
 
 def test_provenance_hash_and_status_are_required_for_a_pass():
-    c = lambda item: SV.counted(item, spec(), REG)
+    c = lambda item: counted(item, spec(), REG)
     assert c(ev("historical_test", provenance=""))[1] == "PASS_WITHOUT_REAL_PROVENANCE"
     for weak in ("unknown", "ASSUMED", "modelled", " estimated ", "x", "short"):
         assert c(ev("historical_test", provenance=weak))[1] == "PASS_WITHOUT_REAL_PROVENANCE", weak
@@ -232,9 +265,9 @@ def test_provenance_hash_and_status_are_required_for_a_pass():
 
 def test_evidence_must_be_about_this_candidate_and_this_exact_spec():
     other = ev("historical_test", candidate_id="someone_else")
-    assert SV.counted(other, spec(), REG)[1] == "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"
+    assert counted(other, spec(), REG)[1] == "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"
     stale = ev("historical_test", spec_digest=SV.spec_digest(spec(entry="a different entry rule")))
-    assert SV.counted(stale, spec(), REG)[1] == "EVIDENCE_GATHERED_AGAINST_A_DIFFERENT_SPEC"
+    assert counted(stale, spec(), REG)[1] == "EVIDENCE_GATHERED_AGAINST_A_DIFFERENT_SPEC"
     items = [ev(x) for x in OFFLINE]
     assert verdict(spec(), *items) == SV.PROMISING
     assert verdict(spec(capacity_model={"min_viable_capacity_usd": 1.0}), *items) == SV.INSUFFICIENT_DATA        # editing the spec AFTER the evidence invalidates it
@@ -283,18 +316,180 @@ def test_a_dropped_fail_cannot_hide_when_the_verdict_comes_from_the_sealed_regis
         SV.record_evidence(reg, "cand1", ev(x))
     SV.record_evidence(reg, "cand1", ev("oos_test", "FAIL", metrics={}))                                          # an inconvenient failure is on the record
     hr.seal(reg)
-    assert SV.evaluate_registered(reg, spec()).verdict == SV.REJECTED
+    assert SV.evaluate_registered(reg, spec(), now_ms=NOW_MS).verdict == SV.REJECTED
     reg["trials"][0]["evidence"] = [e for e in reg["trials"][0]["evidence"] if not e["result"].endswith("FAIL")]   # someone deletes it
     with pytest.raises(SV.SpecError, match="integrity"):
-        SV.evaluate_registered(reg, spec())
+        SV.evaluate_registered(reg, spec(), now_ms=NOW_MS)
 
 
 def test_forged_owner_results_do_not_count():
     base = [ev(x) for x in OFFLINE] + [ev("prospective_observation"), ev("execution_validation")]
-    forged = ev("reconciled_owner_result", metrics={"net_usd_after_all_costs": 1e9, "observation_started_ms": FUTURE_MS, "import_report_sha256": H})
-    assert verdict(spec(), *base, forged) == SV.OWNER_PROFIT_EVIDENCED                                           # a huge net is not itself disqualifying: the RECONCILED status + report hash are the gate
-    no_hash = ev("reconciled_owner_result", metrics={"import_report_sha256": None})                              # the default metrics are merged: override the hash with nothing
-    assert verdict(spec(), *base, no_hash) == SV.QUALIFIED
+    assert verdict(spec(), *base, ev("reconciled_owner_result")) == SV.OWNER_PROFIT_EVIDENCED                    # positive control: built from a sealed importer report
+    forged = SV.EvidenceItem(stage="reconciled_owner_result", result="PASS", provenance="owner_import report", status="RECONCILED", candidate_id="cand1",
+                             spec_digest=SV.spec_digest(spec()), metrics={"net_usd_after_all_costs": 1e9, "observation_started_ms": FUTURE_MS, "import_report_sha256": H})
+    assert counted(forged, spec(), REG) == (False, "OWNER_RESULT_HAS_NO_ATTACHED_IMPORT_REPORT")
+    assert verdict(spec(), *base, forged) == SV.QUALIFIED                                                        # a free-form figure with a made-up hash is not an owner result
+
+
+# ---------------------------------------------------------------- red-team 2: the ladder cannot be climbed on fiction
+
+def _registered(**kw):
+    return _registry(**kw)
+
+
+def test_rt2_1a_offline_data_hashes_must_be_the_registered_input_hashes():
+    other = [ev(x, data_sha256=H2) for x in OFFLINE]                                    # a perfectly hash-shaped, unregistered hash on every stage
+    for item in other:
+        assert counted(item, spec(), REG) == (False, "OFFLINE_DATA_HASH_NOT_IN_REGISTERED_INPUTS")
+    assert evaluate(spec(), other).verdict == SV.INSUFFICIENT_DATA
+    assert counted(other[0], spec(), None) == (True, None)                               # no registry: it can count toward PROMISING, and no further (below)
+    assert all(counted(ev(x), spec(), REG) == (True, None) for x in OFFLINE)             # positive control: the registered hash
+    reg2 = _registered(hashes={"funding": H, "costs": H2})
+    assert counted(other[0], spec(), reg2) == (True, None)                               # registering the hash is what binds it
+
+
+def test_rt2_1a_without_a_registry_the_ladder_stops_below_qualified():
+    full = [ev(x) for x in OFFLINE] + [ev("prospective_observation"), ev("execution_validation"), ev("reconciled_owner_result")]
+    assert evaluate(spec(), full, registry=None).verdict in (SV.PROMISING, SV.PROSPECTIVE)
+    r = evaluate(spec(), [ev(x) for x in OFFLINE], registry=None)
+    assert r.verdict == SV.PROMISING and any("UNBOUND" in x for x in r.reasons)          # said out loud
+
+
+def test_rt2_1b_variant_count_is_cross_checked_against_the_registry_and_the_metrics():
+    fam = spec(multiple_testing_family="fam")
+    sib = spec(candidate_id="sibling", multiple_testing_family="fam")
+    reg = _registered(s_=fam, others=[sib])
+    one = ev("historical_test", spec_=fam, metrics={"n_variants_tested": 1})
+    assert counted(one, fam, reg) == (False, "N_VARIANTS_BELOW_REGISTERED_COUNT")      # two registered trials share the family: 1 cannot be right
+    assert counted(ev("historical_test", spec_=fam, metrics={"n_variants_tested": 2}), fam, reg) == (True, None)
+    grid = spec(parameter_grid={"a": [1, 2, 3], "b": [1, 2]})
+    greg = _registered(s_=grid)
+    assert counted(ev("historical_test", spec_=grid, metrics={"n_variants_tested": 3}), grid, greg) == (False, "N_VARIANTS_BELOW_REGISTERED_COUNT")      # 3 x 2 grid cells
+    assert counted(ev("historical_test", spec_=grid, metrics={"n_variants_tested": 6}), grid, greg) == (True, None)
+    # what the evidence itself implies binds even with no registry at all
+    implied = ev("oos_test", metrics={"n_variants_tested": 3, "variant_names": ["a", "b", "c", "d", "e"]})
+    assert counted(implied, spec(), None) == (False, "N_VARIANTS_BELOW_WHAT_THE_EVIDENCE_IMPLIES")
+    assert counted(ev("oos_test", metrics={"n_variants_tested": 5, "variant_names": ["a", "b", "c", "d", "e"]}), spec(), None) == (True, None)
+    assert counted(ev("oos_test", metrics={"n_variants_tested": 3, "n_variants_attempted": 9}), spec(), None) == (False, "N_VARIANTS_BELOW_WHAT_THE_EVIDENCE_IMPLIES")
+
+
+@pytest.mark.parametrize("mut,why", [
+    ({"observation_ended_ms": FUTURE_MS + 1000}, "PROSPECTIVE_DURATION_SHORTER_THAN_REGISTERED_WINDOW"),         # complete:True with no real duration
+    ({"observation_ended_ms": None}, "OBSERVATION_END_INVALID_OR_IN_THE_FUTURE"),
+    ({"observation_ended_ms": NOW_MS + DAY}, "OBSERVATION_END_INVALID_OR_IN_THE_FUTURE"),                          # claims to end after now
+    ({"observation_ended_ms": FUTURE_MS - 1}, "OBSERVATION_END_INVALID_OR_IN_THE_FUTURE"),                         # ends before it starts
+    ({"observed_settlements": 3}, "TOO_FEW_OBSERVED_SETTLEMENTS"),
+    ({"observed_settlements": None}, "TOO_FEW_OBSERVED_SETTLEMENTS"),
+    ({"coverage": 0.5}, "COVERAGE_BELOW_FLOOR"),
+    ({"coverage": 1.5}, "COVERAGE_BELOW_FLOOR"),
+    ({"coverage": True}, "COVERAGE_BELOW_FLOOR"),
+])
+def test_rt2_1c_a_prospective_pass_needs_a_real_observed_duration_count_and_coverage(mut, why):
+    ok, got = counted(ev("prospective_observation", metrics=mut), spec(), REG)
+    assert ok is False and got.startswith(why), got
+    assert counted(ev("prospective_observation"), spec(), REG) == (True, None)
+
+
+def test_rt2_1c_the_registered_window_is_machine_readable_or_prospective_cannot_count():
+    for proto in ("free text only", {"description": "no duration"}):
+        s = spec(prospective_protocol=proto)
+        reg = _registered(s_=s)
+        assert counted(ev("prospective_observation", spec_=s), s, reg) == (False, "PROSPECTIVE_WINDOW_NOT_MACHINE_READABLE")
+    s = spec(prospective_protocol=f"{FUTURE_MS}..{FUTURE_MS + 30 * DAY}")                 # the 'start..end' form carries its own duration
+    assert counted(ev("prospective_observation", spec_=s), s, _registered(s_=s)) == (True, None)
+    assert counted(ev("prospective_observation", spec_=s, metrics={"observation_ended_ms": FUTURE_MS + DAY}), s, _registered(s_=s))[0] is False
+    floor = spec(prospective_protocol={"min_duration_ms": 30 * DAY, "min_settlements": 200, "min_coverage": 0.99})       # a protocol can only RAISE the floors
+    assert counted(ev("prospective_observation", spec_=floor), floor, _registered(s_=floor))[1].startswith("TOO_FEW_OBSERVED_SETTLEMENTS")
+
+
+@pytest.mark.parametrize("mut", [{"fills_count": 0}, {"fills_count": 3}, {"fills_count": True}, {"fee_observations_count": 0}, {"execution_log_sha256": None},
+                                 {"execution_log_sha256": "0" * 64}, {"execution_log_sha256": "nothex"}, {"candidate_id": "someone_else"}, {"spec_digest": H}])
+def test_rt2_1e_execution_validation_needs_measured_counts_and_a_log_hash_tied_to_the_candidate(mut):
+    ok, why = counted(ev("execution_validation", metrics=mut), spec(), REG)
+    assert ok is False and why.startswith("EXECUTION_NOT_MEASURED")
+    flags_only = ev("execution_validation", metrics={k: None for k in ("fills_count", "fee_observations_count", "execution_log_sha256")})
+    assert counted(flags_only, spec(), REG)[0] is False                                   # the three self-asserted flags alone are not enough
+    assert counted(ev("execution_validation"), spec(), REG) == (True, None)
+
+
+def test_rt2_1d_owner_result_is_built_only_from_a_sealed_reconciled_report_and_recomputes_the_hash():
+    rep = import_report()
+    item = owner_item(rep)
+    assert item.result == SV.PASS and item.status == "RECONCILED" and item.metrics["import_report_sha256"] == rep["report_sha256"]
+    assert item.metrics["net_usd_after_all_costs"] == rep["layers"]["economic_total"]["net_economic_pnl_usd"] > 0           # the figure comes from the report, not the caller
+    assert item.metrics["net_usd_after_all_costs"] != rep["headline_realised_cash_usd"]                                    # and it is the ECONOMIC total, not the cash headline
+    assert counted(item, spec(), REG) == (True, None)
+    # tamper with the figure inside the attachment: the hash no longer recomputes
+    t = copy.deepcopy(item.attachment); t["layers"]["economic_total"]["net_economic_pnl_usd"] = 1e9
+    forged = SV.EvidenceItem(stage=item.stage, result="PASS", provenance=item.provenance, status="RECONCILED", candidate_id=item.candidate_id, spec_digest=item.spec_digest,
+                             metrics=dict(item.metrics, net_usd_after_all_costs=1e9), attachment=t)
+    ok, why = counted(forged, spec(), REG)
+    assert ok is False and why.startswith("OWNER_REPORT_FAILS_VERIFICATION") and "does_not_recompute" in why
+    # a hash that is not the attached report's
+    wrong = SV.EvidenceItem(stage=item.stage, result="PASS", provenance=item.provenance, status="RECONCILED", candidate_id=item.candidate_id, spec_digest=item.spec_digest,
+                            metrics=dict(item.metrics, import_report_sha256=H), attachment=item.attachment)
+    assert counted(wrong, spec(), REG) == (False, "OWNER_HASH_NOT_RECOMPUTED_FROM_THE_ATTACHED_REPORT")
+    # a figure that is not the attached report's economic total
+    lie = SV.EvidenceItem(stage=item.stage, result="PASS", provenance=item.provenance, status="RECONCILED", candidate_id=item.candidate_id, spec_digest=item.spec_digest,
+                          metrics=dict(item.metrics, net_usd_after_all_costs=item.metrics["net_usd_after_all_costs"] + 1.0), attachment=item.attachment)
+    assert counted(lie, spec(), REG) == (False, "OWNER_FIGURE_NOT_THE_REPORTS_ECONOMIC_TOTAL")
+    # a hand-made report that merely claims RECONCILED
+    handmade = {"status": "RECONCILED", "report_sha256": H, "layers": {"economic_total": {"status": "ESTIMATED", "net_economic_pnl_usd": 1e9}}}
+    with pytest.raises(SV.SpecError):
+        SV.evidence_from_import_report(handmade, spec())
+
+
+def test_rt2_2_the_owner_figure_is_the_economic_total_and_a_none_or_nonpositive_total_never_passes():
+    neg = import_report(spot_close=59_000.0)                                                  # realised cash +476, owned BTC -1000: economic total negative
+    assert neg["headline_realised_cash_usd"] > 0 > neg["layers"]["economic_total"]["net_economic_pnl_usd"]
+    it = owner_item(neg)
+    assert it.result == SV.FAIL and it.metrics["net_usd_after_all_costs"] < 0                 # the profitable-looking cash headline cannot carry it
+    pa = [ev(x) for x in OFFLINE] + [ev("prospective_observation"), ev("execution_validation")]
+    assert verdict(spec(), *pa, it) == SV.REJECTED
+    # same report with the PASS forced: counted() refuses it on the economic figure
+    forced = SV.EvidenceItem(stage=it.stage, result="PASS", provenance=it.provenance, status="RECONCILED", candidate_id=it.candidate_id, spec_digest=it.spec_digest,
+                             metrics=it.metrics, attachment=it.attachment)
+    ok, why = counted(forced, spec(), REG)
+    assert ok is False and "OWNER_ECONOMIC_TOTAL_NOT_POSITIVE" in why
+    # a withheld (None) / stale / unavailable total
+    for bad_status, bad_net in (("STALE", None), ("UNAVAILABLE", None), ("ESTIMATED", None), ("STALE", 500.0)):
+        rep = import_report()
+        rep["layers"]["economic_total"].update(status=bad_status, net_economic_pnl_usd=bad_net)
+        rep = _reseal(rep)
+        item = SV.evidence_from_import_report(rep, spec())
+        assert item.result == SV.INCONCLUSIVE, (bad_status, bad_net)
+        f2 = SV.EvidenceItem(stage=item.stage, result="PASS", provenance=item.provenance, status="RECONCILED", candidate_id=item.candidate_id, spec_digest=item.spec_digest,
+                             metrics=dict(item.metrics, net_usd_after_all_costs=500.0), attachment=item.attachment)
+        assert counted(f2, spec(), REG)[0] is False, (bad_status, bad_net)
+
+
+def _reseal(rep):
+    import owner_import as OI
+    lin = rep["lineage"]
+    for path, e in lin["figures"].items():
+        cur = rep
+        for k in path.split("."):
+            cur = cur[k]
+        e["value"] = cur
+        e["provenance_digest"] = OI._sha_text(OI._canon({k: e.get(k) for k in ("value", "formula", "sources", "derived_digests", "all_records_digest", "empty_set")}))
+    fh = {p: [e["value"], e["provenance_digest"]] for p, e in sorted(lin["figures"].items())}
+    lin["digest"] = OI._sha_text(OI._canon({"files": [[e["role"], e["sha256"]] for e in lin["files"]], "marks": lin.get("marks"), "stages": lin["stages"], "figures": fh}))
+    rep["report_sha256"] = OI._sha_text(OI._canon({k: v for k, v in rep.items() if k != "report_sha256"}))
+    return rep
+
+
+def test_rt2_3_a_prospective_promotion_needs_the_same_binding_as_counted():
+    s = spec()
+    off = [ev(x) for x in OFFLINE]
+    good = ev("prospective_observation", "INCONCLUSIVE", metrics={"complete": False})
+    assert verdict(s, *off, good) == SV.PROSPECTIVE                                      # honest pending observation, registered before it started
+    # the metric's own claim of 'registered_before_observation' is never trusted
+    claim = lambda **o: ev("prospective_observation", "INCONCLUSIVE", metrics=dict({"complete": False, "registered_before_observation": True}, **o))
+    assert verdict(s, *off, claim(observation_started_ms=1)) == SV.PROMISING              # started BEFORE registration
+    assert verdict(s, *off, ev("prospective_observation", "INCONCLUSIVE", candidate_id="someone_else", metrics={"complete": False, "registered_before_observation": True})) == SV.PROMISING
+    assert verdict(s, *off, ev("prospective_observation", "INCONCLUSIVE", spec_digest=H, metrics={"complete": False, "registered_before_observation": True})) == SV.PROMISING
+    assert evaluate(s, off + [claim()], registry=None).verdict == SV.PROMISING            # no registry: nothing is 'registered'
+    assert evaluate(s, off + [claim()], registry={"trials": []}).verdict == SV.PROMISING
 
 
 def test_a_not_counted_pass_leaves_the_candidate_where_it_was():

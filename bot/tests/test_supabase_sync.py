@@ -539,7 +539,7 @@ def test_mutation_secret_guard_value_shapes():
     s = _shapes()["credentialed url"]
     with pytest.raises(SS.SecretGuardError):
         SS.incident_put(A, "I", "WARN", s, 1762300800000)
-    m = _mutant("    hits = [name for name, rx in _VALUE_RULES if rx.search(s)]", "    hits = []")
+    m = _mutant('    hits = [name for name, rx in _VALUE_RULES if name != "plain_english_secret" and rx.search(s)]', "    hits = []")
     assert m.incident_put(A, "I", "WARN", s, 1762300800000)                                  # mutant lets a credentialed URL through: the hostile table would fail on it
 
 
@@ -621,8 +621,8 @@ def test_rt3_1_forger_helper_positive_control_and_every_tamper_is_named():
     _refused(edit(fig_value), "lineage.figures:value_differs_from_report")
 
     def fig_digest(r):
-        r["lineage"]["figures"]["headline_profit_usd"]["value"] = 9999.0
-        r["headline_profit_usd"] = 9999.0
+        r["lineage"]["figures"]["headline_realised_cash_usd"]["value"] = 9999.0
+        r["headline_realised_cash_usd"] = 9999.0
         r["report_sha256"] = OI._sha_text(OI._canon({k: v for k, v in r.items() if k != "report_sha256"}))
     _refused(edit(fig_digest), "lineage.figures:provenance_digest_does_not_recompute")
     # fully re-forged digests, but the CLAIM is inconsistent with the report's own layers / headline
@@ -635,21 +635,21 @@ def test_rt3_1_forger_helper_positive_control_and_every_tamper_is_named():
 
     def reconciled_layer_under_disputed(r):
         r["status"] = "DISPUTED"
-        r["headline_profit_usd"] = None
-        r["lineage"]["figures"]["headline_profit_usd"]["value"] = None
+        r["headline_realised_cash_usd"] = None
+        r["lineage"]["figures"]["headline_realised_cash_usd"]["value"] = None
         return _reseal_by_hand(r)
     _refused(reconciled_layer_under_disputed(import_report()), "claims_RECONCILED_under_a_weaker_report_status")
 
     def headline_not_net(r):
-        r["headline_profit_usd"] = 1.0
-        r["lineage"]["figures"]["headline_profit_usd"]["value"] = 1.0
+        r["headline_realised_cash_usd"] = 1.0
+        r["lineage"]["figures"]["headline_realised_cash_usd"]["value"] = 1.0
         return _reseal_by_hand(r)
     _refused(headline_not_net(import_report()), "headline:not_the_realised_cash_net")
 
     def reconciled_no_layers(r):
         r["layers"] = {}
-        r["headline_profit_usd"] = None
-        for k in [k for k in r["lineage"]["figures"] if k.startswith("layers.") or k == "headline_profit_usd"]:
+        r["headline_realised_cash_usd"] = None
+        for k in [k for k in r["lineage"]["figures"] if k.startswith("layers.") or k == "headline_realised_cash_usd"]:
             del r["lineage"]["figures"][k]
         return _reseal_by_hand(r)
     _refused(reconciled_no_layers(import_report()), "RECONCILED_without_a_realised_cash_layer")
@@ -861,7 +861,7 @@ def test_rt3_3_a_secret_used_as_a_key_is_not_echoed_in_whitelist_refusals_either
 def test_rt3_3_guard_positive_controls_legitimate_text_and_hashes_pass():
     clean = ["trial_btc_carry_funding_basis_v1", "2026-11-07T00:00:00Z", "vol://md/md-20261101.db", "universe-1762300800000", "private://owner/imports/1",
              "seal-md-20261101-abababababababab", "funding carry earns the basis", "n=120 sharpe 1.25", "RUNBOOKS.md#collector", "tools/hypothesis_registry.py",
-             "split-2025-01-01", "abcdef1", str(uuid.uuid4()), "carry_book@1"]
+             "split-2025-01-01", "abcdef1", "carry_book@1"]            # a UUID in FREE text is refused since round 4 B; typed uuid columns are exempt
     for c in clean:
         assert SS.scan_value({"field": c}) == [], c
     for k in ("trial_id", "segment_ids", "per_trade_loss_usd", "max_exposure_usd", "hurdle_pct", "taker_bps", "data_window"):
@@ -1217,8 +1217,8 @@ def test_conflicting_duplicate_is_reported_against_real_postgres(pg):
     client = SqlClient(pg)
     # same trial_id, different registration content -> put_row False for both; the writer must say CONFLICT, and the stored row must stay the original
     reg = next(x for x in puts if x.table == "experiment_registrations" and x.row["trial_id"] == "T1")
-    changed = dict(reg.row, mechanism="a different mechanism", content_sha256=H("c"))
-    rep = SS.write(dataclasses.replace(SS.plan(A, []), puts=(SS.Put("experiment_registrations", changed),)), client)
+    changed_reg = next(x for x in SS.registration_puts(A, reg_entry(trial_id="T1", mechanism="a different mechanism")) if x.table == "experiment_registrations")
+    rep = SS.write(dataclasses.replace(SS.plan(A, []), puts=(changed_reg,)), client)
     assert not rep.ok and rep.results[0].outcome == SS.CONFLICT
     assert pg.scalar(f"select mechanism from carry.experiment_registrations where trial_id='T1' and owner_id='{A}';", role="service_role") == "funding carry earns the basis"
     inc = SS.incident_put(A, "INC-1", "CRITICAL", "different title", 1762387200000)
@@ -1250,7 +1250,7 @@ def test_status_vocabulary_and_no_raw_owner_rows_in_the_stored_import(pg):
     stored = pg.run(f"select to_jsonb(i)::text from carry.owner_account_imports i where owner_id='{owner}';", role="service_role").stdout
     assert "SENTINEL" not in stored and "476.275" not in stored
     cols = set(json.loads(stored.splitlines()[0]))
-    assert cols <= set(SQL["owner_account_imports"]["cols"]) and not (cols & {"fills", "wallet", "accountId", "headline_profit_usd"})
+    assert cols <= set(SQL["owner_account_imports"]["cols"]) and not (cols & {"fills", "wallet", "accountId", "headline_realised_cash_usd"})
 
 
 def test_pre_fix_schema_could_not_replay_evidence_of_an_abandoned_trial(server):
@@ -1320,3 +1320,130 @@ def test_rt3_hostile_plans_never_reach_postgres_and_a_forged_report_leaves_no_im
     assert c.calls == 0 and counts(pg, owner) == before
     assert pg.scalar(f"select count(*) from carry.owner_account_imports where owner_id='{owner}';", role="service_role") == "0"
     assert SS.write(SS.plan(owner, [good]), c).ok and c.calls == 1              # positive control: the clean row goes through the same client
+
+
+def test_a_report_whose_headline_does_not_declare_it_is_realised_cash_only_is_refused():
+    import copy as _c
+    good = import_report()
+    assert SS.verify_import_report(good) == [] and good["headline_basis"] == "realised_cash_only"
+    bad = _c.deepcopy(good)
+    bad["headline_basis"] = "total_profit"
+    assert "headline:basis_not_declared_realised_cash_only" in SS.verify_import_report(_reseal_by_hand(bad))      # resealed by hand: only the basis rule can stop it
+
+
+# --------------------------------------------------------------------------- red-team round 4 (A): the registry digest is attested, not trusted
+
+def _reg_put(**over):
+    return next(x for x in SS.registration_puts(A, reg_entry(**over)) if x.table == "experiment_registrations")
+
+
+def test_rt4_a_a_registration_whose_content_changed_under_the_same_digest_is_refused():
+    good = _reg_put()
+    assert SS.plan(A, [good]).puts and SS.write(SS.plan(A, [good]), MemClient()).ok               # positive control
+    row = dict(good.row, parameter_grid={"x": ["999999"]})                                           # content changed, content_sha256 untouched
+    with pytest.raises(SS.SyncError, match="registry_digest_not_attested"):
+        SS.plan(A, [good, SS.Put("experiment_registrations", row)])
+    with pytest.raises(SS.SyncError, match="registry_digest_not_attested"):
+        SS.plan(A, [dataclasses.replace(good, row=row)])                                             # the attestation travels with the Put, not the row: replace() does not launder it
+    with pytest.raises(SS.SyncError, match="registry_digest_not_attested"):
+        SS.write(dataclasses.replace(SS.plan(A, [good]), puts=(dataclasses.replace(good, row=row),)), MemClient())
+
+
+def test_rt4_a_a_fabricated_digest_is_refused():
+    good = _reg_put()
+    fab = SS.Put("experiment_registrations", dict(good.row, trial_id="T-fab", content_sha256="f" * 64))
+    with pytest.raises(SS.SyncError, match="registry_digest_not_attested"):
+        SS.plan(A, [fab])
+    with pytest.raises(SS.SyncError, match="registry_digest_not_attested"):
+        SS.plan(A, [dataclasses.replace(good, row=dict(good.row, trial_id="T-fab", content_sha256="f" * 64))])
+
+
+def test_rt4_a_the_same_trial_resent_with_changed_content_is_a_conflict_never_unchanged():
+    v1, v2 = _reg_put(), _reg_put(mechanism="a different mechanism")
+    assert v1.row["trial_id"] == v2.row["trial_id"] and v1.row["content_sha256"] != v2.row["content_sha256"]
+    pl = SS.plan(A, [v1, v2])
+    assert len(pl.puts) == 1 and len(pl.conflicts) == 1                                              # in one plan
+    c = MemClient()
+    assert SS.write(SS.plan(A, [v1]), c).ok
+    rep = SS.write(SS.plan(A, [v2]), c)                                                              # across writes
+    assert not rep.ok and rep.results[0].outcome == SS.CONFLICT and rep.results[0].outcome != SS.UNCHANGED
+    assert SS.write(SS.plan(A, [v1]), c).results[0].outcome == SS.UNCHANGED                          # positive control: the identical registration is UNCHANGED
+
+
+def test_rt4_a_identical_hash_but_different_row_is_a_conflict_not_a_collapse():
+    good = _reg_put()
+    twin = dataclasses.replace(good, row=dict(good.row, note="edited"))                              # same trial, same digest, same attest, different row
+    with pytest.raises(SS.SyncError):
+        SS.plan(A, [good, twin])
+
+
+def test_mutation_registry_attestation():
+    good = _reg_put()
+    row = dict(good.row, parameter_grid={"x": ["999999"]})
+    m = _mutant('if put.table == "experiment_registrations" and (not isinstance(put.attest, str) or put.attest != _registry_attest(put.row)):', 'if False:')
+    forged = m.Put("experiment_registrations", row)
+    assert m.plan(A, [forged]).puts                                                                  # mutant accepts the forged registration: the refusal tests above would fail on it
+
+
+# --------------------------------------------------------------------------- red-team round 4 (B): the secret / PII guard folds Unicode and covers more shapes
+
+ZW = "\u200b"
+
+
+@pytest.mark.parametrize("name,text", [
+    ("zero_width_jwt", f"eyJhbGciOi{ZW}JIUzI1NiJ9.eyJzdWIiOiIx{ZW}MjM0NTY3ODkwIn0.abc"),
+    ("soft_hyphen_jwt", "eyJhbGciOi\u00adJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc"),
+    ("fullwidth_email", "bob\uff20example.com"),
+    ("fullwidth_letters_key", "sk-\uff41\uff42\uff43\uff44\uff45\uff46\uff47\uff48\uff49\uff4a\uff4b\uff4c\uff4d\uff4e\uff4f\uff50\uff51"),
+    ("ipv6", "host 2001:db8:85a3::8a2e:370:7334 down"),
+    ("ipv6_loopback", "listening on ::1 only"),
+    ("ipv6_full", "peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334 reset"),
+    ("uuid_in_text", "approved by 8f14e45f-ceea-467a-9c5a-1b2c3d4e5f60"),
+    ("internal_fqdn", "ssh root at prod-db-1.internal.example.net port 22"),
+    ("corp_fqdn", "see wiki.corp.acme.com"),
+    ("plain_password", "the testnet password is hunter2hunter2 ok"),
+    ("plain_password_word", "password is swordfish"),
+    ("plain_passphrase_eq", "passphrase = correcthorse"),
+    ("letters_only_18", "AbCdEfGhIjKlMnOpQr"),
+    ("letters_only_36", "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGhIj"),
+    ("letters_only_36_pascal", "Alpha" * 8),
+    ("letters_only_in_text", "key xKjQpWmZrTbVnLcHdSe was rotated"),
+])
+def test_rt4_b_guard_gaps_are_closed(name, text):
+    with pytest.raises(SS.SecretGuardError):
+        SS.incident_put(A, "inc-1", "INFO", text, 1762300800000)
+
+
+@pytest.mark.parametrize("text", [
+    "run 2026-11-07T12:30:45Z finished", "ratio 12:30:45 elapsed", "BTC::USDT linear", "OWNER_PROFIT_EVIDENCED", "INSUFFICIENT_DATA after review",
+    "ExperimentRegistrations table", "OwnerAccountImportStatusEvents", "the password is required", "password is missing", "password rotated; no password is stored here",
+    "token is expired", "carry.risk_policy_versions", "funding carry paused after review", "build 3f2a9b1c",
+])
+def test_rt4_b_legitimate_text_still_passes(text):
+    assert SS.incident_put(A, "inc-1", "INFO", text, 1762300800000)                                   # positive controls: the new rules are not a blanket refusal
+
+
+def test_rt4_b_a_uuid_in_a_typed_uuid_column_is_still_fine_and_hashes_are_exempt():
+    assert SS.plan(A, [SS.incident_put(A, "inc-1", "INFO", "t", 1762300800000)]).puts                # owner_id is a UUID column
+    assert SS.scan_value("ab" * 32, "h", frozenset({"h"})) == []                                      # a proven sha256 column is exempt
+
+
+def test_mutation_unicode_fold():
+    t = f"eyJhbGciOi{ZW}JIUzI1NiJ9.eyJzdWIiOiIx{ZW}MjM0NTY3ODkwIn0.abc"
+    m = _mutant('    s = _fold(s)\n', '    pass\n')
+    assert not [h for h in m._shape_rules(t) if h == "jwt"]                                           # mutant never folds: the zero-width JWT passes
+    assert "jwt" in SS._shape_rules(t)
+
+
+def test_rt4_b_field_names_are_folded_too():
+    assert SS.key_rule("pass​word") == "account_or_secret_field_name" and SS.key_rule("ｐａｓｓｗｏｒｄ")
+    assert SS.key_rule("trial_id") is None
+
+
+def test_rt4_a_same_digest_same_key_but_a_different_attested_row_is_a_conflict_not_a_collapse():
+    good = _reg_put()
+    row = dict(good.row, note="edited")
+    twin = SS.Put("experiment_registrations", row, attest=SS._registry_attest(row))                 # a valid attestation of a different row under the same digest
+    pl = SS.plan(A, [good, twin])
+    assert len(pl.puts) == 1 and len(pl.conflicts) == 1 and pl.collapsed == 0
+    assert SS.plan(A, [good, good]).collapsed == 1                                                    # positive control: an identical resend collapses

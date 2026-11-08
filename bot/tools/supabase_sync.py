@@ -35,6 +35,8 @@ import math
 import os
 import re
 import sys
+import unicodedata
+import ipaddress
 from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -527,6 +529,9 @@ _VALUE_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("url_secret_param", re.compile(r"(?i)[?&](api_?key|apikey|token|access_token|secret|sig|signature|key|auth)=[^&\s]{6,}")),
     ("assigned_secret", re.compile(r"(?i)\b(api[_-]?key|api[_-]?secret|secret|token|password|passwd)\b\s*[:=]\s*[\"']?[A-Za-z0-9._~+/=-]{8,}")),
     ("email_address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")),
+    ("uuid_in_text", re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![0-9A-Za-z])")),
+    ("internal_hostname", re.compile(r"(?i)(?<![A-Za-z0-9-])(?:[a-z0-9-]+\.)+(?:internal|intranet|corp|lan|local|localdomain|private|vpc|flycast)(?:\.[a-z0-9-]+)*(?![A-Za-z0-9-])")),
+    ("plain_english_secret", re.compile(r"(?i)\b(?:password|passwd|passphrase|pwd)\b\s*(?:is|was|=|:|equals|set to|changed to)\s+[\"']?(?P<w>[^\s\"',;]{4,})")),
     ("ipv4_address", re.compile(r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])")),
     ("long_hex_token", re.compile(r"(?<![0-9A-Za-z])(?:0[xX])?[0-9a-fA-F]{24,}(?![0-9A-Za-z])")),
     ("base32_token", re.compile(r"(?<![A-Za-z0-9])[A-Z2-7]{26,}=*(?![A-Za-z0-9])")),
@@ -538,6 +543,46 @@ _VALUE_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
 _OPAQUE_RUN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{18,}(?![A-Za-z0-9])")
 _ALNUM_RUN = re.compile(r"[A-Za-z0-9]{24,}")
 _B64_RUN = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+_LETTER_RUN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{18,}(?![A-Za-z0-9])")
+_IPV6_RUN = re.compile(r"(?<![A-Za-z0-9_:.])[0-9A-Fa-f:.]{3,}(?![A-Za-z0-9_])")
+#: words that follow 'password is' in ordinary prose and are not a password
+_PROSE_AFTER_PASSWORD = frozenset("""required missing empty blank unset none null stored hidden redacted rotated expired invalid wrong incorrect correct unknown changed reset set
+needed not never absent supplied provided managed handled held kept removed disabled enabled long short weak strong""".split())
+#: a letters-only token that is nothing but PascalCase / camelCase words of 3+ letters (and short acronyms) is an identifier, not a credential
+_WORDY = re.compile(r"^(?:[a-z]{3,})?(?:[A-Z][a-z]{2,}|[A-Z]{2,6}(?![a-z]))+$")
+
+
+def _fold(s: str) -> str:
+    """NFKC-normalise (full-width letters/punctuation become ASCII) and drop every format character (zero-width space/joiner, soft hyphen, bidi marks, BOM) before scanning."""
+    return "".join(c for c in unicodedata.normalize("NFKC", s) if unicodedata.category(c) != "Cf")
+
+
+def _has_ipv6(s: str) -> bool:
+    for m in _IPV6_RUN.finditer(s):
+        t = m.group(0).strip(".")
+        if t.count(":") >= 2:
+            try:
+                ipaddress.IPv6Address(t)
+                return True
+            except ValueError:
+                continue
+    return False
+
+
+def _plain_password(s: str) -> bool:
+    for m in _VALUE_RULES_BY_NAME["plain_english_secret"].finditer(s):
+        if m.group("w").lower().strip(".") not in _PROSE_AFTER_PASSWORD:
+            return True
+    return False
+
+
+def _letters_only_token(s: str) -> bool:
+    """18+ letters of mixed case that are not PascalCase words, or ANY mixed-case letters-only run of 36+: a key with no digits in it."""
+    for m in _LETTER_RUN.finditer(s):
+        t = m.group(0)
+        if re.search(r"[a-z]", t) and re.search(r"[A-Z]", t) and (len(t) >= 36 or not _WORDY.match(t)):
+            return True
+    return False
 
 
 def _entropy(t: str) -> float:
@@ -563,14 +608,23 @@ def _opaque_token(s: str) -> bool:
     return False
 
 
+_VALUE_RULES_BY_NAME = dict(_VALUE_RULES)
+
+
 def _shape_rules(s: str) -> List[str]:
-    hits = [name for name, rx in _VALUE_RULES if rx.search(s)]
-    if _opaque_token(s):
+    s = _fold(s)
+    hits = [name for name, rx in _VALUE_RULES if name != "plain_english_secret" and rx.search(s)]
+    if _plain_password(s):
+        hits.append("plain_english_secret")
+    if _has_ipv6(s):
+        hits.append("ipv6_address")
+    if _opaque_token(s) or _letters_only_token(s):
         hits.append("opaque_credential_like")
     return hits
 
 
 def key_rule(k: str) -> Optional[str]:
+    k = _fold(k)
     n = re.sub(r"[^a-z0-9]", "", k.lower())
     if n in _KEY_EXACT:
         return "account_or_secret_field_name"
@@ -639,10 +693,28 @@ def scan_row(table: str, row: Mapping[str, Any]) -> List[str]:
 
 # ------------------------------------------------------------------ rows, plans
 
+#: Process-private key: only ``registration_puts`` can produce a valid attestation, so a hand-built or ``dataclasses.replace``-edited registration Put cannot carry a digest it did not earn.
+_ATTEST_KEY = os.urandom(32)
+
+
+def _registry_attest(row: Mapping[str, Any]) -> str:
+    """Binds a registration row's content to the registry ``entry_digest`` it was built with. Any change to any column, or a different digest, breaks it."""
+    body = canonical_json({k: v for k, v in row.items() if k != "content_sha256"})
+    return hashlib.sha256(_ATTEST_KEY + b"|registry/1|" + sha256_text(body).encode() + b"|" + str(row.get("content_sha256")).encode()).hexdigest()
+
+
 @dataclasses.dataclass(frozen=True)
 class Put:
     table: str
     row: Mapping[str, Any]
+    attest: Optional[str] = None            # registrations only: see _registry_attest
+
+
+def _put_problems(put: "Put") -> List[str]:
+    """Problems that need the Put itself (not just the row): a registration's digest must be the one ``registration_puts`` attested."""
+    if put.table == "experiment_registrations" and (not isinstance(put.attest, str) or put.attest != _registry_attest(put.row)):
+        return ["content_sha256:registry_digest_not_attested"]
+    return []
 
 
 def _uuid(owner_id: Any) -> str:
@@ -731,7 +803,7 @@ def registration_puts(owner_id: str, entry: Mapping[str, Any], *, source: Option
         "costs": _json_col(entry["costs"]), "statistical_design": _json_col(entry["statistical_design"]), "train_test": _json_col(entry["train_test"]),
         "multiple_testing_family": str(entry["multiple_testing_family"]), "prospective_period": pp if isinstance(pp, str) else canonical_json(pp),
         "registered_utc": utc(entry["registered_utc"]), "note": entry.get("note")}, source=src, content=_registry_digest(entry))
-    return [hyp, reg]
+    return [hyp, Put(reg.table, reg.row, attest=_registry_attest(reg.row))]
 
 
 def evidence_put(owner_id: str, trial_id: str, level: str, *, result: str, provenance: str, details: Optional[Mapping[str, Any]] = None, recorded_utc: Any,
@@ -938,13 +1010,15 @@ def verify_import_report(report: Any) -> List[str]:
         out.append(f"status:{status}_without_a_realised_cash_layer")
     if real is not None and real.get("status") != status:
         out.append("status:differs_from_the_realised_cash_layer")
-    headline = report.get("headline_profit_usd")
+    headline = report.get("headline_realised_cash_usd")
     if headline is not None:
         net = real.get("net_realised_cash_usd") if real is not None else None
         if status not in _PROFIT_STATUSES:
             out.append(f"headline:non_null_under_{status}")
         elif net is None or headline != net:
             out.append("headline:not_the_realised_cash_net")
+        if report.get("headline_basis") != "realised_cash_only":
+            out.append("headline:basis_not_declared_realised_cash_only")
     return out
 
 
@@ -1070,13 +1144,14 @@ def plan(owner_id: str, *groups: Iterable[Put], skipped: Sequence[str] = ()) -> 
     if findings:
         raise SecretGuardError(findings)
     for i, p in enumerate(flat):
-        bad = row_problems(p.table, p.row)
+        bad = row_problems(p.table, p.row) + _put_problems(p)
         if bad:
             raise SyncError(f"{p.table}[{i}]: {', '.join(bad[:6])}")
     cross = cross_problems(flat)
     if cross:
         raise SyncError("; ".join(cross[:6]))
     seen_hash: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
+    kept_row: Dict[Tuple[str, str], Mapping[str, Any]] = {}
     seen_key: Dict[Tuple[str, Tuple[Any, ...]], str] = {}
     kept: List[Put] = []
     conflicts: List[Put] = []
@@ -1085,7 +1160,7 @@ def plan(owner_id: str, *groups: Iterable[Put], skipped: Sequence[str] = ()) -> 
         nk = tuple(p.row.get(c) for c in NATURAL_KEY[p.table])
         h = p.row["content_sha256"]
         if (p.table, h) in seen_hash:
-            if seen_hash[(p.table, h)] == nk:
+            if seen_hash[(p.table, h)] == nk and dict(kept_row[(p.table, h)]) == dict(p.row):          # a collapse needs the SAME row, not merely the same digest
                 collapsed += 1
             else:
                 conflicts.append(p)
@@ -1094,6 +1169,7 @@ def plan(owner_id: str, *groups: Iterable[Put], skipped: Sequence[str] = ()) -> 
             conflicts.append(p)
             continue
         seen_hash[(p.table, h)] = nk
+        kept_row[(p.table, h)] = p.row
         if NATURAL_KEY[p.table]:
             seen_key[(p.table, nk)] = h
         kept.append(p)
@@ -1190,6 +1266,8 @@ def write(p: Plan, client: Any) -> WriteReport:
         raise SecretGuardError(findings)
     for i, put in enumerate(p.puts):
         bad = row_problems(put.table, put.row)
+        if put.table == "experiment_registrations" and put.attest != _registry_attest(put.row):
+            bad = bad + _put_problems(put)
         if bad:
             raise SyncError(f"{put.table}[{i}]: {', '.join(bad[:6])}")
     cross = cross_problems(p.puts)

@@ -73,7 +73,7 @@ def flag_codes(rep, sev=None):
 def no_profit_claim(rep):
     """An account that is not complete must never show a verified / reconciled profit, anywhere in the report."""
     assert rep["status"] in OI.STATUSES
-    assert rep["headline_profit_usd"] is None
+    assert rep["headline_realised_cash_usd"] is None
     for layer in rep["layers"].values():
         assert layer["status"] not in ("VERIFIED", "RECONCILED"), layer
     assert "RECONCILED" != rep["status"] and "VERIFIED" != rep["status"]
@@ -108,7 +108,7 @@ def test_a_clean_round_trip_reconciles_to_hand_arithmetic_and_the_second_impleme
     close(cash["figures"]["perp_fees_usd"], -32.725)
     close(cash["figures"]["funding_net_usd"], 9.0)
     close(cash["net_realised_cash_usd"], 476.275)
-    close(rep["headline_profit_usd"], 476.275)
+    close(rep["headline_realised_cash_usd"], 476.275)
     ind = indep(t.executions(), t.txlog())
     close(ind["net"], 476.275)
     close(ind["realised"], 500.0)
@@ -155,7 +155,7 @@ def test_identical_duplicate_fill_is_dropped_counted_and_changes_nothing(tmp_pat
     rep = OI.run_import(pairs + [("linear_execution", second)], marks=marks())
     assert rep["duplicates"]["identical_dropped"] == 2 and rep["duplicates"]["conflicting"] == []
     assert rep["status"] == "RECONCILED"
-    close(rep["headline_profit_usd"], 500.0 - 16.5 - 16.225 + 9.0)                  # not 476.275 + 500 - ...: counted once
+    close(rep["headline_realised_cash_usd"], 500.0 - 16.5 - 16.225 + 9.0)                  # not 476.275 + 500 - ...: counted once
     # positive/negative control: without the guard the realised leg would double to 1000
     assert abs(rep["layers"]["realised_cash"]["figures"]["perp_realised_usd"] - 500.0) < 1e-9
 
@@ -170,7 +170,7 @@ def test_conflicting_duplicate_is_disputed_and_computes_nothing(tmp_path):
     rep = OI.run_import(pairs, marks=marks())
     assert rep["status"] == "DISPUTED" and rep["layers"] == {}
     assert rep["duplicates"]["conflicting"][0]["id"] == "x1"
-    assert rep["headline_profit_usd"] is None and rep["status"] not in OI._PROFIT_OK
+    assert rep["headline_realised_cash_usd"] is None and rep["status"] not in OI._PROFIT_OK
     # the same disagreement inside the transaction log
     tx = t.txlog()
     tx.append(dict(tx[0], change="-1.0"))
@@ -187,8 +187,8 @@ def test_out_of_order_fills_and_a_newest_first_log_give_the_same_answer(tmp_path
     sub.mkdir()
     rep = run(sub, t, execs=list(reversed(t.executions())), txlog=t.txlog(newest_first=True))
     assert rep["status"] == "RECONCILED"
-    close(rep["headline_profit_usd"], base["headline_profit_usd"])
-    close(rep["headline_profit_usd"], 500.0 - 16.5 - 16.225 + 9.0)
+    close(rep["headline_realised_cash_usd"], base["headline_realised_cash_usd"])
+    close(rep["headline_realised_cash_usd"], 500.0 - 16.5 - 16.225 + 9.0)
 
 
 def test_partial_fills_reconcile_to_the_cent(tmp_path):
@@ -201,7 +201,7 @@ def test_partial_fills_reconcile_to_the_cent(tmp_path):
     close(fees, 6.6 + 9.9 + 9.735 + 6.545)
     net = 400.0 - 32.78 + 9.0
     assert rep["status"] == "RECONCILED"
-    close(rep["headline_profit_usd"], net)
+    close(rep["headline_realised_cash_usd"], net)
     close(indep(t.executions(), t.txlog())["net"], net)
     assert rep["layers"]["realised_cash"]["figures"]["perp_realised_usd"] == pytest.approx(400.0)
 
@@ -230,7 +230,7 @@ def test_spot_fee_in_quote_coin_costs_cash_and_in_base_coin_reduces_held_quantit
     close(closing["BTC"], btc_after)
     close(closing["USDT"], usdt_after + 476.275)
     # the perpetual net is unaffected by how the spot fee was paid
-    close(rep["headline_profit_usd"], 476.275)
+    close(rep["headline_realised_cash_usd"], 476.275)
 
 
 def test_a_base_coin_fee_written_as_usd_is_refused_as_a_unit_slip(tmp_path):
@@ -324,9 +324,9 @@ def test_missing_mark_leaves_the_inventory_unvalued_never_zero(tmp_path):
     assert "INVENTORY_UNVALUED" in flag_codes(rep)
     # the cash leg that needs no mark is still shown, but unanchored to balances: PROVISIONAL, not RECONCILED
     assert rep["status"] == "PROVISIONAL" and rep["layers"]["realised_cash"]["status"] == "PROVISIONAL"
-    # CHANGED in integration review: this used to assert headline_profit_usd == 476.275 here. That figure omitted interest and every other statement line (unknown, not zero), so a
+    # CHANGED in integration review: this used to assert headline_realised_cash_usd == 476.275 here. That figure omitted interest and every other statement line (unknown, not zero), so a
     # PROVISIONAL account headlined a profit it could not support. The known components are now reported only as a labelled partial.
-    assert rep["headline_profit_usd"] is None
+    assert rep["headline_realised_cash_usd"] is None
     close(rep["layers"]["realised_cash"]["partial_net_of_known_components_usd"], 476.275)
 
 
@@ -580,6 +580,17 @@ def test_unknown_components_are_not_zero_so_a_partial_sum_is_never_the_headline(
     pairs = F.lay_out(tmp_path, F.Trip(), with_wallets=False)
     rep = OI.run_import(pairs)
     layer = rep["layers"]["realised_cash"]
-    assert rep["headline_profit_usd"] is None and layer["net_realised_cash_usd"] is None
+    assert rep["headline_realised_cash_usd"] is None and layer["net_realised_cash_usd"] is None
     assert set(layer["unknown_components"]) == {"interest_usd", "other_cash_lines_usd"}
     assert isinstance(layer["partial_net_of_known_components_usd"], float)            # reported, labelled, never the headline
+
+
+# ---------------------------------------------------------------- the headline is realised cash, said so, and is not the verdict's figure
+
+def test_the_headline_is_named_and_labelled_realised_cash_and_the_economic_total_can_be_negative(tmp_path):
+    rep = run(tmp_path, Trip())
+    assert "headline_profit_usd" not in rep                                         # the misleading name is gone
+    assert rep["headline_basis"] == OI.HEADLINE_BASIS == "realised_cash_only"
+    assert "NOT total profit" in rep["headline_caveat"] and "economic_total" in rep["headline_caveat"]
+    assert rep["headline_realised_cash_usd"] > 0 > rep["layers"]["economic_total"]["net_economic_pnl_usd"]     # the very case the old name hid
+    assert "headline_realised_cash_usd" in rep["lineage"]["figures"] and "REALISED CASH ONLY" in rep["lineage"]["figures"]["headline_realised_cash_usd"]["formula"]
