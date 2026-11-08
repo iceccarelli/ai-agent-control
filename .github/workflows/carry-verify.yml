@@ -55,7 +55,7 @@ jobs:
   carry-correctness:
     name: carry correctness (python ${{ matrix.python }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90          # the gate grew (multi-symbol, Testnet and control-centre suites): 3.11 took ~26 min and 3.12 hit the old 40-minute limit (reported as 'cancelled')
     strategy:
       fail-fast: false
       matrix:
