@@ -392,3 +392,22 @@ It signs only observed-stage items (prospective, execution, owner result), and o
 **A changed spec is a new candidate.** The registry stores the spec digest and the cost-chain declarations (fees, slippage, funding, capacity, execution, holding period, eligibility, OOS protocol, parameter grid) at registration. A spec whose digest differs gets INSUFFICIENT_DATA with `SPEC_DIFFERS_FROM_REGISTERED(<what changed>)`. To change anything legitimately, register a NEW candidate id/version and start its ladder again. A registration from before digests were stored reports `REGISTERED_SPEC_DIGEST_MISSING`: its observed evidence is not counted, so it stays below QUALIFIED; re-register it as a new version.
 
 **What they prove, and what they do not.** The key proves that the key holder signed these claims about this candidate and spec. The anchor proves the registry still has the history it had when you recorded the anchor. Neither proves the claims are true: a key holder can sign a falsehood, and nothing here independently checks the exchange, the fills or the account. QUALIFIED means "consistent claims you signed on a registry you anchored", not "verified profit".
+
+## Universe and status capture: what to run in your Codespace and how to read the result
+
+The capture is read-only and unsigned (the `public_collector` role: GET of two allow-listed public paths, no credential), but Bybit geo-blocks some hosts, so YOU run it from your own Codespace, writing OUTSIDE the repository (the tool refuses an output directory inside this repo or any git work tree).
+
+```bash
+cd bot
+install -d -m 700 ~/datasets
+python3 tools/universe_capture.py capture --out-dir ~/datasets/universe-$(date -u +%Y%m%dT%H%M%SZ) --private-root ~/datasets --categories linear
+# optionally: --categories linear,inverse,spot   --statuses Trading,PreLaunch,Closed
+python3 tools/universe_capture.py verify --dir ~/datasets/universe-<that directory>
+python3 tools/universe_capture.py diff <old>/universe-<ms>.jsonl <new>/universe-<ms>.jsonl
+```
+
+`capture` asks for `instruments-info` with no status (the control: what the venue returns by default) and once per status (Trading, PendingOpen, PreLaunch, Delivering, Closed), each cursor-paginated (the venue's percent-encoded cursor is sent back unchanged), then one tickers snapshot. It prints a JSON summary and exits 0 only for `COMPLETE`, 3 for `CONFLICTED`/`PARTIAL`, 4 for `STALE`/`UNVERIFIED`, 2 for a refusal. Every response is stored byte for byte (0600) with its hash; `manifest.json` (schema `universe_capture/v2`) lists them.
+
+How to read it. Each partition has one outcome: `OBSERVED_ROWS`, `OBSERVED_EMPTY`, `REFUSED_BY_VENUE:<code>/<msg>` (the venue said no; this is recorded, not a crash), `TRANSPORT_ERROR:<class>`, or `PARTIAL` (the cursor chain broke: repeated cursor, empty page that names a cursor, a page that repeats an earlier first row, page cap, a later page missing). `delisting_observability` is `OBSERVED` only when the `Closed` partition was answered with a complete cursor chain and every row really was `Closed`; a venue that ignores the status parameter is recorded as `REFUSED_BY_VENUE:status_param_not_honored(...)`, never credited. `dataset_status`: `CONFLICTED` means two different records for one symbol (or one symbolId on two symbols) exist inside the capture, listed under `conflicts` with the differing fields; nothing is merged. `ticker_reconciliation` lists tickers with no instrument in any partition (ORPHAN) and instruments with no ticker; hyphenated dated futures in the tickers are counted under `rejected_tickers`, not fatal. `verify` re-hashes every file and re-derives all of the above from the raw bytes; hand a directory to anyone else only after `verify` says `"ok": true`.
+
+What the `Closed` partition can and cannot prove. It shows only the instruments the venue still serves with that status today. It can establish that those instruments were delisted/expired as of this capture, with their last published rules. It cannot show instruments the venue has dropped entirely, it says nothing about the history before your first capture (which is NOT point-in-time verified), and an empty or refused `Closed` partition proves nothing about whether delistings occurred. Point-in-time evidence only starts from the first verified capture; repeat the capture on a schedule and use `diff` to see listings, status transitions, symbol renames (same symbolId, new symbol) and changed tick, lot, leverage, funding-interval and cap rules.
