@@ -281,7 +281,7 @@ def _engine_symbols() -> Sequence[str]:
 #: taker figures are `carry_costs`' own constants; the maker figures are the
 #: `config.py` linear/spot defaults (a test pins both to `config.load({})`).
 #: The live account's tier is read from the venue at run time and may differ.
-PERP_MAKER_BPS = 2.0
+PERP_MAKER_BPS = costs.MAKER_BPS_PERP_MODELLED
 SPOT_MAKER_BPS = 10.0
 
 
@@ -664,7 +664,8 @@ def single_print_ceiling(rows: Sequence[Settle], cost_levels: Sequence[float]
 
 
 def funding_persistence(rows: Sequence[Settle], hold: int,
-                        cost_levels: Sequence[float] = (4.0, 11.0, 13.0)
+                        cost_levels: Sequence[float] = (costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED,
+                                                        costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY, 13.0)
                         ) -> Dict[str, Any]:
     """How well does the gate's smoothed rate predict the funding actually
     collected over the hold? OLS of realised hold-funding on the EWMA at entry."""
@@ -1034,7 +1035,7 @@ def build_report(repo: str, *, discovery_start: float, discovery_end: float,
                          "share_at_or_above_1bp": (
                              sum(1 for r in rows if _year(r.ms) == 2026 and r.rate_bps >= 1.0)
                              / max(1, len([r for r in rows if _year(r.ms) == 2026])))},
-        "single_print_harvest_ceiling": single_print_ceiling(rows, (cost_maker, 11.0, cost_taker)),
+        "single_print_harvest_ceiling": single_print_ceiling(rows, (cost_maker, costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY, cost_taker)),
         "funding_persistence": funding_persistence(rows, hold),
         "funding_formula_check": funding_formula_check(rows),
         "window_timing_bybit": window_timing(rows),

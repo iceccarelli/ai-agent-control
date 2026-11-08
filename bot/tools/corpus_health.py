@@ -269,6 +269,17 @@ def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
     for report in reports:
         report.pop("_days", None)
 
+    # Two different questions, kept apart so one cannot be read as the other:
+    #   data freshness   - is the corpus behind the clock? Goes red on its own as
+    #                      real time passes with no refresh; says NOTHING about
+    #                      the code. (STALE:*)
+    #   data integrity   - is what IS in the files well formed and aligned?
+    #                      (missing/empty/duplicate/holes/open bar/ordering)
+    # `healthy` keeps its old meaning (both). The code-correctness signal is the
+    # test suite: `pytest -m "not data_freshness"`.
+    freshness_problems = [p for p in problems if ": STALE:" in p]
+    integrity_problems = [p for p in problems if p not in freshness_problems]
+
     return {
         "checked_utc": str(today),
         "asset": str(asset).upper(),
@@ -282,6 +293,10 @@ def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
         "coverage_differences": coverage,
         "series_too_stale": too_stale,
         "problems": problems,
+        "freshness_problems": freshness_problems,
+        "integrity_problems": integrity_problems,
+        "data_fresh": not freshness_problems,
+        "data_integrity_ok": not integrity_problems and not alignment,
         "healthy": not problems and not alignment,
         "note": ("carry_backtest INTERSECTS these series silently. A day present "
                  "in one and missing from another is dropped without comment, "
@@ -335,7 +350,17 @@ def main(argv=None) -> int:
               f"{report['max_stale_days']} days stale.")
         print("  A book deciding on today's funding against a two-week-old spot")
         print("  mark is not hedged. It is guessing, and it would not say so.")
-    print(f"\n  healthy: {report['healthy']}")
+    print("\n  DATA INTEGRITY (what is in the files):  "
+          f"{'OK' if report['data_integrity_ok'] else 'PROBLEMS'}")
+    for problem in report["integrity_problems"]:
+        print(f"    ! {problem}")
+    print("  DATA FRESHNESS (behind the clock; not a code defect):  "
+          f"{'FRESH' if report['data_fresh'] else 'STALE'}")
+    for problem in report["freshness_problems"]:
+        print(f"    ! {problem}")
+    print("  CODE CORRECTNESS is not measured here: "
+          "`pytest -m \"not data_freshness\"`.")
+    print(f"\n  healthy (integrity AND freshness): {report['healthy']}")
     print(f"  {report['note']}")
 
     if args.out:

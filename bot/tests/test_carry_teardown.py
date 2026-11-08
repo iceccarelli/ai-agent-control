@@ -348,7 +348,7 @@ def test_the_tool_imports_only_the_pure_modules_and_reads_no_runtime_state():
             got |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom):
             got.add((n.module or "").split(".")[0])
-    assert got <= {"__future__", "argparse", "datetime", "gzip", "json", "math", "os", "sys", "typing", "evidence_stats", "statistical_power", "trade_economics"}, got
+    assert got <= {"__future__", "argparse", "datetime", "gzip", "json", "math", "os", "sys", "typing", "evidence_stats", "statistical_power", "trade_economics", "carry_costs"}  # carry_costs: the pure cost vocabulary (math, dataclasses, typing only), got
     for forbidden in ("trading_state", "testnet_session_evidence", "runs/", ".env", "requests", "urllib", "socket"):
         assert forbidden not in src, forbidden
 

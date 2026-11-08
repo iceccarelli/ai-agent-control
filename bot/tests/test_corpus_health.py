@@ -125,3 +125,49 @@ class TestItOnlyReads:
         """A health check that fixes things is one nobody can trust."""
         assert "healthy" in report
         assert isinstance(report["problems"], list)
+
+
+class TestFreshnessIsReportedApartFromIntegrity:
+    """A stale corpus must never read as healthy, and staleness must not be mistaken for a structural or code defect."""
+
+    @staticmethod
+    def _corpus(tmp_path, last_day, today):
+        import csv
+        import gzip
+        for name, rel, col, per in ch.series_for("BTC"):
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(path, "wt", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow([col])
+                d = last_day - dt.timedelta(days=5)
+                while d <= last_day:
+                    for k in range(per):
+                        if col == "funding_time_ms":
+                            ts = int(dt.datetime(d.year, d.month, d.day, 8 * k, tzinfo=dt.timezone.utc).timestamp() * 1000)
+                            w.writerow([ts])
+                        else:
+                            w.writerow([f"{d}T00:00:00Z"])
+                    d += dt.timedelta(days=1)
+        return ch.check(str(tmp_path), today=today)
+
+    def test_a_current_corpus_is_fresh_and_healthy(self, tmp_path):
+        today = dt.date(2026, 11, 8)
+        r = self._corpus(tmp_path, today - dt.timedelta(days=1), today)
+        assert r["data_fresh"] and r["freshness_problems"] == [] and r["healthy"]
+
+    def test_a_stale_corpus_is_never_healthy_and_the_staleness_is_a_freshness_problem_only(self, tmp_path):
+        today = dt.date(2026, 11, 8)
+        r = self._corpus(tmp_path, today - dt.timedelta(days=40), today)
+        assert not r["healthy"] and not r["data_fresh"]
+        assert r["freshness_problems"] and all(": STALE:" in p for p in r["freshness_problems"])
+        assert r["data_integrity_ok"] and r["integrity_problems"] == []      # structurally fine: only the clock moved
+        assert set(r["series_too_stale"]) == {"perp_1d", "spot_1d", "funding"}
+
+    def test_an_integrity_defect_is_not_reported_as_staleness(self, tmp_path):
+        today = dt.date(2026, 11, 8)
+        r = self._corpus(tmp_path, today - dt.timedelta(days=1), today)
+        (tmp_path / ch.series_for("BTC")[1][1]).unlink()                     # spot removed
+        r = ch.check(str(tmp_path), today=today)
+        assert not r["healthy"] and not r["data_integrity_ok"] and any("MISSING" in p for p in r["integrity_problems"])
+        assert not any("MISSING" in p for p in r["freshness_problems"])

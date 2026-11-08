@@ -77,6 +77,30 @@ def _last_local_timestamps() -> dict:
     }
 
 
+def count_new_closed(timestamps_us, *, t1_ms: int, checked_ms: int,
+                     bar_ms: int) -> dict:
+    """Count rows strictly after t1 that were CLOSED as of ``checked_ms``.
+
+    ``bar_ms`` is the bar length (``DAY_MS`` for a daily bar, ``0`` for an
+    instantaneous event such as a funding print, which has no open state).
+    Rows that start after t1 but have not closed by ``checked_ms`` (the open
+    bar, or a row dated in the future) are NOT observations: they are returned
+    separately as ``open_or_future`` so that a corpus carrying one is a named
+    defect and never "new data". (Before this, every row after t1 counted, so an
+    in-progress bar written as a close reported ``new_bars_available: true``.)
+    """
+    closed = open_or_future = 0
+    for ts_us in timestamps_us:
+        start_ms = ts_us // 1000
+        if start_ms <= t1_ms:
+            continue
+        if start_ms + bar_ms <= checked_ms:
+            closed += 1
+        else:
+            open_or_future += 1
+    return {"closed_after_t1": closed, "open_or_future": open_or_future}
+
+
 def _attempt_fetch(symbol: str, after_ms: int) -> dict:
     """Try the project's sanctioned fetcher. Record whatever happens.
 
@@ -140,19 +164,51 @@ def main(argv=None) -> int:
     # source that has passed eligibility, so anything a fetch returned is
     # reported but not counted until a human ingests it through the sanctioned
     # corpus path with synthetic:false.
-    local_new_linear = sum(
-        1 for r in _rows(LINEAR_FILE)
-        if md.parse_timestamp(r["time_period_start"]) // 1000 > t1_ms)
-    local_new_funding = sum(
-        1 for r in _rows(FUNDING_FILE)
-        if md.parse_timestamp(r["funding_time"]) // 1000 > t1_ms)
+    checked_ms = int(checked.timestamp() * 1000)
+    linear_count = count_new_closed(
+        (md.parse_timestamp(r["time_period_start"]) for r in _rows(LINEAR_FILE)),
+        t1_ms=t1_ms, checked_ms=checked_ms, bar_ms=DAY_MS)
+    funding_count = count_new_closed(
+        (md.parse_timestamp(r["funding_time"]) for r in _rows(FUNDING_FILE)),
+        t1_ms=t1_ms, checked_ms=checked_ms, bar_ms=0)
+    local_new_linear = linear_count["closed_after_t1"]
+    local_new_funding = funding_count["closed_after_t1"]
 
     manifest_linear = json.load(open(os.path.join(
         REPO, "data", "real_linear_1d", "MANIFEST.json"), encoding="utf-8"))
     manifest_funding = json.load(open(os.path.join(
         REPO, "data", "real_funding", "MANIFEST.json"), encoding="utf-8"))
 
-    new_available = bool(local_new_linear > 0)
+    # Synthetic data is never an observation (section 43b): a manifest that does
+    # not declare synthetic == False cannot make new bars "available".
+    linear_real = manifest_linear.get("synthetic") is False
+    funding_real = manifest_funding.get("synthetic") is False
+    new_available = bool(local_new_linear > 0 and linear_real)
+
+    # DATA FRESHNESS, stated apart from everything else. "No new bars" is not
+    # "the corpus is current": a corpus that stopped growing months ago also has
+    # zero new bars. The lag is the clock minus the newest CLOSED row held.
+    newest_linear_ms = max((md.parse_timestamp(r["time_period_start"]) // 1000
+                            for r in _rows(LINEAR_FILE)), default=None)
+    newest_closed_linear_ms = None
+    if newest_linear_ms is not None:
+        newest_closed_linear_ms = newest_linear_ms \
+            if newest_linear_ms + DAY_MS <= checked_ms else None
+    lag_days = None if newest_linear_ms is None else \
+        max(0, (last_closed_ms - newest_linear_ms) // DAY_MS)
+    data_freshness = {
+        "scope": ("DATA FRESHNESS ONLY: how far the committed corpus is behind "
+                  "the clock. Says nothing about whether the code is correct; "
+                  "that signal is `pytest -m \"not data_freshness\"`."),
+        "corpus_lag_days_behind_last_closed_bar": lag_days,
+        "corpus_is_current": lag_days == 0,
+        "corpus_status": ("UNKNOWN_EMPTY" if lag_days is None else
+                          "CURRENT" if lag_days == 0 else "STALE"),
+        "open_or_future_rows": {"linear": linear_count["open_or_future"],
+                                "funding": funding_count["open_or_future"]},
+        "manifest_synthetic_false": {"linear": linear_real,
+                                     "funding": funding_real},
+    }
 
     payload = {
         "schema": SCHEMA,
@@ -173,6 +229,7 @@ def main(argv=None) -> int:
         "new_linear_bars_count": local_new_linear,
         "new_funding_prints_count": local_new_funding,
         "new_bars_available": new_available,
+        "data_freshness": data_freshness,
 
         "closed_bar_ceiling": {
             "last_bar_that_could_have_closed_utc": dt.datetime.fromtimestamp(
@@ -241,6 +298,14 @@ def main(argv=None) -> int:
     print(f"  new linear bars           : {local_new_linear}")
     print(f"  new funding prints        : {local_new_funding}")
     print(f"  NEW BARS AVAILABLE        : {new_available}")
+    print()
+    print("  -- DATA FRESHNESS (not a statement about code correctness) --")
+    print(f"  corpus status             : {data_freshness['corpus_status']}"
+          f" (lag {data_freshness['corpus_lag_days_behind_last_closed_bar']}"
+          " days behind the last closed bar)")
+    print(f"  open/future rows in corpus: "
+          f"{data_freshness['open_or_future_rows']}")
+    print("  code correctness is `pytest -m \"not data_freshness\"`")
     print(f"  bars fabricated           : 0")
     print(f"  corpus appended to        : False")
     print()

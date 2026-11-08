@@ -13,8 +13,8 @@ Every number carries exactly one provenance tag:
   PUBLIC_OBSERVATION  read from the committed public Bybit history (funding prints, 4h perp and spot klines, risk-limit table).
                       Public, observed, IN-SAMPLE, not account data and not tick-level.
   SIMULATED           computed by replaying a declared rule over that history (a rolling-start holding simulation).
-  ASSUMED             a declared input that nobody measured (the 11.4 bps round trip is the repository's PUBLISHED taker schedule,
-                      not the owner's account fee tier; the 10% reserve; the holding period).
+  ASSUMED             a declared input that nobody measured (the 11.4 bps round trip = 11.0 published two-leg perp taker fee
+                      + 0.4 ASSUMED spread allowance, see carry_costs; not the owner's account fee tier; the 10% reserve; the holding period).
   UNKNOWN             a required input that is not available. Never defaulted to a favourable value.
   MEASURED / ACCOUNT_VERIFIED   exist as tags and are NEVER produced here: no measurement of fills and no account record is read.
 
@@ -46,6 +46,7 @@ BOT = os.path.dirname(HERE)
 if BOT not in sys.path:
     sys.path.insert(0, BOT)
 
+import carry_costs as CC               # noqa: E402  (the one definition of every round-trip cost figure)
 import evidence_stats as ES            # noqa: E402
 import statistical_power as SP         # noqa: E402
 import trade_economics as TE           # noqa: E402
@@ -55,8 +56,9 @@ SETTLE_MS = 8 * 3_600_000
 BAR_MS = 4 * 3_600_000
 PER_DAY = 3
 TAGS = ("MEASURED", "ACCOUNT_VERIFIED", "PUBLIC_OBSERVATION", "SIMULATED", "ASSUMED", "UNKNOWN")
-DEFAULT_ROUND_TRIP_BPS = 11.4          # the repository's PUBLISHED taker schedule round trip; NOT the owner's account tier
-COST_SCENARIOS_BPS = (6.0, 11.4, 17.0)
+#: 11.4 = 11.0 (2 perp taker legs, published base tier: venue_stated) + 0.4 (ASSUMED spread allowance, unmeasured). NOT the owner's account tier.
+DEFAULT_ROUND_TRIP_BPS = CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY
+COST_SCENARIOS_BPS = (6.0, DEFAULT_ROUND_TRIP_BPS, 17.0)
 HOLD_DAYS = (7, 14, 30, 60, 90)
 HURDLES_PCT = TE.SCREENING_HURDLES_PCT
 FAMILY_TRIALS = 16                      # the opportunity engine's predeclared variant family
@@ -440,7 +442,7 @@ def build(funding_path: Optional[str] = None, perp_path: Optional[str] = None, s
         "unknowns": ["account fee tier", "market impact", "latency", "borrow", "operational cost", "owner hurdle", "owner alternative return",
                      "tick-level basis", "queue/fill behaviour", "account funding settlements", "future funding regime"],
         "limits": ["in-sample public history, not a forecast", "4h klines: intra-bar basis excursions are invisible",
-                   "the 11.4 bps round trip is the published schedule, not the owner's tier", "overlapping windows are not independent samples",
+                   "the 11.4 bps round trip is 11.0 published fee + 0.4 ASSUMED spread allowance, not the owner's tier", "overlapping windows are not independent samples",
                    "no tick-level execution, queue or latency model", "the holding rule is mechanical (no entry filter), a filtered rule would need pre-registration",
                    "the rolling-start simulation holds a FIXED BTC quantity (funding at each settlement's perp open, exit basis over the ENTRY spot); costs stay a constant bps of entry notional"],
     }
