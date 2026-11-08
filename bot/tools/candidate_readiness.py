@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Candidate readiness: for every research candidate (research/candidates/*.json plus the frozen BTC carry description), what is actually known, and the honest verdict.
 
-    python3 tools/candidate_readiness.py [--data-root DIR] [--json OUT] [--spot-symbols FILE]
+    python3 tools/candidate_readiness.py [--data-root DIR] [--json OUT] [--history-root ROOT --universe-dir DIR [--spot-dir DIR] [--mark-interval IV]]
 
 Offline, read-only. It never reads a credential, the network, bot/state or a database, and it writes nothing unless --json names a file. For each candidate it answers,
 with a reason and a data basis for each: required data present (real manifests under --data-root; absent = MISSING, never assumed), point in time, universe complete
@@ -20,7 +20,6 @@ pair) only as directional price+funding P&L (never as carry), and refuses a verd
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import os
@@ -40,6 +39,8 @@ import research_harness as RH  # noqa: E402
 import statistical_power as SP  # noqa: E402
 import strategy_verdict as SV  # noqa: E402
 import venues  # noqa: E402
+import market_history as MH  # noqa: E402
+import universe_capture as UC  # noqa: E402
 
 SCHEMA = "candidate_readiness/v1"
 CAND_DIR = os.path.join(BOT, "research", "candidates")
@@ -433,7 +434,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     """Walk-forward evaluation of 'short the perps with the highest trailing funding'. Every formation window in the grid is a variant counted in the multiple-testing
     family; the variant used out of sample is chosen on the TRAIN rows only. Returns a verdict capped at INSUFFICIENT_DATA (REJECTED when an adequately sized
     out-of-sample is non-positive). The trailing same-window observation is reported separately and labelled; it is not an expectation."""
-    spec = spec if spec is not None else dict(load_candidates()[[n for n, _ in load_candidates()].index("cross_sectional_funding")][1])
+    spec = spec if spec is not None else _default_spec()
     c = cost_constants()
     cost = float(round_trip_bps) if round_trip_bps is not None else c["perp_round_trip_total_bps"]
     unknown_iv = sorted(s.symbol for s in series if s.interval_min is None)
@@ -515,54 +516,156 @@ def _trailing(series: Sequence[SymbolSeries], days: int) -> Dict[str, Any]:
     return {"label": LABEL_TRAILING, "is_expectation": False, "window_days": days, "selection": "ranked AFTER the fact on this same window", "top": rows[:10]}
 
 
-# ---------------------------------------------------------------- market_history ingestion (adapter: layout is owned by the market_history writer)
-def load_market_history(path: str, *, reader: Optional[Callable[[str, Mapping[str, Any]], List[SymbolSeries]]] = None) -> Tuple[List[SymbolSeries], Dict[str, Any]]:
-    """Read a market_history/v1 directory: manifest schema, dataset_status and coverage are checked here; rows come from ``reader`` or the default reader.
-    DEFAULT READER LAYOUT (an ADAPTER ASSUMPTION to reconcile with the collector): manifest["symbols"] = {SYM: {"fundingInterval_min", "launchTime", "deliveryTime", "spot_listed",
-    "oi_usd", "funding_file", "mark_file"}}; each *_file is a CSV with header ts_ms,value (funding value in bps per print; mark is a price) inside the directory."""
-    m = _read_manifest(os.path.join(path, "manifest.json"))
-    if m is None:
-        raise RH.HarnessError("market_history manifest missing or unreadable")
-    if (m.get("schema") if m.get("schema") is not None else m.get("schema_version")) != "market_history/v1":
-        raise RH.HarnessError("manifest schema is not market_history/v1")
-    info = {"dataset_status": m.get("dataset_status"), "coverage": m.get("coverage")}
-    if m.get("dataset_status") not in ("COMPLETE", "OK", "PASS"):
-        info["warning"] = f"dataset_status {m.get('dataset_status')!r} is not COMPLETE: the evaluation inherits that"
-    return (reader or _default_reader)(path, m), info
+# ---------------------------------------------------------------- market_history ingestion (the layout is owned by tools/market_history.py)
+EXCLUDED_SYMBOL_STATUSES = ("CONFLICTED", "UNVERIFIED")
+SPOT_VERDICT_TO_LISTED = {"SPOT_TRADING": True, "SPOT_NOT_TRADING": False, "NO_SPOT_PAIR": False}      # UNRESOLVED_MULTIPLIER and anything else: unknown (None)
 
 
-def _csv(path: str) -> List[Tuple[int, float]]:
-    with open(path, newline="", encoding="utf-8") as f:
-        return sorted((int(r["ts_ms"]), float(r["value"])) for r in csv.DictReader(f))
+def _default_spec() -> Dict[str, Any]:
+    """The ranked-funding candidate spec, found BY NAME (never by position in the candidate list)."""
+    for n, sp in load_candidates():
+        if n == "cross_sectional_funding":
+            return dict(sp)
+    raise RH.HarnessError("candidate 'cross_sectional_funding' not found among the research candidates")
 
 
-def _default_reader(path: str, m: Mapping[str, Any]) -> List[SymbolSeries]:
+def _verified_dataset(root: str, name: str) -> Tuple[Dict[str, Any], str]:
+    ddir = os.path.join(root, name)
+    if os.path.islink(ddir) or not os.path.isdir(ddir):
+        raise RH.HarnessError(f"dataset {name!r} not found under the history root")
+    v = MH.verify_dataset(ddir)
+    if not v.get("ok"):
+        raise RH.HarnessError(f"dataset {name!r} does not verify: " + "; ".join(str(x) for x in v.get("problems", [])[:3]))
+    with open(os.path.join(ddir, "manifest.json"), "rb") as fh:
+        man = json.loads(fh.read())
+    return man, ddir
+
+
+def _rows(ddir: str, sym: str) -> List[Dict[str, Any]]:
     out = []
-    syms = m.get("symbols")
-    if not isinstance(syms, dict):
-        raise RH.HarnessError("manifest has no symbols map (reconcile the default reader with the collector layout or pass reader=)")
-    for sym in sorted(syms):
-        e = syms[sym]
-        for k in ("funding_file", "mark_file"):
-            fn = e.get(k)
-            if not isinstance(fn, str) or fn != os.path.basename(fn):
-                raise RH.HarnessError(f"{sym}: unsafe or missing {k}")
-        iv = e.get("fundingInterval_min")
-        d = e.get("deliveryTime")
-        out.append(SymbolSeries(sym, iv if isinstance(iv, int) and not isinstance(iv, bool) and iv > 0 else None, _csv(os.path.join(path, e["funding_file"])),
-                                _csv(os.path.join(path, e["mark_file"])), int(e.get("launchTime") or 0), int(d) if d else None, e.get("spot_listed"), e.get("oi_usd")))
+    with open(os.path.join(ddir, sym, "rows.jsonl"), "rb") as fh:
+        for line in fh.read().splitlines():
+            r = json.loads(line)
+            if isinstance(r, dict) and isinstance(r.get("ts"), int) and isinstance(r.get("v"), dict):
+                out.append(r)
     return out
+
+
+def _mark_dataset_name(root: str, mark_interval: Optional[str]) -> Tuple[str, str]:
+    if mark_interval is not None:
+        return MH.dataset_dirname(MH.MARK, str(mark_interval)), str(mark_interval)
+    found = sorted(n for n in (os.listdir(root) if os.path.isdir(root) else []) if n.startswith(MH.MARK + "-"))
+    if len(found) != 1:
+        raise RH.HarnessError(f"mark_interval not given and {len(found)} mark-kline datasets found under the root (need exactly one)")
+    return found[0], found[0][len(MH.MARK) + 1:]
+
+
+def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None) -> Tuple[List[SymbolSeries], Dict[str, Any]]:
+    """Series from a market_history root written by ``tools/market_history.py``: ``<root>/funding``, ``<root>/mark-kline-<interval>`` (rows.jsonl per symbol), plus a verified
+    universe_capture directory (launch / delivery / fundingInterval_min) and optionally a spot-instruments snapshot (hedgeability).
+
+    Nothing unverified is evaluated: each dataset must pass ``market_history.verify_dataset``, the universe ``universe_capture.verify_capture_dir`` with a RE-DERIVED
+    dataset_status of COMPLETE or PARTIAL (PARTIAL is a warning), the spot snapshot ``verify_spot``; otherwise HarnessError. Funding is stored as a decimal FRACTION per print
+    (bps = rate * 1e4); the mark is the kline close. Symbols must be in both datasets AND the universe; CONFLICTED / UNVERIFIED symbols and symbols missing anywhere are
+    excluded and LISTED in ``info['excluded']``; other non-COMPLETE symbol statuses are kept and reported in ``info['non_complete_symbols']``. Gaps are never filled."""
+    from decimal import Decimal, InvalidOperation
+    if not isinstance(universe_dir, str) or not universe_dir:
+        raise RH.HarnessError("universe_dir is required: instrument attributes do not live in the history manifests")
+    if not os.path.isdir(root) or os.path.islink(root):
+        raise RH.HarnessError("history root not found")
+    try:
+        recs, uinfo = MH.load_universe_dir(universe_dir)          # verify_capture_dir ok AND re-derived status COMPLETE|PARTIAL, else HistoryError
+    except (MH.HistoryError, OSError, UC.CaptureError) as exc:
+        raise RH.HarnessError(f"universe capture refused: {exc}") from exc
+    mark_name, mark_iv = _mark_dataset_name(root, mark_interval)
+    fman, fdir = _verified_dataset(root, MH.FUNDING)
+    mman, mdir = _verified_dataset(root, mark_name)
+    verdicts: Dict[str, str] = {}
+    hedge_info: Optional[Dict[str, Any]] = None
+    if spot_dir is not None:
+        try:
+            h = MH.hedge_availability(recs, spot_dir)
+        except (MH.HistoryError, OSError, ValueError, KeyError) as exc:
+            raise RH.HarnessError(f"spot snapshot refused: {exc}") from exc
+        verdicts = {k: x["verdict"] for k, x in h["by_symbol"].items()}
+        hedge_info = {"spot_snapshot": h["spot_snapshot"], "counts": h["counts"]}
+    excluded: List[Dict[str, str]] = []
+    non_complete: Dict[str, Dict[str, str]] = {}
+    warnings: List[str] = []
+    if uinfo.get("dataset_status") != "COMPLETE":
+        warnings.append(f"universe capture re-derived dataset_status {uinfo.get('dataset_status')!r}: the evaluation inherits that")
+    for nm, man in (("funding", fman), (mark_name, mman)):
+        if man.get("dataset_status") != "COMPLETE":
+            warnings.append(f"dataset {nm} dataset_status {man.get('dataset_status')!r}: the evaluation inherits that")
+    allsyms = sorted(set(fman["symbols"]) | set(mman["symbols"]))
+    series: List[SymbolSeries] = []
+    for sym in allsyms:
+        why = None
+        if sym not in recs:
+            why = "not_in_universe"
+        elif sym not in fman["symbols"]:
+            why = "not_in_funding_dataset"
+        elif sym not in mman["symbols"]:
+            why = "not_in_mark_dataset"
+        else:
+            sts = {"funding": fman["symbols"][sym].get("status"), mark_name: mman["symbols"][sym].get("status")}
+            bad = {k: v for k, v in sts.items() if v in EXCLUDED_SYMBOL_STATUSES or v is None}
+            if bad:
+                why = "symbol_status:" + ",".join(f"{k}={v}" for k, v in sorted(bad.items()))
+            elif any(v != "COMPLETE" for v in sts.values()):
+                non_complete[sym] = {k: str(v) for k, v in sts.items() if v != "COMPLETE"}
+        if why:
+            excluded.append({"symbol": sym, "reason": why})
+            continue
+        try:
+            fund = sorted((r["ts"], float(Decimal(r["v"]["fundingRate"]) * 10000)) for r in _rows(fdir, sym))
+            mark = sorted((r["ts"], float(Decimal(r["v"]["close"]))) for r in _rows(mdir, sym))
+        except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
+            raise RH.HarnessError(f"{sym}: rows.jsonl unreadable after verification: {type(exc).__name__}") from exc
+        if not fund or not mark:
+            excluded.append({"symbol": sym, "reason": "no_rows"})
+            continue
+        rec = recs[sym]
+        iv = rec.get("fundingInterval_min")
+        d = rec.get("deliveryTime")
+        launch = rec.get("launchTime")
+        series.append(SymbolSeries(sym, iv if isinstance(iv, int) and not isinstance(iv, bool) and iv > 0 else None, fund, mark,
+                                   launch if isinstance(launch, int) and not isinstance(launch, bool) and launch > 0 else 0,
+                                   d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None))
+    if non_complete:
+        warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
+    if excluded:
+        warnings.append(f"{len(excluded)} symbols excluded (listed in excluded)")
+    info: Dict[str, Any] = {"root": os.path.abspath(root), "mark_interval": mark_iv,
+                            "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
+                                         mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
+                            "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols")},
+                            "non_complete_symbols": non_complete, "excluded": excluded, "symbols_loaded": len(series), "warnings": warnings}
+    if hedge_info is not None:
+        info["hedge_verdicts"] = {s.symbol: verdicts.get(s.symbol) for s in series}
+        info["hedge"] = hedge_info
+    if warnings:
+        info["warning"] = "; ".join(warnings)
+    return series, info
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Candidate readiness table (offline, read-only).")
     ap.add_argument("--data-root", default=None, help="directory searched for real capture manifests; absent = MISSING")
     ap.add_argument("--json", default="", help="write the machine-readable report here")
-    ap.add_argument("--market-history", default="", help="a market_history/v1 directory: also run the ranked-funding walk-forward on it")
+    ap.add_argument("--history-root", default="", help="a market_history root (funding/, mark-kline-<interval>/): also run the ranked-funding walk-forward on it")
+    ap.add_argument("--universe-dir", default="", help="the verified universe_capture directory the history was built from (required with --history-root)")
+    ap.add_argument("--spot-dir", default=None, help="a spot-instruments snapshot dir (hedgeability; absent = unknown)")
+    ap.add_argument("--mark-interval", default=None, help="mark-kline interval (e.g. 240); needed when the root holds more than one")
     a = ap.parse_args(argv)
+    if a.history_root and not a.universe_dir:
+        ap.error("--history-root needs --universe-dir")
     rep = build_report(data_root=a.data_root)
-    if a.market_history:
-        series, info = load_market_history(a.market_history)
+    if a.history_root:
+        try:
+            series, info = load_history_root(a.history_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval)
+        except RH.HarnessError as exc:
+            ap.exit(2, f"refused: {exc}\n")
         rep["ranked_funding"] = {"input": info, **evaluate_ranked_funding(series)}
     print(render_table(rep))
     for r in rep["candidates"]:

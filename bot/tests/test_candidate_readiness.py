@@ -208,29 +208,181 @@ def test_walk_forward_rejects_when_costs_exceed_a_real_but_small_edge_with_enoug
     assert out["verdict"] in ("REJECTED", "INSUFFICIENT_DATA") and out["verdict"] != "QUALIFIED"
 
 
-def test_market_history_ingest_checks_schema_and_names(tmp_path):
-    d = tmp_path / "mh"
-    d.mkdir()
-    (d / "a_f.csv").write_text("ts_ms,value\n28800000,1.0\n57600000,2.0\n")
-    (d / "a_m.csv").write_text("ts_ms,value\n0,100\n28800000,101\n")
-    man = {"schema": "market_history/v1", "dataset_status": "COMPLETE", "coverage": {"first_ts": 0, "last_ts": 57600000},
-           "symbols": {"AAAUSDT": {"fundingInterval_min": 240, "launchTime": 0, "deliveryTime": 57600000, "spot_listed": False, "funding_file": "a_f.csv", "mark_file": "a_m.csv"}}}
-    (d / "manifest.json").write_text(json.dumps(man))
-    series, info = CR.load_market_history(str(d))
-    assert series[0].interval_min == 240 and series[0].delivery_ms == 57600000 and CR.hedgeability(series[0]) == "PERP_ONLY" and info["dataset_status"] == "COMPLETE"
-    man["schema"] = "market_history/v0"
-    (d / "manifest.json").write_text(json.dumps(man))
+# ------------------------------------------------------------------ round trip through the REAL market_history writer
+import socket  # noqa: E402
+
+import market_history as MH  # noqa: E402
+import test_market_history as TMH  # noqa: E402  (its scripted fetch / clock / universe helpers; none of its tests are re-collected from here)
+
+H4 = 4 * 3600 * 1000
+MARK_IV = "240"
+
+
+@pytest.fixture(autouse=False)
+def offline(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("network touched")
+    monkeypatch.setattr(socket.socket, "connect", boom)
+    monkeypatch.setattr(socket, "create_connection", boom)
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+
+
+def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT")):
+    """A real dataset root: universe capture (BTC/ETH 8h, FAST 240m, OLD Closed with a deliveryTime), funding + mark-kline-240 written by the real writer with a scripted
+    fetch / clock / sleep, and (optionally) a spot-instruments snapshot. Returns (root, universe_dir, spot_dir)."""
+    delivery = TMH.BASE - 60 * TMH.H8
+    root = tmp_path / "hist"
+    os.mkdir(root, 0o700)
+    uni = TMH._universe_dir(tmp_path, syms=syms, intervals={"FASTUSDT": 240}, bases={"FASTUSDT": "1000FAST"}, statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": delivery})
+    recs, info = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
+    fdata = {("funding", "BTCUSDT"): TMH.grid(TMH.FIRST, TMH.N, TMH.H8), ("funding", "ETHUSDT"): TMH.grid(TMH.FIRST, TMH.N, TMH.H8),
+             ("funding", "FASTUSDT"): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4), ("funding", "OLDUSDT"): TMH.grid(TMH.FIRST, TMH.N - 60, TMH.H8)}
+    fdata = {k: v for k, v in fdata.items() if k[1] in syms}
+    fspecs = MH.build_specs("funding", None, sorted(recs), TMH.START, TMH.END, recs)
+    fv = TMH.HV(fdata)
+    TMH.run(root, fspecs, fv, universe=info)
+    mdata = {("mark-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in syms if s != "OLDUSDT"}
+    if "OLDUSDT" in syms:
+        mdata[("mark-kline", "OLDUSDT")] = TMH.grid(TMH.FIRST, (delivery - TMH.FIRST) // H4 + 1, H4)
+    mspecs = MH.build_specs("mark-kline", MARK_IV, sorted(recs), TMH.START, TMH.BASE + 10, recs)
+    mv = TMH.HV(mdata)
+    for k, v in (mark_scripts or {}).items():
+        mv.script[k] = v
+    TMH.run(root, mspecs, mv, "mark-kline", MARK_IV, universe=info)
+    sd = None
+    if spot:
+        res = MH.capture_spot_instruments(str(root), fetch=lambda u: TMH.spot_body([TMH.spot_row("BTC"), TMH.spot_row("ETH", "USDC"), TMH.spot_row("FAST"), TMH.spot_row("OLD", status="Delisted")]),
+                                          clock=TMH.Clock(), sleep=lambda _s: None, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
+        sd = res["dir"]
+    return str(root), str(uni), sd
+
+
+def test_round_trip_real_writer_to_ranked_funding_plumbing(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path)
+    series, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    by = {s.symbol: s for s in series}
+    assert sorted(by) == ["BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT"], info
+    assert by["FASTUSDT"].interval_min == 240 and by["BTCUSDT"].interval_min == 480
+    assert by["OLDUSDT"].delivery_ms == TMH.BASE - 60 * TMH.H8
+    assert by["BTCUSDT"].delivery_ms is None and by["BTCUSDT"].launch_ms == TMH.FIRST - 1
+    assert by["BTCUSDT"].funding[0] == (TMH.FIRST, pytest.approx(1.0)) and by["BTCUSDT"].mark[0] == (TMH.FIRST, pytest.approx(100.5))      # 0.0001 fraction = 1 bp; mark = close
+    assert len(by["FASTUSDT"].funding) == 2 * TMH.N - 1 and by["OLDUSDT"].funding[-1][0] <= by["OLDUSDT"].delivery_ms
+    assert [by[s].spot_listed for s in ("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT")] == [True, False, None, False]       # SPOT_TRADING / NO_SPOT_PAIR / UNRESOLVED_MULTIPLIER / SPOT_NOT_TRADING
+    assert info["datasets"]["funding"]["dataset_status"] == "COMPLETE" and info["datasets"][f"mark-kline-{MARK_IV}"]["verified"] is True
+    assert info["universe"]["dataset_status"] in ("COMPLETE", "PARTIAL") and info["excluded"] == [] and "hedge_verdicts" in info
+    out = CR.evaluate_ranked_funding(series)
+    assert out["verdict"] in ("INSUFFICIENT_DATA", "UNTESTED") and out["status"] in ("TOO_FEW_HOLDING_ROWS", "WALK_FORWARD_DONE") and out["verdict"] != "QUALIFIED"
+    assert out["symbols"] == 4 and out["closed_contracts"] == 1 and out["intervals_min_counts"] == {"240": 1, "480": 3}
+
+
+def test_without_spot_data_hedgeability_is_unknown_not_assumed(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert {s.spot_listed for s in series} == {None} and {CR.hedgeability(s) for s in series} == {"HEDGE_UNKNOWN"}
+
+
+def test_mark_interval_is_discovered_when_unique_and_required_when_ambiguous(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    assert CR.load_history_root(root, universe_dir=uni)[1]["mark_interval"] == MARK_IV
+    os.mkdir(os.path.join(root, "mark-kline-60"))
     with pytest.raises(RH.HarnessError):
-        CR.load_market_history(str(d))
-    man["schema"] = "market_history/v1"
-    man["symbols"]["AAAUSDT"]["mark_file"] = "../a_m.csv"
-    (d / "manifest.json").write_text(json.dumps(man))
+        CR.load_history_root(root, universe_dir=uni)
+    assert CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[0]
+
+
+def _first_file(d, pattern):
+    return next(os.path.join(d, n) for n in sorted(os.listdir(d)) if n.startswith(pattern))
+
+
+@pytest.mark.parametrize("what", ["funding_raw_page", "funding_rows", "mark_rows", "mark_manifest", "universe_page", "spot_rows"])
+def test_tampering_with_any_input_makes_the_loader_refuse(tmp_path, offline, what):
+    root, uni, spot = _hist(tmp_path)
+    assert CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)[0]                  # positive control: untouched, it loads
+    target = {"funding_raw_page": os.path.join(root, "funding", "BTCUSDT", "page-000001.json"), "funding_rows": os.path.join(root, "funding", "ETHUSDT", "rows.jsonl"),
+              "mark_rows": os.path.join(root, f"mark-kline-{MARK_IV}", "BTCUSDT", "rows.jsonl"), "mark_manifest": os.path.join(root, f"mark-kline-{MARK_IV}", "manifest.json"),
+              "universe_page": _first_file(uni, "linear_Trading_page"), "spot_rows": os.path.join(spot, "rows.jsonl")}[what]
+    os.chmod(target, 0o600)
+    if what == "mark_manifest":                                   # a content change (trailing whitespace is not one: the digest covers the parsed content)
+        txt = open(target).read()
+        assert '"dataset_status": "COMPLETE"' in txt
+        open(target, "w").write(txt.replace('"dataset_status": "COMPLETE"', '"dataset_status": "PARTIAL"', 1))
+    else:
+        with open(target, "ab") as f:
+            f.write(b" ")
     with pytest.raises(RH.HarnessError):
-        CR.load_market_history(str(d))
-    man["dataset_status"] = "PARTIAL"
-    man["symbols"]["AAAUSDT"]["mark_file"] = "a_m.csv"
-    (d / "manifest.json").write_text(json.dumps(man))
-    assert "warning" in CR.load_market_history(str(d))[1]
+        CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+
+
+def test_a_missing_dataset_or_universe_is_refused(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path)
+    with pytest.raises(RH.HarnessError):
+        CR.load_history_root(root, universe_dir=str(tmp_path / "nowhere"), mark_interval=MARK_IV)
+    with pytest.raises(RH.HarnessError):
+        CR.load_history_root(root, universe_dir=uni, mark_interval="999")
+    with pytest.raises(RH.HarnessError):
+        CR.load_history_root(str(tmp_path / "nowhere"), universe_dir=uni, mark_interval=MARK_IV)
+
+
+def test_nothing_unverified_is_evaluated_when_the_verifier_says_not_ok(tmp_path, offline, monkeypatch):
+    root, uni, spot = _hist(tmp_path)
+    monkeypatch.setattr(MH, "verify_dataset", lambda d: {"ok": False, "problems": ["x"], "dataset_status": "COMPLETE"})
+    with pytest.raises(RH.HarnessError):
+        CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+
+
+def test_a_conflicted_symbol_is_excluded_and_listed_not_silently_dropped(tmp_path, offline):
+    t = TMH.FIRST + 5 * TMH.H8
+    bad = TMH.envelope("mark-kline", "ETHUSDT", [TMH.row_for("mark-kline", "ETHUSDT", TMH.BASE), TMH.row_for("mark-kline", "ETHUSDT", t), TMH.row_for("mark-kline", "ETHUSDT", t, row=[str(t), "100", "101", "99", "100.7"])], TMH.SERVER0)
+    root, uni, _ = _hist(tmp_path, spot=False, mark_scripts={("mark-kline", "ETHUSDT"): [bad]})
+    man = json.load(open(os.path.join(root, f"mark-kline-{MARK_IV}", "manifest.json")))
+    assert man["symbols"]["ETHUSDT"]["status"] == "CONFLICTED" and man["dataset_status"] == "CONFLICTED"
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert sorted(s.symbol for s in series) == ["BTCUSDT", "FASTUSDT", "OLDUSDT"]                      # only the conflicted symbol goes; the rest still load
+    assert info["excluded"] == [{"symbol": "ETHUSDT", "reason": f"symbol_status:mark-kline-{MARK_IV}=CONFLICTED"}]
+    assert info["datasets"][f"mark-kline-{MARK_IV}"]["dataset_status"] == "CONFLICTED" and "warning" in info
+
+
+def test_a_stale_symbol_is_kept_but_reported_non_complete(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    # OLD is COMPLETE only because of its delivery; make the live BTC symbol stale by giving it no recent funding
+    r2 = tmp_path / "h2"
+    os.mkdir(r2, 0o700)
+    recs, info = MH.load_universe_dir(uni, include_statuses=["Trading", "Closed"])
+    fv = TMH.HV({("funding", s): TMH.grid(TMH.FIRST, TMH.N - (50 if s == "BTCUSDT" else 0) - (60 if s == "OLDUSDT" else 0), TMH.H8) if s != "FASTUSDT" else TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in recs})
+    TMH.run(r2, MH.build_specs("funding", None, sorted(recs), TMH.START, TMH.END, recs), fv, universe=info)
+    mv = TMH.HV({("mark-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1 if s != "OLDUSDT" else (TMH.BASE - 60 * TMH.H8 - TMH.FIRST) // H4 + 1, H4) for s in recs})
+    TMH.run(r2, MH.build_specs("mark-kline", MARK_IV, sorted(recs), TMH.START, TMH.BASE + 10, recs), mv, "mark-kline", MARK_IV, universe=info)
+    series, info2 = CR.load_history_root(str(r2), universe_dir=uni, mark_interval=MARK_IV)
+    assert "BTCUSDT" in {s.symbol for s in series} and info2["non_complete_symbols"] == {"BTCUSDT": {"funding": "STALE"}} and info2["excluded"] == []
+    assert info2["datasets"]["funding"]["dataset_status"] == "STALE" and "warning" in info2
+
+
+def test_a_symbol_outside_the_universe_or_one_dataset_is_excluded_and_listed(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    # evaluate against a universe that lacks FASTUSDT
+    uni2 = TMH._universe_dir(tmp_path, syms=("BTCUSDT", "ETHUSDT", "OLDUSDT"), statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": TMH.BASE - 60 * TMH.H8}, name="uni2")
+    series, info = CR.load_history_root(root, universe_dir=str(uni2), mark_interval=MARK_IV)
+    assert "FASTUSDT" not in {s.symbol for s in series} and [x for x in info["excluded"] if x["symbol"] == "FASTUSDT"][0]["reason"] == "not_in_universe"
+
+
+def test_cli_history_root_requires_a_universe_and_runs_the_round_trip(tmp_path, offline, capsys):
+    root, uni, spot = _hist(tmp_path)
+    with pytest.raises(SystemExit):
+        CR.main(["--history-root", root])
+    with pytest.raises(SystemExit):
+        CR.main(["--market-history", root])                                                                         # the old assumed layout is gone
+    assert CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV]) == 0
+    assert "ranked funding:" in capsys.readouterr().out
+
+
+def test_the_default_spec_is_looked_up_by_name_not_position(monkeypatch):
+    real = CR.load_candidates()
+    monkeypatch.setattr(CR, "load_candidates", lambda: list(reversed(real)))
+    assert CR.evaluate_ranked_funding([])["verdict"] == "UNTESTED"                                                # order does not matter: found by name
+    assert CR._default_spec()["candidate_id"] == dict(real)["cross_sectional_funding"]["candidate_id"]
+    monkeypatch.setattr(CR, "load_candidates", lambda: [("zzz", {})])
+    with pytest.raises(RH.HarnessError):
+        CR.evaluate_ranked_funding([])
 
 
 # ------------------------------------------------------------------ mutation checks
