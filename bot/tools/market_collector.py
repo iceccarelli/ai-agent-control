@@ -39,6 +39,8 @@ What it cannot show: that the bytes came from the exchange (a hash proves what w
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -104,6 +106,10 @@ class CollectorError(ValueError):
 
 class SealError(CollectorError):
     pass
+
+
+class Locked(SealError):
+    """Another collector operation holds ``<root>/.lock``."""
 
 
 class RateLimited(Exception):
@@ -669,6 +675,33 @@ def _artifact(kind: str, symbol: str, file: str, body: bytes, url: str, recv: in
             **UC._skew(recv, info.get("venue_time_ms")), "validation": {k: v for k, v in info.items() if k != "venue_time_ms"}}
 
 
+def _inside(path: str, directory: str) -> bool:
+    """True when ``path`` is ``directory`` or anything under it AFTER resolving symlinks (an alias, a subdirectory or a link into the root is still inside)."""
+    rp, rd = os.path.realpath(path), os.path.realpath(directory)
+    return rp == rd or rp.startswith(rd + os.sep)
+
+
+LOCK_NAME = ".lock"
+
+
+@contextlib.contextmanager
+def _locked(root: str):
+    """Exclusive, NON-blocking flock on ``<root>/.lock`` for a whole operation (run_once, seal, backup, repair-log). A second concurrent operation gets ``Locked``
+    instead of renaming the first one's in-progress directory to ``.INCOMPLETE`` (reproduced). The kernel drops the lock when the process dies, so a crash never wedges it."""
+    if not os.path.isdir(root):
+        yield                                           # nothing exists to protect; the operation reports its own error
+        return
+    fd = os.open(os.path.join(root, LOCK_NAME), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise Locked(f"REFUSED_LOCKED: another collector operation holds {os.path.join(root, LOCK_NAME)}") from exc
+        yield
+    finally:
+        os.close(fd)
+
+
 def _refuse(status: str, **kw: Any) -> Dict[str, Any]:
     return {"status": status, **kw}
 
@@ -695,7 +728,15 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
         raise CollectorError("the output root must be a real directory, not a link")
     UC.AR._refuse_protected(os.path.join(root, LOG_NAME))
     os.makedirs(root, mode=0o700, exist_ok=True)
+    try:
+        with _locked(root):
+            return _run_locked(root, now_ms, fetch, clock, sleep, max_symbols, depth, trades_limit, interval_ms, reserve_bytes, max_bytes, free_bytes_fn, max_retries, backoff_s)
+    except Locked as exc:
+        return _refuse("REFUSED_LOCKED", reason=str(exc))
 
+
+def _run_locked(root: str, now_ms: int, fetch: Callable[[str], bytes], clock: Callable[[], int], sleep: Callable[[float], None], max_symbols: int, depth: int,
+                trades_limit: int, interval_ms: int, reserve_bytes: int, max_bytes: int, free_bytes_fn: Callable[[str], int], max_retries: int, backoff_s: float) -> Dict[str, Any]:
     # storage budget: refuse BEFORE anything is created, and report
     used, free = _tree_bytes(root), int(free_bytes_fn(root))
     if free < reserve_bytes or used > max_bytes:
@@ -833,7 +874,7 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
                     info["stale"] = bool(info["ok"] and (ts is None or recv - ts > bound or (kind == "book" and ts - recv > bound)))
                     artifacts.append(_artifact(kind, sym, fname, body, url, recv, info))
                     sleep(PAUSE_S)
-    except OSError as exc:                                  # e.g. disk full mid-cycle: the directory has no COMPLETE and is set aside next run
+    except (OSError, UC.CaptureError, CollectorError) as exc:   # e.g. disk full or a vanished file mid-cycle: a report, not a crash; the directory has no COMPLETE and is set aside next run
         return _refuse("ABORTED", cycle=cid, reason=f"{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------ manifest
@@ -897,8 +938,13 @@ def _describe_cycle(root: str, name: str) -> Dict[str, Any]:
 def seal_cycles(root: str, manifest: str, *, now_ms: Optional[int] = None, accept_problems: bool = False) -> Dict[str, Any]:
     """Append one chained row describing every COMPLETE cycle not yet sealed (and the ids in cycles.jsonl now). REFUSES over existing problems."""
     now = int(time.time() * 1000) if now_ms is None else _check_ms("now_ms", now_ms)
-    if os.path.dirname(os.path.abspath(manifest)) == os.path.abspath(root):
-        raise SealError("the seal manifest must not live in the collector's own directory: it is the outside memory")
+    if _inside(manifest, root):
+        raise SealError("the seal manifest must not live at or under the collector's own directory: it is the outside memory")
+    with _locked(os.path.abspath(root)):
+        return _seal_locked(root, manifest, now, accept_problems)
+
+
+def _seal_locked(root: str, manifest: str, now: int, accept_problems: bool) -> Dict[str, Any]:
     if os.path.isfile(manifest) and not accept_problems:
         prior = check_cycles(root, manifest)
         if not prior["ok"]:
@@ -987,20 +1033,48 @@ def copy_cycle_dir(src: str, dst: str) -> None:
             _write(target, fh.read())
 
 
-def backup_cycles(src: str, dest: str, receipts: str, copy_fn: Callable[[str, str], None] = copy_cycle_dir, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
-    """Copy every COMPLETE, self-consistent, recorded cycle to ``dest`` (never overwriting), re-hash the COPY, then write a chained receipt.
-    A corrupt copy is set aside as ``.REJECTED`` and gets no receipt."""
+def _sealed_cycles(manifest: str) -> Dict[str, Dict[str, Any]]:
+    """Every cycle the seal manifest describes (its first description: a cycle is sealed once)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if os.path.isfile(manifest):
+        for r in EC.rows_of(EC.read_lines(manifest)[0]):
+            if isinstance(r, dict):
+                for c in r.get("cycles", []):
+                    if isinstance(c, dict) and isinstance(c.get("cycle"), str):
+                        out.setdefault(c["cycle"], c)
+    return out
+
+
+def backup_cycles(src: str, dest: str, receipts: str, copy_fn: Callable[[str, str], None] = copy_cycle_dir, *, manifest: str, now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Copy every COMPLETE, self-consistent, recorded AND SEALED cycle to ``dest`` (never overwriting), re-hash the COPY against the sealed hashes, then write a chained
+    receipt. Bound to the seal ``manifest`` like ``md_seal.backup``: the whole backup is REFUSED when the root fails its seal or ``cycles.jsonl`` does not verify (a backup
+    would launder the damage). A cycle that is skipped because it fails its own manifest, is not recorded in cycles.jsonl, or is not sealed makes the result NOT ok
+    (an interrupted cycle without COMPLETE and an already-receipted one do not). A corrupt copy is set aside as ``.REJECTED`` and gets no receipt."""
     now = int(time.time() * 1000) if now_ms is None else _check_ms("now_ms", now_ms)
-    rs, rd = os.path.realpath(src), os.path.realpath(dest)
-    if rd == rs or rd.startswith(rs + os.sep):
+    if _inside(dest, src):
         raise SealError("the backup destination is the collector's own directory: a copy beside the original is lost with it")
+    if _inside(receipts, src) or _inside(manifest, src):
+        raise SealError("the receipts and the seal manifest must not live at or under the collector's own directory: they are the outside memory")
+    with _locked(os.path.abspath(src)):
+        return _backup_locked(src, dest, receipts, copy_fn, manifest, now)
+
+
+def _backup_locked(src: str, dest: str, receipts: str, copy_fn: Callable[[str, str], None], manifest: str, now: int) -> Dict[str, Any]:
+    chk = check_cycles(src, manifest)
+    if not chk["ok"]:
+        raise SealError(f"refusing to back up: the collector's root fails its seal manifest (a backup would launder the damage): {chk['problems'][:3]}")
+    log = os.path.join(src, LOG_NAME)
+    if not os.path.isfile(log) or not EC.verify(log).get("ok", False):
+        raise SealError(f"refusing to back up: {LOG_NAME} is missing or does not verify")
+    sealed = _sealed_cycles(manifest)
     os.makedirs(dest, exist_ok=True)
     have: Set[str] = set()
     if os.path.isfile(receipts):
         have = {r.get("cycle") for r in _log_rows(receipts)}
-    recorded = {r.get("cycle") for r in _log_rows(os.path.join(src, LOG_NAME))}
+    recorded = {r.get("cycle") for r in _log_rows(log)}
     done: List[Dict[str, Any]] = []
     skipped: List[str] = []
+    failed: List[str] = []
     rejected: List[str] = []
     for name in cycle_dirs(src, complete_only=False):
         sp = os.path.join(src, name)
@@ -1011,11 +1085,15 @@ def backup_cycles(src: str, dest: str, receipts: str, copy_fn: Callable[[str, st
             skipped.append(f"{name}: already backed up")
             continue
         if name not in recorded:
-            skipped.append(f"{name}: not recorded in {LOG_NAME}")
+            failed.append(f"{name}: not recorded in {LOG_NAME}; not backed up")
             continue
         prob = verify_cycle_dir(sp)
         if prob:
-            skipped.append(f"{name}: the source fails its own manifest ({prob[0]}); not copied")
+            failed.append(f"{name}: the source fails its own manifest ({prob[0]}); not copied")
+            continue
+        want = sealed.get(name)
+        if want is None:
+            failed.append(f"{name}: NOT SEALED (run seal first); not backed up")
             continue
         dp = os.path.join(dest, name)
         if os.path.lexists(dp):
@@ -1024,25 +1102,44 @@ def backup_cycles(src: str, dest: str, receipts: str, copy_fn: Callable[[str, st
         bad = verify_cycle_dir(dp) if os.path.isdir(dp) else ["the copy is missing"]
         if not bad and _file_sha(os.path.join(dp, "manifest.json")) != _file_sha(os.path.join(sp, "manifest.json")):
             bad = ["the copy's manifest differs from the source's"]
+        d: Dict[str, Any] = {}
+        if not bad:
+            d = _describe_cycle(dest, name)
+            if d["manifest_sha256"] != want.get("manifest_sha256") or d["tree_sha256"] != want.get("tree_sha256"):
+                bad = ["the copy differs from the sealed value"]
         if bad:
             if os.path.lexists(dp):
                 _aside(dp, ".REJECTED")
             rejected.append(f"{name}: {bad[0]}")
             continue
-        d = _describe_cycle(dest, name)
         EC.append(receipts, {"at_ms": now, "cycle": name, "manifest_sha256": d["manifest_sha256"], "tree_sha256": d["tree_sha256"], "files": len(d["files"]),
                              "bytes": sum(f["bytes"] for f in d["files"].values())})
         done.append({"cycle": name, "files": len(d["files"])})
-    return {"ok": not rejected, "backed_up": done, "skipped": skipped, "rejected": rejected}
+    return {"ok": not rejected and not failed, "backed_up": done, "skipped": skipped + failed, "failed": failed, "rejected": rejected}
 
 
-def restore_check(backup_dir: str, receipts: str) -> Dict[str, Any]:
-    """A backup is not proven until this passes: every receipted copy exists, is self-consistent and hashes as receipted."""
+def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, Any]:
+    """A backup is not proven until this passes: every receipted copy exists, is self-consistent and hashes as receipted, AND every cycle the seal ``manifest`` holds has
+    a receipt whose manifest and tree hashes equal the sealed ones (mirrors ``md_seal.restore_check``: a backup that silently omits a sealed cycle proves nothing)."""
     problems: List[str] = []
     if not os.path.isfile(receipts):
         return {"ok": False, "problems": ["no receipts"], "checked": 0}
     if not EC.verify(receipts).get("ok", False):
         problems.append("the receipts' own chain does not verify")
+    if not os.path.isfile(manifest):
+        problems.append("no seal manifest: nothing says which cycles the backup must hold")
+    else:
+        if not EC.verify(manifest).get("ok", False):
+            problems.append("the seal manifest's own chain does not verify")
+        latest = {r.get("cycle"): r for r in _log_rows(receipts)}
+        for name, want in sorted(_sealed_cycles(manifest).items()):
+            got = latest.get(name)
+            if got is None:
+                problems.append(f"{name}: sealed but has NO receipt (never backed up)")
+                continue
+            for k in ("manifest_sha256", "tree_sha256"):
+                if got.get(k) != want.get(k):
+                    problems.append(f"{name}: the receipt's {k} differs from the sealed value")
     n = 0
     for r in _log_rows(receipts):
         name = r["cycle"]
@@ -1068,6 +1165,11 @@ def repair_log(out_root: str) -> Dict[str, Any]:
     ``evidence_chain.repair``: the row is kept and marked ``resealed`` in the chain, a torn final line goes to ``cycles.jsonl.torn``. Refuses (changes nothing)
     when the file needs no repair or when anything before the tail fails to verify (that is tampering or loss, not a crash)."""
     root = os.path.abspath(out_root)
+    with _locked(root):
+        return _repair_locked(root)
+
+
+def _repair_locked(root: str) -> Dict[str, Any]:
     log = os.path.join(root, LOG_NAME)
     if not os.path.isfile(log):
         raise CollectorError(f"{LOG_NAME} does not exist under {root}")
@@ -1099,7 +1201,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     s.add_argument("--accept-problems", action="store_true")
     c = sub.add_parser("check"); c.add_argument("--root", required=True); c.add_argument("--manifest", required=True)
     b = sub.add_parser("backup"); b.add_argument("--root", required=True); b.add_argument("--to", required=True); b.add_argument("--receipts", required=True)
+    b.add_argument("--manifest", required=True, help="the seal manifest the root is checked against first")
     k = sub.add_parser("restore-check"); k.add_argument("--backup", required=True); k.add_argument("--receipts", required=True)
+    k.add_argument("--manifest", required=True, help="the seal manifest: every sealed cycle needs a matching receipt")
     g = sub.add_parser("repair-log", help="owner-invoked: reseal a crash's UNCHAINED_TAIL in cycles.jsonl (kept and marked resealed; never automatic)")
     g.add_argument("--out-root", required=True)
     a = ap.parse_args(argv)
@@ -1114,11 +1218,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif a.cmd == "check":
             res = check_cycles(a.root, a.manifest)
         elif a.cmd == "backup":
-            res = backup_cycles(a.root, a.to, a.receipts)
+            res = backup_cycles(a.root, a.to, a.receipts, manifest=a.manifest)
         elif a.cmd == "repair-log":
             res = repair_log(a.out_root)
         else:
-            res = restore_check(a.backup, a.receipts)
+            res = restore_check(a.backup, a.receipts, a.manifest)
     except (CollectorError, UC.CaptureError, UC.AR.RecordError, OSError, EC.ChainDesync) as exc:
         print(f"market_collector: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

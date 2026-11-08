@@ -328,6 +328,28 @@ overwritten or deleted. A backup is not proven until `restore-check` passes. Kee
 recorder's host cannot write (a printed page, another account): the code cannot protect a manifest its own writer can rewrite. The recorder's default retention deletes depth-log
 segments after 2 days; do not rely on retention for evidence you have not backed up and restore-checked. Nothing here schedules itself; the schedule and the storage are yours.
 
+**Back up BEFORE retention (operational consequence).** `python3 tools/md_seal.py check|seal ... --receipts <OTHER-VOLUME>/receipts.jsonl` excuses a sealed day that is no longer in the
+directory ONLY if all hold: it is older than the oldest segment still present; the receipts verify and hold a receipt for it whose last chain value equals the sealed one; and the oldest
+remaining segment's `chain_start` equals that receipt's last chain (a run of pruned days must chain unbroken). `pruned.jsonl` is written by the recorder and is not trusted for this. A day
+pruned by the recorder's `--retention-days` BEFORE it was backed up stays a loud failure: `check` says `MISSING ... NOT backed up`, and `seal` and `backup` refuse, because evidence that was
+never copied has vanished and nobody should be able to launder that by re-sealing. Therefore: run `seal`, then `backup`, then `restore-check` daily, and keep `--retention-days` longer than
+that cycle; pass `--receipts` to `check` and `seal` once retention has started pruning. If a day was pruned unbacked-up, investigate (is a copy elsewhere?); the manifest keeps reporting it (there is deliberately no automatic way to retire a sealed day: start a new
+manifest only as a recorded owner decision). `check` also reports any `md-YYYYMMDD.db` dated after today (UTC) as FUTURE and `seal` refuses it: a fabricated far-future file must not decide
+which segment is the newest. The seal manifest, receipts and backup may not be at, under, or a symlink into the recorder's directory.
+
+## The market collector: one run at a time; seal, back up, restore-check (owner-run; offline)
+`tools/market_collector.py run-once|seal|check|backup|restore-check|repair-log` take an exclusive non-blocking `flock` on `<out-root>/.lock` for the whole operation (the kernel drops it if the
+process dies). A second concurrent `run-once` returns `REFUSED_LOCKED` (no state touched; the first cycle is never renamed to `.INCOMPLETE`); `seal`, `backup` and `repair-log` refuse the same way
+with exit 2: retry after the running one finishes. An unexpected capture error mid-cycle is reported as `ABORTED` and the unfinished directory is set aside on the next run.
+
+    python3 tools/market_collector.py seal          --root <ROOT> --manifest <OTHER-VOLUME>/cseal.jsonl
+    python3 tools/market_collector.py backup        --root <ROOT> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/creceipts.jsonl --manifest <OTHER-VOLUME>/cseal.jsonl
+    python3 tools/market_collector.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/creceipts.jsonl --manifest <OTHER-VOLUME>/cseal.jsonl
+
+`backup` is bound to the seal manifest and `cycles.jsonl` like `md_seal backup`: it refuses when the root fails its seal or the log does not verify; only sealed, recorded, self-consistent cycles are
+copied and each copy must equal the sealed hashes. A cycle skipped because it fails its own manifest, is not in `cycles.jsonl` or is not sealed makes `ok` false (seal first, then back up).
+`restore-check` needs a receipt for every sealed cycle. Manifest and receipts may not be at, under or a symlink into the collector's root.
+
 ## The entry authority: why an opening order is refused, and what you must do (owner)
 Every order that can ADD exposure now passes one authority inside `BybitClient._request` (`entry_authority.py`), whoever the caller is: the carry book, `place_order`, the drills, the
 linear-stop drill, the unattended runner. A client with no authority refuses (`NO_ENTRY_AUTHORITY`). A reduce-only exit is not gated by it; a spot sell is an exit only if the venue's own position and wallet reads show the short perp stays covered (spot left >= 98% of the short), otherwise it is refused `WRONG_DIRECTION` (unreadable = refused: close the long by hand, it is price risk; a stripped hedge is a naked short). The production book installs

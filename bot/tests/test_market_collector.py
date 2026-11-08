@@ -424,7 +424,7 @@ def test_module_has_no_order_capability_or_credentials_by_ast():
             imported |= {a.name for a in n.names}
         elif isinstance(n, ast.ImportFrom):
             imported.add(n.module or "")
-    assert imported == {"__future__", "argparse", "hashlib", "json", "os", "re", "shutil", "sys", "time", "urllib.error", "urllib.parse", "urllib.request", "decimal", "typing",
+    assert imported == {"__future__", "argparse", "contextlib", "fcntl", "hashlib", "json", "os", "re", "shutil", "sys", "time", "urllib.error", "urllib.parse", "urllib.request", "decimal", "typing",
                         "evidence_chain", "universe_capture", "venues", "runtime_capability"}
     assert not any(any(f in i for f in ("bybit_connection", "carry_broker", "hmac", "broker", "signing", "secrets")) for i in imported)
     strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
@@ -557,18 +557,26 @@ def test_seal_manifest_must_live_outside_and_check_without_manifest_fails(tmp_pa
 
 # ---------------------------------------------------------------- backup / restore-check
 
+def sealed_backup(tmp_path, root, dest, rec, copy_fn=None):
+    """Seal what is new (backup is bound to the seal manifest), then back up. Returns (result, manifest path)."""
+    man = str(tmp_path / "bk-seal.jsonl")
+    MC.seal_cycles(str(root), man)
+    kw = {} if copy_fn is None else {"copy_fn": copy_fn}
+    return MC.backup_cycles(str(root), str(dest), rec, manifest=man, **kw), man
+
+
 def test_backup_then_restore_check_passes_and_is_incremental(tmp_path, root):
     filled(root, 2)
     dest, rec = tmp_path / "bk", str(tmp_path / "receipts.jsonl")
     (root / f"cycle-{T0 + 9 * STEP}").mkdir()                            # an interrupted cycle is never copied
-    b = MC.backup_cycles(str(root), str(dest), rec)
+    b, man = sealed_backup(tmp_path, root, dest, rec)
     assert b["ok"] and [d["cycle"] for d in b["backed_up"]] == [f"cycle-{T0}", f"cycle-{T0 + STEP}"] and any("no COMPLETE" in s for s in b["skipped"])
     assert sorted(os.listdir(dest)) == [f"cycle-{T0}", f"cycle-{T0 + STEP}"]
-    assert MC.restore_check(str(dest), rec) == {"ok": True, "problems": [], "checked": 2}
+    assert MC.restore_check(str(dest), rec, man) == {"ok": True, "problems": [], "checked": 2}
     assert stat.S_IMODE(os.stat(dest / f"cycle-{T0}" / "manifest.json").st_mode) == 0o600
-    assert MC.backup_cycles(str(root), str(dest), rec)["backed_up"] == []                  # second run: already receipted, nothing re-copied
+    assert sealed_backup(tmp_path, root, dest, rec)[0]["backed_up"] == []                  # second run: already receipted, nothing re-copied
     cycle(root, Venue(), i=2)
-    assert [d["cycle"] for d in MC.backup_cycles(str(root), str(dest), rec)["backed_up"]] == [f"cycle-{T0 + 2 * STEP}"]
+    assert [d["cycle"] for d in sealed_backup(tmp_path, root, dest, rec)[0]["backed_up"]] == [f"cycle-{T0 + 2 * STEP}"]
     assert EC.verify(rec)["ok"]
 
 
@@ -583,11 +591,12 @@ def test_corrupt_copy_is_set_aside_and_gets_no_receipt(tmp_path, root):
             with open(p, "r+b") as fh:
                 fh.truncate(20)                                         # a short copy
 
-    b = MC.backup_cycles(str(root), str(dest), rec, flaky)
+    b, man = sealed_backup(tmp_path, root, dest, rec, flaky)
     assert b["ok"] is False and len(b["rejected"]) == 1 and "TRUNCATED" in b["rejected"][0]
     assert sorted(os.listdir(dest)) == sorted([f"cycle-{T0 + STEP}", f"cycle-{T0}.REJECTED"])
     assert [r["cycle"] for r in EC.rows_of(EC.read_lines(rec)[0])] == [f"cycle-{T0 + STEP}"]
-    assert MC.restore_check(str(dest), rec)["ok"]                      # the rejected copy is not in the proven set
+    assert not MC.restore_check(str(dest), rec, man)["ok"]             # the rejected cycle has no receipt: a sealed cycle never backed up is NOT proven
+    assert all("NO receipt" in x for x in MC.restore_check(str(dest), rec, man)["problems"])
     # a corrupt copy that silently changes bytes (same length) is caught too, and a copy that never arrives
     for tag, damage in (("flip", lambda d: open(os.path.join(d, "tickers.jsonl"), "r+b").write(b"X")), ("none", None)):
         d2, r2 = tmp_path / f"bk_{tag}", str(tmp_path / f"r_{tag}.jsonl")
@@ -598,7 +607,7 @@ def test_corrupt_copy_is_set_aside_and_gets_no_receipt(tmp_path, root):
         else:
             def cp(src, dst):
                 pass
-        out = MC.backup_cycles(str(root), str(d2), r2, cp)
+        out, _m = sealed_backup(tmp_path, root, d2, r2, cp)
         assert out["ok"] is False and len(out["rejected"]) == 2 and not os.path.exists(r2)
 
 
@@ -608,30 +617,151 @@ def test_backup_never_overwrites_and_never_sits_beside_the_original(tmp_path, ro
     os.makedirs(dest / f"cycle-{T0}")
     (dest / f"cycle-{T0}" / "precious").write_bytes(b"do not touch")
     with pytest.raises(MC.SealError):
-        MC.backup_cycles(str(root), str(dest), rec)
+        sealed_backup(tmp_path, root, dest, rec)
     assert (dest / f"cycle-{T0}" / "precious").read_bytes() == b"do not touch"
     with pytest.raises(MC.SealError):
-        MC.backup_cycles(str(root), str(root / "inside"), rec)
+        sealed_backup(tmp_path, root, root / "inside", rec)
     with pytest.raises(MC.CollectorError):                             # the copy primitive itself is exclusive
         MC.copy_cycle_dir(str(root / f"cycle-{T0}"), str(dest / f"cycle-{T0}"))
     assert (dest / f"cycle-{T0}" / "precious").read_bytes() == b"do not touch"
 
 
-def test_a_corrupt_source_is_not_backed_up_and_restore_detects_later_damage(tmp_path, root):
+def test_a_source_damaged_after_sealing_refuses_the_whole_backup_and_restore_detects_later_damage(tmp_path, root):
     filled(root, 2)
-    p = root / f"cycle-{T0}" / "trades" / "ETHUSDT.json"
-    p.write_bytes(p.read_bytes()[:-4])
     dest, rec = tmp_path / "bk", str(tmp_path / "receipts.jsonl")
-    b = MC.backup_cycles(str(root), str(dest), rec)
-    assert [d["cycle"] for d in b["backed_up"]] == [f"cycle-{T0 + STEP}"] and any("fails its own manifest" in s for s in b["skipped"])
+    b, man = sealed_backup(tmp_path, root, dest, rec)                                            # positive control: clean source backs up
+    assert b["ok"] and len(b["backed_up"]) == 2
     bp = dest / f"cycle-{T0 + STEP}" / "universe" / "tickers.json"
     bp.write_bytes(bp.read_bytes() + b" ")
-    r = MC.restore_check(str(dest), rec)
+    r = MC.restore_check(str(dest), rec, man)
     assert not r["ok"] and any("ALTERED" in x for x in r["problems"])
     import shutil
     shutil.rmtree(dest / f"cycle-{T0 + STEP}")
-    assert any("missing from the backup" in x for x in MC.restore_check(str(dest), rec)["problems"])
-    assert MC.restore_check(str(dest), str(tmp_path / "nope.jsonl"))["ok"] is False
+    assert any("missing from the backup" in x for x in MC.restore_check(str(dest), rec, man)["problems"])
+    assert MC.restore_check(str(dest), str(tmp_path / "nope.jsonl"), man)["ok"] is False
+    p = root / f"cycle-{T0}" / "trades" / "ETHUSDT.json"                                         # a SEALED cycle truncated afterwards
+    p.write_bytes(p.read_bytes()[:-4])
+    d2 = tmp_path / "bk2"
+    with pytest.raises(MC.SealError, match="refusing to back up"):
+        MC.backup_cycles(str(root), str(d2), str(tmp_path / "r2.jsonl"), manifest=man)
+    assert not os.path.exists(d2 / f"cycle-{T0}")
+
+
+def test_backup_is_not_ok_when_a_cycle_is_skipped_for_failing_unsealed_or_unrecorded(tmp_path, root):
+    """Reproduced: a corrupt/unrecorded cycle was only listed in 'skipped' and the backup still reported ok=true."""
+    import shutil
+    filled(root, 1)
+    dest, rec = tmp_path / "bk", str(tmp_path / "receipts.jsonl")
+    man = str(tmp_path / "s.jsonl")
+    MC.seal_cycles(str(root), man)
+    assert MC.backup_cycles(str(root), str(dest), rec, manifest=man)["ok"] is True               # positive control
+    cycle(root, Venue(), i=1)                                                                    # complete and recorded, never sealed
+    b = MC.backup_cycles(str(root), str(dest), rec, manifest=man)
+    assert b["ok"] is False and any("NOT SEALED" in x for x in b["skipped"]) and b["backed_up"] == []
+    MC.seal_cycles(str(root), man)
+    p = root / f"cycle-{T0 + STEP}" / "trades" / "ETHUSDT.json"
+    cycle(root, Venue(), i=2)                                                                    # an unsealed cycle that fails its own manifest
+    q = root / f"cycle-{T0 + 2 * STEP}" / "trades" / "ETHUSDT.json"
+    q.write_bytes(q.read_bytes()[:-4])
+    b = MC.backup_cycles(str(root), str(dest), rec, manifest=man)
+    assert b["ok"] is False and any("fails its own manifest" in x for x in b["skipped"])
+    assert [d["cycle"] for d in b["backed_up"]] == [f"cycle-{T0 + STEP}"] and p.exists()
+    shutil.copytree(root / f"cycle-{T0}", root / f"cycle-{T0 + 5 * STEP}")                       # complete, but not in cycles.jsonl
+    b = MC.backup_cycles(str(root), str(dest), rec, manifest=man)
+    assert b["ok"] is False and any("not recorded" in x for x in b["skipped"])
+
+
+def test_restore_check_needs_a_matching_receipt_for_every_sealed_cycle(tmp_path, root):
+    filled(root, 2)
+    dest, rec = tmp_path / "bk", str(tmp_path / "receipts.jsonl")
+    b, man = sealed_backup(tmp_path, root, dest, rec)
+    assert MC.restore_check(str(dest), rec, man)["ok"]
+    cycle(root, Venue(), i=2)
+    MC.seal_cycles(str(root), man)                                                               # sealed, never backed up
+    r = MC.restore_check(str(dest), rec, man)
+    assert not r["ok"] and any(f"cycle-{T0 + 2 * STEP}" in x and "NO receipt" in x for x in r["problems"])
+    assert not MC.restore_check(str(dest), rec, str(tmp_path / "nope.jsonl"))["ok"]              # no manifest: nothing says what the backup must hold
+    wrong = str(tmp_path / "wrong.jsonl")                                                        # receipts that are valid but for the wrong content
+    for rr in EC.rows_of(EC.read_lines(rec)[0]):
+        EC.append(wrong, dict(rr, tree_sha256="0" * 64))
+    r = MC.restore_check(str(dest), wrong, man)
+    assert any("differs from the sealed value" in x for x in r["problems"])
+
+
+def test_a_manifest_or_receipts_under_the_collectors_root_or_a_symlink_to_it_is_refused(tmp_path, root):
+    filled(root, 1)
+    os.symlink(str(root), str(tmp_path / "alias"))
+    os.makedirs(root / "sub")
+    for bad in (tmp_path / "alias" / "m.jsonl", root / "sub" / "m.jsonl"):
+        with pytest.raises(MC.SealError):
+            MC.seal_cycles(str(root), str(bad))
+    os.makedirs(tmp_path / "off")
+    os.symlink(str(root / "m5.jsonl"), str(tmp_path / "off" / "l.jsonl"))
+    with pytest.raises(MC.SealError):
+        MC.seal_cycles(str(root), str(tmp_path / "off" / "l.jsonl"))
+    assert not os.path.exists(root / "m.jsonl") and not os.path.exists(root / "sub" / "m.jsonl") and not os.path.exists(root / "m5.jsonl")
+    man = str(tmp_path / "ok.jsonl")
+    MC.seal_cycles(str(root), man)                                                               # positive control
+    for bad in (str(root / "sub" / "r.jsonl"), str(tmp_path / "alias" / "r.jsonl")):
+        with pytest.raises(MC.SealError):
+            MC.backup_cycles(str(root), str(tmp_path / "bk"), bad, manifest=man)
+    with pytest.raises(MC.SealError):
+        MC.backup_cycles(str(root), str(tmp_path / "bk"), str(tmp_path / "r.jsonl"), manifest=str(root / "sub" / "m.jsonl"))
+
+
+# ---------------------------------------------------------------- one collector at a time (flock on root/.lock)
+
+def test_a_second_run_during_a_live_cycle_is_refused_locked_and_the_first_is_untouched(root):
+    """Reproduced: the second run_once renamed the first's in-progress dir to .INCOMPLETE and the first crashed."""
+    inner = {}
+    v1, v2 = Venue(), Venue()
+
+    def fetch_a(url):
+        if "second" not in inner:
+            inner["second"] = cycle(root, v2, i=1)
+        return v1(url)
+    res = MC.run_once(str(root), T0, fetch_a, Clock(T0), sleep=lambda _s: None, max_symbols=3, free_bytes_fn=lambda _p: 1 << 40)
+    assert inner["second"]["status"] == "REFUSED_LOCKED"
+    assert res["status"] == "OK" and not any(n.endswith(".INCOMPLETE") for n in os.listdir(root))
+    assert [r["cycle"] for r in rows(root)] == [f"cycle-{T0}"]
+    assert cycle(root, Venue(), i=2)["status"] == "OK"                                           # the lock is released afterwards
+
+
+def _hold_lock(root):
+    import fcntl
+    os.makedirs(root, exist_ok=True)
+    fd = os.open(os.path.join(str(root), ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_seal_backup_and_repair_log_also_refuse_while_a_cycle_holds_the_lock(tmp_path, root):
+    filled(root, 1)
+    man = str(tmp_path / "s.jsonl")
+    fd = _hold_lock(root)
+    try:
+        assert cycle(root, Venue(), i=1)["status"] == "REFUSED_LOCKED"
+        with pytest.raises(MC.SealError, match="REFUSED_LOCKED"):
+            MC.seal_cycles(str(root), man)
+        with pytest.raises(MC.SealError, match="REFUSED_LOCKED"):
+            MC.backup_cycles(str(root), str(tmp_path / "bk"), str(tmp_path / "r.jsonl"), manifest=man)
+        with pytest.raises(MC.SealError, match="REFUSED_LOCKED"):
+            MC.repair_log(str(root))
+    finally:
+        os.close(fd)
+    assert MC.seal_cycles(str(root), man)["sealed_new"] == 1                                     # positive control: free lock, everything works
+    assert cycle(root, Venue(), i=1)["status"] == "OK"
+
+
+def test_an_unexpected_capture_error_mid_cycle_is_an_aborted_report_not_a_crash(root, monkeypatch):
+    def boom(_p):
+        raise UC.CaptureError("universe file vanished")
+    monkeypatch.setattr(MC.UC, "load_universe", boom)
+    res = cycle(root, Venue(), i=0)
+    assert res["status"] == "ABORTED" and "universe file vanished" in res["reason"]
+    monkeypatch.undo()
+    ok = cycle(root, Venue(), i=1)                                                               # the half-written dir is set aside and the next cycle runs
+    assert ok["status"] == "OK" and any(x["reason"] == "no COMPLETE marker" for x in ok["set_aside"])
 
 
 # ---------------------------------------------------------------- CLI (offline commands only)
@@ -641,8 +771,8 @@ def test_cli_seal_check_backup_restore(tmp_path, root, capsys):
     man, rec, dest = str(tmp_path / "s.jsonl"), str(tmp_path / "r.jsonl"), str(tmp_path / "bk")
     assert MC.main(["seal", "--root", str(root), "--manifest", man]) == 0
     assert MC.main(["check", "--root", str(root), "--manifest", man]) == 0
-    assert MC.main(["backup", "--root", str(root), "--to", dest, "--receipts", rec]) == 0
-    assert MC.main(["restore-check", "--backup", dest, "--receipts", rec]) == 0
+    assert MC.main(["backup", "--root", str(root), "--to", dest, "--receipts", rec, "--manifest", man]) == 0
+    assert MC.main(["restore-check", "--backup", dest, "--receipts", rec, "--manifest", man]) == 0
     p = root / f"cycle-{T0}" / "manifest.json"
     p.write_bytes(p.read_bytes() + b" ")
     assert MC.main(["check", "--root", str(root), "--manifest", man]) == 1
@@ -686,7 +816,7 @@ def test_seal_and_backup_refuse_a_hostile_now_ms(tmp_path, root, bad):
     with pytest.raises(MC.CollectorError):
         MC.seal_cycles(str(root), str(tmp_path / "m.json"), now_ms=bad)
     with pytest.raises(MC.CollectorError):
-        MC.backup_cycles(str(root), str(tmp_path / "d"), str(tmp_path / "r"), now_ms=bad)
+        MC.backup_cycles(str(root), str(tmp_path / "d"), str(tmp_path / "r"), manifest=str(tmp_path / "m.jsonl"), now_ms=bad)
     assert not (tmp_path / "d").exists()
 
 

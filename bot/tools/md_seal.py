@@ -56,6 +56,18 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def _inside(path: str, directory: str) -> bool:
+    """True when ``path`` is the directory or anything under it, after resolving symlinks (an alias or a link into the recorder's directory is still inside)."""
+    rp, rd = os.path.realpath(path), os.path.realpath(directory)
+    return rp == rd or rp.startswith(rd + os.sep)
+
+
+def future_problems(names: Sequence[str], now_ms: int) -> List[str]:
+    """Segments dated after today's UTC date (relative to ``now_ms``): a fabricated far-future day would otherwise become 'the newest segment'."""
+    today = _today(now_ms)
+    return [f"{n}: FUTURE segment (dated {n[3:11]}, today is {today}): fabricated or a clock fault; it is not part of the recorded history" for n in names if n[3:11] > today]
+
+
 def _today(now_ms: int) -> str:
     return datetime.datetime.fromtimestamp(now_ms / 1000.0, tz=datetime.timezone.utc).strftime("%Y%m%d")
 
@@ -101,7 +113,7 @@ def _pruned_tail(directory: str) -> Optional[str]:
         return None
 
 
-def continuity_problems(directory: str, descs: Sequence[Dict[str, Any]], baseline: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
+def continuity_problems(directory: str, descs: Sequence[Dict[str, Any]], baseline: Optional[Dict[str, Dict[str, Any]]] = None, *, excused: bool = False) -> List[str]:
     """At least as strict as ``MarketStore.verify()``: every segment's ``chain_start`` must equal the previous segment's last chain and its first id must follow the
     previous last id (a backdated segment that carries its OWN chain_start is not part of the chain). The OLDEST segment must start from genesis, from the recorder's
     recorded prune tail, or from the chain_start it had when it was first sealed. ``descs`` is oldest first."""
@@ -114,6 +126,8 @@ def continuity_problems(directory: str, descs: Sequence[Dict[str, Any]], baselin
             tail = _pruned_tail(directory)
             sealed_start = (baseline or {}).get(name, {}).get("chain_start")
             ok_starts = {MS.GENESIS} | ({tail} if tail else set()) | ({sealed_start} if sealed_start else set())
+            if excused:
+                ok_starts.add(start)            # check() already proved this start equals the last receipted chain of the pruned days
             if start not in ok_starts:
                 problems.append(f"{name}: CHAIN BREAK (the oldest segment starts from {start[:12]!r}: not genesis, not a recorded prune tail, not its sealed start)")
         elif prev_chain is not None and start != prev_chain:
@@ -131,22 +145,26 @@ def continuity_problems(directory: str, descs: Sequence[Dict[str, Any]], baselin
 CLOSE_MARGIN_MS = 3_600_000
 
 
-def seal(directory: str, manifest: str, *, now_ms: Optional[int] = None, accept_problems: bool = False) -> Dict[str, Any]:
+def seal(directory: str, manifest: str, *, now_ms: Optional[int] = None, accept_problems: bool = False, receipts: Optional[str] = None) -> Dict[str, Any]:
     """Append one manifest row describing every segment now. Segments whose day ended over an hour ago are 'closed' and hash-pinned. Without an EXPLICIT ``now_ms``
     the NEWEST segment is never closed: a wall clock stepped forward would otherwise hash-pin a day the recorder is still writing (the next check would call the
     recorder's own growth ALTERED). The owner passes ``--now-ms`` to close the newest day after the recorder has stopped.
     REFUSES when ``check`` already finds a problem: sealing over a truncation would launder it into the new baseline (reproduced). ``accept_problems`` is
-    the owner's explicit decision to re-baseline after investigating."""
+    the owner's explicit decision to re-baseline after investigating. ``receipts`` (the backup receipts) lets ``check`` excuse a day the recorder's retention pruned
+    AFTER it was backed up; a pruned day with no verified receipt still refuses."""
     now = int(time.time() * 1000) if now_ms is None else min(int(now_ms), int(time.time() * 1000))
-    if os.path.abspath(os.path.dirname(os.path.abspath(manifest))) == os.path.abspath(directory):
-        raise SealError("the manifest must not live in the recorder's own directory: it is the outside memory")
+    if _inside(manifest, directory):
+        raise SealError("the manifest must not live at or under the recorder's own directory: it is the outside memory")
     today = _today(now - CLOSE_MARGIN_MS)
     names = segment_names(directory)
+    future = future_problems(names, int(time.time() * 1000))        # the REAL clock: an owner's earlier --now-ms must not turn existing days into 'future'
+    if future and not accept_problems:
+        raise SealError(f"refusing to seal: {future[:3]}")
     segs = [describe(directory, n, closed=n[3:11] < today and (now_ms is not None or n != names[-1])) for n in names]
     if not segs:
         raise SealError("no segments to seal")
     if os.path.isfile(manifest) and not accept_problems:
-        prior = check(directory, manifest)
+        prior = check(directory, manifest, receipts=receipts)
         if not prior["ok"]:
             raise SealError(f"refusing to seal over existing problems (that would make them the new baseline): {prior['problems'][:3]}")
     if not accept_problems:
@@ -157,10 +175,48 @@ def seal(directory: str, manifest: str, *, now_ms: Optional[int] = None, accept_
     return {"manifest_rows": n, "head": head, "segments": len(segs)}
 
 
-def check(directory: str, manifest: str, *, deep: bool = False) -> Dict[str, Any]:
+def _pruned_excused(directory: str, by_segment: Dict[str, List[Dict[str, Any]]], names_now: Sequence[str], receipts: Optional[str]) -> Dict[str, str]:
+    """Sealed segments that are absent because the recorder's retention pruned them, mapped to why they are excused. A MISSING sealed segment is excused ONLY when
+    ALL hold: it is older than the oldest segment still present; the receipts verify and hold a receipt for it whose last_chain equals the sealed (closed) row's;
+    and the chain of absent days runs unbroken from the sealed history into the oldest present segment (each absent day's sealed chain_start is the previous absent
+    day's last chain, and the oldest present segment's chain_start equals the last absent day's receipted last_chain). ``pruned.jsonl`` is NOT consulted: the
+    recorder writes it, so it cannot vouch for itself. Returns {} (nothing excused) otherwise."""
+    if not receipts or not os.path.isfile(receipts) or not names_now:
+        return {}
+    try:
+        if not EC.verify(receipts).get("ok", False):
+            return {}
+        got = {r["segment"]: r for r in EC.rows_of(EC.read_lines(receipts)[0]) if isinstance(r, dict) and "segment" in r}
+    except (OSError, ValueError, KeyError, TypeError, EC.ChainDesync):
+        return {}
+    oldest = names_now[0]
+    absent = sorted(n for n in by_segment if n not in set(names_now) and n < oldest)
+    if not absent:
+        return {}
+    try:
+        oldest_start = describe(directory, oldest, closed=False)["chain_start"]
+    except sqlite3.DatabaseError:
+        return {}
+    prev_chain: Optional[str] = None
+    for name in absent:
+        descs = by_segment[name]
+        closed = [d for d in descs if d.get("closed")]
+        r = got.get(name)
+        if not closed or r is None or r.get("last_chain") != closed[-1]["last_chain"] or r.get("records") != closed[-1]["records"]:
+            return {}
+        if prev_chain is not None and descs[0].get("chain_start") != prev_chain:
+            return {}
+        prev_chain = closed[-1]["last_chain"]
+    if prev_chain != oldest_start:
+        return {}
+    return {n: "pruned by retention after a verified backup receipt" for n in absent}
+
+
+def check(directory: str, manifest: str, *, deep: bool = False, receipts: Optional[str] = None, now_ms: Optional[int] = None) -> Dict[str, Any]:
     """Compare the directory with every sealed row. ``deep`` also recomputes every record's chain from its payload (catches an edit INSIDE an open segment, which the
     cheap checks cannot; slow on a large day). Returns {'ok', 'problems', 'rows_checked'}."""
     problems: List[str] = []
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     if not os.path.isfile(manifest):
         return {"ok": False, "problems": ["no manifest: nothing outside the recorder remembers how far it got"], "rows_checked": 0}
     ver = EC.verify(manifest)
@@ -171,9 +227,20 @@ def check(directory: str, manifest: str, *, deep: bool = False) -> Dict[str, Any
     names_now = segment_names(directory)
     present = set(names_now)
     by_segment = _by_segment(rows)                                       # EVERY description of each segment, oldest first
+    future = future_problems(names_now, now)
+    problems += future
+    names_now = [n for n in names_now if n[3:11] <= _today(now)]         # a fabricated future day is reported, and never decides which segment is the newest
+    present = set(names_now)
+    excused = _pruned_excused(directory, by_segment, names_now, receipts)
     for name, descs in sorted(by_segment.items()):
         if name not in present:
-            problems.append(f"{name}: MISSING (it was sealed with {max(d['records'] for d in descs)} records)")
+            if name in excused:
+                continue
+            why = ""
+            if names_now and name < names_now[0]:
+                why = (" older than the oldest segment present: it looks like retention pruning, but there is NO verified backup receipt that matches it and chains into "
+                       "the oldest remaining day, so this evidence is NOT backed up and has vanished: back up BEFORE retention (RUNBOOKS), then investigate")
+            problems.append(f"{name}: MISSING (it was sealed with {max(d['records'] for d in descs)} records){why}")
             continue
         try:
             con = _ro(os.path.join(directory, name))
@@ -216,7 +283,7 @@ def check(directory: str, manifest: str, *, deep: bool = False) -> Dict[str, Any
                 descs.append(describe(directory, name, closed=False))
             except sqlite3.DatabaseError:
                 continue                                                   # already reported as unreadable above when it was sealed
-        problems += continuity_problems(directory, descs, {k: v[0] for k, v in by_segment.items()})
+        problems += continuity_problems(directory, descs, {k: v[0] for k, v in by_segment.items()}, excused=bool(excused))
     return {"ok": not problems, "problems": problems, "rows_checked": len(rows)}
 
 
@@ -296,9 +363,11 @@ def backup(directory: str, dest: str, receipts: str, *, manifest: str, now_ms: O
     also equal the sealed record count, last id and last chain. A closed day the manifest does not hold as closed is skipped and the result is not ok: seal first.
     The injected ``copy_fn`` lets a test (or an object-store uploader) replace the transfer; verification always re-reads the copy."""
     now = int(time.time() * 1000) if now_ms is None else min(int(now_ms), int(time.time() * 1000))
-    if os.path.realpath(dest) == os.path.realpath(directory) or os.path.realpath(dest).startswith(os.path.realpath(directory) + os.sep):
+    if _inside(dest, directory):
         raise SealError("the backup destination is the recorder's own directory: a copy beside the original is lost with it")
-    chk = check(directory, manifest)
+    if _inside(receipts, directory) or _inside(manifest, directory):
+        raise SealError("the receipts and the manifest must not live at or under the recorder's directory: they are the outside memory")
+    chk = check(directory, manifest, receipts=receipts, now_ms=now)
     if not chk["ok"]:
         raise SealError(f"refusing to back up: the directory fails its seal manifest (a backup would launder the damage): {chk['problems'][:3]}")
     sealed = sealed_closed(manifest)
@@ -396,7 +465,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("seal"); s.add_argument("--dir", required=True); s.add_argument("--manifest", required=True)
     s.add_argument("--accept-problems", action="store_true", help="re-baseline over problems you have investigated (otherwise sealing refuses)")
+    s.add_argument("--receipts", default=None, help="backup receipts: excuse days the recorder's retention pruned AFTER they were backed up")
     c = sub.add_parser("check"); c.add_argument("--dir", required=True); c.add_argument("--manifest", required=True)
+    c.add_argument("--receipts", default=None, help="backup receipts: excuse days the recorder's retention pruned AFTER they were backed up")
     c.add_argument("--deep", action="store_true", help="also recompute every record's chain (slow on a large day)")
     s.add_argument("--now-ms", type=int, default=None, help="explicit clock: lets seal close the NEWEST day too (use after the recorder has stopped)")
     b = sub.add_parser("backup"); b.add_argument("--dir", required=True); b.add_argument("--to", required=True); b.add_argument("--receipts", required=True)
@@ -406,9 +477,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "seal":
-            res = seal(a.dir, a.manifest, now_ms=a.now_ms, accept_problems=a.accept_problems)
+            res = seal(a.dir, a.manifest, now_ms=a.now_ms, accept_problems=a.accept_problems, receipts=a.receipts)
         elif a.cmd == "check":
-            res = check(a.dir, a.manifest, deep=a.deep)
+            res = check(a.dir, a.manifest, deep=a.deep, receipts=a.receipts)
         elif a.cmd == "backup":
             res = backup(a.dir, a.to, a.receipts, manifest=a.manifest)
         else:

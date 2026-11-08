@@ -390,3 +390,129 @@ def test_seal_without_an_explicit_clock_never_closes_the_newest_day(world):
     # an explicit clock closes it (owner's decision after the recorder stopped)
     SL.seal(world["md"], world["manifest"], now_ms=NOW + 2 * 86_400_000)
     assert EC.rows_of(EC.read_lines(world["manifest"])[0])[-1]["segments"][-1]["closed"] is True
+
+
+# ---------------------------------------------------------------- round 3: retention pruning, manifest location, future segments
+
+def _prune_oldest(world):
+    st = ST.MarketStore(world["md"], commit_every=1, environment="mainnet")
+    try:
+        return st.prune_segments_before(ST._utc_day(DAY2))
+    finally:
+        st.close()
+
+
+def test_retention_pruning_after_a_verified_backup_is_not_a_deadlock(world):
+    """Reproduced: the recorder's own --retention-days pruned a sealed day, check said MISSING, and seal and backup then refused forever."""
+    import evidence_chain as EC
+    seal(world); M = world["manifest"]
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)                                  # backup BEFORE retention
+    assert _prune_oldest(world), "positive control: the recorder really pruned the oldest day"
+    chk = SL.check(world["md"], M, receipts=rec)
+    assert chk["ok"], chk
+    SL.seal(world["md"], M, now_ms=NOW, receipts=rec)                                           # and sealing works again
+    assert SL.check(world["md"], M, receipts=rec)["ok"]
+    assert SL.restore_check(dest, rec, M)["ok"]                                                 # the copy still proves the pruned day
+    # without the receipts the pruned day is still reported (the receipts are what excuse it)
+    assert not SL.check(world["md"], M)["ok"]
+    assert EC.verify(rec)["ok"]
+
+
+def test_a_pruned_day_without_a_backup_receipt_stays_a_loud_failure(world):
+    seal(world); M = world["manifest"]
+    rec = _rec(world)
+    assert _prune_oldest(world)
+    for r in (None, rec):                                                                       # no receipts at all / an empty receipts file
+        chk = SL.check(world["md"], M, receipts=r)
+        assert not chk["ok"]
+        msg = " ".join(chk["problems"])
+        assert "MISSING" in msg and "NOT backed up" in msg and "retention" in msg, msg
+    with pytest.raises(SL.SealError):
+        SL.backup(world["md"], str(world["tmp"] / "bk"), rec, manifest=M, now_ms=NOW)
+
+
+def test_a_deleted_day_is_not_excused_by_a_forged_pruned_jsonl_or_a_mismatched_receipt(world):
+    import evidence_chain as EC
+    seal(world); M = world["manifest"]
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)
+    name = SL.segment_names(world["md"])[0]
+    # delete the OLDEST day and forge a pruned.jsonl, but receipt from a DIFFERENT chain value
+    os.remove(os.path.join(world["md"], name))
+    rows = EC.rows_of(EC.read_lines(rec)[0])
+    forged = str(world["tmp"] / "forged.jsonl")
+    EC.append(forged, dict(rows[0], last_chain="ab" * 32))
+    assert not SL.check(world["md"], M, receipts=forged)["ok"]
+    # positive control: the genuine receipt excuses it, because the next day's chain_start equals its last_chain
+    assert SL.check(world["md"], M, receipts=rec)["ok"]
+
+
+def test_a_missing_day_that_is_not_the_oldest_is_never_excused(world):
+    seal(world); M = world["manifest"]
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)
+    names = SL.segment_names(world["md"])
+    os.remove(os.path.join(world["md"], names[1]))                                              # the newer day vanished, the older remains
+    chk = SL.check(world["md"], M, receipts=rec)
+    assert not chk["ok"] and any("MISSING" in p and names[1] in p for p in chk["problems"])
+
+
+def test_the_manifest_may_not_hide_behind_a_symlink_or_a_subdirectory_of_the_recorder(world):
+    """Reproduced: abspath(dirname(manifest)) != recorder dir for an alias or a subdir, so seal wrote into the recorder's directory."""
+    os.symlink(world["md"], str(world["tmp"] / "alias"))
+    before = sorted(os.listdir(world["md"]))
+    with pytest.raises(SL.SealError, match="outside memory"):
+        SL.seal(world["md"], str(world["tmp"] / "alias" / "m2.jsonl"), now_ms=NOW)
+    os.makedirs(os.path.join(world["md"], "sub"))
+    with pytest.raises(SL.SealError, match="outside memory"):
+        SL.seal(world["md"], os.path.join(world["md"], "sub", "m3.jsonl"), now_ms=NOW)
+    os.makedirs(str(world["tmp"] / "off"), exist_ok=True)
+    os.symlink(os.path.join(world["md"], "m4.jsonl"), str(world["tmp"] / "off" / "link.jsonl"))   # the manifest file itself is a link into the directory
+    with pytest.raises(SL.SealError, match="outside memory"):
+        SL.seal(world["md"], str(world["tmp"] / "off" / "link.jsonl"), now_ms=NOW)
+    assert sorted(os.listdir(world["md"])) == sorted(before + ["sub"])
+    seal(world)                                                                                 # positive control: a real outside manifest still seals
+    with pytest.raises(SL.SealError, match="recorder"):
+        SL.backup(world["md"], str(world["tmp"] / "bk"), os.path.join(world["md"], "sub", "r.jsonl"), manifest=world["manifest"], now_ms=NOW)
+
+
+def test_a_fabricated_future_segment_is_flagged_and_does_not_change_the_newest(world):
+    seal(world)
+    assert SL.check(world["md"], world["manifest"], now_ms=NOW)["ok"]                           # positive control
+    name = _fabricate(world, 2_900_000_000_000 * 10)                                            # year ~2920
+    chk = SL.check(world["md"], world["manifest"], now_ms=NOW)
+    assert not chk["ok"] and any("FUTURE" in p and name in p for p in chk["problems"]), chk
+    assert not any("CHAIN BREAK" in p or "ID GAP" in p for p in chk["problems"]), chk                 # the fake day is reported once, not folded into the chain
+    with pytest.raises(SL.SealError):
+        SL.seal(world["md"], world["manifest"], now_ms=NOW)
+    # a first seal over a directory with a future segment is refused too
+    os.remove(os.path.join(world["md"], name))
+    _fabricate(world, 2_900_000_000_000 * 10)
+    os.makedirs(str(world["tmp"] / "off2"))
+    with pytest.raises(SL.SealError, match="FUTURE"):
+        SL.seal(world["md"], str(world["tmp"] / "off2" / "m.jsonl"), now_ms=NOW)
+
+
+def test_pruning_is_not_excused_when_the_oldest_remaining_day_does_not_chain_from_the_receipted_one(world):
+    seal(world); M = world["manifest"]
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)
+    assert _prune_oldest(world) and SL.check(world["md"], M, receipts=rec)["ok"]               # positive control
+    con = sqlite3.connect(os.path.join(world["md"], SL.segment_names(world["md"])[0]))
+    con.execute("UPDATE meta SET value=? WHERE key='chain_start'", ("cd" * 32,)); con.commit(); con.close()
+    chk = SL.check(world["md"], M, receipts=rec)
+    assert not chk["ok"] and any("MISSING" in p for p in chk["problems"]) and any("CHAIN BREAK" in p for p in chk["problems"]), chk
+
+
+def test_pruning_is_not_excused_by_receipts_whose_own_chain_does_not_verify(world):
+    seal(world); M = world["manifest"]
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)
+    assert _prune_oldest(world)
+    raw = open(rec, "rb").read()
+    open(rec, "wb").write(raw.replace(b'"at_ms":1700090000000', b'"at_ms":1700090000001'))  # edit a field that does not matter to the excuse: only the chain notices
+    assert raw != open(rec, "rb").read()
+    assert not SL.check(world["md"], M, receipts=rec)["ok"]
+    open(rec, "wb").write(raw)
+    assert SL.check(world["md"], M, receipts=rec)["ok"]
