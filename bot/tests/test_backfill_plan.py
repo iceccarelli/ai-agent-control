@@ -481,3 +481,168 @@ def test_the_module_reads_files_only():
         assert not any((i or "").split(".")[0] == bad for i in imps)
     calls = " ".join(ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call))
     assert "BybitClient" not in calls and "environ" not in calls and "getenv" not in calls
+
+
+# ---------------------------------------------------------------- run-plan: sealed plan -> dataset by dataset, resumable, into a NEW root
+
+import itertools  # noqa: E402
+import urllib.parse  # noqa: E402
+
+import market_collector as MC  # noqa: E402
+
+
+def _sealed(tmp_path, uni, **kw):
+    doc = do_plan(uni, **kw)
+    pf = tmp_path / "plan.json"
+    pf.write_text(json.dumps(doc))
+    return doc, str(pf)
+
+
+def _clock():
+    c = itertools.count(SERVER + 100, 3)
+    return lambda: next(c)
+
+
+def _venue_for_plan(uni, doc):
+    recs, _ = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
+    syms = doc["eligible_symbols"]
+    return venue_for(syms, {s: {k: str(x) if k in ("launchTime", "deliveryTime") else x for k, x in recs[s].items()} for s in syms}, W0, T)
+
+
+def _run(pf, out, uni, v, **kw):
+    a = dict(universe_dir=str(uni), fetch=v, clock=_clock(), sleep=lambda _s: None, mono=lambda: 0.0, workers=1, rate=1000.0, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
+    a.update(kw)
+    return MH.run_plan(pf, str(out), **a)
+
+
+def test_run_order_is_the_planners_dataset_order():
+    assert MH.RUN_ORDER == BP.DATASET_ORDER
+
+
+def test_run_plan_collects_every_required_dataset_for_the_same_symbols_and_the_replan_is_ready(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    prog = _run(pf, out, uni, _venue_for_plan(uni, doc))
+    assert prog["status"] == "DONE" and [d for d in prog["datasets"]] == ["funding", "mark-kline"]
+    f, m = (json.loads((out / d / "manifest.json").read_text()) for d in ("funding", "mark-kline-240"))
+    assert sorted(f["symbols"]) == sorted(m["symbols"]) == doc["eligible_symbols"]
+    assert f["selection"] == {"mode": "FROM_PLAN", "plan_digest": doc["plan_digest"], "symbols_n": 3}
+    p = json.loads((out / MH.PROGRESS_NAME).read_text())
+    assert p["datasets"]["funding"]["symbols_remaining_count"] == 0 and p["totals"]["requests_made"] > 0 and p["totals"]["eta_lower_bound_s"] == 0.0 and oct(os.stat(out / MH.PROGRESS_NAME).st_mode & 0o777) == "0o600"
+    assert do_plan(uni, out)["readiness"]["research_ready"] is True
+    assert BP.diagnose(str(uni), str(out), study_from_ms=None, study_to_ms=T, **P)["funnel_matches_loader"] is True
+
+
+def test_an_interrupted_run_resumes_without_refetching_a_single_page(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    v1 = _venue_for_plan(uni, doc)
+    with pytest.raises(KeyboardInterrupt):
+        _run(pf, out, uni, v1, stop_after_requests=2)
+    p = json.loads((out / MH.PROGRESS_NAME).read_text())
+    assert p["status"] == "INTERRUPTED" and p["last_error"]["error"].startswith("KeyboardInterrupt") and p["datasets"]["funding"]["status"] == "INTERRUPTED"
+    assert 0 < len(v1.urls) <= 2 and p["datasets"]["funding"]["symbols_remaining_count"] > 0
+    v2 = _venue_for_plan(uni, doc)
+    prog = _run(pf, out, uni, v2)
+    assert prog["status"] == "DONE" and prog["resumed"] == 1
+    assert not (set(v1.urls) & set(v2.urls)), "a page fetched before the interruption was fetched again"
+    assert do_plan(uni, out)["readiness"]["research_ready"] is True
+    v3 = _venue_for_plan(uni, doc)
+    assert _run(pf, out, uni, v3)["status"] == "DONE" and v3.urls == []                       # a finished run costs zero requests
+
+
+def test_a_429_storm_backs_off_boundedly_stops_before_the_next_dataset_and_resumes(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    sleeps, now = [], [0.0]
+
+    def sleep(sec):                                              # a virtual clock: the token bucket's penalty only elapses when somebody sleeps
+        sleeps.append(sec)
+        now[0] += sec
+
+    def storm(url):
+        raise MC.RateLimited("429")
+    prog = _run(pf, out, uni, storm, sleep=sleep, mono=lambda: now[0], max_retries=3, backoff_s=1.0)
+    assert prog["status"] == "INCOMPLETE" and "rate_limited" in prog["last_error"]["error"] and not (out / "mark-kline-240").exists()
+    assert {1.0, 2.0, 4.0} <= set(sleeps) and max(sleeps) <= MC.BACKOFF_CAP_S             # exponential, bounded, per symbol
+    assert prog["datasets"]["funding"]["rate_limit_events"] > 0
+    v = _venue_for_plan(uni, doc)
+    assert _run(pf, out, uni, v)["status"] == "DONE"
+
+
+def test_a_closed_contract_is_never_asked_past_its_delivery_time(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    v = _venue_for_plan(uni, doc)
+    _run(pf, tmp_path / "new", uni, v)
+    endtime = lambda u: int(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query))[MH.DATASETS[MH.FUNDING]["end"]])      # noqa: E731
+    fund_urls = [u for u in v.urls if MH.DATASETS[MH.FUNDING]["path"] in u]
+    ends = [endtime(u) for u in fund_urls if "symbol=OLDUSDT" in u]
+    assert ends and max(ends) <= T - 2 * DAY and any(e == T - 2 * DAY for e in ends)
+    other = [endtime(u) for u in fund_urls if "symbol=AAAUSDT" in u]
+    assert max(other) == T
+
+
+def test_run_plan_refuses_git_roots_existing_datasets_foreign_plans_and_forming_candles(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    v = Venue({})
+    with pytest.raises(MH.HistoryError, match="git work tree"):
+        _run(pf, os.path.join(BOT, "zz_never_created_runplan"), uni, v)
+    assert not os.path.exists(os.path.join(BOT, "zz_never_created_runplan"))
+    old = tmp_path / "old"
+    os.mkdir(old, 0o700)
+    os.mkdir(old / "funding", 0o700)
+    (old / "funding" / "manifest.json").write_text("{}")
+    with pytest.raises(MH.HistoryError, match="existing dataset"):
+        _run(pf, old, uni, v)
+    assert (old / "funding" / "manifest.json").read_text() == "{}" and v.urls == []
+    other = do_plan(uni, formation_days=3)
+    (tmp_path / "plan2.json").write_text(json.dumps(other))
+    done = tmp_path / "new"
+    _run(pf, done, uni, _venue_for_plan(uni, doc))
+    with pytest.raises(MH.HistoryError, match="different plan"):
+        _run(str(tmp_path / "plan2.json"), done, uni, v)
+    with pytest.raises(MH.HistoryError, match="WINDOW_END_NOT_CLOSED"):
+        _run(pf, tmp_path / "early", uni, v, clock=lambda: T + 1000)
+    assert not (tmp_path / "early").exists() and v.urls == []
+    assert sorted(os.listdir(tmp_path)) == sorted(["uni", "plan.json", "plan2.json", "old", "new"])          # nothing was written anywhere else
+
+
+def test_a_dataset_whose_symbol_set_differs_from_the_plan_stops_the_run(tmp_path):
+    uni = make_universe(tmp_path)
+    inject = lambda rec, a, b, st, q: (True, "", []) if rec["symbol"] == "GONEUSDT" else BP.classify_record(rec, a, b, st, q)      # noqa: E731
+    doc, pf = _sealed(tmp_path, uni, classifier=inject)
+    assert "GONEUSDT" in doc["eligible_symbols"]
+    v = Venue({(MH.FUNDING, s): grid(W0, T, H8) for s in doc["eligible_symbols"]})
+    prog = _run(pf, tmp_path / "new", uni, v)
+    assert prog["status"] == "FAILED" and "SYMBOL_SET_MISMATCH" in prog["last_error"]["error"] and not (tmp_path / "new" / "mark-kline-240").exists()
+
+
+def test_an_unproven_funding_interval_change_still_blocks_the_dataset_through_run_plan(tmp_path):
+    uni = make_universe(tmp_path, [inst("AAAUSDT"), inst("BBBUSDT")])
+    doc, pf = _sealed(tmp_path, uni)
+    mid = W0 + 3 * DAY
+    g = {(MH.FUNDING, "AAAUSDT"): grid(W0, mid, H8) + grid(mid + H4, T, H4), (MH.FUNDING, "BBBUSDT"): grid(W0, T, H8)}
+    prog = _run(pf, tmp_path / "new", uni, Venue(g))
+    man = json.loads((tmp_path / "new" / "funding" / "manifest.json").read_text())
+    assert man["symbols"]["AAAUSDT"]["status"] == "PARTIAL" and "unproven_regime_change" in man["symbols"]["AAAUSDT"]["reasons"]
+    assert prog["status"] == "INCOMPLETE" and not (tmp_path / "new" / "mark-kline-240").exists()
+
+
+def test_the_cli_run_plan_and_the_recorded_selection_modes(tmp_path, capsys):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    v = _venue_for_plan(uni, doc)
+    rc = MH.main(["run-plan", "--plan", pf, "--out-root", str(tmp_path / "cli"), "--universe-capture", str(uni), "--rate", "1000"], fetch=v, clock=_clock(), sleep=lambda _s: None,
+                 mono=lambda: 0.0, free_bytes_fn=lambda _p: 1 << 40)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and out["status"] == "DONE" and out["progress_file"].endswith(MH.PROGRESS_NAME)
+    ex = tmp_path / "explicit"
+    MH.main(["funding", "--out-root", str(ex), "--symbols", "AAAUSDT", "--start-ms", str(W0), "--end-ms", str(T), "--rate", "1000"], fetch=_venue_for_plan(uni, doc), clock=_clock(),
+            sleep=lambda _s: None, mono=lambda: 0.0, free_bytes_fn=lambda _p: 1 << 40)
+    assert json.loads((ex / "funding" / "manifest.json").read_text())["selection"] == {"mode": "EXPLICIT_SYMBOLS", "plan_digest": None, "symbols_n": 1}
+    capsys.readouterr()
