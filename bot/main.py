@@ -2376,6 +2376,14 @@ def _entry_mark(bot: Any, symbol: str) -> Optional[float]:
     return None
 
 
+def _entry_hedge_read(bot: Any) -> "Tuple[float, float]":
+    """(perp short size, spot inventory) as the VENUE reports them now, for the entry authority's spot-sell check. Raises on an unreadable venue (the authority treats that as
+    'cannot show the hedge is kept' and refuses the sell)."""
+    c = bot.carry
+    broker = getattr(c.broker, "inner", c.broker)
+    return float(broker.get_perp_position(c.perp_symbol)), float(broker.get_spot_inventory(c.spot_symbol))
+
+
 def _entry_risk_state(bot: Any, pending_notional_usd: Optional[float] = None) -> "Any":
     """The entry authority's risk inputs, from the authoritative RiskInputProvider: venue quantities and account state, the book's own snapshot, deterministic derivations. Every
     getter is STAMPED with the time it was read (a bare value is not accepted). Anything it cannot establish is None and risk_policy refuses on it. ``pending_notional_usd`` is the
@@ -2633,7 +2641,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             mark_provider=lambda symbol: _entry_mark(bot, symbol),
             policy_path=(str(cfg.RISK_POLICY_PATH) or None),
             state_provider=lambda pending_notional_usd=None: _entry_risk_state(bot, pending_notional_usd),
-            require_risk_policy=True)
+            require_risk_policy=True,
+            # Bound to the carry's own legs (short perp, long spot) and, for a spot SELL, to the venue's own position/wallet reads: a sell that would strip the hedge off
+            # the short perp is not an exit. A failed read refuses the sell (fail closed).
+            perp_symbol=bot.carry.perp_symbol, spot_symbol=bot.carry.spot_symbol,
+            hedge_reader=lambda: _entry_hedge_read(bot))
         # The staged close is built only from an OWNER-APPROVED close policy
         # (close_policy.py). Anything less leaves the original single-order
         # close exactly as it was; the reason is logged, never defaulted.

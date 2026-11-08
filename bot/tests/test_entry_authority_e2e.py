@@ -17,6 +17,7 @@ for _p in (BOT, HERE, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import entry_authority as EA  # noqa: E402
+from main import _entry_hedge_read  # noqa: E402
 import risk_policy as RP  # noqa: E402
 from carry_engine import BookState  # noqa: E402
 from test_testnet_lifecycle_offline import CREATE, B, H8, World, clock, no_live_ack, no_network, world  # noqa: E402,F401
@@ -31,7 +32,8 @@ def approve(w: World, tmp_path, *, state=GOOD):
     path.write_text(json.dumps(dataclasses.asdict(POLICY)))
     w.bot.client.entry_authority = EA.build_for_book(
         venue="testnet", store=w.store, state_dir=os.path.dirname(w.path), max_notional_usd=102.0,
-        mark_provider=lambda s: 50_000.0, policy_path=str(path), state_provider=lambda: state, require_risk_policy=True)
+        mark_provider=lambda s: 50_000.0, policy_path=str(path), state_provider=lambda: state, require_risk_policy=True,
+        perp_symbol=w.bot.carry.perp_symbol, spot_symbol=w.bot.carry.spot_symbol, hedge_reader=lambda: _entry_hedge_read(w.bot))
 
 
 def test_production_wiring_refuses_every_entry_without_an_approved_policy_and_leaves_the_book_clean(world):

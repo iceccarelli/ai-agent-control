@@ -138,3 +138,36 @@ def test_every_listed_path_is_canonical_and_sets_are_disjoint_from_forbidden():
         assert RC._CANONICAL.match(p)
         assert not any(w in p for w in RC._FORBIDDEN_WORDS)
     assert not (RC.PUBLIC_MARKET_PATHS & RC.EXECUTOR_POST_PATHS) and not (RC.ACCOUNT_READ_PATHS & RC.EXECUTOR_POST_PATHS)
+
+
+# ---- red-team round 2 (item 6): the public collector may send only Accept and User-Agent ----
+
+class _Inner:
+    def __init__(self):
+        self.sent = []
+
+    def request(self, method, url, *, headers, body, timeout):
+        self.sent.append((method, url, dict(headers)))
+        return b"{}"
+
+
+_TIME_URL = "https://api.bybit.com/v5/market/time"
+
+
+@pytest.mark.parametrize("hdr", [{"Host": "stream.bybit.com"}, {"X-HTTP-Method-Override": "POST"}, {"X-Forwarded-Host": "x"}, {"Content-Length": "5"},
+                                 {"Transfer-Encoding": "chunked"}, {"Content-Type": "application/json"}, {"Accept": "a", "Connection": "close"}])
+def test_public_collector_refuses_any_header_but_accept_and_user_agent(hdr):
+    inner = _Inner()
+    t = RC.CapabilityTransport(inner, RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="mainnet"))
+    with pytest.raises(RC.CapabilityRefused) as e:
+        t.request("GET", _TIME_URL, headers=hdr)
+    assert e.value.code == "HEADERS_REFUSED" and inner.sent == []
+
+
+def test_public_collector_positive_control_accept_and_user_agent_pass_any_case():
+    inner = _Inner()
+    t = RC.CapabilityTransport(inner, RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="mainnet"))
+    t.request("GET", _TIME_URL, headers={"Accept": "application/json", "user-agent": "market-collector/1"})
+    t.request("GET", _TIME_URL, headers={})
+    t.request("GET", _TIME_URL, headers=None)
+    assert len(inner.sent) == 3

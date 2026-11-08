@@ -330,8 +330,8 @@ segments after 2 days; do not rely on retention for evidence you have not backed
 
 ## The entry authority: why an opening order is refused, and what you must do (owner)
 Every order that can ADD exposure now passes one authority inside `BybitClient._request` (`entry_authority.py`), whoever the caller is: the carry book, `place_order`, the drills, the
-linear-stop drill, the unattended runner. A client with no authority refuses (`NO_ENTRY_AUTHORITY`). A reduce-only exit, and a spot sell, are not gated by it. The production book installs
-one that checks, in order: the venue, the persistent kill switch (read now; unreadable = engaged), your approved risk policy with MEASURED inputs (`risk_policy.py`), the order's notional cap,
+linear-stop drill, the unattended runner. A client with no authority refuses (`NO_ENTRY_AUTHORITY`). A reduce-only exit is not gated by it; a spot sell is an exit only if the venue's own position and wallet reads show the short perp stays covered (spot left >= 98% of the short), otherwise it is refused `WRONG_DIRECTION` (unreadable = refused: close the long by hand, it is price risk; a stripped hedge is a naked short). The production book installs
+one that checks, in order: the venue, the persistent kill switch (read now; unreadable = engaged), the instrument (only the carry's legs: perp Sell, spot Buy; anything else `UNKNOWN_INSTRUMENT`/`WRONG_DIRECTION`), the order type (exact `Market`/`Limit`; a Market order with a price is refused; a Market order is sized at the mark), your approved risk policy with MEASURED inputs (`risk_policy.py`), the order's notional cap,
 and a durable per-`orderLinkId` reservation (an identical resend passes, a different order under the same id is refused, at most 2 distinct unresolved entries).
 
 **Nothing is approved by default, so today the book refuses to open on testnet or mainnet.** The refusal reasons name what is missing: `NO_APPROVED_POLICY` until you write a policy file and
@@ -340,3 +340,10 @@ then `MISSING_INPUT:<name>` for every limit whose value the running book does no
 unmeasured list). That is the intended fail-closed state: do not work around it by editing limits to match what is measured. A loss/hedge/fault breach latches the strategy SUSPENDED in
 `risk_latch.json` beside the state database; it survives restarts and clears only by `RiskLatch.clear(strategy, reason=..., at_ms=...)`, which records why. The reservation ledger
 (`entry_reservations.jsonl`, same directory) is evidence: do not delete it to "unblock" an entry. Paper and shadow runs send no orders, so they are unaffected.
+
+**Reservation ledger limits (stated, not hidden).** `ReservationStore.resolve()` is **not called anywhere in production**; nothing marks a reservation done. The "at most 2 distinct unresolved
+entries" bound is therefore a 15-minute WINDOW over `entry_reservations.jsonl`, not a count of truly open entries, and an old `orderLinkId` stays reserved forever (a different body under it is a
+conflict; an identical resend is allowed). An `orderLinkId` must be exactly `[A-Za-z0-9_-]{1,36}` (no whitespace, never stripped) and "identical" means the whole canonical body (category, symbol, side,
+qty, orderType, price, reduceOnly, timeInForce). Rows written by an older version lack the type/price fields and so never equal a new order: a resend of such an id is refused, not guessed.
+**Writes on any client** are limited to an allow-list (`bybit_connection.WRITE_ENDPOINT_ALLOWLIST`: order create/cancel/cancel-all, position trading-stop/set-leverage, and the demo faucet on the demo venue
+only) and a strict canonical path; set-leverage is also bounded (linear, integer 1..10, buy == sell, the carry's perp symbol). A new write endpoint is a reviewed code change, not a flag.

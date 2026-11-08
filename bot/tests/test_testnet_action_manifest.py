@@ -277,3 +277,39 @@ def test_generic_credential_names_are_refused_by_the_generic_name_guard_itself(n
     for field in ("api_key", "api_secret"):
         r = M.refusals(_mut(["credential_env", field], name))
         assert any("generic credential" in x for x in r), r
+
+
+# ---- red-team round 2 (item 7): strict name match, substring bad words, type-strict `signed` ----
+
+def _refused_with(m):
+    return M.refusals(resealed(m))
+
+
+@pytest.mark.parametrize("name", ["BYBIT_TESTNET_DEDICATED_API_KEY\n", "BYBIT_TESTNET_DEDICATED_API_KEY\x00", " BYBIT_TESTNET_DEDICATED_API_KEY"])
+def test_env_name_must_fullmatch_no_trailing_newline(name):
+    m = fresh()
+    m["credential_env"]["api_key"] = name
+    assert _refused_with(m), name
+
+
+@pytest.mark.parametrize("name", ["BYBIT_TESTNET_LIVEKEY_API_KEY", "BYBIT_TESTNET_MAINNETX_API_KEY", "BYBIT_TESTNET_PRODKEY_API_KEY", "BYBIT_TESTNET_DEMOX_API_KEY",
+                                  "BYBIT_TESTNET_EUKEY_API_KEY", "BYBIT_TESTNET_xLiVe_API_KEY"])
+def test_bad_environment_words_match_as_substrings_case_insensitively(name):
+    m = fresh()
+    m["credential_env"]["api_key"] = name
+    assert _refused_with(m), name
+
+
+def test_positive_control_default_names_still_valid_and_testnet_word_required():
+    assert M.refusals(fresh()) == []
+    m = fresh()
+    m["credential_env"]["api_key"] = "BYBIT_SANDBOX_DEDICATED_API_KEY"
+    assert _refused_with(m)
+
+
+@pytest.mark.parametrize("val", [1, 0, 1.0, "true"])
+def test_preflight_signed_must_be_a_real_boolean(val):
+    m = fresh()
+    idx = next(i for i, r in enumerate(m["preflight_reads"]) if r["signed"] is True)
+    m["preflight_reads"][idx]["signed"] = val
+    assert _refused_with(m), val

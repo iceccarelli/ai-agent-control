@@ -69,7 +69,7 @@ def test_executor_positive_construction():
 # ---- the transport wrapper ----------------------------------------------------------------------------------------------------------------------------------
 def test_collector_transport_passes_a_public_get_and_delegates_attributes():
     t, spy = wrap(RC.PUBLIC_COLLECTOR)
-    assert t.request("GET", f"https://{TN}/v5/market/tickers?category=linear&symbol=BTCUSDT", headers={"Content-Type": "application/json"}, body=None, timeout=5) == (200, "{}")
+    assert t.request("GET", f"https://{TN}/v5/market/tickers?category=linear&symbol=BTCUSDT", headers={"Accept": "application/json"}, body=None, timeout=5) == (200, "{}")  # was Content-Type: the collector is now Accept/User-Agent only
     assert len(spy.calls) == 1 and t.marker == "inner-attr"
 
 

@@ -32,12 +32,12 @@ import shadow  # noqa: E402
 
 SCHEMA = "testnet_action_manifest/1"
 NOT_GRANTED = "NOT_GRANTED"
-_GRANTED = re.compile(r"^GRANTED_BY_OWNER:[A-Za-z0-9._-]{3,64}$")
+_GRANTED = re.compile(r"GRANTED_BY_OWNER:[A-Za-z0-9._-]{3,64}")
 
 GENERIC_CREDENTIAL_NAMES = frozenset({"BYBIT_API_KEY", "BYBIT_API_SECRET"})
 DEFAULT_KEY_ENV = "BYBIT_TESTNET_DEDICATED_API_KEY"
 DEFAULT_SECRET_ENV = "BYBIT_TESTNET_DEDICATED_API_SECRET"
-_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{5,63}$")
+_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{5,63}")
 _BAD_NAME_WORDS = ("MAINNET", "LIVE", "DEMO", "PROD", "EU")
 
 MAX_ENTRIES = 1
@@ -114,14 +114,14 @@ def _is_num(x: Any) -> bool:
 
 
 def _check_name(label: str, name: Any, out: List[str]) -> None:
-    if not isinstance(name, str) or not _ENV_NAME.match(name):
+    if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
         out.append(f"credential_env.{label}: not an upper-case env var name")
         return
     if name.upper() in GENERIC_CREDENTIAL_NAMES:
         out.append(f"credential_env.{label}: {name} is the generic credential; it is never a testnet credential")
     if "TESTNET" not in name:
         out.append(f"credential_env.{label}: {name} does not say TESTNET")
-    if any(re.search(rf"(^|_){w}(_|$)", name) for w in _BAD_NAME_WORDS):
+    if any(w in name.upper() for w in _BAD_NAME_WORDS):            # SUBSTRING, case-insensitive: LIVEKEY / MAINNETX must not pass as 'not a whole word'
         out.append(f"credential_env.{label}: {name} names a non-testnet environment")
 
 
@@ -168,7 +168,7 @@ def refusals(m: Any) -> List[str]:
     want_reads = [{"fact": f, "endpoint": e, "signed": s} for f, e, s in PREFLIGHT_READS]
     if not isinstance(pr, list) or any(not isinstance(r, dict) or set(r) != set(_READ) for r in pr):
         out.append("preflight_reads must be a list of {fact, endpoint, signed}")
-    elif pr != want_reads:
+    elif pr != want_reads or any(type(r["signed"]) is not bool or type(r["fact"]) is not str or type(r["endpoint"]) is not str for r in pr):
         out.append("preflight_reads must be exactly the required read list (a fact removed, added or re-pointed)")
     else:
         monitor = RC.Capability.for_role(RC.READ_ONLY_MONITOR, venue="testnet")
@@ -184,7 +184,7 @@ def refusals(m: Any) -> List[str]:
     if m["evidence_capture"] != list(EVIDENCE):
         out.append("evidence_capture must be exactly the required list")
     a = m["authorisation"]
-    if not isinstance(a, str) or not (a == NOT_GRANTED or _GRANTED.match(a)):
+    if not isinstance(a, str) or not (a == NOT_GRANTED or _GRANTED.fullmatch(a)):
         out.append("authorisation must be 'NOT_GRANTED' or 'GRANTED_BY_OWNER:<reference>'")
     try:
         digest_ok = m["plan_sha256"] == plan_digest(m)

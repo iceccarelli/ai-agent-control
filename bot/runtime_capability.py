@@ -62,6 +62,9 @@ FORBIDDEN_FAMILIES: Tuple[str, ...] = ("/v5/asset/", "/v5/user/", "/v5/account/w
                                        "/v5/lending", "/v5/broker/", "/v5/affiliate/", "/v5/earn/")
 _FORBIDDEN_WORDS = ("withdraw", "transfer", "deposit", "sub-member", "create-sub", "api-key", "apikey", "universal")
 
+#: The only request headers a public collector may send (case-insensitive). Everything else is refused, not filtered.
+COLLECTOR_HEADERS: FrozenSet[str] = frozenset({"accept", "user-agent"})
+
 _CANONICAL = re.compile(r"/v5(/[a-z0-9]+(-[a-z0-9]+)*)+")
 _CREDENTIAL_ENV = re.compile(r"^BYBIT_.*(KEY|SECRET|TOKEN)", re.IGNORECASE)
 _SIGNED_HEADERS = ("x-bapi-api-key", "x-bapi-sign", "x-bapi-sign-type", "x-bapi-timestamp", "authorization", "x-api-key", "cookie", "proxy-authorization",
@@ -255,5 +258,9 @@ class CapabilityTransport:
         if _query_has_credential(parts.query):
             raise CapabilityRefused("URL_REFUSED", "a credential-looking query parameter (credentials travel in signed headers only)")
         clean, signed = _normalize_headers(headers)
+        if self.capability.role == PUBLIC_COLLECTOR:
+            extra = sorted(k for k in clean if k.casefold() not in COLLECTOR_HEADERS)
+            if extra:                                         # Host / X-HTTP-Method-Override / Content-Length etc. can re-route or re-method a request after the check
+                raise CapabilityRefused("HEADERS_REFUSED", f"public_collector may send only {sorted(COLLECTOR_HEADERS)}; got {extra}")
         self.capability.enforce(method, parts.path, signed, host_raw)
         return self._inner.request(method, url, headers=clean, body=body, timeout=timeout)
