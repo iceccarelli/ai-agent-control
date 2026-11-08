@@ -1715,3 +1715,81 @@ def test_mutation_probe_rows_made_usable_again_would_enter_the_universe(tmp_path
     exec(compile(src.replace(old, 'if not (outcome in ("OBSERVED_ROWS", "PARTIAL", "UNDOCUMENTED_STATUS_ROWS") or'), UC.__file__, "exec"), mod.__dict__)
     assert [r["symbol"] for r in mod.derive_partition("linear", "Settling", [env([inst("SETUSDT", status="Settling")])])["usable_rows"]] == ["SETUSDT"]
     assert UC.derive_partition("linear", "Settling", [env([inst("SETUSDT", status="Settling")])])["usable_rows"] == []
+
+
+# ================================================================ universe lifecycle classification (owner evidence: five PendingOpen rows inside status=Closed)
+# The owner's real capture is NOT available here: every fixture below is built from the SHAPES the owner reported (two dated LinearFutures and three
+# LinearPerpetual rows whose own status is PendingOpen with a historical deliveryTime, inside the status=Closed responses). No byte of the real dataset appears.
+
+SRV = NOW
+PAST = str(NOW - 86_400_000)
+EVID_NONE = {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}
+
+
+def lc(row, requested="Closed", observed=None, evidence=None, srv=SRV):
+    return UC.classify_lifecycle(row, requested_status=requested, server_time_ms=srv, observed_in=observed or {}, evidence=evidence)
+
+
+def pend(sym, **over):
+    return inst(sym, status="PendingOpen", deliveryTime=PAST, launchTime="1000", symbolId=f"sid-{sym}"[:40], **over)
+
+
+def dated(sym):
+    return inst(sym, contractType="LinearFutures", status="PendingOpen", deliveryTime=PAST, launchTime="1000", quoteCoin="USD", settleCoin="BTC")
+
+
+def test_contract_constants_and_dataclass_are_frozen():
+    assert {UC.LC_OUT_OF_SCOPE_DATED_FUTURE, UC.LC_CONFIRMED_CLOSED_PERPETUAL, UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING, UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN,
+            UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION} <= set(UC.LIFECYCLE_CLASSES)
+    v = lc(pend("DATAOLD01USDT"))
+    with pytest.raises(Exception):
+        v.klass = "X"                                                                                   # frozen
+    assert set(v.__dataclass_fields__) == {"klass", "scope_eligible", "research_eligible_window", "reasons", "evidence_used"}
+
+
+def test_dated_futures_are_out_of_scope_not_errors():
+    for sym in ("BTC-24MAR23", "ETH-24MAR23"):
+        v = lc(dated(sym))
+        assert v.klass == UC.LC_OUT_OF_SCOPE_DATED_FUTURE and v.scope_eligible is False and v.research_eligible_window is None and "LinearFutures" in v.reasons[0]
+    assert lc(inst("BTC-24MAR23", status="Trading")).klass == UC.LC_OUT_OF_SCOPE_DATED_FUTURE      # a hyphenated symbol is out of scope even if the type were lost
+
+
+def test_closed_perpetual_with_a_past_delivery_is_confirmed_closed_with_a_window():
+    v = lc(inst("OLDUSDT", status="Closed", deliveryTime=PAST, launchTime="1000"))
+    assert v.klass == UC.LC_CONFIRMED_CLOSED_PERPETUAL and v.scope_eligible and v.research_eligible_window == (1000, int(PAST))
+    assert lc(inst("OLDUSDT", status="Closed", deliveryTime=str(NOW + 5))).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION       # delivery in the future
+    assert lc(inst("OLDUSDT", status="Closed", deliveryTime="0")).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+
+
+def test_cancelled_before_opening_needs_positive_history_evidence():
+    assert lc(pend("LITENTRYUSDT")).klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN                  # timestamps alone are not enough
+    assert lc(pend("LITENTRYUSDT"), observed={"linear:PendingOpen": UC.ABSENT}).klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN     # nor is absence from the live partition
+    v = lc(pend("LITENTRYUSDT"), evidence=EVID_NONE)
+    assert v.klass == UC.LC_CONFIRMED_CANCELLED_BEFORE_OPENING and v.research_eligible_window is None and v.scope_eligible
+    for weak in ({"funding_rows": 0, "kline_rows": 0}, {"funding_rows": 0, "kline_rows": 0, "coverage_complete": False}, {"funding_rows": 0, "coverage_complete": True},
+                 {"funding_rows": "0", "kline_rows": 0, "coverage_complete": True}, {"funding_rows": False, "kline_rows": 0, "coverage_complete": True}, {}):
+        assert lc(pend("LITENTRYUSDT"), evidence=weak).klass == UC.LC_TERMINAL_UNRESOLVED_PENDINGOPEN, weak
+
+
+def test_a_pending_open_perpetual_with_history_rows_traded_so_it_is_a_contradiction():
+    for ev in ({"funding_rows": 3, "kline_rows": 0, "coverage_complete": True}, {"funding_rows": 0, "kline_rows": 7, "coverage_complete": False}):
+        v = lc(pend("MONPROUSDT"), evidence=ev)
+        assert v.klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION and any("traded" in r for r in v.reasons)
+
+
+def test_unknown_or_missing_status_and_cross_partition_contradictions_are_unexplained():
+    for bad in ("Weird", "", None):
+        r = pend("MONPROUSDT")
+        r["status"] = bad
+        if bad is None:
+            del r["status"]
+        assert lc(r).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+    assert lc(pend("MONPROUSDT"), observed={"linear:default": "Trading"}).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+    live = inst("MONPROUSDT", status="PendingOpen", deliveryTime="0")                                   # not terminal: absence from PendingOpen IS a contradiction
+    assert lc(live, observed={"linear:PendingOpen": UC.ABSENT}).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+    assert lc(live).klass == UC.LC_ACTIVE_PERPETUAL
+    assert lc(pend("MONPROUSDT"), observed={"symbolId_lineage": "INVALID_RENAME_CHAIN"}).klass == UC.LC_UNEXPLAINED_PARTITION_CONTRADICTION
+
+
+def test_a_non_usdt_perpetual_is_out_of_scope_other_not_a_dated_future():
+    assert lc(inst("BTCPERP", quoteCoin="USDC", settleCoin="USDC", status="Trading")).klass == UC.LC_OUT_OF_SCOPE_OTHER_CONTRACT

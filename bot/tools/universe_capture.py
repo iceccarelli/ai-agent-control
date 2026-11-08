@@ -44,8 +44,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BOT)
@@ -75,7 +76,7 @@ STATUSES = ("Trading", "PendingOpen", "PreLaunch", "Delivering", "Closed")      
 PROBE_STATUSES = ("Settling",)           # asked for, but NOT in the live docs' enum (Settling was reported by a second source, never confirmed): an empty answer proves nothing
 QUERIED_STATUSES = STATUSES + PROBE_STATUSES
 KNOWN_ROW_STATUSES = frozenset(QUERIED_STATUSES)   # any other row status is UNKNOWN_STATUS and makes its partition non-complete
-RULES_VERSION = 2                        # manifests without it were derived under the older rules (an empty page with no category echo was a malformed envelope)
+RULES_VERSION = 3                        # manifests without it were derived under the older rules (an empty page with no category echo was a malformed envelope)
 SCOPE = "linear USDT perpetual lifecycle universe"
 CATEGORIES = ("linear", "inverse", "spot")
 RETRIES = 3
@@ -686,6 +687,91 @@ def _rows_by_symbol(p: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         if isinstance(r, dict) and isinstance(r.get("symbol"), str):
             out.setdefault(r["symbol"], []).append(r)
     return out
+
+
+# ---------------------------------------------------------------- lifecycle classification (the published contract)
+
+LC_OUT_OF_SCOPE_DATED_FUTURE = "OUT_OF_SCOPE_DATED_FUTURE"          # contractType is not LinearPerpetual (LinearFutures, hyphenated expiry symbols): outside the declared scope, counted, never an error
+LC_CONFIRMED_CLOSED_PERPETUAL = "CONFIRMED_CLOSED_PERPETUAL"        # status Closed, deliveryTime present and <= the server time of the page that carried the row
+LC_CONFIRMED_CANCELLED_BEFORE_OPENING = "CONFIRMED_CANCELLED_BEFORE_OPENING"   # PendingOpen/PreLaunch perpetual, past deliveryTime AND caller-supplied positive evidence that it never traded
+LC_TERMINAL_UNRESOLVED_PENDINGOPEN = "TERMINAL_UNRESOLVED_PENDINGOPEN"         # the same, but no such evidence: NEVER silently promoted to cancelled
+LC_UNEXPLAINED_PARTITION_CONTRADICTION = "UNEXPLAINED_PARTITION_CONTRADICTION"  # status contradicts another partition / the default control / lineage / history, or the status is unknown or missing
+LC_ACTIVE_PERPETUAL = "ACTIVE_PERPETUAL"                            # addition: an in-scope perpetual with no terminal lifecycle event (Trading, or a live PendingOpen/PreLaunch/Delivering)
+LC_OUT_OF_SCOPE_OTHER_CONTRACT = "OUT_OF_SCOPE_OTHER_CONTRACT"      # addition: a LinearPerpetual that is not USDT-quoted/settled (e.g. a USDC perpetual)
+LIFECYCLE_CLASSES = (LC_OUT_OF_SCOPE_DATED_FUTURE, LC_CONFIRMED_CLOSED_PERPETUAL, LC_CONFIRMED_CANCELLED_BEFORE_OPENING, LC_TERMINAL_UNRESOLVED_PENDINGOPEN,
+                     LC_UNEXPLAINED_PARTITION_CONTRADICTION, LC_ACTIVE_PERPETUAL, LC_OUT_OF_SCOPE_OTHER_CONTRACT)
+LC_EXPLAINED = frozenset({LC_OUT_OF_SCOPE_DATED_FUTURE, LC_OUT_OF_SCOPE_OTHER_CONTRACT, LC_CONFIRMED_CANCELLED_BEFORE_OPENING, LC_TERMINAL_UNRESOLVED_PENDINGOPEN})   # a status mismatch whose class is one of these is explained
+LIFECYCLE_RULES = "lifecycle/v1"
+ABSENT = "ABSENT"                                                   # an observed_in value: the partition of the row's own status was observed complete WITHOUT the symbol
+
+
+@dataclass(frozen=True)
+class LifecycleVerdict:
+    klass: str
+    scope_eligible: bool                                            # the instrument belongs to the declared scope (a LinearPerpetual USDT contract)
+    research_eligible_window: Optional[Tuple[int, int]]             # (start_ms, end_ms) of the history that may be asked for; None when there is none or it cannot be stated
+    reasons: Tuple[str, ...]
+    evidence_used: Tuple[str, ...]                                  # names of the inputs that decided the class (row fields, observed_in labels, evidence keys)
+
+
+def _is_count(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def classify_lifecycle(row: Any, *, requested_status: Optional[str], server_time_ms: Optional[int], observed_in: Mapping[str, str],
+                       evidence: Optional[Mapping[str, Any]] = None) -> LifecycleVerdict:
+    """Pure. The lifecycle class of ONE raw instrument row. ``observed_in`` maps a label (e.g. ``linear:default``) to the status the SAME symbol shows there, or ``ABSENT`` when the
+    partition of the row's own status was observed complete without it; any entry that differs from the row's own status is a contradiction, EXCEPT ``ABSENT`` on a terminal
+    PendingOpen/PreLaunch row (a cancelled pre-listing is expected to be missing from the live partition). ``evidence`` is supplied by the caller from VERIFIED history datasets
+    (``{'funding_rows': 0, 'kline_rows': 0, 'coverage_complete': True}``); timestamps and absence from tickers are never evidence. Nothing here rewrites a row."""
+    if not isinstance(row, Mapping):
+        return LifecycleVerdict(LC_UNEXPLAINED_PARTITION_CONTRADICTION, False, None, ("row_is_not_an_object",), ())
+    actual = _actual_status(dict(row))
+    sym = row.get("symbol")
+    ctype = row.get("contractType")
+    if ctype != PERP_TYPE or (isinstance(sym, str) and "-" in sym):
+        return LifecycleVerdict(LC_OUT_OF_SCOPE_DATED_FUTURE, False, None, (f"contractType={_printable(ctype)}: not {PERP_TYPE}" + ("; hyphenated expiry symbol" if isinstance(sym, str) and "-" in sym else ""),), ("contractType", "symbol"))
+    if row.get("quoteCoin") != QUOTE or row.get("settleCoin") != QUOTE:
+        return LifecycleVerdict(LC_OUT_OF_SCOPE_OTHER_CONTRACT, False, None, (f"quote/settle {_printable(row.get('quoteCoin'))}/{_printable(row.get('settleCoin'))} is not {QUOTE}",), ("quoteCoin", "settleCoin"))
+    if actual not in KNOWN_ROW_STATUSES:
+        return LifecycleVerdict(LC_UNEXPLAINED_PARTITION_CONTRADICTION, True, None, (f"unknown_or_missing_status:{actual}",), ("status",))
+    delivery, launch = _vtime(row.get("deliveryTime")), _vtime(row.get("launchTime"))
+    srv = server_time_ms if isinstance(server_time_ms, int) and not isinstance(server_time_ms, bool) and server_time_ms > 0 else None
+    past = delivery is not None and srv is not None and delivery <= srv
+    pending = actual in ("PendingOpen", "PreLaunch")
+    used: List[str] = ["status"]
+    contradictions = [f"{lab} shows {v}" for lab, v in sorted(observed_in.items()) if v != actual and not (v == ABSENT and pending and past)]
+    if contradictions:
+        return LifecycleVerdict(LC_UNEXPLAINED_PARTITION_CONTRADICTION, True, None, tuple(contradictions), tuple(["status"] + sorted(observed_in)))
+    if observed_in:
+        used += sorted(observed_in)
+    notes = [f"requested_status={requested_status or 'default'}, returned_status={actual}"]
+    if actual == "Closed":
+        if not past:
+            return LifecycleVerdict(LC_UNEXPLAINED_PARTITION_CONTRADICTION, True, None, ("status Closed without a deliveryTime at or before the server time",), tuple(used + ["deliveryTime"]))
+        win = (launch, delivery) if launch is not None and launch <= delivery else None
+        return LifecycleVerdict(LC_CONFIRMED_CLOSED_PERPETUAL, True, win, tuple(notes + ([] if win else ["no usable launchTime: the window cannot be stated"])), tuple(used + ["deliveryTime", "launchTime"]))
+    if pending and past:
+        if ABSENT in observed_in.values():
+            notes.append("absent from the live partition of its own status, consistent with a terminal delivery")
+        used += ["deliveryTime"]
+        if evidence is None:
+            return LifecycleVerdict(LC_TERMINAL_UNRESOLVED_PENDINGOPEN, True, None, tuple(notes + ["past deliveryTime but no history evidence supplied: whether it ever traded is unknown"]), tuple(used))
+        fr, kr, cc = evidence.get("funding_rows"), evidence.get("kline_rows"), evidence.get("coverage_complete")
+        used += [f"evidence.{k}" for k in ("funding_rows", "kline_rows", "coverage_complete") if k in evidence]
+        if (_is_count(fr) and fr > 0) or (_is_count(kr) and kr > 0):
+            return LifecycleVerdict(LC_UNEXPLAINED_PARTITION_CONTRADICTION, True, None, tuple(notes + [f"history shows it traded (funding_rows={fr!r}, kline_rows={kr!r}) although the venue says {actual}"]), tuple(used))
+        if fr == 0 and kr == 0 and _is_count(fr) and _is_count(kr) and cc is True:
+            return LifecycleVerdict(LC_CONFIRMED_CANCELLED_BEFORE_OPENING, True, None, tuple(notes + ["past deliveryTime and verified complete history holds no funding and no kline rows"]), tuple(used))
+        return LifecycleVerdict(LC_TERMINAL_UNRESOLVED_PENDINGOPEN, True, None, tuple(notes + ["history evidence is incomplete or not positive: stays unresolved"]), tuple(used))
+    # an in-scope perpetual with no terminal event
+    end = srv
+    if actual == "Delivering" and past:
+        end = delivery
+    win = (launch, end) if actual in ("Trading", "Delivering") and launch is not None and end is not None and launch <= end else None
+    if actual == "Trading" and past:
+        return LifecycleVerdict(LC_UNEXPLAINED_PARTITION_CONTRADICTION, True, None, ("status Trading with a deliveryTime at or before the server time",), tuple(used + ["deliveryTime"]))
+    return LifecycleVerdict(LC_ACTIVE_PERPETUAL, True, win, tuple(notes), tuple(used))
 
 
 _DEFAULT_RETURNS = ("Trading", "PendingOpen")        # what instruments-info returns for linear when no status is given (live docs)
