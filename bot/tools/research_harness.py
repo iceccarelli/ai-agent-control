@@ -28,7 +28,7 @@ import os
 import re
 import sys
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +45,7 @@ GAPS = (
     "the variant family count survives a restart only if the caller gives VariantLedger a path (append-only hash-chained JSONL); a deleted file plus sidecars is caught only with the caller's external anchors=",
     "AsOfView makes the future unreachable through its API; Python cannot stop deliberate reflection into the caller's own full arrays",
     "detect_lookahead catches leaks visible as a difference between full-history and truncated-history features; a leak through a label is for audit_split",
-    "PointInTimeUniverse accepts only allow-listed source KINDS and a delisting inside the observed window (or a hash-tied no-delisting attestation); the harness cannot verify either against the exchange",
+    "PointInTimeUniverse accepts only allow-listed source KINDS and a delisting inside the observed window (or a no-delisting attestation); the harness cannot verify either against the exchange. An attestation is checked only for SHAPE (bound to the observed window, at least two DISTINCT, non-placeholder 64-hex snapshot hashes): the hashes are not verified against any snapshot file, so a fabricated attestation of that shape passes. The evidence says so (universe_pit_basis, universe_pit_verified_against_exchange=False); attestation is a claim, not verification",
     "the selection log is verified by recomputing a best-train-mean selector; a different (documented) selection rule needs its own selector= and is only as honest as that function",
 )
 
@@ -85,6 +85,8 @@ NON_PIT_SOURCES = ("hand_picked", "hand_picked_survivors", "current_listing", "c
 #: The ONLY source kinds accepted as point in time (documented kinds that record status history / dated snapshots). Anything else is not PIT.
 PIT_SOURCE_KINDS = ("exchange_instruments_info_snapshots_with_status_history", "recorded_universe_snapshots")
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+MIN_ATTESTATION_SNAPSHOTS = 2
+MIN_DISTINCT_HEX_CHARS = 8
 
 
 class PointInTimeUniverse:
@@ -92,7 +94,8 @@ class PointInTimeUniverse:
 
     Point in time requires ALL of: an allow-listed ``membership_source`` kind, ``includes_delisted``, an observed window
     [observed_from_ms, observed_to_ms], and either at least one delisting event dated inside that window or an explicit
-    ``no_delistings_attestation = {"no_delistings_observed_in_window": True, "snapshot_sha256": [64-hex, ...]}`` tied to snapshot hashes."""
+    ``no_delistings_attestation = {"no_delistings_observed_in_window": True, "window_from_ms", "window_to_ms" (== the observed window),
+    "snapshot_sha256": [>= 2 distinct 64-hex, ...]}``. The attestation's SHAPE is checked, not its truth (see GAPS)."""
 
     def __init__(self, members: Mapping[str, Mapping[str, Any]], *, membership_source: str, includes_delisted: bool,
                  observed_from_ms: Optional[int] = None, observed_to_ms: Optional[int] = None,
@@ -152,8 +155,24 @@ class PointInTimeUniverse:
         a = self.no_delistings_attestation
         if not a or a.get("no_delistings_observed_in_window") is not True:
             return False
+        for k, want in (("window_from_ms", self.observed_from_ms), ("window_to_ms", self.observed_to_ms)):
+            v = a.get(k)
+            if want is None or isinstance(v, bool) or not isinstance(v, int) or v != want:
+                return False                                   # the attestation must be about THIS observed window, not any window
         h = a.get("snapshot_sha256")
-        return isinstance(h, (list, tuple)) and len(h) > 0 and all(isinstance(x, str) and _HEX64.fullmatch(x) for x in h)
+        if not isinstance(h, (list, tuple)) or len(h) < MIN_ATTESTATION_SNAPSHOTS:
+            return False
+        if not all(isinstance(x, str) and _HEX64.fullmatch(x) and len(set(x)) >= MIN_DISTINCT_HEX_CHARS for x in h):
+            return False                                       # shape only: a real SHA-256 is not '00..0' or 'cdcd..cd'
+        return len(set(h)) == len(h)                           # one snapshot repeated is one snapshot
+
+    @property
+    def pit_basis(self) -> str:
+        """What the point-in-time claim rests on. None of these bases is verified against the exchange."""
+        if self.survivorship_problems():
+            return "not_point_in_time"
+        inside = [s for s, (_lo, hi) in self._m.items() if hi is not None and self.observed_from_ms <= hi <= self.observed_to_ms]
+        return "self_declared_delisting_event_in_window" if inside else "attested_no_delistings_unverified"
 
     def survivorship_problems(self) -> List[str]:
         """Why this universe is NOT point in time. Empty = point in time (as far as its own source says)."""
@@ -278,10 +297,26 @@ def detect_lookahead(feature_fn: Callable[[List[int], List[float]], List[float]]
 
 # ---------------------------------------------------------------- walk-forward with purge and embargo
 
+_FOLD_NONCE = os.urandom(16).hex()          # per process: only walk_forward_folds can stamp a Fold
+
+
+def _fold_tag(train: Sequence[int], test: Sequence[int], n: int, horizon: int, embargo: int) -> str:
+    return hashlib.sha256(json.dumps([_FOLD_NONCE, list(train), list(test), n, horizon, embargo]).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class Fold:
+    """A train/test split. Only ``walk_forward_folds`` stamps (n, label_horizon, embargo, tag): ``oos_evidence`` refuses a Fold that is hand-built or whose
+    indices were edited afterwards, so a zero-embargo adjacent split cannot be re-audited against a horizon/embargo the caller chooses."""
     train: Tuple[int, ...]
     test: Tuple[int, ...]
+    n: int = -1
+    label_horizon: int = -1
+    embargo: int = -1
+    tag: str = field(default="", repr=False)
+
+    def authentic(self) -> bool:
+        return bool(self.tag) and self.tag == _fold_tag(self.train, self.test, self.n, self.label_horizon, self.embargo)
 
 
 def walk_forward_folds(n: int, train_min: int, test_len: int, label_horizon: int, embargo: int) -> List[Fold]:
@@ -289,7 +324,8 @@ def walk_forward_folds(n: int, train_min: int, test_len: int, label_horizon: int
     chronological. ``embargo`` must be >= max(1, label_horizon): an embargo shorter than the label horizon lets training labels see test values."""
     if embargo < max(1, label_horizon):
         raise HarnessError(f"embargo ({embargo}) must be at least max(1, label_horizon={label_horizon})")
-    folds = [Fold(tuple(a), tuple(b)) for a, b in SP.walk_forward(n, train_min, test_len, label_horizon, embargo)]
+    folds = [Fold(tuple(a), tuple(b), n, label_horizon, embargo, _fold_tag(a, b, n, label_horizon, embargo))
+             for a, b in SP.walk_forward(n, train_min, test_len, label_horizon, embargo)]
     seen_end = -1
     for k, f in enumerate(folds):
         a = SP.audit_split(list(f.train), list(f.test), n, label_horizon, embargo)
@@ -331,6 +367,7 @@ class VariantLedger:
         self.family = normalise_family(family)
         self.path = os.path.abspath(path) if path is not None else None
         self._tl = SP.TrialLedger()
+        self._meta: List[Dict[str, Any]] = []          # per trial: what the ledger recorded ABOUT the series (digest, ess, independent obs, declared horizon)
         self._persisted = 0
         if self.path is None:
             self._carried = _FAMILY_HIGH_WATER.get(self.family, 0)
@@ -357,6 +394,7 @@ class VariantLedger:
                 self._tl.record(row["strategy_id"], row["params_hash"], row["window_id"], row["statistic"], pvalue=row["pvalue"], n_obs=row["n_obs"])
             except (KeyError, SP.StatisticalPowerError) as exc:
                 raise HarnessError(f"variant ledger row {i} is not a valid trial: {exc}") from exc
+            self._meta.append({k: row.get(k) for k in ("returns_sha256", "ess", "independent_observations", "horizon")})
         seen = _PATH_HIGH_WATER.get(self.path, 0)
         if self._tl.n_trials < seen:
             raise HarnessError(f"variant ledger file holds {self._tl.n_trials} variants but this process already saw {seen}: truncated")
@@ -367,7 +405,7 @@ class VariantLedger:
             return
         t = self._tl.trials[-1]
         EC.append(self.path, {"kind": "variant", "seq": self._persisted, "family": self.family, "strategy_id": t.strategy_id, "params_hash": t.params_hash,
-                              "window_id": t.window_id, "statistic": t.statistic, "pvalue": t.pvalue, "n_obs": t.n_obs})
+                              "window_id": t.window_id, "statistic": t.statistic, "pvalue": t.pvalue, "n_obs": t.n_obs, **self._meta[-1]})
         self._persisted += 1
         _PATH_HIGH_WATER[self.path] = max(_PATH_HIGH_WATER.get(self.path, 0), self._persisted)
 
@@ -393,11 +431,27 @@ class VariantLedger:
         self._tl.verify()
         return tuple(sorted({t.strategy_id for t in self._tl.trials if t.window_id != "rejected"}))
 
-    def best_trial(self) -> Any:
+    def best_index(self) -> int:
         pv = self._tl.pvalues()
         if not pv:
             raise HarnessError("no variants recorded")
-        return self._tl.trials[min(range(len(pv)), key=lambda i: (pv[i], i))]
+        return min(range(len(pv)), key=lambda i: (pv[i], i))
+
+    def best_trial(self) -> Any:
+        return self._tl.trials[self.best_index()]
+
+    def trial_meta(self, index: int) -> Mapping[str, Any]:
+        """What the ledger itself recorded about trial ``index``'s series (None fields: recorded before this was tracked, or a rejected variant)."""
+        return dict(self._meta[index]) if 0 <= index < len(self._meta) else {}
+
+    def variant_horizon(self, name: str) -> Optional[int]:
+        """The label horizon (rows a label looks forward = the variant's hold) DECLARED when the variant was recorded; the largest if recorded repeatedly."""
+        hs = [m.get("horizon") for t, m in zip(self._tl.trials, self._meta) if t.strategy_id == name and t.window_id != "rejected"]
+        hs = [h for h in hs if isinstance(h, int)]
+        return max(hs) if hs else None
+
+    def returns_digests(self, name: str) -> frozenset:
+        return frozenset(m.get("returns_sha256") for t, m in zip(self._tl.trials, self._meta) if t.strategy_id == name and m.get("returns_sha256"))
 
     def anchor(self) -> SP.LedgerAnchor:
         return self._tl.anchor()
@@ -405,10 +459,16 @@ class VariantLedger:
     def verify(self, anchor: Optional[SP.LedgerAnchor] = None) -> bool:
         return self._tl.verify(anchor)
 
-    def record(self, name: str, params: Mapping[str, Any], returns: Sequence[float], *, window_id: str = "full") -> Dict[str, Any]:
-        """Count a variant AND test it. Returns its significance statistics."""
+    def record(self, name: str, params: Mapping[str, Any], returns: Sequence[float], *, window_id: str = "full",
+               horizon: Optional[int] = None) -> Dict[str, Any]:
+        """Count a variant AND test it. Returns its significance statistics. The ledger remembers a digest of the exact series, its ESS / independent
+        observations (evidence takes those from here, never from the caller) and the variant's declared label ``horizon`` (rows a label looks forward;
+        ``oos_evidence`` needs it to size the purge/embargo)."""
+        if horizon is not None and (isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1):
+            raise HarnessError(f"horizon must be a positive integer number of rows, got {horizon!r}")
         st = significance(returns, ci=False)
         self._tl.record(name, SP.params_hash(params), window_id, st["mean"] if st["mean"] is not None else 0.0, pvalue=st["p_one_sided"], n_obs=st["n"])
+        self._meta.append({"returns_sha256": series_digest(returns), "ess": st["ess"], "independent_observations": st["independent_observations"], "horizon": horizon})
         self._persist()
         self._sync()
         st["variant"] = name
@@ -419,6 +479,7 @@ class VariantLedger:
         if not isinstance(reason, str) or not reason.strip():
             raise HarnessError("a rejected variant needs a reason")
         self._tl.record(name, SP.params_hash({**dict(params), "_rejected": reason}), "rejected", 0.0, pvalue=None, n_obs=0)
+        self._meta.append({"returns_sha256": None, "ess": None, "independent_observations": None, "horizon": None})
         self._persist()
         self._sync()
 
@@ -441,6 +502,11 @@ class VariantLedger:
         return {"best_variant": t.strategy_id, "best_params_hash": t.params_hash, "best_p_unadjusted": pv[k], "best_p_adjusted": adj["adjusted"][k],
                 "significant_after_adjustment": bool(adj["reject"][k]), "n_variants_tested": n, "method": method, "alpha": alpha,
                 "n_rejected_of_family": adj["n_rejected"]}
+
+
+def series_digest(returns: Sequence[float]) -> str:
+    """Digest of an exact return series (repr of each float: round-trips, so the same series gives the same digest on every run)."""
+    return hashlib.sha256(",".join(repr(float(x)) for x in returns).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- significance (reuses ESS + bootstrap + t tail)
@@ -553,9 +619,18 @@ def _build(stage: str, *, stats: Mapping[str, Any], p_adjusted: float, alpha: fl
         result = SV.INCONCLUSIVE               # significant-but-biased, or too little data to say anything either way
     metrics = {"independent_observations": n_ind, "n_variants_tested": int(n_variants), "multiple_testing_adjusted": True,
                "uses_future_information": bool(uses_future), "universe_point_in_time": bool(pit), "alpha": alpha, "p_adjusted": p_adjusted,
+               "universe_pit_basis": universe.pit_basis, "universe_pit_verified_against_exchange": False,
                "mean_net_per_settlement_bps": mean, "ess": stats["ess"], "n_raw": stats["n"], "guard_notes": notes}
     metrics.update(dict(extra))
     return SV.EvidenceItem(stage=stage, result=result, provenance=provenance, metrics=metrics, data_sha256=data_sha256, **_stamp(spec))
+
+
+def _require_family(spec: Mapping[str, Any], ledger: VariantLedger) -> None:
+    """The ledger must count the SAME family the candidate registered (``multiple_testing_family``, else its candidate_id, as ``register_candidate`` does).
+    Otherwise a best-of-N winner can be re-recorded in a fresh, differently named ledger with n_variants = 1."""
+    want = normalise_family(spec.get("multiple_testing_family") or spec.get("candidate_id"))
+    if ledger.family != want:
+        raise HarnessError(f"the variant ledger counts family {ledger.family!r} but the candidate's multiple_testing_family is {want!r}")
 
 
 def historical_evidence(*, stats: Mapping[str, Any], ledger: VariantLedger, spec: Mapping[str, Any], universe: PointInTimeUniverse, leak: LeakAudit,
@@ -563,11 +638,19 @@ def historical_evidence(*, stats: Mapping[str, Any], ledger: VariantLedger, spec
                         extra: Optional[Mapping[str, Any]] = None) -> SV.EvidenceItem:
     """Historical_test evidence for the BEST variant of a family, judged against the whole family. ``n_variants_tested`` and the adjusted p come from the
     LEDGER (never a free integer), and ``stats`` must be the ledger's best variant's own statistics."""
+    _require_family(spec, ledger)
     selection = ledger.selection(alpha=alpha, method=method)
     best = ledger.best_trial()
     if stats.get("n") != best.n_obs or stats.get("mean") is None or best.statistic is None or \
             not math.isclose(float(stats["mean"]), float(best.statistic), rel_tol=1e-9, abs_tol=1e-12):
         raise HarnessError("stats are not the ledger's best variant's statistics (n/mean differ from the recorded trial)")
+    meta = ledger.trial_meta(ledger.best_index())
+    if meta.get("ess") is None or meta.get("independent_observations") is None:
+        raise HarnessError("the ledger holds no recorded ESS / independent observations for its best variant: re-record it so the evidence can be checked against the ledger")
+    if stats.get("independent_observations") != meta["independent_observations"] or stats.get("ess") is None or \
+            not math.isclose(float(stats["ess"]), float(meta["ess"]), rel_tol=1e-9, abs_tol=1e-12):
+        raise HarnessError(f"stats claim independent_observations={stats.get('independent_observations')} ess={stats.get('ess')} but the ledger recorded "
+                           f"{meta['independent_observations']} / {meta['ess']}")
     return _build("historical_test", stats=stats, p_adjusted=selection["best_p_adjusted"], alpha=selection["alpha"], n_variants=selection["n_variants_tested"],
                   universe=universe, leak=leak, data_sha256=data_sha256, provenance=provenance, split_clean=True, spec=spec,
                   extra={"best_variant": selection["best_variant"], **dict(extra or {})})
@@ -584,7 +667,8 @@ def train_only_best(train_returns: Mapping[str, Sequence[float]]) -> str:
 
 def verify_selection_log(*, selection_log: Any, variant_returns: Mapping[str, Sequence[float]], folds: Sequence[Fold], oos_returns: Sequence[float],
                          tested_variants: Sequence[str], index_offset: int = 0,
-                         selector: Callable[[Mapping[str, Sequence[float]]], str] = train_only_best) -> None:
+                         selector: Callable[[Mapping[str, Sequence[float]]], str] = train_only_best,
+                         recorded_digests: Optional[Mapping[str, Any]] = None) -> None:
     """Each fold's chosen variant must be what ``selector`` returns from the TRAIN returns alone, the log's train window must be the fold's, every chosen
     variant must be a counted (tested) variant, and ``oos_returns`` must be exactly the chosen variants' TEST-window returns, in order. Raises otherwise."""
     if not isinstance(selection_log, (list, tuple)) or len(selection_log) != len(folds) or not folds:
@@ -598,6 +682,10 @@ def verify_selection_log(*, selection_log: Any, variant_returns: Mapping[str, Se
     unknown_names = [k for k in variant_returns if k not in set(tested_variants)]
     if unknown_names:
         raise SelectionLogError(f"variants {unknown_names} are not counted in the variant ledger")
+    if recorded_digests is not None:
+        for name, series in variant_returns.items():
+            if series_digest(series[index_offset:]) not in recorded_digests.get(name, ()):
+                raise SelectionLogError(f"variant {name!r}: the supplied return series is not the series the ledger recorded for it")
     expected: List[float] = []
     for k, (f, e) in enumerate(zip(folds, selection_log)):
         if not isinstance(e, Mapping) or e.get("fold") != k or not isinstance(e.get("chosen"), str) or e.get("chosen") not in variant_returns:
@@ -617,20 +705,48 @@ def verify_selection_log(*, selection_log: Any, variant_returns: Mapping[str, Se
 
 
 def oos_evidence(*, oos_returns: Sequence[float], ledger: VariantLedger, spec: Mapping[str, Any], universe: PointInTimeUniverse, leak: LeakAudit,
-                 folds: Sequence[Fold], n: int, label_horizon: int, embargo: int, data_sha256: str, selection_log: Sequence[Mapping[str, Any]],
+                 folds: Sequence[Fold], data_sha256: str, selection_log: Sequence[Mapping[str, Any]],
                  variant_returns: Mapping[str, Sequence[float]], index_offset: int = 0,
                  selector: Callable[[Mapping[str, Sequence[float]]], str] = train_only_best, alpha: float = 0.05,
                  provenance: str = "offline_walk_forward", extra: Optional[Mapping[str, Any]] = None) -> SV.EvidenceItem:
-    """Out-of-sample evidence from STITCHED test-window returns. The p-value is adjusted over the ledger's whole family. The folds are re-audited here
-    (a leaking fold makes ``uses_future_information`` True) and the ``selection_log`` is RECOMPUTED from the train windows (SelectionLogError otherwise)."""
+    """Out-of-sample evidence from STITCHED test-window returns. The p-value is adjusted over the ledger's whole family (which must be the spec's).
+
+    The folds must be ones ``walk_forward_folds`` produced (a hand-built or edited ``Fold`` is refused). Label horizon, embargo and n are NOT caller
+    numbers: they are read from the folds' stamp and must cover every variant's DECLARED horizon (``VariantLedger.record(..., horizon=)``) with
+    ``embargo >= max(1, horizon)``. Each variant's supplied returns must be the series the ledger recorded, and the ``selection_log`` is RECOMPUTED from
+    the train windows (SelectionLogError otherwise)."""
+    _require_family(spec, ledger)
+    if not folds or not all(isinstance(f, Fold) and f.authentic() for f in folds):
+        raise HarnessError("folds must be exactly those produced by walk_forward_folds (a hand-built or edited Fold is refused)")
+    params = {(f.n, f.label_horizon, f.embargo) for f in folds}
+    if len(params) != 1:
+        raise HarnessError("folds were produced with different n / label_horizon / embargo")
+    n, label_horizon, embargo = params.pop()
+    if embargo < max(1, label_horizon):
+        raise HarnessError(f"embargo ({embargo}) must be at least max(1, label_horizon={label_horizon})")
+    if not isinstance(variant_returns, Mapping) or not variant_returns:
+        raise SelectionLogError("variant_returns (every variant's full return series) is required to recompute the selection")
+    declared: Dict[str, int] = {}
+    for name in variant_returns:
+        h = ledger.variant_horizon(name)
+        if h is None:
+            raise HarnessError(f"variant {name!r} has no declared label horizon in the ledger: record it with horizon= (its hold, in rows)")
+        declared[name] = h
+    if label_horizon < max(declared.values()):
+        raise HarnessError(f"the folds purge a label horizon of {label_horizon} rows but a variant declares a horizon of {max(declared.values())}")
+    rows = len(next(iter(variant_returns.values())))
+    if rows - index_offset != n:
+        raise HarnessError(f"the folds index {n} rows but the variant returns hold {rows - index_offset} after index_offset")
     verify_selection_log(selection_log=selection_log, variant_returns=variant_returns, folds=folds, oos_returns=oos_returns,
-                         tested_variants=ledger.variant_names(), index_offset=index_offset, selector=selector)
+                         tested_variants=ledger.variant_names(), index_offset=index_offset, selector=selector,
+                         recorded_digests={name: ledger.returns_digests(name) for name in variant_returns})
     st = significance(oos_returns)
-    clean = bool(folds) and all(SP.audit_split(list(f.train), list(f.test), n, label_horizon, embargo)["clean"] for f in folds)
+    clean = all(SP.audit_split(list(f.train), list(f.test), n, label_horizon, embargo)["clean"] for f in folds)
     m = ledger.n_variants
     adj = SP.adjust_pvalues([st["p_one_sided"]], "holm", alpha=alpha, n_tested=m)["adjusted"][0]
     return _build("oos_test", stats=st, p_adjusted=adj, alpha=alpha, n_variants=m, universe=universe, leak=leak, data_sha256=data_sha256, provenance=provenance,
-                  split_clean=clean, spec=spec, extra={"n_folds": len(folds), "selection_log_verified": True, **dict(extra or {})})
+                  split_clean=clean, spec=spec, extra={"n_folds": len(folds), "selection_log_verified": True, "label_horizon": label_horizon, "embargo": embargo,
+                                                       **dict(extra or {})})
 
 
 # ---------------------------------------------------------------- the demonstration: cross-sectional funding on 3 hand-picked survivors
@@ -683,7 +799,7 @@ def _load_spec(name: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0.05, spec: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+def cross_sectional_funding_demo(data_dir: str, *, family: Optional[str] = None, alpha: float = 0.05, spec: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Run the whole harness over the committed Binance 3-symbol funding history. Returns the evidence items, the selection, the universe audit and numbers.
     The universe is three hand-picked survivors: the harness marks it NOT point in time and the evidence says so."""
     files = {s: os.path.join(data_dir, "real_funding_full", "funding", fn) for s, fn in FUNDING_FILES.items()}
@@ -691,14 +807,15 @@ def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0
     grid = sorted(set.intersection(*[set(r) for r in raw.values()]))
     series = {s: PITSeries([g * MS_8H for g in grid], [raw[s][g] for g in grid]) for s in raw}
     universe = PointInTimeUniverse({s: {"listed_ms": grid[0] * MS_8H} for s in raw}, membership_source="hand_picked_survivors", includes_delisted=False)
-    vl = VariantLedger(family)
     spec = spec if spec is not None else _load_spec("cross_sectional_funding")
+    family = family if family is not None else str(spec.get("multiple_testing_family") or spec["candidate_id"])
+    vl = VariantLedger(family)             # the evidence builders refuse a ledger whose family is not the spec's multiple_testing_family
     per_variant: Dict[str, List[float]] = {}
     for L in LOOKBACKS:
         for H in HOLDS:
             name = f"L{L}_H{H}"
             per_variant[name] = _variant_returns(grid, series, raw, L, H)
-            vl.record(name, {"lookback": L, "hold": H}, per_variant[name][max(LOOKBACKS):])
+            vl.record(name, {"lookback": L, "hold": H}, per_variant[name][max(LOOKBACKS):], horizon=H)
     n = len(grid)
     # causal-feature audit of the signal's building block (trailing mean) on one real series
     def trailing_mean(ts: List[int], v: List[float]) -> List[float]:
@@ -722,7 +839,7 @@ def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0
         chosen.append(pick)
         log.append({"fold": k, "chosen": pick, "train_window": [f.train[0], f.train[-1]]})
         oos.extend(per_variant[pick][start + f.test[0]:start + f.test[-1] + 1])
-    oos_ev = oos_evidence(oos_returns=oos, ledger=vl, spec=spec, universe=universe, leak=leak, folds=folds, n=n - start, label_horizon=h_max, embargo=emb,
+    oos_ev = oos_evidence(oos_returns=oos, ledger=vl, spec=spec, universe=universe, leak=leak, folds=folds,
                           data_sha256=sha, alpha=alpha, selection_log=log, variant_returns={k: v[:] for k, v in per_variant.items()}, index_offset=start,
                           extra={"selected_per_fold": chosen})
     return {"family": family, "grid_settlements": n, "universe_point_in_time": universe.point_in_time, "survivorship_problems": universe.survivorship_problems(),
@@ -739,7 +856,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.print_help()
         return 2
     spec = _load_spec("cross_sectional_funding")
-    r = cross_sectional_funding_demo(a.data_dir, family="cli_demo_cross_sectional_funding", spec=spec)
+    r = cross_sectional_funding_demo(a.data_dir, spec=spec)
     v = SV.evaluate(spec, [r["historical"], r["oos"]])
     print(json.dumps({"universe_point_in_time": r["universe_point_in_time"], "problems": r["survivorship_problems"], "selection": r["selection"],
                       "historical": {"result": r["historical"].result, "metrics": dict(r["historical"].metrics)},

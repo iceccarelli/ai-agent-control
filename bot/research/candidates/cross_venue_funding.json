@@ -9,8 +9,8 @@
     "train_test_boundary": "later period of the aligned two-venue history"
   },
   "bias_declarations": {
-    "fills_modelled_against_real_depth": true,
-    "hedge_completeness_modelled": true,
+    "fills_modelled_against_real_depth": false,
+    "hedge_completeness_modelled": false,
     "no_future_funding_knowledge": true,
     "no_look_ahead": true,
     "point_in_time_universe": true
@@ -60,18 +60,27 @@
   ],
   "required_data": [
     {
+      "declaration_keys": [
+        "no_future_funding_knowledge"
+      ],
       "gap": "BTC on Binance and Bybit exists; different intervals and no collateral-transfer cost data",
       "name": "funding history for the same symbol on two venues, aligned to settlement clocks",
       "point_in_time": true,
       "repo_has": true
     },
     {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
       "gap": "owner has a Bybit account only; second venue is unqualified (venues.py)",
       "name": "per-venue fees, margin, withdrawal and transfer cost/latency",
       "point_in_time": true,
       "repo_has": false
     },
     {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
       "gap": "none",
       "name": "per-venue depth",
       "point_in_time": true,
@@ -89,5 +98,5 @@
       "value": 2.5
     }
   },
-  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. Such a candidate is not yet a testable specification (the verdict reports BIAS_NOT_RULED_OUT) until that data is collected."
 }

@@ -67,9 +67,10 @@ def test_ten_x_funding():
     assert "FUNDING_MAGNITUDE_CONTRADICTION" in recon(three(cash="100")).flags       # rate*qty*mark = 10, booked 100
     assert "FUNDING_MAGNITUDE_CONTRADICTION" in recon(three(cash="1")).flags         # and a /10 slip
     assert "RATE_OUTSIDE_VENUE_BOUNDS" in recon(three(rate="0.075", cash="100")).flags   # 10x the 0.0075 cap
-    assert EM.carry_gross_edge(P, q("0.0001"), 30).value == D("30")
-    assert EM.carry_gross_edge(P, q("0.001"), 30).value == D("300")                  # still inside the cap: accepted (the cap IS the screen)
-    assert EM.carry_gross_edge(P, q("0.01"), 30).value is None                       # a 10x slip above the cap is unknown, not 300 bps
+    d10 = D(10)                                                                      # 10 days = 30 settlements
+    assert EM.carry_gross_edge(P, q("0.0001"), hold_days=d10).value == D("30")
+    assert EM.carry_gross_edge(P, q("0.001"), hold_days=d10).value == D("300")       # still inside the cap: accepted (the cap IS the screen)
+    assert EM.carry_gross_edge(P, q("0.01"), hold_days=d10).value is None            # a 10x slip above the cap is unknown, not 300 bps
 
 
 # 4. wrong fee unit
@@ -160,7 +161,9 @@ def test_missing_settlement():
     assert "MISSING_SETTLEMENT" in r.flags and r.missing_ts == (24 * H,) and r.total.value is None
     fills = [fill("a"), fill("b", side="sell", px="50010")]
     assert realised(fills, "ab", {"S": D(0)}, funding=r).pnl_usd.value is None
-    assert realised(fills, "ab", {"S": D(0)}, funding=recon(rows)).pnl_usd.value == D("40")      # control: 10 + 30
+    full = EM.realised_result(fills=[EM.Fill("a", "BTCUSDT", "sell", D(2), D("50000"), D(0), "USDT", 1), EM.Fill("b", "BTCUSDT", "buy", D(2), D("49995"), D(0), "USDT", 25 * H)],
+                              expected_fill_ids="ab", funding=recon(rows), venue_net_qty={"BTCUSDT": D(0)}, marks={})
+    assert full.pnl_usd.value == D("40") and full.flags == ()                                    # control: realised 10 (short 2 sold 50000, bought 49995) + funding 30
 
 
 # 12. unpriced inventory
@@ -168,7 +171,8 @@ def test_unpriced_inventory():
     f = [fill("a")]
     r = realised(f, "a", {"S": D(1)})
     assert "UNPRICED_INVENTORY:S" in r.flags and r.pnl_usd.value is None
-    assert realised(f, "a", {"S": D(1)}, marks={"S": D("50020")}).pnl_usd.value == D("20")       # control: 1*50020 - 50000
+    ok = realised(f, "a", {"S": D(1)}, marks={"S": D("50020")})                                   # control: 1*50020 - 50000, but UNREALISED
+    assert ok.pnl_usd.value == D("0") and ok.unrealised_usd.value == D("20") and ok.flags == ()
     assert "VENUE_POSITION_READ_MISSING:S" in realised(f, "a", {"S": None}, marks={"S": D("50020")}).flags
     assert "INVENTORY_MISMATCH:S" in realised(f, "a", {"S": D(0)}, marks={"S": D("50020")}).flags  # FLAT is the venue's read, not fill arithmetic
 
@@ -310,3 +314,182 @@ def test_maker_leg_has_no_derived_zero_cost():
 def test_taker_chain_is_unaffected_by_maker_fill_probability_default():
     r = EM.evaluate_chain(overlay())
     assert r.components["maker_fill"].value == 0 and r.net_edge_bps.known
+
+
+# ================================================================== red-team round 2 (economic model)
+# Every test pairs a POSITIVE CONTROL (the correct input is accepted) with the fault, so a model that refuses everything also fails.
+def _gross(rate, prov, hold_days):
+    return EM.carry_gross_edge(P, q(rate, prov), hold_days=D(hold_days))
+
+
+# ---- A) assumed gross edge / hedge ratio can never PASS
+def test_assumed_funding_rate_in_gross_edge_is_inconclusive_never_pass():
+    pos = EM.cost_model_evidence(EM.evaluate_chain(overlay()), spec=SPEC, data_sha256=SHA_IN)
+    assert pos.result == SV.PASS                                                      # control: a modelled rate may PASS
+    ch = EM.evaluate_chain(overlay(gross_edge_bps=_gross("0.0001", "assumed", D(30) * 8 / 24)))
+    assert ch.net_edge_bps.value > 0 and "gross_edge" in ch.assumed_inputs
+    ev = EM.cost_model_evidence(ch, spec=SPEC, data_sha256=SHA_IN)
+    assert ev.result == SV.INCONCLUSIVE and "gross_edge" in ev.metrics["assumed_names"] and ev.metrics["net_edge_bps_after_costs"] is not None
+
+
+def test_assumed_hedge_ratio_is_inconclusive_never_pass():
+    ch = EM.evaluate_chain(overlay(hedge_ratio=q("1", "assumed", "ratio"), adverse_move_bps=q("0", "measured", "bps")))
+    assert "hedge_ratio" in ch.assumed_inputs
+    assert EM.cost_model_evidence(ch, spec=SPEC, data_sha256=SHA_IN).result == SV.INCONCLUSIVE
+    ok = EM.evaluate_chain(overlay(hedge_ratio=q("1", "measured", "ratio"), adverse_move_bps=q("0", "measured", "bps")))
+    assert "hedge_ratio" not in ok.assumed_inputs and EM.cost_model_evidence(ok, spec=SPEC, data_sha256=SHA_IN).result == SV.PASS
+
+
+# ---- B) every cost component known-or-unknown (never silently negative); hold_days > 0
+@pytest.mark.parametrize("name,unit", [("impact_bps", "bps"), ("basis_cost_bps", "bps"), ("borrow_apr", "fraction"), ("opportunity_cost_apr", "fraction"),
+                                       ("adverse_move_bps", "bps"), ("adverse_selection_bps", "bps")])
+def test_negative_cost_inputs_are_refused(name, unit):
+    assert EM.evaluate_chain(overlay(**{name: q("0", "measured", unit)})).net_edge_bps.known          # control: a measured zero is a real cost
+    with pytest.raises(EM.EconomicModelError):
+        EM.evaluate_chain(overlay(**{name: q("-300", "measured", unit)}))
+
+
+@pytest.mark.parametrize("hd", ["0", "-3650", "-1"])
+def test_hold_days_must_be_positive(hd):
+    with pytest.raises(EM.EconomicModelError):
+        EM.evaluate_chain(overlay(hold_days=D(hd), gross_edge_bps=q("30", "modelled", "bps"), borrow_apr=q("0.1", "measured", "fraction")))
+    assert EM.evaluate_chain(overlay(hold_days=D("0.5"), gross_edge_bps=q("30", "modelled", "bps"))).net_edge_bps.known
+
+
+def test_hedge_ratio_cannot_be_negative():
+    with pytest.raises(EM.EconomicModelError):
+        EM.evaluate_chain(overlay(hedge_ratio=q("-1", "measured", "ratio")))
+
+
+# ---- C) settlements derive from hold_days * settlements_per_day
+def test_funding_edge_settlements_are_derived_from_hold_days():
+    g = _gross("0.0001", "modelled", "1")                       # 1 day on an 8h perp = 3 settlements = 3 bps
+    assert g.value == D("3") and g.hold_days == D("1")
+    assert _gross("0.0001", "modelled", "10").value == D("30")
+    assert EM.carry_gross_edge(perp(funding_interval_hours=4), q("0.0001"), hold_days=D("1")).value == D("6")
+    with pytest.raises(EM.EconomicModelError):
+        _gross("0.0001", "modelled", "0")
+    with pytest.raises(EM.EconomicModelError):
+        _gross("0.0001", "modelled", "1.5")                     # 4.5 settlements: not a whole number of settlements held
+    with pytest.raises(TypeError):
+        EM.carry_gross_edge(P, q("0.0001"), 24)                 # the old free n_settlements is gone
+
+
+def test_eightfold_settlement_overstatement_is_refused():
+    ok = EM.evaluate_chain(overlay(hold_days=D(1), gross_edge_bps=_gross("0.0003", "modelled", "1")))
+    assert ok.components["borrow"].known                                                  # control: consistent 1 day
+    eight_x = _gross("0.0003", "modelled", "8")                 # 24 settlements of an 8h perp = 8 days of funding ...
+    with pytest.raises(EM.EconomicModelError):
+        EM.evaluate_chain(overlay(hold_days=D(1), gross_edge_bps=eight_x))               # ... claimed for a 1-day hold
+
+
+# ---- D) zero-rate funding with cash
+def test_zero_rate_funding_with_cash_is_flagged():
+    assert recon(three(rate="0", cash="0")).flags == ()                                   # control
+    assert recon(three(rate="0", cash="0.001")).flags == ()                               # dust
+    bad = recon(three(rate="0", cash="-1000"))
+    assert "FUNDING_CASH_AT_ZERO_RATE" in bad.flags and bad.total.value is None
+    assert "FUNDING_CASH_AT_ZERO_RATE" in recon(three(rate="0", cash="1000")).flags
+
+
+# ---- magnitude bracket: a systematic one-sided bias inside the per-row x2 bracket
+def test_systematic_one_sided_funding_bias_is_flagged():
+    assert recon(three(cash="10")).flags == ()                                            # control: exact
+    assert recon(three(cash="10.2")).flags == ()                                          # 2% rounding-scale deviation is accepted
+    for cash in ("15", "6"):                                                              # every row 50% high / 40% low: inside x2, but systematic
+        r = recon(three(cash=cash))
+        assert "FUNDING_SYSTEMATIC_BIAS" in r.flags and r.total.value is None, cash
+    mixed = [settle(8 * H, cash="15"), settle(16 * H, cash="6"), settle(24 * H, cash="10")]    # deviations of both signs average out near 10
+    assert "FUNDING_SYSTEMATIC_BIAS" not in recon(mixed).flags
+
+
+# ---- G) fills
+def test_fill_construction_is_validated():
+    assert fill("a").qty == D(1)                                                         # control
+    for kw in ({"side": "hold"}, {"side": "BUY"}, {"qty": "0"}, {"qty": "-1"}, {"px": "0"}, {"px": "-5"}):
+        with pytest.raises(EM.EconomicModelError):
+            fill("a", **kw)
+    with pytest.raises(EM.EconomicModelError):
+        EM.Fill("a", "S", "buy", 1.0, D("1"), D("0"), "USDT", 1)                         # float qty
+
+
+def test_fee_currency_is_quote_or_base_only():
+    f = [fill("a", fee="1", ccy="MNT")]
+    r = realised(f, "a", {"S": D(1)}, marks={"S": D("50000")})
+    assert "FEE_CCY_UNSUPPORTED:S:MNT" in r.flags and r.pnl_usd.value is None            # never multiply a foreign-currency fee by price
+    assert realised([fill("a", fee="1", ccy="USDT")], "a", {"S": D(1)}, marks={"S": D("50000")}).pnl_usd.value == D("-1")     # control: quote coin
+    base = EM.realised_result(fills=[fill("a", fee="0.001", ccy="BTC")], expected_fill_ids="a", funding=EM.reconcile_funding(P, [], 0, 0), venue_net_qty={"S": D(1)},
+                              marks={"S": D("50000")}, base_coins={"S": "BTC"})
+    assert base.flags == () and base.components["fees"].value == D("50")                   # 0.001 BTC at 50000
+    nob = EM.realised_result(fills=[fill("a", fee="0.001", ccy="BTC")], expected_fill_ids="a", funding=EM.reconcile_funding(P, [], 0, 0), venue_net_qty={"S": D(1)},
+                             marks={"S": D("50000")})
+    assert "FEE_CCY_UNSUPPORTED:S:BTC" in nob.flags                                        # base coin unknown for the symbol: refused, not guessed
+
+
+# ---- E) realised vs unrealised
+def _flat_funding():
+    return EM.reconcile_funding(P, [], 0, 0)
+
+
+def test_unrealised_mark_to_market_is_not_realised_profit():
+    f = [fill("a", sym="BTCUSDT")]
+    r = EM.realised_result(fills=f, expected_fill_ids="a", funding=_flat_funding(), venue_net_qty={"BTCUSDT": D(1)}, marks={"BTCUSDT": D("60000")})
+    assert r.pnl_usd.value == D("0")                                                    # nothing was realised
+    assert r.unrealised_usd.value == D("10000") and r.open_inventory == {"BTCUSDT": D(1)}
+    closed = EM.realised_result(fills=f + [fill("b", side="sell", sym="BTCUSDT", px="60000")], expected_fill_ids="ab", funding=_flat_funding(),
+                                venue_net_qty={"BTCUSDT": D(0)}, marks={})
+    assert closed.pnl_usd.value == D("10000") and closed.unrealised_usd.value == D("0")   # control: closed -> realised
+
+
+def test_marks_carry_a_timestamp_and_provenance():
+    f = [fill("a", sym="BTCUSDT")]
+    kw = dict(fills=f, expected_fill_ids="a", funding=_flat_funding(), venue_net_qty={"BTCUSDT": D(1)})
+    bare = EM.realised_result(marks={"BTCUSDT": D("60000")}, **kw)
+    assert bare.unrealised_usd.provenance == "assumed"                                    # an unstamped mark is not 'measured'
+    fresh = EM.realised_result(marks={"BTCUSDT": EM.Mark(D("60000"), 1_000_000, "venue_mark")}, as_of_ms=1_010_000, **kw)
+    assert fresh.unrealised_usd.provenance == "measured" and fresh.unrealised_usd.value == D("10000")
+    stale = EM.realised_result(marks={"BTCUSDT": EM.Mark(D("60000"), 1_000_000, "venue_mark")}, as_of_ms=1_000_000 + EM.MAX_MARK_AGE_MS + 1, **kw)
+    assert "STALE_MARK:BTCUSDT" in stale.flags and stale.pnl_usd.value is None
+    future = EM.realised_result(marks={"BTCUSDT": EM.Mark(D("60000"), 2_000_000, "venue_mark")}, as_of_ms=1_000_000, **kw)
+    assert "STALE_MARK:BTCUSDT" in future.flags
+    with pytest.raises(EM.EconomicModelError):
+        EM.Mark(D("0"), 1, "venue_mark")
+    with pytest.raises(EM.EconomicModelError):
+        EM.Mark(D("1"), 1, "")
+
+
+def test_hedged_claim_requires_a_neutral_hedge_check():
+    f = [fill("a", sym="BTCUSDT")]
+    kw = dict(fills=f, expected_fill_ids="a", funding=_flat_funding(), venue_net_qty={"BTCUSDT": D(1)}, marks={"BTCUSDT": D("50000")}, claim_hedged=True)
+    assert "HEDGE_CHECK_MISSING" in EM.realised_result(**kw).flags and EM.realised_result(**kw).pnl_usd.value is None
+    assert "HEDGE_NOT_NEUTRAL" in EM.realised_result(hedge=EM.hedge_check(D("1"), D("0.5")), **kw).flags
+    ok = EM.realised_result(hedge=EM.hedge_check(D("1"), D("1")), **kw)
+    assert ok.flags == () and ok.pnl_usd.known
+
+
+# ---- F) funding rows must be backed by fills / a consistent position
+def _perp_funding(qty="-1", n=3):
+    rows = [settle(t, qty=qty, cash=str(-D(qty) * 5)) for t in (8 * H, 16 * H, 24 * H)][:n]
+    return EM.reconcile_funding(P, rows, 0, n * 8 * H)
+
+
+def test_funding_without_any_fills_is_not_a_profit():
+    fr = _perp_funding()
+    assert fr.total.value == D("15") and fr.flags == ()
+    r = EM.realised_result(fills=[], expected_fill_ids=[], funding=fr, venue_net_qty={}, marks={})
+    assert "FUNDING_WITHOUT_FILLS" in r.flags and r.pnl_usd.value is None
+
+
+def test_funding_position_must_match_the_fill_derived_position():
+    open_short = [EM.Fill("s", "BTCUSDT", "sell", D(1), D("50000"), D(0), "USDT", 1)]
+    fr = _perp_funding("-1")
+    good = EM.realised_result(fills=open_short, expected_fill_ids="s", funding=fr, venue_net_qty={"BTCUSDT": D(-1)}, marks={"BTCUSDT": D("50000")})
+    assert good.flags == () and good.pnl_usd.value == D("15")                              # control
+    big = EM.realised_result(fills=open_short, expected_fill_ids="s", funding=_perp_funding("-5"), venue_net_qty={"BTCUSDT": D(-1)}, marks={"BTCUSDT": D("50000")})
+    assert "FUNDING_POSITION_MISMATCH:BTCUSDT" in big.flags and big.pnl_usd.value is None   # funding paid on 5 BTC, fills show 1
+    late = [EM.Fill("s", "BTCUSDT", "sell", D(1), D("50000"), D(0), "USDT", 20 * H)]       # position opened after the first two settlements
+    r = EM.realised_result(fills=late, expected_fill_ids="s", funding=fr, venue_net_qty={"BTCUSDT": D(-1)}, marks={"BTCUSDT": D("50000")})
+    assert "FUNDING_POSITION_MISMATCH:BTCUSDT" in r.flags
+    manual = EM.FundingRecon(EM.Quantity(D("15"), "measured", "usd"), (), (), 3)           # a hand-built recon carries no positions to check
+    r2 = EM.realised_result(fills=open_short, expected_fill_ids="s", funding=manual, venue_net_qty={"BTCUSDT": D(-1)}, marks={"BTCUSDT": D("50000")})
+    assert "FUNDING_POSITIONS_UNVERIFIED" in r2.flags and r2.pnl_usd.value is None

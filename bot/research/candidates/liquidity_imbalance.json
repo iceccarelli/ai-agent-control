@@ -9,10 +9,10 @@
     "train_test_boundary": "later recorded sessions; the threshold frozen first"
   },
   "bias_declarations": {
-    "fills_modelled_against_real_depth": true,
+    "fills_modelled_against_real_depth": false,
     "hedge_completeness_modelled": true,
     "no_future_funding_knowledge": true,
-    "no_look_ahead": true,
+    "no_look_ahead": false,
     "point_in_time_universe": true
   },
   "candidate_id": "liquidity_imbalance@spec-1",
@@ -60,18 +60,28 @@
   ],
   "required_data": [
     {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth",
+        "no_look_ahead"
+      ],
       "gap": "BTC/ETH spot L2 snapshots at coarse intervals (data/orderbook); no perp book history",
       "name": "L2 book snapshots/deltas with exchange timestamps for the traded instrument",
       "point_in_time": true,
       "repo_has": false
     },
     {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
       "gap": "none",
       "name": "trade tape for realised mid moves",
       "point_in_time": true,
       "repo_has": false
     },
     {
+      "declaration_keys": [
+        "no_look_ahead"
+      ],
       "gap": "none",
       "name": "measured order latency",
       "point_in_time": true,
@@ -89,5 +99,5 @@
       "value": 2.0
     }
   },
-  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. Such a candidate is not yet a testable specification (the verdict reports BIAS_NOT_RULED_OUT) until that data is collected."
 }

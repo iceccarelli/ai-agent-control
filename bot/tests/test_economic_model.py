@@ -65,7 +65,7 @@ def overlay(*, rate="0.0001", n=30, notional="50000", fee=None, bk=None, **over)
     """Short-perp overlay on owned BTC (no spot leg): 11 bps round trip. Every input known and non-assumed."""
     pi = perp()
     leg = EM.Leg("perp", pi, "sell", bk or book(), fee or tier())
-    kw = dict(legs=(leg,), notional_usd=D(notional), gross_edge_bps=EM.carry_gross_edge(pi, q(rate, "modelled"), n),
+    kw = dict(legs=(leg,), notional_usd=D(notional), gross_edge_bps=EM.carry_gross_edge(pi, q(rate, "modelled"), hold_days=D(n) * 8 / 24),
               hold_days=D(n) * 8 / 24, now_ms=NOW, max_book_age_ms=5000, max_fee_age_ms=24 * H,
               impact_bps=q("0.5"), basis_cost_bps=q("1"), borrow_apr=q("0", "measured"), opportunity_cost_apr=q("0.0365", "venue_stated"),
               hedge_ratio=q("1", "measured"), adverse_move_bps=q("100", "modelled"))
@@ -202,10 +202,11 @@ def test_two_leg_generic_spread():
 
 def test_funding_edge_screened_against_instrument_bounds():
     p = perp()
-    assert EM.carry_gross_edge(p, q("0.0001"), 30).value == D("30")
-    assert EM.carry_gross_edge(p, q("0.0001"), 30, short=False).value == D("-30")      # a long pays
-    assert EM.carry_gross_edge(p, q("0.0076"), 30).value is None                       # above the venue cap: not an edge
-    assert EM.carry_gross_edge(p, EM.unknown(), 30).value is None
+    d10 = D(10)                                                                          # 10 days on an 8h perp = 30 settlements
+    assert EM.carry_gross_edge(p, q("0.0001"), hold_days=d10).value == D("30")
+    assert EM.carry_gross_edge(p, q("0.0001"), hold_days=d10, short=False).value == D("-30")      # a long pays
+    assert EM.carry_gross_edge(p, q("0.0076"), hold_days=d10).value is None                       # above the venue cap: not an edge
+    assert EM.carry_gross_edge(p, EM.unknown(), hold_days=d10).value is None
 
 
 # ---------------------------------------------------------------- capacity
@@ -248,12 +249,15 @@ def test_capacity_evidence():
 
 # ---------------------------------------------------------------- realised
 def test_realised_hand_computed():
-    fills = [EM.Fill("a", "SPOT", "buy", D(1), D("50010"), D("50.01"), "USDT", 1), EM.Fill("b", "PERP", "sell", D(1), D("49990"), D("27.4945"), "USDT", 2),
-             EM.Fill("c", "SPOT", "sell", D(1), D("50030"), D("50.03"), "USDT", 3), EM.Fill("d", "PERP", "buy", D(1), D("50020"), D("27.511"), "USDT", 4)]
-    fr = EM.FundingRecon(EM.Quantity(D("30"), "measured", "usd"), (), (), 3)
-    r = EM.realised_result(fills=fills, expected_fill_ids="abcd", funding=fr, venue_net_qty={"SPOT": D(0), "PERP": D(0)}, marks={})
-    # cash -50010 + 49990 + 50030 - 50020 = -10 ; fees 50.01 + 27.4945 + 50.03 + 27.511 = 155.0455 ; funding +30
+    ts_close = 25 * H
+    fills = [EM.Fill("a", "SPOT", "buy", D(1), D("50010"), D("50.01"), "USDT", 1), EM.Fill("b", "BTCUSDT", "sell", D(1), D("49990"), D("27.4945"), "USDT", 2),
+             EM.Fill("c", "SPOT", "sell", D(1), D("50030"), D("50.03"), "USDT", ts_close), EM.Fill("d", "BTCUSDT", "buy", D(1), D("50020"), D("27.511"), "USDT", ts_close + 1)]
+    rows = [EM.Settlement(t, "BTCUSDT", D("0.0002"), D("-1"), D("50000"), D("10")) for t in (8 * H, 16 * H, 24 * H)]
+    fr = EM.reconcile_funding(perp(), rows, 0, 24 * H)
+    r = EM.realised_result(fills=fills, expected_fill_ids="abcd", funding=fr, venue_net_qty={"SPOT": D(0), "BTCUSDT": D(0)}, marks={})
+    # spot +20, perp -30 (sold 49990, bought back 50020) = -10 ; fees 50.01 + 27.4945 + 50.03 + 27.511 = 155.0455 ; funding +30
     assert r.pnl_usd.value == D("-135.0455") and r.pnl_usd.provenance == "derived" and r.flags == ()
+    assert r.unrealised_usd.value == D("0") and r.open_inventory == {}
 
 
 # ---------------------------------------------------------------- cross-checks against the repo's authorities

@@ -9,7 +9,7 @@
     "train_test_boundary": "prospective only for BTC (frozen plan); any other symbol needs its own registration"
   },
   "bias_declarations": {
-    "fills_modelled_against_real_depth": true,
+    "fills_modelled_against_real_depth": false,
     "hedge_completeness_modelled": true,
     "no_future_funding_knowledge": true,
     "no_look_ahead": true,
@@ -60,24 +60,34 @@
   ],
   "required_data": [
     {
+      "declaration_keys": [
+        "no_future_funding_knowledge"
+      ],
       "gap": "BTC/ETH/SOL Binance, BTC Bybit",
       "name": "funding history for the traded symbols",
       "point_in_time": true,
       "repo_has": true
     },
     {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
       "gap": "spot BTC OHLCV exists; basis at settlement partial (tools/basis_at_settlement)",
       "name": "spot price history and hedge-leg basis at entry/exit",
       "point_in_time": true,
       "repo_has": true
     },
     {
+      "declaration_keys": [],
       "gap": "OKX USDT lending 1h only; not the owner's actual cost",
       "name": "borrow/financing rate for the capital held",
       "point_in_time": true,
       "repo_has": true
     },
     {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
       "gap": "BTC/ETH spot L2 only",
       "name": "L2 depth for capacity",
       "point_in_time": true,
@@ -95,5 +105,5 @@
       "value": 0.2
     }
   },
-  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. Such a candidate is not yet a testable specification (the verdict reports BIAS_NOT_RULED_OUT) until that data is collected."
 }

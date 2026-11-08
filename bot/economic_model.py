@@ -12,6 +12,11 @@ Design rules, each enforced in code and attacked in tests/test_economic_faults.p
 * Funding sign convention: positive rate => LONGS PAY, SHORTS RECEIVE (cash = -signed_qty * mark * rate; signed_qty < 0 is short).
 * A fee tier carries an AGE; a tier older than the stated limit is UNKNOWN, not current.
 * FLAT is the venue's own position read, never fill arithmetic (``realised_result`` needs the venue's read and refuses a mismatch).
+* The funding edge is DERIVED from the hold (``carry_gross_edge(hold_days=)``: n = hold_days * the instrument's own settlements per day); a scenario whose
+  hold differs from the edge's is refused. A known cost input below zero is refused (a negative cost would manufacture edge); hold_days must be positive.
+* ``assumed`` anywhere that matters (a cost, the gross edge, the hedge ratio, a maker probability) can never PASS: it makes the evidence INCONCLUSIVE.
+* ``realised_result`` reports REALISED P&L only (average-cost closed trades + funding - fees). Open inventory's mark-to-market is reported separately, with
+  its mark's timestamp/provenance; funding must be backed by fills and by a position that matches them; a fee in a foreign currency is refused.
 
 It never changes ``carry_costs`` / ``ledger`` / ``funding_reconcile`` / ``carry_broker``; tests cross-check against them.
 """
@@ -418,19 +423,34 @@ def funding_cash(rate_fraction: Decimal, signed_qty: Decimal, mark: Decimal) -> 
     return -signed_qty * mark * rate_fraction
 
 
-def carry_gross_edge(perp: Instrument, expected_rate: Quantity, n_settlements: int, *, short: bool = True) -> Quantity:
-    """THEORETICAL edge in bps of notional: sign * rate * n. The rate must lie inside the instrument's own cap/floor, else UNKNOWN."""
+@dataclass(frozen=True)
+class GrossEdge(Quantity):
+    """A funding edge that REMEMBERS the hold it was built for (``hold_days``, ``n_settlements``). ``evaluate_chain`` refuses a scenario whose hold differs:
+    the edge is derived from the hold, never an independently stated settlement count."""
+    hold_days: Optional[Decimal] = None
+    n_settlements: Optional[Decimal] = None
+
+
+def carry_gross_edge(perp: Instrument, expected_rate: Quantity, *, hold_days: Any, short: bool = True) -> Quantity:
+    """THEORETICAL edge in bps of notional: sign * rate * n, with n = hold_days * the instrument's OWN settlements per day (a whole number of settlements).
+    There is no free ``n_settlements``: 24 settlements for a 1-day hold on an 8h perp (8x overstated) cannot be expressed. The rate must lie inside the
+    instrument's own cap/floor, else UNKNOWN."""
     if perp.category != "linear":
         raise EconomicModelError("funding edge needs a perpetual")
-    if n_settlements <= 0:
-        raise EconomicModelError("n_settlements must be positive")
+    hd = to_decimal(hold_days)
+    if hd <= 0:
+        raise EconomicModelError("hold_days must be positive")
+    n = hd * perp.settlements_per_day
+    if n <= 0 or n != n.to_integral_value():
+        raise EconomicModelError(f"hold_days={hd} on a {perp.funding_interval_hours}h perp is {n} settlements; a hold must cover a whole number of settlements")
     if not expected_rate.known:
         return unknown("bps")
     r = expected_rate.value
     if r > perp.funding_cap or r < perp.funding_floor:
         return unknown("bps")                              # outside the venue's own bounds: a unit slip, not an edge
     sign = Decimal(1) if short else Decimal(-1)
-    return expected_rate * sign * BPS * Decimal(n_settlements) * Quantity(Decimal(1), "measured", "bps")
+    q = expected_rate * sign * BPS * n * Quantity(Decimal(1), "measured", "bps")
+    return GrossEdge(q.value, q.provenance, "bps", hd, n)
 
 
 @dataclass(frozen=True)
@@ -443,7 +463,11 @@ class Settlement:
     cash_usd: Decimal              # reported by the venue/export: + received
 
 
-MAGNITUDE_BRACKET = Decimal(2)      # same bracket funding_reconcile uses; a x10 slip or a cumulative field falls outside it
+MAGNITUDE_BRACKET = Decimal(2)      # same per-row bracket funding_reconcile uses; a x10 slip or a cumulative field falls outside it
+# A x2 per-row bracket alone lets a consistent +-50% bias through, so the AGGREGATE of the checkable rows must also agree with the venue's own formula.
+# Rows of both signs average out; a one-sided deviation does not.
+AGGREGATE_BIAS_TOLERANCE = Decimal("0.10")
+FUNDING_CASH_DUST = Decimal("0.01")  # quote units: cash this small at a zero rate is rounding, anything more is invented funding
 
 
 @dataclass(frozen=True)
@@ -452,6 +476,8 @@ class FundingRecon:
     flags: Tuple[str, ...]
     missing_ts: Tuple[int, ...]
     rows: int
+    symbol: Optional[str] = None                                   # what the rows are about ...
+    positions: Tuple[Tuple[int, Decimal], ...] = ()                # ... and the (ts_ms, signed position_qty) each row claims, for a cross-check against fills
 
 
 def expected_settlement_times(perp: Instrument, start_ms: int, end_ms: int) -> List[int]:
@@ -475,11 +501,14 @@ def reconcile_funding(perp: Instrument, rows: Sequence[Settlement], start_ms: in
     wantset = set(want)
     if any(t not in wantset for t in seen):
         flags.append("SETTLEMENT_OFF_INTERVAL_GRID")       # catches a venue/export on another interval than the instrument's
+    exp_sum, cash_sum = Decimal(0), Decimal(0)
     for r in rows:
         if r.symbol != perp.symbol:
             flags.append("WRONG_SYMBOL_ROW")
         if r.rate > perp.funding_cap or r.rate < perp.funding_floor:
             flags.append("RATE_OUTSIDE_VENUE_BOUNDS")
+        if r.rate == 0 and abs(r.cash_usd) > FUNDING_CASH_DUST:
+            flags.append("FUNDING_CASH_AT_ZERO_RATE")           # a zero rate pays nothing: cash here is invented, whatever the position
         if r.mark is None or r.mark <= 0 or r.position_qty == 0:
             flags.append("UNCHECKABLE_ROW")
             continue
@@ -491,10 +520,15 @@ def reconcile_funding(perp: Instrument, rows: Sequence[Settlement], start_ms: in
             ratio = abs(r.cash_usd) / abs(exp)
             if ratio > MAGNITUDE_BRACKET or ratio * MAGNITUDE_BRACKET < 1:
                 flags.append("FUNDING_MAGNITUDE_CONTRADICTION")
+            exp_sum += exp
+            cash_sum += r.cash_usd
+    if exp_sum != 0 and abs(cash_sum - exp_sum) > AGGREGATE_BIAS_TOLERANCE * abs(exp_sum):
+        flags.append("FUNDING_SYSTEMATIC_BIAS")
     flags_t = tuple(sorted(set(flags)))
+    pos = tuple((r.ts_ms, r.position_qty) for r in sorted(rows, key=lambda x: x.ts_ms))
     if flags_t:
-        return FundingRecon(unknown("usd"), flags_t, missing, len(rows))
-    return FundingRecon(Quantity(sum((r.cash_usd for r in rows), Decimal(0)), "measured", "usd"), (), (), len(rows))
+        return FundingRecon(unknown("usd"), flags_t, missing, len(rows), perp.symbol, pos)
+    return FundingRecon(Quantity(sum((r.cash_usd for r in rows), Decimal(0)), "measured", "usd"), (), (), len(rows), perp.symbol, pos)
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -543,6 +577,7 @@ class ChainResult:
     blockers: Tuple[str, ...]
     capital_utilisation: Quantity          # notional / margin
     digest: str
+    scenario_inputs: Mapping[str, Quantity] = field(default_factory=dict)      # the scenario's own non-cost inputs (gross edge, hedge ratio ...) with provenance
 
     @property
     def unknown_inputs(self) -> Tuple[str, ...]:
@@ -550,7 +585,10 @@ class ChainResult:
 
     @property
     def assumed_inputs(self) -> Tuple[str, ...]:
-        return tuple(sorted(k for k, q in self.components.items() if q.provenance == "assumed"))
+        """Every input whose number is an ASSUMPTION: cost components AND the scenario's gross edge / hedge ratio / maker probability. Any one blocks a PASS."""
+        names = {k for k, q in self.components.items() if q.provenance == "assumed"}
+        names |= {k for k, q in self.scenario_inputs.items() if q.known and q.provenance == "assumed"}
+        return tuple(sorted(names))
 
     @property
     def net_edge_bps(self) -> Quantity:
@@ -610,10 +648,27 @@ def _leg_costs(leg: Leg, notional: Decimal, scn: Scenario) -> Tuple[Quantity, Qu
     return fee, spread, slip, blockers
 
 
+def _validate_scenario(scn: Scenario) -> None:
+    """Refuse inputs that would make a cost into an edge. An UNKNOWN input stays unknown (INCONCLUSIVE); a KNOWN one must be a non-negative cost."""
+    hold = to_decimal(scn.hold_days)
+    if hold <= 0:
+        raise EconomicModelError(f"hold_days must be positive, got {hold}")
+    for name in ("impact_bps", "basis_cost_bps", "borrow_apr", "opportunity_cost_apr", "adverse_move_bps", "adverse_selection_bps", "hedge_ratio"):
+        q = getattr(scn, name)
+        if not isinstance(q, Quantity):
+            raise EconomicModelError(f"{name} must be a Quantity")
+        if q.known and q.value < 0:
+            raise EconomicModelError(f"{name} is a cost/ratio and cannot be negative (got {q.value}): a negative cost would add edge out of nothing")
+    ge = scn.gross_edge_bps
+    if isinstance(ge, GrossEdge) and ge.hold_days is not None and ge.hold_days != hold:
+        raise EconomicModelError(f"the funding edge was built for hold_days={ge.hold_days} ({ge.n_settlements} settlements) but the scenario holds {hold}")
+
+
 def evaluate_chain(scn: Scenario) -> ChainResult:
     n = to_decimal(scn.notional_usd)
     if n <= 0 or not scn.legs:
         raise EconomicModelError("notional must be positive and at least one leg is required")
+    _validate_scenario(scn)
     fees: List[Quantity] = []
     spreads: List[Quantity] = []
     slips: List[Quantity] = []
@@ -652,7 +707,10 @@ def evaluate_chain(scn: Scenario) -> ChainResult:
         cap = cap - comps[k]
     stages = {"THEORETICAL": theo, "EXECUTABLE": exe, "CAPTURABLE": cap, "REALISED": unknown("bps")}
     util = (Quantity(n, "measured", "usd") / scn.margin_usd) if scn.margin_usd.known else unknown("ratio")
-    return ChainResult(comps, stages, executable, tuple(blockers), util, digest((scn,)))
+    inputs = {"gross_edge": scn.gross_edge_bps, "hedge_ratio": scn.hedge_ratio, "adverse_move": scn.adverse_move_bps}
+    if maker_legs:
+        inputs["maker_fill_probability"] = p_fill
+    return ChainResult(comps, stages, executable, tuple(blockers), util, digest((scn,)), inputs)
 
 
 def round_trip_fee_bps(rates: Sequence[Quantity]) -> Quantity:
@@ -749,8 +807,22 @@ class Fill:
     qty: Decimal
     price: Decimal
     fee: Decimal                   # >= 0 cost (negative = rebate), in fee_ccy
-    fee_ccy: str                   # quote coin or base coin
+    fee_ccy: str                   # quote coin or the symbol's base coin (anything else is refused in realised_result)
     ts_ms: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fill_id, str) or not self.fill_id or not isinstance(self.symbol, str) or not self.symbol:
+            raise EconomicModelError("a fill needs a fill_id and a symbol")
+        if self.side not in ("buy", "sell"):
+            raise EconomicModelError(f"fill side must be 'buy' or 'sell', got {self.side!r}")
+        for name in ("qty", "price", "fee"):
+            v = getattr(self, name)
+            if not isinstance(v, Decimal) or not v.is_finite():
+                raise EconomicModelError(f"fill {name} must be a finite Decimal (floats are refused), got {v!r}")
+        if self.qty <= 0 or self.price <= 0:
+            raise EconomicModelError("fill qty and price must be positive")
+        if not isinstance(self.fee_ccy, str) or not self.fee_ccy or isinstance(self.ts_ms, bool) or not isinstance(self.ts_ms, int):
+            raise EconomicModelError("a fill needs a fee_ccy and an integer ts_ms")
 
 
 @dataclass(frozen=True)
@@ -820,53 +892,134 @@ def check_owner_export(export: Mapping[str, Any], window_start_ms: int, window_e
     return ExportCheck(not p, tuple(p))
 
 
+MAX_MARK_AGE_MS = 60_000     # a mark older than this (or from the future) relative to ``as_of_ms`` is not a price for today's inventory
+
+
+@dataclass(frozen=True)
+class Mark:
+    """A price with WHEN and WHERE it was observed. A bare Decimal mark carries neither, so its unrealised value is only ``assumed``."""
+    price: Decimal
+    ts_ms: int
+    source: str                    # e.g. 'venue_mark', 'venue_last', 'index'
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.price, Decimal) or not self.price.is_finite() or self.price <= 0:
+            raise EconomicModelError("a mark price must be a positive finite Decimal")
+        if isinstance(self.ts_ms, bool) or not isinstance(self.ts_ms, int):
+            raise EconomicModelError("a mark needs an integer ts_ms")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise EconomicModelError("a mark needs a source")
+
+
 @dataclass(frozen=True)
 class RealisedResult:
+    """``pnl_usd`` is REALISED only: closed-trade P&L (average cost) + funding received - fees. Open inventory's mark-to-market is ``unrealised_usd``,
+    reported separately and never added to ``pnl_usd``."""
     pnl_usd: Quantity
     flags: Tuple[str, ...]
     components: Mapping[str, Quantity]
+    unrealised_usd: Quantity = field(default_factory=lambda: unknown("usd"))
+    open_inventory: Mapping[str, Decimal] = field(default_factory=dict)
 
 
 def realised_result(*, fills: Sequence[Fill], expected_fill_ids: Sequence[str], funding: FundingRecon,
-                    venue_net_qty: Mapping[str, Optional[Decimal]], marks: Mapping[str, Optional[Decimal]],
-                    export: Optional[ExportCheck] = None, quote_coin: str = "USDT") -> RealisedResult:
-    """Realised PnL in quote currency. UNKNOWN (never a number) when the fills, funding, export, inventory read or a mark is not whole.
-    Inventory is the VENUE's net position read; fill arithmetic that disagrees with it is a flag, not an inference."""
+                    venue_net_qty: Mapping[str, Optional[Decimal]], marks: Mapping[str, Any],
+                    export: Optional[ExportCheck] = None, quote_coin: str = "USDT", base_coins: Optional[Mapping[str, str]] = None,
+                    hedge: Optional[HedgeCheck] = None, claim_hedged: bool = False, as_of_ms: Optional[int] = None,
+                    max_mark_age_ms: int = MAX_MARK_AGE_MS) -> RealisedResult:
+    """REALISED PnL in quote currency. UNKNOWN (never a number) when the fills, funding, export, inventory read, a fee currency or a mark is not whole.
+    Inventory is the VENUE's net position read; fill arithmetic that disagrees with it is a flag, not an inference. Open inventory is marked to market into
+    ``unrealised_usd`` (a ``Mark`` with a timestamp and source, fresh against ``as_of_ms``; a bare Decimal is only 'assumed'). ``claim_hedged`` demands a
+    neutral ``hedge`` check. Funding must be backed by fills: rows with no fills, or whose position differs from the fill-derived position at that
+    settlement, are flagged."""
     flags: List[str] = []
+    bases = dict(base_coins or {})
     if export is not None and not export.complete:
         flags.append("OWNER_EXPORT_INCOMPLETE")
     fr = reconcile_fills(fills, expected_fill_ids)
     flags.extend(fr.flags)
     flags.extend(f"FUNDING:{f}" for f in funding.flags)
-    cash = Decimal(0)
+    if claim_hedged:
+        if hedge is None:
+            flags.append("HEDGE_CHECK_MISSING")
+        elif not hedge.neutral:
+            flags.append("HEDGE_NOT_NEUTRAL")
+    # fees, in quote currency; a fee in any other currency is never multiplied by a price on faith
     fees = Decimal(0)
-    net: Dict[str, Decimal] = {}
     for f in fills:
+        if f.fee_ccy == quote_coin:
+            fees += f.fee
+        elif bases.get(f.symbol) == f.fee_ccy:
+            fees += f.fee * f.price
+        else:
+            flags.append(f"FEE_CCY_UNSUPPORTED:{f.symbol}:{f.fee_ccy}")
+    # average-cost accounting per symbol: only the CLOSED part of a position is realised
+    net: Dict[str, Decimal] = {}
+    cost: Dict[str, Decimal] = {}              # signed cost basis of the open position (position * average price)
+    realised_trading = Decimal(0)
+    for f in sorted(fills, key=lambda x: x.ts_ms):
         sgn = Decimal(1) if f.side == "buy" else Decimal(-1)
-        cash += -sgn * f.qty * f.price
-        fees += f.fee if f.fee_ccy == quote_coin else f.fee * f.price
-        net[f.symbol] = net.get(f.symbol, Decimal(0)) + sgn * f.qty
-    inventory = Decimal(0)
-    for sym, arith in net.items():
+        pos, basis = net.get(f.symbol, Decimal(0)), cost.get(f.symbol, Decimal(0))
+        if pos == 0 or (pos > 0) == (sgn > 0):
+            pos, basis = pos + sgn * f.qty, basis + sgn * f.qty * f.price
+        else:
+            closing = min(f.qty, abs(pos))
+            avg = basis / pos
+            realised_trading += (f.price - avg) * closing * (Decimal(1) if pos > 0 else Decimal(-1))
+            pos2 = pos + sgn * closing
+            basis = avg * pos2
+            rest = f.qty - closing
+            pos = pos2
+            if rest > 0:
+                pos, basis = sgn * rest, sgn * rest * f.price
+        net[f.symbol], cost[f.symbol] = pos, basis
+    # funding must be backed by fills
+    if funding.rows > 0:
+        if not fills:
+            flags.append("FUNDING_WITHOUT_FILLS")
+        elif funding.symbol is None or len(funding.positions) != funding.rows:
+            flags.append("FUNDING_POSITIONS_UNVERIFIED")
+        else:
+            for ts, claimed in funding.positions:
+                derived = sum((((Decimal(1) if f.side == "buy" else Decimal(-1)) * f.qty) for f in fills if f.symbol == funding.symbol and f.ts_ms <= ts), Decimal(0))
+                if derived != claimed:
+                    flags.append(f"FUNDING_POSITION_MISMATCH:{funding.symbol}")
+                    break
+    # inventory is the venue's read; every open lot is marked with a stamped, fresh mark
+    open_inv: Dict[str, Decimal] = {}
+    unreal = Decimal(0)
+    unreal_prov = "measured"
+    for sym, pos in net.items():
         venue = venue_net_qty.get(sym)
         if venue is None:
             flags.append(f"VENUE_POSITION_READ_MISSING:{sym}")
             continue
-        if venue != arith:
+        if venue != pos:
             flags.append(f"INVENTORY_MISMATCH:{sym}")
             continue
-        if venue != 0:
-            mk = marks.get(sym)
-            if mk is None or mk <= 0:
-                flags.append(f"UNPRICED_INVENTORY:{sym}")
+        if venue == 0:
+            continue
+        open_inv[sym] = venue
+        mk = marks.get(sym)
+        if isinstance(mk, Mark):
+            if as_of_ms is None:
+                unreal_prov = weakest(unreal_prov, "modelled")           # stamped, but nothing to judge its age against
+            elif mk.ts_ms > as_of_ms or as_of_ms - mk.ts_ms > max_mark_age_ms:
+                flags.append(f"STALE_MARK:{sym}")
                 continue
-            inventory += venue * mk
-    comps = {"trade_cash": Quantity(cash, "measured", "usd"), "fees": Quantity(fees, "measured", "usd"),
-             "funding": funding.total, "inventory_value": Quantity(inventory, "measured", "usd")}
+            price = mk.price
+        elif mk is not None and mk > 0:
+            price = mk
+            unreal_prov = weakest(unreal_prov, "assumed")                # an unstamped number: no time, no source
+        else:
+            flags.append(f"UNPRICED_INVENTORY:{sym}")
+            continue
+        unreal += venue * price - cost[sym]
+    comps = {"realised_trading": Quantity(realised_trading, "derived", "usd"), "fees": Quantity(fees, "measured", "usd"), "funding": funding.total}
     if flags:
-        return RealisedResult(unknown("usd"), tuple(sorted(set(flags))), comps)
-    total = comps["trade_cash"] - comps["fees"] + comps["funding"] + comps["inventory_value"]
-    return RealisedResult(total, (), comps)
+        return RealisedResult(unknown("usd"), tuple(sorted(set(flags))), comps, unknown("usd"), open_inv)
+    total = comps["realised_trading"] - comps["fees"] + comps["funding"]
+    return RealisedResult(total, (), comps, Quantity(unreal, unreal_prov, "usd"), open_inv)
 
 
 @dataclass(frozen=True)
