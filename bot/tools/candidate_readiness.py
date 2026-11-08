@@ -351,7 +351,46 @@ def render_table(rep: Mapping[str, Any]) -> str:
 
 # ---------------------------------------------------------------- ranked-funding evaluator (formation window != holding window)
 MS_DAY = 86_400_000
-KEY_BASIS_OBSERVATION = "OBSERVATION_TIME"
+KEY_BASIS_LABEL = "OBSERVATION_TIME"      # a LABEL for reports only: it proves nothing and nothing compares against it
+
+
+class _Sentinel:
+    """A process-local capability token, compared by identity. It cannot be written in JSON, typed into a test fixture by accident, or reconstructed by copy/pickle."""
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __repr__(self) -> str:
+        return f"<{self._name}>"
+
+    def __copy__(self) -> "_Sentinel":
+        return self
+
+    def __deepcopy__(self, _memo: Any) -> "_Sentinel":
+        return self
+
+    def __reduce__(self) -> Any:
+        raise TypeError("a loader-only token is never serialised")
+
+
+_KEY_BASIS_OBSERVED = _Sentinel("key_basis:observation_time (load_history_root only)")      # attached by ``load_history_root`` and by nothing else
+_UNIVERSE_SEAL = _Sentinel("universe verdict seal (load_history_root only)")
+
+
+@dataclass(frozen=True)
+class UniverseVerdict:
+    """The survivorship facts ``load_history_root`` derived, frozen. ``evaluate_ranked_funding`` reads these and never the (mutable, forgeable) info dict."""
+    survivorship: str
+    closed_count: int
+    closed_names: Tuple[str, ...]
+    _seal: Any = field(default=None, repr=False, compare=False)
+
+
+class LoadedInfo(dict):
+    """The ``info`` dict returned by ``load_history_root``: a plain dict for printing, plus the frozen ``verdict`` the evaluator trusts. A copy (``dict(info)``,
+    ``{**info}``) or a hand-made dict has no verdict and is therefore UNVERIFIED (SURVIVORS_ONLY)."""
+    verdict: Optional[UniverseVerdict] = None
 STALENESS_INTERVALS = 2                   # a mark older than this many mark intervals at t is not "the price at t"
 NAMES_CAP = 20
 
@@ -372,8 +411,9 @@ class SymbolSeries:
     spot_listed: Optional[bool] = None
     oi_usd: Optional[float] = None
     funding_intervals: Optional[List[Tuple[int, int, int]]] = None
-    key_basis: Optional[str] = None          # KEY_BASIS_OBSERVATION only when built by ``load_history_root`` (marks/funding keyed by observation time); None = hand-built, unverified
+    key_basis: Any = None                    # the loader-only sentinel ``_KEY_BASIS_OBSERVED`` (identity compare) only when built by ``load_history_root``; anything else (a string, True) = hand-built, unverified
     mark_interval_ms: Optional[int] = None   # the mark-kline interval from the mark manifest (staleness bound = 2 intervals); None = inferred from the mark spacing
+    settlement_price: Optional[float] = None  # the venue's delivery/settlement price of a Closed contract, from a verified source. NO loader fills it today: terminal exits are then priced only by a mark within one interval of delivery
 
 
 def hedgeability(s: SymbolSeries) -> str:
@@ -461,13 +501,35 @@ def staleness_bound_ms(s: SymbolSeries, override: Optional[int] = None) -> Optio
     return STALENESS_INTERVALS * iv if iv else None
 
 
+def _terminal_price(s: SymbolSeries, override: Optional[int]) -> Tuple[Optional[float], Optional[str]]:
+    """The price a leg is closed at when its contract is delivered during the hold: a verified settlement price, else the last mark at or before deliveryTime when it is no
+    older than ONE mark interval (``override``, when given and smaller, tightens it). (None, None) = unpriced."""
+    sp = s.settlement_price
+    if isinstance(sp, (int, float)) and not isinstance(sp, bool) and math.isfinite(sp) and sp > 0:
+        return float(sp), "SETTLEMENT_PRICE"
+    iv = s.mark_interval_ms if isinstance(s.mark_interval_ms, int) and not isinstance(s.mark_interval_ms, bool) and s.mark_interval_ms > 0 else None
+    if iv is None and len(s.mark) >= 2:
+        iv = int(statistics.median(b[0] - a[0] for a, b in zip(s.mark, s.mark[1:]) if b[0] > a[0]) or 0) or None
+    if iv is None or s.delivery_ms is None:
+        return None, None
+    if override is not None:
+        iv = min(iv, int(override))
+    row = _last_row_at_or_before(s.mark, s.delivery_ms)
+    if row is None or s.delivery_ms - row[0] > iv or not row[1] > 0:
+        return None, None
+    return row[1], "LAST_MARK_WITHIN_1_MARK_INTERVAL_OF_DELIVERY"
+
+
 def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_days: int, top_k: int, round_trip_bps: float, t_start: int, t_end: int,
                 max_staleness_ms: Optional[int] = None) -> Dict[str, Any]:
     """Non-overlapping holds on a fixed rebalance grid. At each t: rank on the FORMATION window ending at t, hold (t, t+hold] (capped at a Closed contract's deliveryTime),
     short the top ``top_k`` perp-only. Per row: directional total = funding received + price leg of the short - perp round-trip cost (measured from mark prices);
     for HEDGEABLE symbols also the funding-net-of-cost 'carry' (basis residual UNMEASURED here).
-    A stale entry or exit mark (older than ``max_staleness_ms``, default 2 mark intervals) SKIPS the leg (``skipped_legs_without_marks``). A contract that closed during the hold
-    and whose exit mark is stale/absent is a TERMINAL EXIT UNPRICED: the loss is unknown, the leg is listed in ``terminal_exit_unpriced_legs`` and the evaluation cannot pass."""
+    A stale entry or exit mark (older than ``max_staleness_ms``, default 2 mark intervals) SKIPS the leg (``skipped_legs_without_marks``).
+    A TERMINAL exit (a contract delivered/closed during the hold) is never priced by the ordinary 2-interval staleness rule: a delisting can crash inside the last interval. It is priced
+    only by a verified ``settlement_price``, else by the last mark when that mark is within ONE mark interval of deliveryTime (the residual is a move inside that final interval, stated
+    on the leg as ``terminal_price_basis``). Every other terminal leg, and every entry-stale leg of a contract delisted during the hold, is a TERMINAL EXIT UNPRICED: the loss is
+    unknown, the leg is listed in ``terminal_exit_unpriced_legs`` (with its reason) and the evaluation cannot pass."""
     f_ms, h_ms = formation_days * MS_DAY, hold_days * MS_DAY
     rows: List[Dict[str, Any]] = []
     skipped = 0
@@ -480,17 +542,26 @@ def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_day
         for sc, s in picks:
             end = min(t + h_ms, s.delivery_ms) if s.delivery_ms is not None else t + h_ms
             bound = staleness_bound_ms(s, max_staleness_ms)
-            m0, m1 = price_at(s.mark, t, bound), price_at(s.mark, end, bound)
+            terminal = s.delivery_ms is not None and s.delivery_ms <= t + h_ms
+            m0 = price_at(s.mark, t, bound)
+            terminal_basis = None
+            if terminal:
+                m1, terminal_basis = _terminal_price(s, max_staleness_ms)
+            else:
+                m1 = price_at(s.mark, end, bound)
             fund, nprints = _sum_range(s.funding, t, end)
             if m0 is None or m1 is None or m0 <= 0:
                 skipped += 1
-                if m0 is not None and m0 > 0 and m1 is None and s.delivery_ms is not None and s.delivery_ms <= t + h_ms:
-                    unpriced.append({"symbol": s.symbol, "t": t, "delivery_ms": s.delivery_ms})
+                if terminal:
+                    unpriced.append({"symbol": s.symbol, "t": t, "delivery_ms": s.delivery_ms,
+                                     "reason": "entry_mark_stale_and_delisted_during_hold" if (m0 is None or m0 <= 0) else "no_settlement_price_and_last_mark_older_than_1_mark_interval_at_delivery"})
                 continue
             price_bps = -(m1 / m0 - 1.0) * 1e4
             hed = hedgeability(s)
             leg = {"symbol": s.symbol, "interval_min": s.interval_min, "hedgeability": hed, "formation_bps_per_day": sc, "funding_bps": fund, "prints": nprints, "hedgeability_basis": HEDGE_BASIS,
-                   "price_leg_bps": price_bps, "directional_total_bps": fund + price_bps - round_trip_bps, "closed_during_hold": s.delivery_ms is not None and s.delivery_ms <= t + h_ms}
+                   "price_leg_bps": price_bps, "directional_total_bps": fund + price_bps - round_trip_bps, "closed_during_hold": terminal}
+            if terminal:
+                leg["terminal_price_basis"] = terminal_basis
             if hed == "HEDGEABLE_ON_BYBIT":
                 leg["hedged_carry_funding_net_of_cost_bps"] = fund - float(CC.position_class_costs("acquire_spot_perp")["total_bps"])      # spot + perp round trip
                 leg["basis_residual"] = "UNMEASURED"
@@ -503,16 +574,20 @@ def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_day
             rows.append({"t": t, "legs": legs, "row_total_bps": statistics.fmean(l["directional_total_bps"] for l in legs)})
         t += h_ms
     return {"rows": rows, "skipped_legs_without_marks": skipped, "terminal_exit_unpriced": len(unpriced), "terminal_exit_unpriced_legs": unpriced,
+            "terminal_exit_unpriced_symbols": sorted({x["symbol"] for x in unpriced})[:NAMES_CAP], "terminal_bound": "settlement_price_else_last_mark_within_1_mark_interval_of_delivery",
             "staleness_bound": "explicit" if max_staleness_ms is not None else f"{STALENESS_INTERVALS}x_mark_interval_per_symbol", "time_mode": "REPLAY_OBSERVATION_TIME"}
 
 
-def _survivorship_of(universe_info: Optional[Mapping[str, Any]]) -> str:
-    v = universe_info.get("survivorship") if isinstance(universe_info, Mapping) else None
-    if v != DELISTINGS_OBSERVED:
-        return SURVIVORS_ONLY                                                           # nothing said = survivors only (fail closed)
-    missing = universe_info.get("closed_in_universe_not_in_series")
-    if not isinstance(missing, Mapping) or missing.get("count") != 0:                   # absent (cannot be verified) or non-empty: the series is survivors-only
-        return SURVIVORS_ONLY
+def _verified_verdict(universe_info: Any) -> Optional[UniverseVerdict]:
+    """The loader's own frozen verdict, or None for anything else (a plain dict, a copy, a subclass built elsewhere): UNVERIFIED."""
+    v = getattr(universe_info, "verdict", None) if isinstance(universe_info, LoadedInfo) else None
+    return v if isinstance(v, UniverseVerdict) and v._seal is _UNIVERSE_SEAL else None
+
+
+def _survivorship_of(universe_info: Any) -> str:
+    v = _verified_verdict(universe_info)
+    if v is None or v.survivorship != DELISTINGS_OBSERVED or v.closed_count != 0:
+        return SURVIVORS_ONLY                                                           # unverified, nothing said, or Closed contracts missing: survivors only (fail closed)
     return DELISTINGS_OBSERVED
 
 
@@ -530,9 +605,9 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
 
     ``universe_info`` is the ``info`` from ``load_history_root``: it supplies ``survivorship`` (absent = SURVIVORS_ONLY). ``multiple_testing_scope`` is PER_PROCESS for the
     default path-less ledger (the count survives only inside this process) and PERSISTENT_LEDGER_FILE with ``ledger_path``."""
-    unkeyed = sorted(s.symbol for s in series if s.key_basis != KEY_BASIS_OBSERVATION)
+    unkeyed = sorted(s.symbol for s in series if s.key_basis is not _KEY_BASIS_OBSERVED)
     if unkeyed and not allow_unverified_key_basis_for_tests:
-        raise RH.HarnessError(f"{len(unkeyed)} series lack key_basis={KEY_BASIS_OBSERVATION!r} (only load_history_root sets it): marks/funding keyed by candle start would leak the future; "
+        raise RH.HarnessError(f"{len(unkeyed)} series lack the loader's key_basis token (only load_history_root sets it; a string is not accepted): marks/funding keyed by candle start would leak the future; "
                               f"first: {unkeyed[:3]}")
     spec = spec if spec is not None else _default_spec()
     c = cost_constants()
@@ -546,13 +621,14 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     if survivorship == SURVIVORS_ONLY:
         warnings.append("SURVIVORS_ONLY: delistings were not observed in the universe capture (Closed partition refused, empty or absent): the result is a survivorship-biased "
                         "evaluation and no point-in-time claim")
-    cin = universe_info.get("closed_in_universe_not_in_series") if isinstance(universe_info, Mapping) else None
-    if isinstance(cin, Mapping) and cin.get("count"):
-        warnings.append(f"SURVIVORS_ONLY: {cin.get('count')} Closed/delivered perpetuals of the universe record that overlap the study window are absent from the evaluated series "
-                        f"(first: {list(cin.get('names') or [])[:5]})")
-    elif isinstance(universe_info, Mapping) and universe_info.get("survivorship") == DELISTINGS_OBSERVED and survivorship == SURVIVORS_ONLY:
-        warnings.append("SURVIVORS_ONLY (downgraded from a DELISTINGS_OBSERVED claim): " + (
-            "the claim carries no closed_in_universe_not_in_series check, so it cannot be verified against the evaluated series"))
+    verdict = _verified_verdict(universe_info)
+    cin = {"count": verdict.closed_count, "names": list(verdict.closed_names)} if verdict is not None else None
+    if cin and cin["count"]:
+        warnings.append(f"SURVIVORS_ONLY: {cin['count']} Closed/delivered perpetuals of the universe record that overlap the study window are absent from the evaluated series "
+                        f"(first: {cin['names'][:5]})")
+    elif universe_info is not None and verdict is None:
+        warnings.append("SURVIVORS_ONLY (universe info UNVERIFIED): it was not produced by load_history_root (a hand-made or copied dict), so a DELISTINGS_OBSERVED claim in it, "
+                        "or any closed_in_universe_not_in_series check, is ignored (downgraded)")
     if unkeyed:
         warnings.append(f"KEY_BASIS_UNVERIFIED: {len(unkeyed)} hand-built series were not keyed by observation time here (test-only path): the verdict is capped at INSUFFICIENT_DATA")
     if any(sp.spot_listed is not None for sp in series):
@@ -561,7 +637,8 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                            "symbols": len(series), "hedgeability_counts": {}, "intervals_min_counts": {}, "symbols_without_interval": unknown_iv, "closed_contracts": sum(1 for s in series if s.delivery_ms),
                            "ranking_rule_variants": list(formation_days_grid), "hold_days": hold_days, "top_k": top_k, "ceiling": "INSUFFICIENT_DATA",
                            "hold_days_grid": holds, "top_k_grid": ks, "cost_scenarios_bps": dict(costs), "survivorship": survivorship, "warnings": warnings,
-                           "closed_in_universe_not_in_series": dict(cin) if isinstance(cin, Mapping) else None, "key_basis_unverified": bool(unkeyed),
+                           "closed_in_universe_not_in_series": cin, "key_basis_unverified": bool(unkeyed),
+                           "universe_info_verified": verdict is not None,
                            "skipped_legs_without_marks": 0, "terminal_exit_unpriced": 0,
                            "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
                            "time_mode": "REPLAY_OBSERVATION_TIME", "hedgeability_basis": HEDGE_BASIS, "pit_label_note": PIT_LABEL_NOTE}
@@ -846,7 +923,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         series.append(SymbolSeries(sym, iv if isinstance(iv, int) and not isinstance(iv, bool) and iv > 0 else None, fund, mark,
                                    launch if isinstance(launch, int) and not isinstance(launch, bool) and launch > 0 else 0,
                                    d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None,
-                                   funding_intervals=segs, key_basis=KEY_BASIS_OBSERVATION,
+                                   funding_intervals=segs, key_basis=_KEY_BASIS_OBSERVED,
                                    mark_interval_ms=iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None))
     in_series = {x.symbol for x in series}
     w0 = min((x.funding[0][0] for x in series), default=None)
@@ -869,7 +946,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
     if excluded:
         warnings.append(f"{len(excluded)} symbols excluded (listed in excluded)")
-    info: Dict[str, Any] = {"root": os.path.abspath(root), "mark_interval": mark_iv,
+    info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv,
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
                             "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols"),
@@ -878,7 +955,8 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                             "point_in_time_note": "this loader builds series from capture snapshots; it makes no point-in-time claim (use PointInTimeUniverse.from_capture_dirs for that). " + PIT_LABEL_NOTE,
                             "time_basis": "marks and funding are keyed by observation_time (replay mode: receipt time is not stored per row)",
                             "interval_mismatch_symbols": mismatch,
-                            "non_complete_symbols": non_complete, "excluded": excluded, "symbols_loaded": len(series), "warnings": warnings}
+                            "non_complete_symbols": non_complete, "excluded": excluded, "symbols_loaded": len(series), "warnings": warnings})
+    info.verdict = UniverseVerdict(survivorship, len(closed_missing), tuple(closed_missing[:NAMES_CAP]), _UNIVERSE_SEAL)
     if hedge_info is not None:
         info["hedge_verdicts"] = {s.symbol: verdicts.get(s.symbol) for s in series}
         info["hedge"] = hedge_info

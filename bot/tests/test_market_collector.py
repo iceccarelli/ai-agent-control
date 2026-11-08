@@ -801,6 +801,28 @@ def test_a_hand_made_seal_row_is_a_named_problem_not_a_crash(tmp_path, root, cap
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("bad", [["a"], 5, None, {"a": 1}, "", "..", "../x", "a/b"])
+def test_a_hand_made_cycles_log_row_is_a_named_problem_never_a_traceback(tmp_path, root, capsys, bad):
+    filled(root, 2)
+    man = str(tmp_path / "seal.jsonl")
+    MC.seal_cycles(str(root), man)
+    assert MC.check_cycles(str(root), man)["ok"]                                              # positive control
+    EC.append(str(root / MC.LOG_NAME), {"at_ms": 1, "cycle": bad, "cycle_ms": 1, "manifest_sha256": "x"})      # chained, so only the body is hostile
+    r = MC.check_cycles(str(root), man)
+    assert r["ok"] is False and any("MALFORMED_LOG_ROW" in x for x in r["problems"])
+    with pytest.raises(MC.SealError):                                                         # no TypeError/KeyError; sealing over it refuses cleanly
+        MC.seal_cycles(str(root), man)
+    assert MC.main(["check", "--root", str(root), "--manifest", man]) == 1
+    capsys.readouterr()
+
+
+def test_a_hand_made_log_row_does_not_crash_a_first_seal_either(tmp_path, root):
+    filled(root, 1)
+    EC.append(str(root / MC.LOG_NAME), {"at_ms": 1, "cycle": ["x"], "cycle_ms": 1, "manifest_sha256": "x"})
+    with pytest.raises(MC.SealError):
+        MC.seal_cycles(str(root), str(tmp_path / "fresh.jsonl"))
+
+
 def test_the_check_cli_never_prints_a_traceback(tmp_path, root, capsys, monkeypatch):
     filled(root, 1)
     man = str(tmp_path / "seal.jsonl")

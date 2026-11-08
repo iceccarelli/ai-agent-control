@@ -29,7 +29,7 @@ dataset_status (per symbol and for the dataset = the worst symbol; precedence CO
               newest row is within two intervals of the window end.
   STALE       as COMPLETE but the newest row is older than two intervals before the window end (the feed stopped, or the window end was in the future of the data).
   PARTIAL     a known hole or an incomplete run: a gap, an off-grid step (an interval change), a rejected row/page, a rate-limit exhaustion, a stalled cursor, the page
-              cap, an HTTP error, a clock-skew flag, an unclosed candle (ts + interval beyond the server's own time: dropped, listed as unclosed_candles), regime flapping (an interval that comes back non-adjacently), a head that cannot be proved (no launch time and the venue ran out of rows), or no rows at all.
+              cap, an HTTP error, a clock-skew flag, an unclosed candle (ts + interval beyond the server's own time: dropped, listed as unclosed_candles), an unproven_regime_change (an interval change nobody corroborated with --accept-regime-change: it may be a missing head), regime flapping (an interval that comes back non-adjacently), a head that cannot be proved (no launch time and the venue ran out of rows), or no rows at all.
   CONFLICTED  one timestamp carries two different rows (identical repeats are counted and dropped; conflicting ones are never merged).
   UNVERIFIED  the evidence cannot be trusted or the grid cannot be judged: a page failed its hash, the ledger is damaged, the resume parameters differ, or the interval
               is UNKNOWN (funding without a universe record: the grid check is REFUSED and reported, never defaulted to 480).
@@ -89,6 +89,7 @@ MAX_WORKERS = 8
 DEFAULT_RATE = 5.0                                   # requests per second, shared by every worker (Bybit's public limit is far higher; this is polite)
 DEFAULT_MAX_PAGES = 20_000
 STALE_INTERVALS = 2
+CLOSED_SAFETY_MS = 60_000                            # a default window end stays this far behind the clock so a candle the venue has not closed yet is never requested
 FUNDING, KLINE, MARK, INDEX, OI = "funding", "kline", "mark-kline", "index-kline", "open-interest"
 DATASETS: Dict[str, Dict[str, Any]] = {
     FUNDING: {"path": "/v5/market/funding/history", "limit": 200, "start": "startTime", "end": "endTime", "interval_param": None},
@@ -564,12 +565,14 @@ def _accepted_regime_runs(runs: Sequence[Sequence[int]], declared_ms: Optional[i
     return acc
 
 
-def funding_regimes(ts_sorted: Sequence[int], declared_ms: Optional[int]) -> Dict[str, Any]:
+def funding_regimes(ts_sorted: Sequence[int], declared_ms: Optional[int], accepted: Optional[Sequence[Sequence[int]]] = None) -> Dict[str, Any]:
     """Funding grid with REGIME CHANGES. A funding interval is per symbol and can change inside a symbol's history (480 -> 240 -> 60 minutes). Consecutive print spacings are run-length
     encoded; a run of >= MIN_REGIME_RUN equal spacings is a REGIME (segment) with its own interval_ms. A shorter run is judged against the nearest regime before it (else after,
     else the declared interval): a whole multiple of that interval is a GAP (missing prints, reported), anything else is an OFF-GRID step. A legitimate change is therefore never
     a gap, a single odd spacing is never a regime, and nothing is filled. ``declared_ms`` (the instrument record at observation time) must equal the LAST regime: else the
-    record disagrees with the data (``interval_mismatch``). With no declared interval the gap check is REFUSED (regimes are still reported as inferred)."""
+    record disagrees with the data (``interval_mismatch``). With no declared interval the gap check is REFUSED (regimes are still reported as inferred).
+    ``accepted`` = operator-corroborated (from_ms, to_ms) interval changes. Spacing alone cannot tell a genuine 480 -> 60 change from a head hole of the same spacing (8 x 60 min steps look
+    like a regime), so every regime change NOT in ``accepted`` is listed in ``unaccepted_regime_changes`` and the caller marks the symbol PARTIAL (``unproven_regime_change``)."""
     diffs = [b - a for a, b in zip(ts_sorted, ts_sorted[1:])]
     runs: List[List[int]] = []                       # [value, count, first diff index]
     for i, d in enumerate(diffs):
@@ -596,7 +599,8 @@ def funding_regimes(ts_sorted: Sequence[int], declared_ms: Optional[int]) -> Dic
         sg["source"] = "inferred_from_print_spacing" if inferred else "declared_instrument_record"
     changes = [{"at_ts": b["first_ts"], "from_interval_ms": a["interval_ms"], "to_interval_ms": b["interval_ms"]} for a, b in zip(segs, segs[1:])]
     ivs = [sg["interval_ms"] for sg in segs]
-    base = {"segments": segs, "regime_changes": changes, "observed_interval_ms": segs[-1]["interval_ms"] if segs else None,
+    acc = {(int(x[0]), int(x[1])) for x in (accepted or [])}
+    base = {"segments": segs, "regime_changes": changes, "unaccepted_regime_changes": [c for c in changes if (c["from_interval_ms"], c["to_interval_ms"]) not in acc], "observed_interval_ms": segs[-1]["interval_ms"] if segs else None,
             "regime_flapping": len(set(ivs)) != len(ivs),          # an interval that comes back non-adjacently (240/480/240/480): prints are hidden between the runs
 
             "interval_mismatch": bool(declared_ms and inferred and segs[-1]["interval_ms"] != declared_ms)}
@@ -690,7 +694,7 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
                 conflicts += 1
     ts_sorted = sorted(unique)
     if dataset == FUNDING:
-        grid = funding_regimes(ts_sorted, interval_ms)
+        grid = funding_regimes(ts_sorted, interval_ms, spec.get("accepted_regime_changes"))
     else:
         grid = grid_report(ts_sorted, interval_ms)
         grid.update(segments=[{"interval_ms": interval_ms, "first_ts": ts_sorted[0], "last_ts": ts_sorted[-1], "prints": len(ts_sorted), "source": "declared_interval_grid"}] if ts_sorted and interval_ms else [],
@@ -738,6 +742,8 @@ def analyze_symbol(sdir: str, spec: Mapping[str, Any], normalization_ms: int) ->
             reasons_p.append("interval_disagrees_with_record")
         if grid.get("regime_flapping"):
             reasons_p.append("regime_flapping")
+        if grid.get("unaccepted_regime_changes"):
+            reasons_p.append("unproven_regime_change")            # a changed interval nobody corroborated may be a missing head: never silently COMPLETE
         if head_missing:
             reasons_p.append("head_gap")
         if not head_verified:
@@ -989,8 +995,12 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
 
 
 def build_specs(dataset: str, interval: Optional[str], symbols: Sequence[str], start_ms: int, end_ms: int, records: Optional[Mapping[str, Mapping[str, Any]]] = None,
-                funding_interval_min: Optional[Mapping[str, int]] = None) -> List[Dict[str, Any]]:
+                funding_interval_min: Optional[Mapping[str, int]] = None, accept_regime_changes: Optional[Mapping[str, Sequence[Tuple[int, int]]]] = None) -> List[Dict[str, Any]]:
     imap = dict(funding_interval_min or {})
+    acc_map = {k: sorted({(int(a), int(b)) for a, b in v}) for k, v in (accept_regime_changes or {}).items()}
+    unknown = sorted(set(acc_map) - set(symbols))
+    if unknown:
+        raise HistoryError(f"--accept-regime-change names symbols that are not being collected: {unknown}")
     out = []
     for s in sorted(set(symbols)):
         if not _SYMBOL.fullmatch(s):
@@ -1015,6 +1025,8 @@ def build_specs(dataset: str, interval: Optional[str], symbols: Sequence[str], s
                 spec.update(interval_ms=None, interval_source="UNKNOWN")
         else:
             spec.update(interval_ms=interval_ms_of(dataset, interval), interval_source="declared_interval_grid")
+        if dataset == FUNDING and acc_map.get(s):
+            spec["accepted_regime_changes"] = [[a * 60_000, b * 60_000] for a, b in acc_map[s]]       # operator evidence, part of the spec so verify re-derives the same status
         out.append(spec)
     return out
 
@@ -1023,7 +1035,7 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
                 clock: Callable[[], int] = lambda: int(time.time() * 1000), sleep: Callable[[float], None] = time.sleep, mono: Callable[[], float] = time.monotonic,
                 workers: int = DEFAULT_WORKERS, rate: float = DEFAULT_RATE, max_pages: int = DEFAULT_MAX_PAGES, reserve_bytes: int = MC.DEFAULT_RESERVE_BYTES,
                 free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free, universe: Optional[Mapping[str, Any]] = None,
-                max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S) -> Dict[str, Any]:
+                max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S, window_end_basis: str = "OPERATOR_END_MS") -> Dict[str, Any]:
     """Collect every spec'd symbol (bounded concurrency, shared token bucket), then write the dataset manifest. Returns the manifest (or a refusal)."""
     if not 1 <= workers <= MAX_WORKERS:
         raise HistoryError(f"workers must be 1..{MAX_WORKERS}")
@@ -1086,7 +1098,8 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
         statuses = [s["status"] for s in symbols.values()]
         by_status = {k: statuses.count(k) for k in STATUS_ORDER if k in statuses}
         man = {"schema": SCHEMA, "dataset": dataset, "interval": interval, "request": {"host": venues.host_of(venues.rest_for("mainnet")), "path": DATASETS[dataset]["path"],
-               "category": CATEGORY, "limit": DATASETS[dataset]["limit"], "start_ms": specs[0]["start_ms"], "end_ms": specs[0]["window_end_ms"]},
+               "category": CATEGORY, "limit": DATASETS[dataset]["limit"], "start_ms": specs[0]["start_ms"], "end_ms": specs[0]["window_end_ms"],
+               "window_end_basis": window_end_basis},
                "started_ms": started, "finished_ms": int(clock()), "dataset_status": _worst(statuses), "counts": {"symbols": len(symbols), "by_status": by_status},
                "universe": dict(universe) if universe else None, "excluded": excluded, "time_fields": list(TIME_FIELDS), "symbols": symbols,
                "note": "raw pages are the evidence; gaps/rejects/conflicts are reported, never filled; a hash shows what was read, not who produced it"}
@@ -1097,8 +1110,9 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
 
 # ---------------------------------------------------------------- verify (pure Python, re-hashes everything)
 
-def verify_dataset(ddir: str) -> Dict[str, Any]:
-    """Re-derive every symbol from its raw pages and compare with the manifest: page/ledger/rows hashes, coverage, status, stray files. Never fetches."""
+def verify_dataset(ddir: str, accept: Optional[Mapping[str, Sequence[Tuple[int, int]]]] = None) -> Dict[str, Any]:
+    """Re-derive every symbol from its raw pages and compare with the manifest: page/ledger/rows hashes, coverage, status, stray files. Never fetches.
+    ``accept`` ({symbol: [(from_min, to_min)]}) only PREVIEWS what the status would be if those regime changes were corroborated (``status_if_accepted``); ``ok`` never depends on it."""
     problems: List[str] = []
     mp = os.path.join(ddir, "manifest.json")
     if os.path.islink(mp) or not os.path.isfile(mp):
@@ -1112,6 +1126,7 @@ def verify_dataset(ddir: str) -> Dict[str, Any]:
     if man.get("manifest_digest") != _sha(_canon({k: v for k, v in man.items() if k != "manifest_digest"})):
         problems.append("manifest_digest does not match the manifest's content")
     pages = 0
+    preview: Dict[str, Any] = {}
     for sym, rec in sorted(man["symbols"].items()):
         sdir = os.path.join(ddir, sym)
         spec = rec.get("spec")
@@ -1128,6 +1143,12 @@ def verify_dataset(ddir: str) -> Dict[str, Any]:
             problems.append(f"{sym}: cannot be re-derived from its raw pages ({type(exc).__name__}: {exc})")
             continue
         pages += summ["pages"] + summ["pages_failed"]
+        if accept and accept.get(sym) and not summ["problems"]:
+            try:
+                alt, _rb = analyze_symbol(sdir, dict(spec, accepted_regime_changes=[[a * 60_000, b * 60_000] for a, b in accept[sym]]), rec["normalized_ms"])
+                preview[sym] = {"status": alt["status"], "reasons": alt["reasons"]}
+            except (KeyError, ValueError, TypeError, AttributeError, OSError) as exc:
+                preview[sym] = {"status": "UNVERIFIED", "reasons": [f"{type(exc).__name__}"]}
         for p in summ["problems"]:
             problems.append(f"{sym}: {p}")
         for k in ("ledger_sha256", "pages_digest", "rows_sha256", "status", "coverage", "conflicts", "duplicates_identical", "rejects", "gap_count"):
@@ -1146,7 +1167,11 @@ def verify_dataset(ddir: str) -> Dict[str, Any]:
             for f in fn:
                 if os.stat(os.path.join(dp, f)).st_mode & 0o077:
                     problems.append(f"{sym}: {os.path.relpath(os.path.join(dp, f), sdir)} is group/world accessible")
-    return {"ok": not problems, "problems": problems, "symbols_checked": len(man["symbols"]), "pages_checked": pages, "dataset_status": man.get("dataset_status")}
+    out = {"ok": not problems, "problems": problems, "symbols_checked": len(man["symbols"]), "pages_checked": pages, "dataset_status": man.get("dataset_status")}
+    if accept:
+        out["status_if_accepted"] = preview
+        out["note_if_accepted"] = "a PREVIEW only: re-run the collection with the same --accept-regime-change (and the manifest's own --start-ms/--end-ms) to record the acceptance in the manifest"
+    return out
 
 
 # ---------------------------------------------------------------- spot instruments (is there a Bybit SPOT leg for this perp?) and hedge availability
@@ -1322,6 +1347,27 @@ def _parse_overrides(items: Sequence[str]) -> Dict[str, int]:
     return out
 
 
+def _parse_accepts(items: Sequence[str]) -> Dict[str, List[Tuple[int, int]]]:
+    out: Dict[str, List[Tuple[int, int]]] = {}
+    for it in items or []:
+        parts = it.split(":")
+        if len(parts) != 3 or not _SYMBOL.fullmatch(parts[0]) or not all(x.isdigit() and 0 < int(x) <= 1440 for x in parts[1:]) or parts[1] == parts[2]:
+            raise HistoryError(f"--accept-regime-change wants SYMBOL:from_min:to_min (two different minute counts), got {it!r}")
+        out.setdefault(parts[0], []).append((int(parts[1]), int(parts[2])))
+    return out
+
+
+def last_closed_end_ms(now_ms: int, interval: str, dataset: str) -> int:
+    """The newest endTime that cannot include a candle still forming at ``now_ms``: one ms before the last CLOSED boundary,
+    floor((now - safety) / interval) * interval (weekly candles start on a Monday, 4 days after the epoch)."""
+    iv = interval_ms_of(dataset, interval)
+    if not iv:
+        raise HistoryError("no fixed interval grid")
+    off = 4 * 86_400_000 if dataset != OI and interval == "W" else 0
+    boundary = ((now_ms - CLOSED_SAFETY_MS - off) // iv) * iv + off
+    return boundary - 1
+
+
 def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] = http_fetch, clock: Callable[[], int] = lambda: int(time.time() * 1000),
          sleep: Callable[[float], None] = time.sleep, mono: Callable[[], float] = time.monotonic,
          free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free) -> int:
@@ -1337,11 +1383,13 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
         p.add_argument("--only-trading", action="store_true", help="with --universe-dir: only status Trading (default: every accepted instrument, delisted history included)")
         p.add_argument("--start-ms", type=int, help="window start (epoch ms)")
         p.add_argument("--days", type=int, help="window start = end - DAYS")
-        p.add_argument("--end-ms", type=int, help="window end (default: now)")
+        p.add_argument("--end-ms", type=int, help="window end (default: funding = now; kline/mark/index/open-interest = the last CLOSED candle boundary, so a forming candle is never requested)")
         if DATASETS[name]["interval_param"]:
             p.add_argument("--interval", required=True, help=("one of " + ",".join(sorted(OI_INTERVALS_MS))) if name == OI else ("one of " + ",".join(KLINE_INTERVALS_MS)))
         if name == FUNDING:
             p.add_argument("--funding-interval-min", action="append", default=[], metavar="SYMBOL=MIN", help="operator-declared interval when there is no universe record")
+            p.add_argument("--accept-regime-change", action="append", default=[], metavar="SYMBOL:FROM_MIN:TO_MIN",
+                           help="the operator checked the instrument history: this funding interval change is genuine (without it an interval change is PARTIAL unproven_regime_change)")
         p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
         p.add_argument("--rate", type=float, default=DEFAULT_RATE, help="shared requests/second")
         p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
@@ -1355,6 +1403,7 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
     ha.add_argument("--include-statuses", help="e.g. Trading,Closed (default: all)")
     v = sub.add_parser("verify", help="re-hash and re-derive one dataset directory (no network)")
     v.add_argument("--dir", required=True)
+    v.add_argument("--accept-regime-change", action="append", default=[], metavar="SYMBOL:FROM_MIN:TO_MIN", help="preview the status with these changes corroborated (does not alter the manifest)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "spot-instruments":
@@ -1371,14 +1420,19 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
                 res = verify_spot(d)
                 print(json.dumps(res, indent=2, sort_keys=True))
                 return 0 if res["ok"] else 1
-            res = verify_dataset(a.dir)
+            res = verify_dataset(a.dir, _parse_accepts(a.accept_regime_change))
             print(json.dumps(res, indent=2, sort_keys=True))
             return 0 if res["ok"] else 1
-        end_ms = a.end_ms if a.end_ms is not None else int(clock())
+        interval = getattr(a, "interval", None)
+        if a.end_ms is not None:
+            end_ms, end_basis = a.end_ms, "OPERATOR_END_MS"
+        elif a.cmd == FUNDING:
+            end_ms, end_basis = int(clock()), "CLOCK_NOW"
+        else:
+            end_ms, end_basis = last_closed_end_ms(int(clock()), interval, a.cmd), "LAST_CLOSED_BOUNDARY"
         if (a.start_ms is None) == (a.days is None):
             raise HistoryError("give exactly one of --start-ms / --days")
         start_ms = a.start_ms if a.start_ms is not None else end_ms - a.days * 86_400_000
-        interval = getattr(a, "interval", None)
         records = uinfo = None
         if a.universe_dir:
             records, uinfo = load_universe_dir(a.universe_dir, only_trading=a.only_trading,
@@ -1387,9 +1441,9 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
         else:
             symbols = [s for s in a.symbols.split(",") if s]
         ov = _parse_overrides(getattr(a, "funding_interval_min", []))
-        specs = build_specs(a.cmd, interval, symbols, start_ms, end_ms, records, ov)
+        specs = build_specs(a.cmd, interval, symbols, start_ms, end_ms, records, ov, _parse_accepts(getattr(a, "accept_regime_change", [])))
         man = run_dataset(a.out_root, a.cmd, interval, specs, fetch=fetch, clock=clock, sleep=sleep, mono=mono, workers=a.workers, rate=a.rate, max_pages=a.max_pages,
-                          reserve_bytes=a.reserve_bytes, free_bytes_fn=free_bytes_fn, universe=uinfo)
+                          reserve_bytes=a.reserve_bytes, free_bytes_fn=free_bytes_fn, universe=uinfo, window_end_basis=end_basis)
     except (HistoryError, MC.CollectorError, UC.CaptureError, OSError) as exc:
         print(f"market_history: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

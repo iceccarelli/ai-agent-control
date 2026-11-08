@@ -555,6 +555,16 @@ def _log_rows(log: str) -> List[Dict[str, Any]]:
     return [r for r in EC.rows_of(EC.read_lines(log)[0]) if isinstance(r, dict)]
 
 
+def _safe_cycle_name(name: Any) -> bool:
+    return isinstance(name, str) and bool(name) and name not in (".", "..") and name == os.path.basename(name) and "\\" not in name and "\0" not in name
+
+
+def _cycle_rows(log: str) -> List[Dict[str, Any]]:
+    """Log/receipt rows whose ``cycle`` is a plain non-empty name. A hash-chained row can still carry a hand-made body (``cycle`` a list, a dict, an int, a path): such a row is
+    skipped here and reported as MALFORMED_LOG_ROW by ``check_cycles``; it must never reach a hash, a set or a path join as a traceback."""
+    return [r for r in _log_rows(log) if _safe_cycle_name(r.get("cycle"))]
+
+
 def _symlinks(cycle_dir: str) -> List[str]:
     """Every symbolic link in (or being) the cycle directory. A link is never followed: it could make a 'verified' file be somebody else's bytes."""
     out: List[str] = []
@@ -766,7 +776,7 @@ def _run_locked(root: str, now_ms: int, fetch: Callable[[str], bytes], clock: Ca
     # collector: self-consistent is not enough (a fabricated dir with a far-future cycle_ms wedged the log), so it must also carry its own name, a cycle_ms strictly
     # after everything already recorded and not after this run's clock, and agree with its file listing. Anything else is set aside (numbered, never deleted).
     set_aside: List[Dict[str, str]] = []
-    recorded = {r.get("cycle") for r in rows}
+    recorded = {r["cycle"] for r in _cycle_rows(log)}
     max_ms = max((r["cycle_ms"] for r in rows if _is_uint(r.get("cycle_ms"))), default=0)
     for name in sorted(cycle_dirs(root, complete_only=False), key=lambda n: int(n[len("cycle-"):])):
         path = os.path.join(root, name)
@@ -967,7 +977,10 @@ def _seal_locked(root: str, manifest: str, now: int, accept_problems: bool) -> D
     new = [_describe_cycle(root, n) for n in names if n not in already]
     if not names:
         raise SealError("no COMPLETE cycles to seal")
-    log_ids = [r["cycle"] for r in _log_rows(os.path.join(root, LOG_NAME))]
+    log_path = os.path.join(root, LOG_NAME)
+    if len(_cycle_rows(log_path)) != len(_log_rows(log_path)):
+        raise SealError(f"refusing to seal: {LOG_NAME} has a row with a bad cycle name (MALFORMED_LOG_ROW)")
+    log_ids = [r["cycle"] for r in _cycle_rows(log_path)]
     n, head = EC.append(manifest, {"at_ms": now, "cycles": new, "log_cycles": log_ids})
     return {"manifest_rows": n, "head": head, "sealed_new": len(new), "cycles_total": len(names)}
 
@@ -1051,12 +1064,15 @@ def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
             lv = EC.verify(log)
             if not lv.get("ok", False):
                 problems.append(f"{LOG_NAME}: its own chain does not verify")
-            have_ids = {r.get("cycle") for r in _log_rows(log)}
+            have_ids = {r["cycle"] for r in _cycle_rows(log)}
             for cid in sorted(sealed_log - have_ids):
                 problems.append(f"{LOG_NAME}: TRUNCATED (the row for {cid} is gone)")
     if os.path.isfile(log):
         for r in _log_rows(log):
-            p = os.path.join(root, r.get("cycle", ""), "manifest.json")
+            if not _safe_cycle_name(r.get("cycle")):
+                problems.append(f"MALFORMED_LOG_ROW: a {LOG_NAME} row has a bad cycle name {str(r.get('cycle'))[:40]!r}")
+                continue
+            p = os.path.join(root, r["cycle"], "manifest.json")
             if os.path.isfile(p) and _file_sha(p) != r.get("manifest_sha256"):
                 problems.append(f"{r['cycle']}: ALTERED (manifest.json differs from its {LOG_NAME} row)")
             elif not os.path.isfile(p):
@@ -1113,8 +1129,8 @@ def _backup_locked(src: str, dest: str, receipts: str, copy_fn: Callable[[str, s
     os.makedirs(dest, exist_ok=True)
     have: Set[str] = set()
     if os.path.isfile(receipts):
-        have = {r.get("cycle") for r in _log_rows(receipts)}
-    recorded = {r.get("cycle") for r in _log_rows(log)}
+        have = {r["cycle"] for r in _cycle_rows(receipts)}
+    recorded = {r["cycle"] for r in _cycle_rows(log)}
     done: List[Dict[str, Any]] = []
     skipped: List[str] = []
     failed: List[str] = []
@@ -1182,7 +1198,7 @@ def _restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, A
     else:
         if not EC.verify(manifest).get("ok", False):
             problems.append("the seal manifest's own chain does not verify")
-        latest = {r.get("cycle"): r for r in _log_rows(receipts)}
+        latest = {r["cycle"]: r for r in _cycle_rows(receipts)}
         for name, want in sorted(_sealed_cycles(manifest).items()):
             got = latest.get(name)
             if got is None:

@@ -396,7 +396,8 @@ def test_a_funding_interval_change_inside_the_history_is_a_regime_change_never_a
     ts += grid(ts[-1] + H4, 200, H4)                         # 480 -> 240
     ts += grid(ts[-1] + H1, 150, H1)                         # 240 -> 60 (a dynamically shortened contract)
     last = ts[-1]
-    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, last + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 60, "snapshot_ms": 1}})
+    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, last + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 60, "snapshot_ms": 1}},
+                           accept_regime_changes={"BTCUSDT": [(480, 240), (240, 60)]})
     man = run(root, specs, HV({("funding", "BTCUSDT"): ts}))
     s = sym_of(man)
     assert s["status"] == "COMPLETE" and s["reasons"] == [] and s["gap_count"] == 0 and s["off_grid_count"] == 0 and s["coverage"]["missing"] == 0
@@ -410,7 +411,8 @@ def test_a_funding_interval_change_inside_the_history_is_a_regime_change_never_a
 
 def test_a_longer_interval_after_a_shorter_one_is_a_regime_but_a_lone_long_step_is_a_gap(root):
     ts = grid(FIRST, 100, H4) + grid(FIRST + 99 * H4 + H8, 100, H8)                  # 240 -> 480 sustained
-    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 480, "snapshot_ms": 1}})
+    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 480, "snapshot_ms": 1}},
+                           accept_regime_changes={"BTCUSDT": [(240, 480)]})
     s = sym_of(run(root, specs, HV({("funding", "BTCUSDT"): ts})))
     assert s["status"] == "COMPLETE" and len(s["segments"]) == 2 and s["gap_count"] == 0
     ts2 = grid(FIRST, 100, H4)
@@ -475,6 +477,50 @@ def test_a_head_run_of_whole_multiple_spacings_is_a_gap_run_not_a_regime():
     assert r["regime_flapping"] is False
     ok = MH.funding_regimes(_regime_series((H8, 4), (H4, 20), (H1, 20)), H1)             # positive control: 480 -> 240 -> 60 is genuine
     assert ok["missing"] == 0 and ok["gap_count"] == 0 and len(ok["segments"]) == 3 and ok["regime_flapping"] is False
+
+
+def _head_hole_series(head_step, head_n, tail_step, tail_n=200):
+    ts = _regime_series((head_step, head_n), (tail_step, tail_n))
+    return ts
+
+
+@pytest.mark.parametrize("declared,head,tail", [(60, H8, H1), (60, 2 * H1, H1), (240, H8, H4), (30, 8 * H1, H1 // 2)])
+def test_an_uncorroborated_power_of_two_head_regime_is_never_complete(root, declared, head, tail):
+    ts = _head_hole_series(head, 60, tail)
+    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": declared, "snapshot_ms": 1}})
+    s = sym_of(run(root, specs, HV({("funding", "BTCUSDT"): ts})))
+    assert s["status"] == "PARTIAL" and "unproven_regime_change" in s["reasons"]
+    assert len(s["segments"]) == 2 and len(s["regime_changes"]) == 1                    # the regime is still recorded and normalised per segment
+    assert MH.verify_dataset(ddir(root))["ok"]
+
+
+def test_the_unproven_regime_poc_ladder_is_partial_until_the_operator_accepts_it_and_acceptance_is_exact(root):
+    ts = grid(FIRST, 200, H8) + grid(FIRST + 199 * H8 + H4, 200, H4)
+    ts += grid(ts[-1] + H1, 150, H1)
+    rec = {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 60, "snapshot_ms": 1}}
+    s = sym_of(run(root, MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, rec), HV({("funding", "BTCUSDT"): ts})))
+    assert s["status"] == "PARTIAL" and s["reasons"] == ["unproven_regime_change"] and s["gap_count"] == 0
+    r2 = os.path.join(os.path.dirname(str(root)), "data_acc")
+    os.mkdir(r2, 0o700)
+    only_one = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, rec, accept_regime_changes={"BTCUSDT": [(480, 240)]})       # the 240 -> 60 change is still unproven
+    assert sym_of(run(r2, only_one, HV({("funding", "BTCUSDT"): ts})))["reasons"] == ["unproven_regime_change"]
+    r3 = os.path.join(os.path.dirname(str(root)), "data_acc2")
+    os.mkdir(r3, 0o700)
+    both = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, rec, accept_regime_changes={"BTCUSDT": [(480, 240), (240, 60)]})
+    assert sym_of(run(r3, both, HV({("funding", "BTCUSDT"): ts})))["status"] == "COMPLETE"
+    assert MH.verify_dataset(ddir(r3))["ok"]                                         # the acceptance is part of the spec: verify re-derives the same COMPLETE
+    with pytest.raises(MH.HistoryError):
+        MH.build_specs("funding", None, ["BTCUSDT"], START, END, rec, accept_regime_changes={"ETHUSDT": [(480, 60)]})
+
+
+def test_verify_can_preview_the_acceptance_without_touching_the_manifest(root, capsys):
+    ts = _head_hole_series(H8, 60, H1)
+    specs = MH.build_specs("funding", None, ["BTCUSDT"], START, ts[-1] + 1000, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 60, "snapshot_ms": 1}})
+    run(root, specs, HV({("funding", "BTCUSDT"): ts}))
+    assert MH.main(["verify", "--dir", ddir(root), "--accept-regime-change", "BTCUSDT:480:60"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dataset_status"] == "PARTIAL" and out["status_if_accepted"]["BTCUSDT"]["status"] == "COMPLETE"
+    assert MH.main(["verify", "--dir", ddir(root), "--accept-regime-change", "BTCUSDT:480"]) == 2
 
 
 def test_flapping_between_two_intervals_is_never_complete(root):
@@ -1042,6 +1088,36 @@ def test_cli_backfill_then_verify(root, tmp_path, capsys):
     assert rc == 0 and json.loads(capsys.readouterr().out)["ok"] is True
     os.remove(os.path.join(ddir(root), "BTCUSDT", "page-000001.json"))
     assert MH.main(["verify", "--dir", ddir(root)]) == 1
+
+
+@pytest.mark.parametrize("ds,interval", [("kline", "60"), ("mark-kline", "15"), ("index-kline", "D"), ("open-interest", "1h"), ("kline", "W")])
+def test_default_window_end_is_the_last_closed_boundary_so_the_forming_candle_is_never_requested(root, capsys, ds, interval):
+    iv = MH.interval_ms_of(ds, interval)
+    now = 1_800_000_000_000 + 12_345
+    end = MH.last_closed_end_ms(now, interval, ds)
+    off = 4 * 86_400_000 if interval == "W" else 0
+    assert (end + 1 - off) % iv == 0 and end + 1 <= now - MH.CLOSED_SAFETY_MS and now - MH.CLOSED_SAFETY_MS - (end + 1) < iv      # a boundary, the newest one outside the safety margin
+    first = end + 1 - 30 * iv
+    series = [first + i * iv for i in range(31)] + [end + 1]                          # the forming candle is served if it were asked for
+    v = HV({(ds, "BTCUSDT"): series}, server=now)
+    t = Time()
+    rc = MH.main([ds, "--out-root", str(root), "--symbols", "BTCUSDT", "--interval", interval, "--start-ms", str(first), "--rate", "50"],
+                 fetch=v, clock=lambda: now, sleep=t.sleep, mono=t.mono, free_bytes_fn=lambda _p: 1 << 40)
+    out = json.loads(capsys.readouterr().out)
+    man = json.load(open(os.path.join(ddir(root, ds, interval), "manifest.json")))
+    assert man["request"]["window_end_basis"] == "LAST_CLOSED_BOUNDARY" and man["request"]["end_ms"] == end
+    assert "unclosed_candle" not in out["symbols"]["BTCUSDT"]["reasons"] and man["symbols"]["BTCUSDT"]["unclosed_candles"] == [] and rc in (0, 1)
+    assert all(int(dict(p.split("=") for p in u.split("?")[1].split("&"))[MH.DATASETS[ds]["end"]]) == end for u in v.urls)
+
+
+def test_funding_keeps_clock_now_and_an_explicit_end_is_recorded_as_the_operators(root, capsys):
+    v = funding_venue()
+    t = Time()
+    kw = dict(fetch=v, sleep=t.sleep, mono=t.mono, free_bytes_fn=lambda _p: 1 << 40)
+    MH.main(["funding", "--out-root", str(root), "--symbols", "BTCUSDT", "--start-ms", str(START), "--rate", "50", "--funding-interval-min", "BTCUSDT=480"], clock=lambda: END, **kw)
+    capsys.readouterr()
+    man = json.load(open(os.path.join(ddir(root), "manifest.json")))
+    assert man["request"]["window_end_basis"] == "CLOCK_NOW" and man["request"]["end_ms"] == END
 
 
 def test_cli_universe_dir_and_exit_codes(root, tmp_path, capsys):

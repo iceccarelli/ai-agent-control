@@ -117,7 +117,7 @@ def mk(sym, iv, rates, marks=None, *, spot=None, delivery=None, start=0):
     step = (iv or 480) * 60_000
     f = [(start + (i + 1) * step, r) for i, r in enumerate(rates)]
     m = marks if marks is not None else [(start + i * step, 100.0) for i in range(n + 1)]
-    return CR.SymbolSeries(sym, iv, f, m, launch_ms=start, delivery_ms=delivery, spot_listed=spot, key_basis=CR.KEY_BASIS_OBSERVATION)
+    return CR.SymbolSeries(sym, iv, f, m, launch_ms=start, delivery_ms=delivery, spot_listed=spot, key_basis=CR._KEY_BASIS_OBSERVED)
 
 
 def spec(fam=None):
@@ -608,6 +608,39 @@ def test_an_unverifiable_delistings_observed_claim_is_downgraded_in_the_evaluati
     assert out["survivorship"] == "SURVIVORS_ONLY" and any("downgraded" in w for w in out["warnings"])
 
 
+def test_a_hand_made_or_copied_universe_info_is_unverified_even_with_a_perfect_looking_claim(tmp_path, offline):
+    claim = {"survivorship": "DELISTINGS_OBSERVED", "closed_in_universe_not_in_series": {"count": 0}}
+    out = CR.evaluate_ranked_funding([], universe_info=claim)
+    assert out["survivorship"] == "SURVIVORS_ONLY" and out["universe_info_verified"] is False and any("UNVERIFIED" in w for w in out["warnings"])
+    root, uni, spot = _hist(tmp_path)
+    series, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    good = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert good["survivorship"] == "DELISTINGS_OBSERVED" and good["universe_info_verified"] is True                  # positive control
+    for forged in (dict(info), {**info}, CR.LoadedInfo(info)):                                                    # a copy loses the verdict
+        assert CR.evaluate_ranked_funding(series, universe_info=forged)["survivorship"] == "SURVIVORS_ONLY"
+    mutated = CR.LoadedInfo(info)
+    mutated.verdict = CR.UniverseVerdict("DELISTINGS_OBSERVED", 0, ())                                           # a verdict without the loader's seal
+    assert CR.evaluate_ranked_funding(series, universe_info=mutated)["survivorship"] == "SURVIVORS_ONLY"
+    info["survivorship"] = "SURVIVORS_ONLY"                                                                        # editing the printable dict does not change the frozen verdict
+    assert CR.evaluate_ranked_funding(series, universe_info=info)["survivorship"] == "DELISTINGS_OBSERVED"
+    with pytest.raises(Exception):
+        info.verdict.survivorship = "x"                                                                            # frozen
+
+
+def test_the_key_basis_marker_is_a_private_token_not_a_string():
+    for forged in ("OBSERVATION_TIME", True, 1, object(), CR.KEY_BASIS_LABEL):
+        s = CR.SymbolSeries("A", 480, [(H8, 1.0)], [(0, 100.0)], key_basis=forged)
+        with pytest.raises(RH.HarnessError, match="key_basis"):
+            CR.evaluate_ranked_funding([s], spec=spec())
+        assert CR.evaluate_ranked_funding([s], spec=spec(), allow_unverified_key_basis_for_tests=True)["key_basis_unverified"] is True
+    assert not hasattr(CR, "KEY_BASIS_OBSERVATION")
+    import copy
+    import pickle
+    assert copy.deepcopy(CR._KEY_BASIS_OBSERVED) is CR._KEY_BASIS_OBSERVED
+    with pytest.raises(TypeError):
+        pickle.dumps(CR._KEY_BASIS_OBSERVED)
+
+
 H8 = 8 * 3600 * 1000
 
 
@@ -617,10 +650,10 @@ def _marks(upto_ms, step=4 * 3600 * 1000, price=100.0):
 
 def test_a_stale_entry_mark_skips_the_leg_instead_of_carrying_an_old_price():
     fund = [(i * H8, 5.0) for i in range(1, 400)]
-    s = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(2 * DAY) + _marks(40 * DAY)[int(8 * DAY // (4 * 3600 * 1000)):], 0, None, True, key_basis=CR.KEY_BASIS_OBSERVATION)   # no marks between 2d and 8d
+    s = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(2 * DAY) + _marks(40 * DAY)[int(8 * DAY // (4 * 3600 * 1000)):], 0, None, True, key_basis=CR._KEY_BASIS_OBSERVED)   # no marks between 2d and 8d
     r = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY)
     assert r["rows"] == [] and r["skipped_legs_without_marks"] == 1 and r["terminal_exit_unpriced"] == 0
-    full = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(40 * DAY), 0, None, True, key_basis=CR.KEY_BASIS_OBSERVATION)
+    full = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(40 * DAY), 0, None, True, key_basis=CR._KEY_BASIS_OBSERVED)
     ok = CR.run_variant([full], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY)           # positive control
     assert len(ok["rows"]) == 1 and ok["skipped_legs_without_marks"] == 0
     assert CR.price_at(s.mark, 5 * DAY) == 100.0 and CR.price_at(s.mark, 5 * DAY, 8 * 3600 * 1000) is None and CR.price_at(s.mark, 5 * DAY, 4 * DAY) == 100.0
@@ -628,7 +661,7 @@ def test_a_stale_entry_mark_skips_the_leg_instead_of_carrying_an_old_price():
 
 def test_a_stale_exit_mark_skips_the_leg():
     fund = [(i * H8, 5.0) for i in range(1, 400)]
-    s = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(6 * DAY), 0, None, True, key_basis=CR.KEY_BASIS_OBSERVATION)                     # marks end at 6d, hold ends at 12d
+    s = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(6 * DAY), 0, None, True, key_basis=CR._KEY_BASIS_OBSERVED)                     # marks end at 6d, hold ends at 12d
     r = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY)
     assert r["rows"] == [] and r["skipped_legs_without_marks"] == 1 and r["terminal_exit_unpriced"] == 0                                  # not delisted: skipped, not a terminal loss
     assert CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY, max_staleness_ms=10 * DAY)["rows"]   # explicit bound honoured
@@ -636,12 +669,59 @@ def test_a_stale_exit_mark_skips_the_leg():
 
 def test_a_delisted_leg_whose_last_mark_is_stale_at_delivery_is_an_unpriced_terminal_exit():
     fund = [(i * H8, 5.0) for i in range(1, 400)]
-    s = CR.SymbolSeries("BBBUSDT", 480, fund, _marks(3 * DAY + 4 * 3600_000), 0, 6 * DAY, True, key_basis=CR.KEY_BASIS_OBSERVATION)
+    s = CR.SymbolSeries("BBBUSDT", 480, fund, _marks(3 * DAY + 4 * 3600_000), 0, 6 * DAY, True, key_basis=CR._KEY_BASIS_OBSERVED)
     r = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)
     assert r["rows"] == [] and r["terminal_exit_unpriced"] == 1 and r["terminal_exit_unpriced_legs"][0]["symbol"] == "BBBUSDT" and r["skipped_legs_without_marks"] == 1
-    fresh = CR.SymbolSeries("BBBUSDT", 480, fund, _marks(6 * DAY), 0, 6 * DAY, True, key_basis=CR.KEY_BASIS_OBSERVATION)              # positive control: priced at delivery
+    fresh = CR.SymbolSeries("BBBUSDT", 480, fund, _marks(6 * DAY), 0, 6 * DAY, True, key_basis=CR._KEY_BASIS_OBSERVED)              # positive control: priced at delivery
     ok = CR.run_variant([fresh], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)
     assert ok["terminal_exit_unpriced"] == 0 and ok["rows"][0]["legs"][0]["closed_during_hold"] is True
+
+
+H4_ = 4 * 3600_000
+
+
+def _delisted(marks, delivery, mi=H4_, **kw):
+    fund = [(i * H8, 1.0) for i in range(1, 400)]
+    return CR.SymbolSeries("XUSDT", 480, fund, marks, 0, delivery, None, None, None, CR._KEY_BASIS_OBSERVED, mi, **kw)
+
+
+def _rv(s):
+    return CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=10, t_start=5 * DAY, t_end=30 * DAY)
+
+
+def test_a_terminal_exit_needs_a_mark_within_one_interval_of_delivery_not_two():
+    marks = [(i * H4_, 100.0) for i in range(0, 11 * 6)]                                 # last mark 10d20h, delivery 11d02h: 6h old = 1.5 intervals
+    r = _rv(_delisted(marks, 11 * DAY + 2 * 3600_000))
+    assert r["terminal_exit_unpriced"] == 1 and r["rows"] == [] and r["terminal_exit_unpriced_symbols"] == ["XUSDT"]
+    assert r["terminal_exit_unpriced_legs"][0]["reason"].startswith("no_settlement_price")
+    ok = _rv(_delisted(marks, 11 * DAY - 1 * 3600_000))                                    # positive control: last mark 4h before delivery... within one interval
+    assert ok["terminal_exit_unpriced"] == 0 and ok["rows"][0]["legs"][0]["terminal_price_basis"] == "LAST_MARK_WITHIN_1_MARK_INTERVAL_OF_DELIVERY"
+    edge = _rv(_delisted(marks, 10 * DAY + 20 * 3600_000 + H4_))                           # exactly one interval: still priced
+    assert edge["terminal_exit_unpriced"] == 0 and edge["rows"]
+    over = _rv(_delisted(marks, 10 * DAY + 20 * 3600_000 + H4_ + 1))
+    assert over["terminal_exit_unpriced"] == 1
+
+
+def test_a_daily_mark_series_cannot_price_a_delisting_two_days_after_its_last_mark():
+    r = _rv(_delisted([(i * DAY, 100.0) for i in range(0, 12)], 13 * DAY, mi=DAY))
+    assert r["terminal_exit_unpriced"] == 1 and r["terminal_exit_unpriced_legs"][0]["t"] == 12 * DAY       # the t=5d hold ends before delivery and is priced normally
+
+
+def test_a_verified_settlement_price_prices_the_terminal_exit_and_is_labelled():
+    marks = [(i * H4_, 100.0) for i in range(0, 8 * 6)]                                  # marks stop long before delivery
+    r = _rv(_delisted(marks, 11 * DAY, settlement_price=60.0))
+    leg = r["rows"][0]["legs"][0]
+    assert r["terminal_exit_unpriced"] == 0 and leg["terminal_price_basis"] == "SETTLEMENT_PRICE" and leg["price_leg_bps"] == pytest.approx(4000.0)
+    for bad in (0.0, -1.0, float("nan"), True):
+        assert _rv(_delisted(marks, 11 * DAY, settlement_price=bad))["terminal_exit_unpriced"] == 1                   # not a price: unpriced, never used
+
+
+def test_a_stale_entry_leg_of_a_contract_delisted_during_the_hold_is_unpriced_not_skipped():
+    marks = [(i * H4_, 100.0) for i in range(0, 3 * 6)]                                  # marks end at day 3: stale at the day-5 entry
+    r = _rv(_delisted(marks, 9 * DAY))
+    assert r["terminal_exit_unpriced"] == 1 and r["terminal_exit_unpriced_legs"][0]["reason"] == "entry_mark_stale_and_delisted_during_hold" and r["skipped_legs_without_marks"] == 1
+    live = _rv(_delisted(marks, None))                                                      # control: the same stale entry on a live contract is only skipped
+    assert live["terminal_exit_unpriced"] == 0 and live["skipped_legs_without_marks"] >= 1
 
 
 def _capture_with_delisting(full_marks):
@@ -668,14 +748,14 @@ def test_series_without_the_observation_key_basis_are_refused_unless_explicitly_
         CR.evaluate_ranked_funding([legacy], spec=spec())
     out = CR.evaluate_ranked_funding([legacy], spec=spec(), allow_unverified_key_basis_for_tests=True)
     assert out["key_basis_unverified"] is True and out["verdict"] == "INSUFFICIENT_DATA" and any("KEY_BASIS_UNVERIFIED" in w for w in out["warnings"])
-    marked = CR.SymbolSeries("A", 480, [(H8, 1.0)], [(0, 100.0)], key_basis=CR.KEY_BASIS_OBSERVATION)
+    marked = CR.SymbolSeries("A", 480, [(H8, 1.0)], [(0, 100.0)], key_basis=CR._KEY_BASIS_OBSERVED)
     assert CR.evaluate_ranked_funding([marked], spec=spec())["key_basis_unverified"] is False                                              # positive control
 
 
 def test_the_loader_sets_the_key_basis_and_the_mark_interval(tmp_path, offline):
     root, uni, _ = _hist(tmp_path, spot=False)
     series, _info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
-    assert series and all(x.key_basis == "OBSERVATION_TIME" and x.mark_interval_ms == H4 for x in series)
+    assert series and all(x.key_basis is CR._KEY_BASIS_OBSERVED and x.mark_interval_ms == H4 for x in series)
 
 
 def test_mutation_without_the_staleness_check_an_old_mark_prices_the_leg():
@@ -684,9 +764,9 @@ def test_mutation_without_the_staleness_check_an_old_mark_prices_the_leg():
 
 
 def test_mutation_without_the_terminal_count_a_lost_delisting_vanishes():
-    m = _mutant("if m0 is not None and m0 > 0 and m1 is None and s.delivery_ms is not None", "if False and s.delivery_ms is not None")
+    m = _mutant("                if terminal:\n                    unpriced.append", "                if False:\n                    unpriced.append")
     fund = [(i * H8, 5.0) for i in range(1, 400)]
-    s = CR.SymbolSeries("B", 480, fund, _marks(3 * DAY + 4 * 3600_000), 0, 6 * DAY, True, key_basis=CR.KEY_BASIS_OBSERVATION)
+    s = CR.SymbolSeries("B", 480, fund, _marks(3 * DAY + 4 * 3600_000), 0, 6 * DAY, True, key_basis=CR._KEY_BASIS_OBSERVED)
     assert m.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)["terminal_exit_unpriced"] == 0
     assert CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)["terminal_exit_unpriced"] == 1
 
