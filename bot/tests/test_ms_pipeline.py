@@ -532,6 +532,49 @@ def test_mutation_an_allocator_blind_to_halts_is_caught(tmp_path, monkeypatch):
     fails(check_allocator_respects_halts, pr)
 
 
+class RejectingExits(EX.SimVenue):
+    """The venue refuses the first ``n`` exit orders it is sent (any group), then behaves."""
+    def __init__(self, n=2):
+        super().__init__()
+        self.left = n
+        self.rejected = []
+
+    def send_order(self, req):
+        if req.link_id.split("-", 1)[1].startswith("x") and self.left > 0 and req.link_id not in self.orders:
+            self.left -= 1
+            self.rejected.append(req.link_id)
+            return EX.Ack(req.link_id, "REJECTED", None, "TEST_VENUE_REJECTS_THE_EXIT")
+        return super().send_order(req)
+
+
+def check_exit_retries_after_rejections_still_close(pr, venue):
+    assert len(venue.rejected) == 2
+    refused = [r for _l, rs in pr.gates.refusals for r in rs]
+    assert not [r for r in refused if "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY" in r], refused       # the retries were not starved of exit quantity
+    gid = venue.rejected[0].split("-", 1)[0]
+    assert getattr(pr.result.states[gid], "value", pr.result.states[gid]) == "CLOSED"
+    net = collections.defaultdict(float)
+    for f in pr.result.venue.executions:                                                       # the VENUE's executions for this group's orders, not the engine's arithmetic
+        if f["link_id"].startswith(gid + "-"):
+            net[(f["symbol"], f["category"])] += f["qty"] if f["side"] == "Buy" else -f["qty"]
+    assert net and all(abs(v) < 1e-9 for v in net.values()), dict(net)                         # the group's positions are closed on the venue
+    assert pr.gates.stats()["exit_reservations_released"] >= 2
+
+
+def test_an_exit_rejected_twice_then_filled_still_closes_the_position_because_the_authority_gets_the_quantity_back(tmp_path):
+    venue = RejectingExits(2)
+    pr = go(tmp_path, world(), cfg(end_ms=T0 + 8 * D), venue=venue)
+    check_exit_retries_after_rejections_still_close(pr, venue)
+    check_consistent(pr)
+
+
+def test_mutation_never_releasing_a_rejected_exit_starves_the_retries_and_is_caught(tmp_path, monkeypatch):
+    monkeypatch.setattr(MAUTH.MultiSymbolAuthority, "release_exit", lambda self, link, unfilled_qty=None: False)
+    venue = RejectingExits(2)
+    pr = go(tmp_path, world(), cfg(end_ms=T0 + 8 * D), venue=venue)
+    fails(check_exit_retries_after_rejections_still_close, pr, venue)
+
+
 def one_leg_world():
     """The perp's measured trades go THROUGH the resting sell; the spot buy never trades through its price: the perp fills, the spot leg never does."""
     ticks = tuple(FM.Tick(T0 + i * H + 1000, 100.5, 1e6) for i in range(0, 80))
@@ -1037,6 +1080,7 @@ def test_mutation_ignoring_the_funding_interval_is_caught(tmp_path, monkeypatch)
     series = world()
     assert_interval_used(go(tmp_path, series, name="ok"))
     monkeypatch.setattr(RP.World, "interval_min", lambda self, sym, t: 480)
+    monkeypatch.setattr(RP.World, "print_interval_min", lambda self, sym, ts: 480)           # the scanner now normalises each trailing print by ITS interval
     fails(assert_interval_used, go(tmp_path, series, name="bad"))
 
 

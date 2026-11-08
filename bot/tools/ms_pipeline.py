@@ -205,6 +205,8 @@ class AuthorityGates:
         self._registered: set = set()
         self._settled: set = set()
         self._resolved: set = set()
+        self._released: set = set()
+        self.exit_releases: List[Tuple[str, str]] = []
         self.authorized: List[str] = []
         self.refusals: List[Tuple[str, Tuple[str, ...]]] = []
         self.plan_refusals: List[Tuple[str, Tuple[str, ...]]] = []
@@ -257,13 +259,33 @@ class AuthorityGates:
             self.plan_refusals.append((plan.group_id, tuple(d.reasons)))
         return d
 
+    def release_dead_exits(self, gid: str) -> None:
+        """The authority reserves exit QUANTITY cumulatively per group / symbol / category (ms_authority ``release_exit``): an exit that was REJECTED, CANCELLED or expired unfilled gave
+        nothing back until told. The engine retries exits under fresh link ids, so without this every retry past ~1.02x the entry quantity is refused and the position can never close.
+        Called before each exit is authorised (the retry is sent in the same step as the rejection) and after every step. Only the UNFILLED remainder is released; the fill stays consumed."""
+        if self.probe is None:
+            return
+        g = self.probe.engine().groups.get(gid)
+        if g is None:
+            return
+        for l in g.exit_legs():
+            if l.status in (EX.REJECTED, EX.CANCELLED) and l.link not in self._released:
+                self._released.add(l.link)
+                left = l.plan_qty - l.filled
+                if left > 0 and self.authority.release_exit(l.link, format(left.normalize(), "f")):
+                    self.exit_releases.append((l.link, format(left.normalize(), "f")))
+
     def on_order(self, req: EX.OrderRequest) -> Optional[str]:
         self._current_group = req.group_id
+        if self.probe is not None and req.link_id.split("-", 1)[-1].startswith("x"):
+            self.release_dead_exits(req.group_id)
         try:
             body = body_from_request(req)
             self.authority.authorize(body, venue=self.policy["venue"])
         except EA.EntryRefused as exc:
             self.refusals.append((req.link_id, tuple(exc.reasons)))
+            if req.link_id.split("-", 1)[-1].startswith("x"):
+                self.authority.release_exit(req.link_id)                    # an exit refused after its quantity was reserved gives it back (False when nothing was reserved)
             return ",".join(exc.reasons)[:300]
         except Exception as exc:                                           # noqa: BLE001 - an authority that cannot decide refuses
             self.refusals.append((req.link_id, (f"AUTHORITY_ERROR:{type(exc).__name__}",)))
@@ -286,6 +308,7 @@ class AuthorityGates:
                 if l.status == EX.FILLED and (gid, l.plan.leg_id) not in self._settled:
                     self._settled.add((gid, l.plan.leg_id))
                     self.authority.settle_leg(gid, l.plan.leg_id)
+            self.release_dead_exits(gid)
             if g.state in (T.GroupState.CLOSED, T.GroupState.FAILED) and gid not in self._resolved:
                 self._resolved.add(gid)
                 self.authority.resolve_group(gid)
@@ -302,7 +325,7 @@ class AuthorityGates:
                 k = r.split(":", 1)[0]
                 plan_refused[k] = plan_refused.get(k, 0) + 1
         return {"mode": self.authority.mode, "policy_digest": self.authority.policy_digest, "venue": self.policy["venue"], "orders_authorised": len(self.authorized),
-                "orders_refused": len(self.refusals), "order_refusal_codes": dict(sorted(refused.items())), "groups_registered": len(self._registered),
+                "orders_refused": len(self.refusals), "exit_reservations_released": len(self.exit_releases), "order_refusal_codes": dict(sorted(refused.items())), "groups_registered": len(self._registered),
                 "groups_refused_at_registration": len(self.plan_refusals), "registration_refusal_codes": dict(sorted(plan_refused.items())), "transport": "IN_PROCESS_SIMULATION"}
 
 
