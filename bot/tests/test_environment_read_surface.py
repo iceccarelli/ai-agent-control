@@ -24,6 +24,8 @@ ALLOWED = {
     "tools/testnet_action_manifest.py": 1,   # records only whether the NAMED testnet credential variables are set (presence booleans), never a value
     "tools/testnet_certificate.py": 1,    # offline certificate: hands os.environ to config.is_live_authorized (main only)
     "tools/strategy_verdict.py": 1,      # default key provider: reads ONE named variable (the owner's attestation key) at verification time; never logged, stored or serialised
+    "tools/candidate_competition.py": 1,   # reads ONE named directory variable (CANDIDATE_LEDGER_DIR) to place the persistent multiple-testing ledger outside the data root; no credential, no secret
+    "tools/candidate_readiness.py": 1,     # reads the same single non-secret ledger-directory variable; see candidate_competition
     "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
     "tools/control_centre.py": 1,        # read-only localhost UI: hands os.environ to owner_console.build (config.is_live_authorized); secrets reported as set/unset only, no value logged or served
     "tools/runner_alerts.py": 1,         # alert transport settings
