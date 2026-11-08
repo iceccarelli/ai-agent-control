@@ -775,7 +775,8 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     # ---- ledger_pnl (realised / unrealised split; a simulated ledger is never realised cash)
     rg = (p["realised"] + p["fees"] + p["slippage"]) if complete else None     # realised price leg AT MID + funding
     ledger_pnl = {"schema": "ledger_pnl/v1", "basis": "SIMULATED", **common, "period_start_ms": cfg.start_ms, "period_end_ms": cfg.end_ms, "realised_gross_usd": rg,
-                  "fees_usd": fees, "funding_usd": L["funding"], "slippage_usd": p["slippage"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": p["unrealised"], "net_usd": net,
+                  "fees_usd": fees, "funding_usd": L["funding"], "slippage_usd": p["slippage"] if complete else None, "taker_slippage_usd": p["taker_slippage"] if complete else None,
+                  "adverse_selection_usd": p["adverse_selection"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": p["unrealised"], "net_usd": net,
                   "net_definition": "net_usd = realised_net + unrealised = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection); ms_accounting's own net omits adverse selection",
                   "ledger_status": L["status"], "ledger_flags": [_short(f, 120) for f in L["flags"][:20]]}
 
@@ -848,6 +849,9 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     n_bad = sum(1 for s in res.states.values() if (s.value if hasattr(s, "value") else s) in ("UNHEDGED", "UNKNOWN_OUTCOME"))
     if n_bad:
         alerts.append({"severity": "WARN", "code": "GROUPS_UNHEDGED_OR_UNKNOWN", "detail": f"{n_bad} group(s) in UNHEDGED or UNKNOWN_OUTCOME at the end of the window"})
+    wide = int(st.get("transport", {}).get("exits_on_wider_book_cap", 0)) if isinstance(st.get("transport"), Mapping) else 0
+    if wide:
+        alerts.append({"severity": "WARN", "code": "EXIT_ON_WIDER_BOOK_CAP", "detail": f"{wide} reduce-only exit(s) were taken against a book older than fill.stale_quote_ms (cap exit_book_max_age_ms={cfg.exit_book_max_age_ms})"})
     ast = gates.stats()
     if ast["orders_refused"] or ast["groups_refused_at_registration"]:
         alerts.append({"severity": "WARN", "code": "AUTHORITY_REFUSALS", "detail": _short(f"orders={ast['order_refusal_codes']} groups={ast['registration_refusal_codes']}", 300)})
@@ -880,8 +884,11 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     # ---- competition (one candidate; never SUFFICIENT_EVIDENCE)
     n_pos_any = sum(1 for _ms, ops in scans for o in ops if not o.exclusions and o.net_bps_horizon is not None and o.net_bps_horizon > 0)
     closed = [g for g in res.groups.values() if g.closed and g.notional_usd > 0]
-    nets = [(g.price_usd + g.funding_usd - g.fees_usd) / g.notional_usd * 1e4 for g in closed]
-    grosses = [(g.price_usd + g.funding_usd) / g.notional_usd * 1e4 for g in closed]
+    # ONE net definition for the whole run (the ledger's): gross = price leg AT MID (actual fill prices + the taker walk added back) + funding; net = gross - fees - taker slippage - adverse selection
+    gross_usd = [g.price_usd + g.taker_slip_usd + g.funding_usd for g in closed]
+    net_usd = [gu - g.fees_usd - g.taker_slip_usd - g.adverse_usd for gu, g in zip(gross_usd, closed)]
+    nets = [n / g.notional_usd * 1e4 for n, g in zip(net_usd, closed)]
+    grosses = [n / g.notional_usd * 1e4 for n, g in zip(gross_usd, closed)]
     traded = sorted({s for g in res.groups.values() for s in g.symbols})
     indep = int(report["observations"]["independent"]) if isinstance(report.get("observations"), Mapping) else 0
     rprov = _prov_cap(str(report["provenance"]["weakest"]) if isinstance(report.get("provenance"), Mapping) else "ASSUMED", label)
@@ -900,7 +907,9 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     comp_kind = kinds.get(next((g for g in sorted(res.groups) if g in kinds), ""), kind_default)
     cand = {"candidate_id": candidate_id, "kind": comp_kind, "spot_hedge": _hedge_label([hedge_of.get(s, "HEDGE_UNKNOWN") for s in traded]) if traded else "HEDGE_UNKNOWN",
             "status": status, "reason": reason, "gross_bps_horizon": (sum(grosses) / len(grosses)) if grosses else None, "net_bps_horizon": (sum(nets) / len(nets)) if nets else None,
-            "n_observations": len(closed), "prov": rprov}
+            "n_observations": len(closed), "prov": rprov,
+            "net_definition": "price leg at mid + funding - fees - taker slippage - adverse selection (the ledger's net), per closed group over its notional; mean of the groups' bps",
+            "net_usd_closed_groups": sum(net_usd) if closed else None, "notional_usd_closed_groups": sum(g.notional_usd for g in closed) if closed else None}
     competition = {"schema": "competition/v1", "basis": "SIMULATED" if closed else "ESTIMATED", **common, "candidates": [cand]}
     return {"replay_report.json": replay_report, "portfolio_state.json": portfolio, "risk_state.json": risk_state, "ledger_pnl.json": ledger_pnl, "competition.json": competition,
             "opportunities.json": opportunities}
@@ -1080,7 +1089,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     history = history_requirement(formation_days=float(params.get("formation_days", SC.DEFAULT_PARAMS["formation_days"])), hold_days=replay_cfg.hold_ms / DAY_MS,
                                   min_rows=min_holding_rows, first_ms=first_ms, last_ms=last_ms, end_ms=replay_cfg.end_ms)
     evidence = {"data": label, "data_parts": dict(sorted(parts.items())), "execution": "MODELLED",
-                "books": "SYNTHETIC_ASSUMED_BOOK_FROM_MARKS (no collector: no measured depth or trades)" if micro_info is None else "MEASURED_BOOK_TAPE_AT_DECISION_TIME (fills still MODELLED)",
+                "books": "SYNTHETIC_ASSUMED_BOOK_FROM_MARKS (no collector: no measured depth or trades)" if micro_info is None else "MEASURED_BOOK_TAPE (PERP leg only; the spot leg uses the synthetic book; fills MODELLED)",
                 "microstructure": micro_info,
                 "fills": f"bar_policy={replay_cfg.fill.bar_policy}: a touch is never a fill; maker fills need a strict trade-through", "claim": "SIMULATED; never MEASURED execution"}
     arts = _build_artifacts(res, led, recorder, series, policy, gates, report, label=label, generated_ms=gen, spec=spec, candidate_id=candidate_id, universe_scope=universe_scope,
@@ -1102,7 +1111,11 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     summary = {"schema": SCHEMA, "mode": mode, "data_label": label, "generated_ms": gen, "identity": ident.as_dict(), "data_parts": dict(sorted(parts.items())), "evidence_basis": evidence, "symbols": symbols, "spec": dict(spec),
                "candidate_id": candidate_id, "spec_digest": spec_digest, "status": status, "gate": gate.as_dict(), "history": history,
                "sample": {"independent": status["independent_observations"], "min_holding_rows": min_holding_rows, "closed_groups": sum(1 for g in res.groups.values() if g.closed)},
-               "execution": {"evidence": "MODELLED", "books": evidence["books"], "fills": evidence["fills"], "bar_policy": replay_cfg.fill.bar_policy},
+               "execution": {"evidence": "MODELLED", "books": evidence["books"], "fills": evidence["fills"], "bar_policy": replay_cfg.fill.bar_policy,
+                             "stale_quote_ms": replay_cfg.fill.stale_quote_ms, "exit_book_max_age_ms": replay_cfg.exit_book_max_age_ms,
+                             "exits_on_wider_book_cap": int(res.stats.get("transport", {}).get("exits_on_wider_book_cap", 0)),
+                             "exits_refused_stale_quote": int(res.stats.get("transport", {}).get("exits_refused_stale_quote", 0)),
+                             "taker_entries_refused_stale_quote": int(res.stats.get("transport", {}).get("refused", {}).get("STALE_QUOTE", 0))},
                "trials_total": trials_total, "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
                "ledger": {"net": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
                "reconcile": {"ever_disagreed": rec_doc["ever_disagreed"], "halt_new_exposure": rec_doc["halt_new_exposure"], "n_steps_checked": rec_doc["n_steps_checked"],
@@ -1283,8 +1296,11 @@ def load_collector(root: str) -> Any:
     return ds
 
 
-MICRO_LIMITS = ("NO_SPOT_ORDERBOOK_RECORDED: the spot / hedge leg is REJECTED (NO_RECORDED_BOOK_FOR_CATEGORY), never borrowed from the perp book",
-                "RECENT_TRADE_TAPE_IS_THE_LAST_TRADES_LIMIT_ROWS_PER_CYCLE: busy symbols at 60 s cadence often have TAPE_GAP, which gives no maker fills (raise --trades-limit / shorten the cadence)",
+MICRO_LIMITS = ("NO_SPOT_ORDERBOOK_RECORDED: the spot / hedge leg is NOT measured; the replay gives it the SYNTHETIC book (SYNTHETIC_BOOK_DEPTH_AND_SPREAD: ReplayConfig.synthetic_spread_bps "
+                "and synthetic_depth_usd, 2 bps / 2M USD by default), flagged in assumed_inputs; it is never borrowed from the perp book",
+                "MAKER_FILLS_USE_THE_REPLAYS_OWN_FILL_MODEL: the replay places makers with ms_fillmodel.place_maker (modelled queue and a MODELLED maker markout) against the measured perp book and "
+                "tape; it does NOT use place_maker_from_micro, so the collector's tape-gap / queue-depletion evidence is not applied",
+                "RECENT_TRADE_TAPE_IS_THE_LAST_TRADES_LIMIT_ROWS_PER_CYCLE: busy symbols at 60 s cadence often have TAPE_GAP, so only tape windows whose coverage is proven give ticks (no maker fills otherwise)",
                 "QUEUE_POSITION_ESTIMATED_FROM_VISIBLE_SIZE_ONLY")
 
 
@@ -1292,6 +1308,8 @@ def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any) -> Tuple[List[RP.
     """Give each symbol the collector's MEASURED books (keyed by the collector's local receive time) and tape (only windows whose coverage the tape proves). Symbols without a recorded
     book are EXCLUDED from a collector run (never traded on a synthetic book beside measured ones) and listed."""
     import ms_microstructure as MM
+    if not getattr(micro, "verified", False) or getattr(micro, "problems", ()):
+        raise PipelineRefused("COLLECTOR_NOT_VERIFIED: an unverified collector dataset is never labelled MEASURED")
     if not MM.evaluates_funding_edge_ok(micro):
         raise PipelineRefused("COLLECTOR_COHORT_FUNDING_SELECTED: a funding-selected cohort must not evaluate a funding edge")
     out: List[RP.ReplaySeries] = []

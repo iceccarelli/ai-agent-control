@@ -105,6 +105,7 @@ class ReplayConfig:
     regime_low_bps_day: float = 1.0
     regime_high_bps_day: float = 5.0
     stale_book_age_ms: int = 600_000
+    exit_book_max_age_ms: int = 3_600_000                  # EXPLICIT wider book-age cap for REDUCE-ONLY taker exits (an entry never gets it: it uses fill.stale_quote_ms); every exit that needed it is counted
 
 
 # ------------------------------------------------------------------ the local P&L ledger (contract-compatible; swap for ms_accounting via ledger_factory)
@@ -340,6 +341,15 @@ class ReplayTransport:
         if self.fault_next and self.fault_next[0] == "STALE_BOOK_ONCE":
             age = self.cfg.fill.stale_quote_ms + 1
             self.fault_next.pop(0)
+        if leg.order_type != "Limit":                                  # a taker walks the book it SEES: a book of any age is not a quote
+            cap = max(self.cfg.exit_book_max_age_ms, self.cfg.fill.stale_quote_ms) if leg.reduce_only else self.cfg.fill.stale_quote_ms
+            if age is None or age > cap:
+                self.stats["refused"]["STALE_QUOTE"] = self.stats["refused"].get("STALE_QUOTE", 0) + 1
+                if leg.reduce_only:
+                    self.stats["exits_refused_stale_quote"] = self.stats.get("exits_refused_stale_quote", 0) + 1
+                return EX.Ack(link, "REJECTED", None, "STALE_QUOTE")
+            if leg.reduce_only and age > self.cfg.fill.stale_quote_ms:
+                self.stats["exits_on_wider_book_cap"] = self.stats.get("exits_on_wider_book_cap", 0) + 1
         self.stats["orders_placed"] += 1
         fault = self.fault_next.pop(0) if self.fault_next and self.fault_next[0] in ("LOST_ACK", "LOST_REQUEST") else None
         if leg.order_type == "Limit":

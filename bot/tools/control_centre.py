@@ -49,6 +49,7 @@ A missing file => section shows an empty state. A malformed/oversize/symlink/NaN
   ledger_pnl.json       schema "ledger_pnl/v1"      basis: SIMULATED | MEASURED | EXCHANGE_REPORTED | OWNER_SUPPLIED_UNVERIFIED
       period_start_ms int|null, period_end_ms int|null
       realised_gross_usd num|null, fees_usd num|null, funding_usd num|null, realised_net_usd num|null, unrealised_usd num|null
+      taker_slippage_usd num|null, adverse_selection_usd num|null (OPTIONAL modelled costs, shown as slippage / adverse selection with their source field)
       net_usd num|null (OPTIONAL: the TOTAL net, = realised_net_usd + unrealised_usd, the same figure as replay_report net_pnl_usd; absent = not stated)
       (a SIMULATED ledger is shown as simulated P&L, never as realised; net is never inferred from gross)
   competition.json      schema "competition/v1"     basis: ESTIMATED | SIMULATED | CALCULATED
@@ -271,7 +272,8 @@ def _v_risk(o: Mapping[str, Any]) -> Dict[str, Any]:
 def _v_ledger(o: Mapping[str, Any]) -> Dict[str, Any]:
     return {"period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), **{k: _num(o, k) for k in
             ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd")},
-            "net_usd": _num(o, "net_usd") if "net_usd" in o else None}          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
+            "net_usd": _num(o, "net_usd") if "net_usd" in o else None,          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
+            **{k: (_num(o, k) if k in o else None) for k in ("taker_slippage_usd", "adverse_selection_usd")}}      # optional modelled costs the producer states; absent / null = unknown (MISSING), never zero
 
 
 def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
@@ -642,7 +644,7 @@ def _research(cand_rows: Sequence[Mapping[str, Any]], comp: Dict[str, Any], opps
                            "economics_loaded": econ_loaded,
                            "note": "Sufficient evidence is not authorisation: authorisation is the owner's act (config.is_live_authorized AND the signed promotion gate)."
                                    + ("" if econ_loaded else " In-sample corpus economics are not loaded (slow); start with --with-economics to include rejection reasons from them.")}
-    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"),
+    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps", "per closed group, as the producer states it; the multi-symbol pipeline uses the ledger's net (after fees, taker slippage and adverse selection)"),
                                                                        }
                                                                       for c in d["candidates"]]},
                                       empty="No competition result yet. Run the candidate competition CLI to write competition.json into the artifacts directory.")
@@ -895,9 +897,9 @@ def _figures(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any]) -> Tuple
         "closed_gross": pick("closed_gross", [(L.get("realised_gross_usd"), lb, "ledger_pnl.json:realised_gross_usd")], "realised price result before fees; GROSS"),
         "closed_net": pick("closed_net", [(L.get("realised_net_usd"), lb, "ledger_pnl.json:realised_net_usd")], "realised after fees and funding; NET of the realised part"),
         "unrealised": pick("unrealised", [(L.get("unrealised_usd"), lb, "ledger_pnl.json:unrealised_usd")] + ([] if lg["state"] == "OK" else [(P.get("unrealised_pnl_usd"), pb, "portfolio_state.json:unrealised_pnl_usd")]), "mark-to-market; not cash"),
-        "slippage": pick("slippage", [], nobackend),
+        "slippage": pick("slippage", [(L.get("taker_slippage_usd"), lb, "ledger_pnl.json:taker_slippage_usd")], "modelled taker walk of the book (inside the fill prices, charged once)"),
         "hedge_cost": pick("hedge_cost", [], nobackend),
-        "adverse_selection": pick("adverse_selection", [], nobackend),
+        "adverse_selection": pick("adverse_selection", [(L.get("adverse_selection_usd"), lb, "ledger_pnl.json:adverse_selection_usd")], "modelled post-fill markout"),
     }
     checks: List[Dict[str, Any]] = []
 
@@ -1449,7 +1451,7 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
     return _scrub(_clean(state), env)
 
 
-_HIDE_MIN = {"LIVE_TRADING_ACK": 3, "BYBIT_API_KEY": 3, "BYBIT_API_SECRET": 3, "OWNER_ATTESTATION_KEY": 3, "USE_TESTNET": 4, "PAPER_TRADING": 4, "BYBIT_VENUE": 4}
+_HIDE_MIN = {"LIVE_TRADING_ACK": 3, "BYBIT_API_KEY": 3, "BYBIT_API_SECRET": 3, "BYBIT_TESTNET_API_KEY": 3, "BYBIT_TESTNET_API_SECRET": 3, "OWNER_ATTESTATION_KEY": 3, "USE_TESTNET": 4, "PAPER_TRADING": 4, "BYBIT_VENUE": 4}
 
 
 def _scrub(o: Any, env: Mapping[str, str]) -> Any:

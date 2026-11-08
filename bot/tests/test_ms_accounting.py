@@ -623,3 +623,11 @@ def test_reconcile_with_venue_ledger_integrity_flags_block_it():
     L.record_fill(fill("a", "Sell", 2, 100, 0.1, leg="P"))                         # conflicting duplicate
     r = L.reconcile_with_venue(**venue_read())
     assert r["venue_reconciled"] is False and "LEDGER_INTEGRITY" in codes(r)
+
+
+def test_a_negative_slippage_amount_is_refused_because_it_would_book_a_gain():
+    L = A.Ledger() if hasattr(A, "Ledger") else None
+    for kind in ("taker", "adverse"):
+        with pytest.raises(A.LedgerError):
+            L.record_slippage(-0.01, kind, "BTCUSDT")
+    assert L.record_slippage(0.0, "taker", "BTCUSDT") is True and L.record_slippage(0.5, "adverse", "BTCUSDT") is True

@@ -656,3 +656,70 @@ def test_the_perp_exit_is_filled_before_the_spot_exit_and_no_exit_is_refused_or_
             checked += 1
             assert min(spot_sell) >= min(perp_close), gid                                              # the spot sell only after the perp exit fill is on the venue book
     assert checked > 0
+
+
+# ------------------------------------------------------------------------------------------------ ONE net per run; ledger slippage figures; unverified collector; honest limits text
+
+def _flat_run(tmp_path, name):
+    ss = [TMP.ser("AAAUSDT", 480, 6.0, n_days=10, delivery_day=8)]
+    return lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name=name, series=ss, c=TMP.cfg(end_ms=TMP.T0 + 9 * TMP.D, hold_ms=2 * TMP.D))
+
+
+def check_one_net(pr):
+    """The competition's net (per closed group, ledger definition) adds up to the ledger's net for a run that ends flat."""
+    comp = TMP.art(pr, "competition.json")["candidates"][0]
+    assert comp["n_observations"] > 0 and not [k for k, v in pr.result.venue.positions().items() if abs(v) > 1e-9], "the fixture must end flat"
+    ledger_net = TMP.art(pr, "ledger_pnl.json")["net_usd"]
+    assert comp["net_usd_closed_groups"] == pytest.approx(ledger_net, rel=1e-6, abs=1e-6), (comp["net_usd_closed_groups"], ledger_net)
+    assert comp["net_usd_closed_groups"] == pytest.approx(TMP.art(pr, "replay_report.json")["net_pnl_usd"], rel=1e-6, abs=1e-6)
+    return comp
+
+
+def test_the_competition_net_and_the_ledger_net_are_one_number_per_run(tmp_path):
+    comp = check_one_net(_flat_run(tmp_path, "one"))
+    assert "adverse selection" in comp["net_definition"]
+    pr = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="happy")                  # the happy fixture: adverse selection and taker slippage are charged in BOTH
+    lp, rr = TMP.art(pr, "ledger_pnl.json"), TMP.art(pr, "replay_report.json")
+    assert lp["adverse_selection_usd"] is not None and lp["adverse_selection_usd"] > 0 and lp["taker_slippage_usd"] is not None and lp["taker_slippage_usd"] >= 0
+    st = TMP.cc_state(pr)
+    comp_v = {c["key"]: c["value"] for c in st["accounting"]["components"]}
+    assert comp_v["adverse_selection"]["v"] == lp["adverse_selection_usd"] and comp_v["adverse_selection"]["src"] == "ledger_pnl.json:adverse_selection_usd"
+    assert comp_v["slippage"]["v"] == lp["taker_slippage_usd"] and comp_v["slippage"]["basis"] != "MISSING"
+    assert not [s_ for s_ in st["evidence"]["sources"] if s_["state"] == "ERROR"]
+
+
+def test_mutation_a_competition_net_that_omits_adverse_selection_is_caught(tmp_path, monkeypatch):
+    check_one_net(_flat_run(tmp_path, "ok"))
+    real = TMP.RP.GroupRecord
+    monkeypatch.setattr(real, "adverse_usd", 0.0, raising=False)
+    import ms_pipeline as M2
+    src = M2._build_artifacts
+    monkeypatch.setattr(M2, "_build_artifacts", lambda *a, **k: _zero_adverse(src(*a, **k)))
+    fails(lambda: check_one_net(_flat_run(tmp_path, "mut")))
+
+
+def _zero_adverse(arts_):
+    c = arts_["competition.json"]["candidates"][0]
+    if c["net_usd_closed_groups"] is not None:
+        c["net_usd_closed_groups"] += 3.0                                                       # what a competition net that dropped the modelled costs would show
+    return arts_
+
+
+def test_an_unverified_collector_is_refused_and_never_labelled_measured(tmp_path):
+    import test_ms_microstructure as TMS
+    import ms_microstructure as MM
+    root = str(tmp_path / "collect")
+    TMS.build(root, n=3)
+    ds = MM.load_cycles(root, verify=False)
+    assert ds.verified is False
+    with pytest.raises(MP.PipelineRefused, match="COLLECTOR_NOT_VERIFIED"):
+        MP.apply_micro([TMP.RP.ReplaySeries("BTCUSDT", (), ((TMS.T0, 100.0),), 480, "BTC")], ds)
+    good = MM.load_cycles(root)
+    out, info = MP.apply_micro([TMP.RP.ReplaySeries("BTCUSDT", (), ((TMS.T0, 100.0),), 480, "BTC")], good)
+    assert info["symbols_with_micro"] == ["BTCUSDT"]                                            # positive control: the verified dataset is accepted
+
+
+def test_the_limits_text_states_what_the_replay_does_for_the_spot_leg_and_the_maker_markout():
+    text = " ".join(MP.MICRO_LIMITS)
+    assert "SYNTHETIC_BOOK_DEPTH_AND_SPREAD" in text and "2 bps" in text and "place_maker_from_micro" in text and "MODELLED" in text
+    assert "REJECTED (NO_RECORDED_BOOK_FOR_CATEGORY)" not in text                              # the replay does not reject the spot leg; it gives it a synthetic book

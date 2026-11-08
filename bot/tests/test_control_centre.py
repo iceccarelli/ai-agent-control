@@ -763,8 +763,9 @@ def test_the_accounting_identities_are_checked_shown_and_a_failure_is_loud(tmp_p
 
 def test_the_components_are_displayed_and_the_ones_no_backend_provides_are_missing(full_state):
     comp = {c["key"]: c for c in full_state["accounting"]["components"]}
-    for k in ("slippage", "hedge_cost", "adverse_selection"):
-        assert comp[k]["value"]["v"] is None and comp[k]["value"]["basis"] == "MISSING" and "no backend" in comp[k]["value"]["note"]
+    assert comp["hedge_cost"]["value"]["v"] is None and comp["hedge_cost"]["value"]["basis"] == "MISSING" and "no backend" in comp["hedge_cost"]["value"]["note"]
+    for k in ("slippage", "adverse_selection"):                                                # no artifact states them in THIS set: missing, never zero
+        assert comp[k]["value"]["v"] is None and comp[k]["value"]["basis"] == "MISSING"
     assert comp["funding"]["value"]["v"] == 2.0 and comp["fees"]["value"]["v"] == 7.0
     assert full_state["accounting"]["complete"] is False and full_state["accounting"]["why_incomplete"]
 
@@ -1275,3 +1276,23 @@ def test_render_smoke_inconsistent_run_and_executed_testnet_and_legacy(tmp_path)
         ad = write_set(tmp_path / tag / "artifacts", files)
         with _serving(CC._Config(None, None, ad, False, False, clock=lambda: NOW, ttl_ms=10 ** 12, env={})) as srv:
             _render(srv, tmp_path / tag, tag)
+
+
+def test_slippage_and_adverse_selection_are_shown_with_their_source_when_the_ledger_states_them(tmp_path):
+    files = good_set()
+    files["ledger_pnl.json"].update(taker_slippage_usd=1.5, adverse_selection_usd=0.75)
+    comp = {c["key"]: c["value"] for c in build(tmp_path, files)["accounting"]["components"]}
+    assert comp["slippage"]["v"] == 1.5 and comp["slippage"]["src"] == "ledger_pnl.json:taker_slippage_usd" and comp["slippage"]["basis"] == "SIMULATED"
+    assert comp["adverse_selection"]["v"] == 0.75 and comp["adverse_selection"]["src"] == "ledger_pnl.json:adverse_selection_usd"
+    files["ledger_pnl.json"].update(taker_slippage_usd=None, adverse_selection_usd=None)
+    comp = {c["key"]: c["value"] for c in build(tmp_path / "unk", files)["accounting"]["components"]}
+    assert comp["slippage"]["v"] is None and comp["slippage"]["basis"] == "MISSING"             # unknown stays unknown
+
+
+def test_the_testnet_credential_names_are_scrubbed_like_the_others(tmp_path):
+    k1, k2 = "TESTNET" + "KEYCANARY123", "TESTNET" + "SECRETCANARY456"
+    env = dict(zip(("BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_SECRET"), (k1, k2)))
+    files = good_set()
+    files["risk_state.json"]["alerts"] = [{"severity": "WARN", "code": "X", "detail": "leaked TESTNETKEYCANARY123 and TESTNETSECRETCANARY456"}]
+    text = json.dumps(build(tmp_path, files, env=env))
+    assert "TESTNETKEYCANARY123" not in text and "TESTNETSECRETCANARY456" not in text and "[value hidden]" in text

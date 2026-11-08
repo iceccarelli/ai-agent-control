@@ -243,6 +243,8 @@ class Ledger:
         v = to_decimal(usd)
         if v is None or kind not in ("taker", "adverse"):
             raise LedgerError("slippage needs a finite amount and kind 'taker' | 'adverse'")
+        if v < 0:
+            raise LedgerError("slippage is a cost: a negative amount would be booked as a gain")
         if key is not None:
             if key in self._slip_keys:
                 return False
