@@ -48,7 +48,7 @@ class ReplaySeries:
     symbol: str
     funding: Tuple[Tuple[int, float], ...]                 # (settlement ts, bps per print), ascending
     mark: Tuple[Tuple[int, float], ...]                    # (observation ts, price), ascending
-    interval_min: int
+    interval_min: Optional[int]                            # None = UNKNOWN (never defaulted to 480): the snapshot carries None and the scanner / allocator block the symbol
     base_coin: str = ""
     launch_ms: int = 0
     delivery_ms: Optional[int] = None
@@ -59,11 +59,12 @@ class ReplaySeries:
     instrument: Optional[T.Instrument] = None
     spot_listed: Optional[bool] = True
     oi_usd: Optional[float] = None
+    mark_stale_ms: Optional[int] = None                    # a mark older than this at the decision is UNKNOWN (None = unbounded, the legacy behaviour; ms_pipeline always bounds it)
 
 
 def from_symbol_series(ss: Any, *, instrument: Optional[T.Instrument] = None) -> ReplaySeries:
     """Adapter from candidate_readiness.SymbolSeries (the loader's output). No book/trade data exists in that capture => synthetic books (ASSUMED), bars from marks."""
-    return ReplaySeries(ss.symbol, tuple((int(t), float(r)) for t, r in ss.funding), tuple((int(t), float(p)) for t, p in ss.mark), int(ss.interval_min or 480),
+    return ReplaySeries(ss.symbol, tuple((int(t), float(r)) for t, r in ss.funding), tuple((int(t), float(p)) for t, p in ss.mark), (int(ss.interval_min) if ss.interval_min else None),
                         ss.symbol[:-4] if ss.symbol.endswith("USDT") else ss.symbol, int(ss.launch_ms or 0), ss.delivery_ms, None, None, None,
                         tuple(tuple(x) for x in ss.funding_intervals) if ss.funding_intervals else None, instrument, ss.spot_listed, ss.oi_usd)
 
@@ -118,6 +119,7 @@ class LocalLedger:
         self.marks: Dict[str, float] = {}
         self.taker_slip = 0.0
         self.adverse = 0.0
+        self.unknown_funding = 0
         self._ids: set = set()
         self._cat: Dict[str, str] = {}
 
@@ -128,7 +130,10 @@ class LocalLedger:
         self.fills.append(f)
         self._cat[f.fill_id] = category
 
-    def record_funding(self, symbol: str, ts_ms: int, amount_usd: float, prov: str) -> None:
+    def record_funding(self, symbol: str, ts_ms: int, amount_usd: Optional[float], prov: str) -> None:
+        if amount_usd is None:                                     # unknown amount: counted, never summed as zero
+            self.unknown_funding += 1
+            return
         self.funding_events.append((symbol, ts_ms, amount_usd, prov))
 
     def record_slippage(self, usd: float, kind: str) -> None:
@@ -158,7 +163,8 @@ class LocalLedger:
         slippage = self.taker_slip + self.adverse
         flat = all(abs(q) < 1e-9 for q in pos.values())
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": slippage, "adverse_selection": self.adverse, "taker_slippage": self.taker_slip,
-                "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": price_leg + funding - fees - slippage}
+                "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": price_leg + funding - fees - slippage,
+                "unknown_funding_events": self.unknown_funding}
 
 
 # ------------------------------------------------------------------ the world: point-in-time lookups over the series
@@ -180,7 +186,12 @@ class World:
 
     def mark(self, sym: str, t: int) -> Optional[float]:
         r = self._at(self.s[sym].mark, self._mk[sym], t)
-        return r[1] if r else None
+        if r is None:
+            return None
+        bound = self.s[sym].mark_stale_ms
+        if bound is not None and t - r[0] > bound:
+            return None                                        # a gap in the marks is an unknown price, not the last one forever
+        return r[1]
 
     def spot_mark(self, sym: str, t: int) -> Optional[float]:
         x = self.s[sym]
@@ -190,7 +201,7 @@ class World:
         self.assumed.add("SPOT_PRICE_EQUALS_PERP_MARK")
         return self.mark(sym, t)
 
-    def interval_min(self, sym: str, t: int) -> int:
+    def interval_min(self, sym: str, t: int) -> Optional[int]:
         x = self.s[sym]
         if x.funding_intervals:
             for a, b, iv in x.funding_intervals:
@@ -211,7 +222,10 @@ class World:
         if i == 0:
             return None
         last = x.funding[i - 1][0]
-        iv = self.interval_min(sym, t) * 60_000
+        ivm = self.interval_min(sym, t)
+        if not ivm:
+            return None                                        # unknown interval: the next print time is unknown too
+        iv = ivm * 60_000
         k = (t - last) // iv + 1
         return last + k * iv
 
@@ -251,8 +265,9 @@ class World:
 # ------------------------------------------------------------------ the simulated transport (fill model behind the lifecycle's send/cancel/venue-read)
 
 class ReplayTransport:
-    def __init__(self, world: World, cfg: ReplayConfig, venue: Optional[EX.SimVenue] = None) -> None:
+    def __init__(self, world: World, cfg: ReplayConfig, venue: Optional[EX.SimVenue] = None, order_gate: Optional[Callable[[EX.OrderRequest], Optional[str]]] = None) -> None:
         self.w, self.cfg = world, cfg
+        self.order_gate = order_gate                               # an authority at the venue-request boundary: a refusal reason => the order never reaches the venue
         self.venue = venue or EX.SimVenue()
         self.sim: Dict[str, FM.SimOrder] = {}
         self.now = 0
@@ -268,6 +283,11 @@ class ReplayTransport:
 
     def send_order(self, req: EX.OrderRequest) -> EX.Ack:
         leg, link = req.leg, req.link_id
+        if self.order_gate is not None:
+            why = self.order_gate(req)
+            if why:
+                self.stats["refused"]["AUTHORITY:" + why.split(":", 1)[0]] = self.stats["refused"].get("AUTHORITY:" + why.split(":", 1)[0], 0) + 1
+                return EX.Ack(link, "REJECTED", None, "AUTHORITY_REFUSED:" + why)
         if link in self.venue.orders:
             return self.venue.send_order(req)                      # an idempotent resend: the venue returns the existing order
         if leg.symbol in self.halted:
@@ -338,6 +358,9 @@ class ReplayTransport:
             o2, fills = FM.advance(o, ticks, t, self.cfg.fill)
             self.sim[link] = o2
             for sf in fills:
+                if sf.fill.qty < 1e-9:                             # a float residue of a completed order (qty ~1e-14): not an execution (ms_accounting refuses a zero-quantity fill)
+                    self.stats["micro_fills_dropped"] = self.stats.get("micro_fills_dropped", 0) + 1
+                    continue
                 f = self.venue.execute(link, sf.fill.qty, sf.fill.price, sf.fill.ts_ms, liquidity="MAKER", fee_usd=sf.fill.fee_usd, fill_id=sf.fill.fill_id)
                 self.cat[f.fill_id] = o.category
                 self.pending.append(f)
@@ -392,14 +415,27 @@ def _utc_year(ts_ms: int) -> int:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).year
 
 
+@dataclass
+class WorldProbe:
+    """Read-only accessors onto the CURRENT replay world, bound once per run to ``gates.bind``: what an authority's state / snapshot providers need (always the present step)."""
+    now: Callable[[], int]
+    snapshots: Callable[[], Dict[str, T.MarketSnapshot]]
+    risk_state: Callable[[], Dict[str, Any]]
+    engine: Callable[[], Any]
+
+
 def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Callable[[int, Mapping[str, T.MarketSnapshot], Mapping[str, T.Instrument]], List[T.Opportunity]],
                risk_assess: Callable[..., Any], risk_policy: Optional[Mapping[str, Any]] = None, ledger_factory: Callable[[], Any] = LocalLedger,
-               store: Optional[Any] = None, venue: Optional[EX.SimVenue] = None, clock: Optional[Callable[[], int]] = None) -> ReplayResult:
-    """Walk ``[start_ms, end_ms]`` in ``step_ms`` steps. ``clock`` (paper mode) overrides the grid time with an injected live-like clock; replay uses the grid."""
+               store: Optional[Any] = None, venue: Optional[EX.SimVenue] = None, clock: Optional[Callable[[], int]] = None, gates: Optional[Any] = None) -> ReplayResult:
+    """Walk ``[start_ms, end_ms]`` in ``step_ms`` steps. ``clock`` (paper mode) overrides the grid time with an injected live-like clock; replay uses the grid.
+
+    ``gates`` (optional, duck-typed; ms_pipeline passes the multi-symbol authority): ``bind(WorldProbe)`` once, ``on_plan(plan) -> decision`` (``.approved``/``.reasons``) BEFORE a plan is
+    submitted (a refusal leaves the group FAILED, never submitted), ``on_order(OrderRequest) -> Optional[str]`` at every send (a reason = the order never reaches the venue) and
+    ``on_step(now)`` after every lifecycle step."""
     if not callable(risk_assess):
         raise ValueError("risk_assess is required: replay never allocates without the risk gate")
     w = World(series, cfg)
-    tr = ReplayTransport(w, cfg, venue)
+    tr = ReplayTransport(w, cfg, venue, order_gate=gates.on_order if gates is not None else None)
     store = store if store is not None else EX.MemoryStore()
     qty_steps = {}
     for x in series:
@@ -441,7 +477,7 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
     last_t = cfg.start_ms
 
     def rec_fill(f: T.Fill, cat: str) -> None:
-        led.record_fill(f, category=cat) if isinstance(led, LocalLedger) else led.record_fill(f)
+        led.record_fill(f, category=cat)              # every ledger takes the category: a spot fill booked as linear would be paid funding (ms_accounting.Ledger defaults to linear)
 
     def flush(t: int) -> None:
         guard = 0
@@ -510,6 +546,11 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
             margin += abs(n) / lev if cat == "linear" else 0.0
         return PF.PortfolioState(equity, equity - cap, max(peak, equity), positions, eng.open_groups(), margin, t, account_ts)
 
+    now = cfg.start_ms
+    if gates is not None:
+        gates.bind(WorldProbe(now=lambda: now, snapshots=lambda: snapshots(now),
+                              risk_state=lambda: portfolio_state(now, snapshots(now), (now - cfg.exec_policy.max_account_age_ms - 1) if now <= stale_account_until else now).to_risk_state(),
+                              engine=lambda: eng))
     t = cfg.start_ms
     next_decision = cfg.start_ms
     while t <= cfg.end_ms:
@@ -587,15 +628,22 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
             i0, i1 = bisect.bisect_right(w._fk[sym], last_t), bisect.bisect_right(w._fk[sym], now)
             for ts, rate in x.funding[i0:i1]:
                 m = w.mark(sym, ts)
-                if m is None:
-                    continue
+                total, held, unknown = 0.0, False, False
                 for gid in list(recs):
                     q = pos_qty(gid, sym, "linear", ts)
-                    if abs(q) > 1e-12:
-                        amt = -q * m * rate / 1e4                      # signed qty: a short (q < 0) with rate > 0 RECEIVES
-                        led.record_funding(sym, ts, amt, "DERIVED")
-                        recs[gid].funding_usd += amt
-                        stats["settlements"] += 1
+                    if abs(q) <= 1e-12:
+                        continue
+                    held = True
+                    if m is None:                                          # a held position whose settlement price is unknown: the amount is UNKNOWN, never skipped, never zero
+                        unknown = True
+                        continue
+                    amt = -q * m * rate / 1e4                              # signed qty: a short (q < 0) with rate > 0 RECEIVES
+                    recs[gid].funding_usd += amt
+                    total += amt
+                    stats["settlements"] += 1
+                if held:                                                   # ONE ledger entry per (symbol, print): ms_accounting keys funding on it (a 2nd differing amount is a conflict)
+                    led.record_funding(sym, ts, None if unknown else total, "UNKNOWN" if unknown else "DERIVED")
+                    stats["funding_unknown"] = stats.get("funding_unknown", 0) + (1 if unknown else 0)
         # (6) lifecycle step
         eng.step(now, market_ts_ms=now, account_ts_ms=(now - cfg.exec_policy.max_account_age_ms - 1) if now <= stale_account_until else now)
         flush(now)
@@ -634,6 +682,8 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
                 rec.closed = True
                 rec.exit_ts = max([f.ts_ms for f in fills if f.group_id == gid] or [now])
                 rec.kind = "UNWOUND" if gid in ever_unwound else "NORMAL"
+        if gates is not None:
+            gates.on_step(now)
         # (8) equity / drawdown
         pnl = led.pnl()
         equity = cfg.equity0 + pnl["net"]
@@ -659,8 +709,11 @@ def run_replay(series: Sequence[ReplaySeries], cfg: ReplayConfig, *, scan_fn: Ca
                     stats["depth_limited"] += 1
             for p in alloc.plans:
                 rec = recs.setdefault(p.group_id, GroupRecord(p.group_id, p.candidate_id, tuple(sorted({l.symbol for l in p.legs})), notional_usd=p.notional_usd / max(1, len(p.legs))))
+                verdict = gates.on_plan(p) if gates is not None else _APPROVED_BY_ALLOCATOR_RISK       # allocate() only returns plans risk_assess approved; an authority may still refuse
                 eng.plan_group(p, now)
-                eng.approve_group(p.group_id, _APPROVED_BY_ALLOCATOR_RISK, now)          # allocate() only returns plans risk_assess approved
+                eng.approve_group(p.group_id, verdict, now)
+                if not getattr(verdict, "approved", False):
+                    continue
                 eng.submit_group(p.group_id, now, market_ts_ms=now, account_ts_ms=account_ts)
                 flush(now)
                 if dup_ack_next[0]:

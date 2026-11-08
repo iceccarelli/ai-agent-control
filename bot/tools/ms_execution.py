@@ -775,7 +775,7 @@ class ExecutionEngine:
             return True
         sent = False
         excess = self._excess(g)
-        for l in g.entry_legs():
+        for l in sorted(g.entry_legs(), key=lambda x: x.plan.category != "linear"):          # the perp (reduce-only) leg first: a spot sell is an exit only while the perp it hedges is already closed (ms_authority.spot_sell_keeps_hedge), and a naked short perp is the worse half-state
             ex = excess.get(l.plan.leg_id, Decimal(0))
             pending = sum((x.plan_qty - x.filled for x in g.exit_legs() if x.parent == l.plan.leg_id and x.status == LIVE), Decimal(0))
             need = ex - pending
