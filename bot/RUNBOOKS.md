@@ -320,8 +320,8 @@ writes into the recorder's directory:
 
     python3 tools/md_seal.py seal          --dir <MD_DIR> --manifest <OTHER-VOLUME>/manifest.jsonl     # run at least daily; append-only, chained
     python3 tools/md_seal.py check         --dir <MD_DIR> --manifest <OTHER-VOLUME>/manifest.jsonl     # TRUNCATED / MISSING / ALTERED against EVERY earlier seal
-    python3 tools/md_seal.py backup        --dir <MD_DIR> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl
-    python3 tools/md_seal.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl
+    python3 tools/md_seal.py backup        --dir <MD_DIR> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl --manifest <OTHER-VOLUME>/manifest.jsonl   # refuses if `check` fails; copies only sealed closed days
+    python3 tools/md_seal.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl --manifest <OTHER-VOLUME>/manifest.jsonl   # every sealed closed day needs a matching receipt
 
 `backup` copies only closed days (before today UTC), re-hashes and re-opens each copy and writes a receipt only if it recomputes; a failed copy is set aside as `.REJECTED`, nothing is
 overwritten or deleted. A backup is not proven until `restore-check` passes. Keep the manifest and receipts off the recorder's volume and record the printed head somewhere the

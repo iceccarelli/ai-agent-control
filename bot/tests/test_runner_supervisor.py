@@ -94,3 +94,44 @@ def test_usage_errors_exit_3():
     assert RS.main([]) == 3
     assert RS.main(["--recorder"]) == 3
     assert RS.main(["--"]) == 3
+
+
+# ---------------------------------------------------------------- red-team: the public recorder child must not inherit credentials
+
+def _dump_env_cmd(path):
+    return f"import os,json; json.dump(dict(os.environ), open(r'{path}','w'))"
+
+
+def _poisoned(monkeypatch):
+    secrets = {"BYBIT_API_KEY": "k1", "BYBIT_API_SECRET": "s1", "BYBIT_TESTNET_API_KEY": "k2", "LIVE_TRADING_ACK": "x", "SUPABASE_SERVICE_ROLE_KEY": "r",
+               "SUPABASE_URL": "u", "FLY_API_TOKEN": "t", "MY_SECRET_THING": "z", "SOME_TOKEN": "z", "AWS_ACCESS_KEY_ID": "z", "DB_PASSWORD": "z", "ANYTHING_ELSE": "z"}
+    for k, v in secrets.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("PYTHONUNBUFFERED", "1")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    return secrets
+
+
+def test_the_recorder_child_gets_a_scrubbed_environment_and_the_monitor_keeps_its_own(tmp_path, monkeypatch):
+    secrets = _poisoned(monkeypatch)
+    rec_out, mon_out = tmp_path / "rec.json", tmp_path / "mon.json"
+    s = sup(_dump_env_cmd(mon_out) + "; import time; time.sleep(0.8)", _dump_env_cmd(rec_out) + "; import time; time.sleep(30)", tmp_path)
+    assert s.run() == 0
+    rec, mon = json.load(open(rec_out)), json.load(open(mon_out))
+    assert not (set(secrets) & set(rec)), sorted(set(secrets) & set(rec))
+    for legit in ("PATH", "PYTHONUNBUFFERED", "LANG"):                      # positive control: what the recorder legitimately needs survives
+        assert rec.get(legit) == os.environ.get(legit)
+    assert mon.get("BYBIT_API_KEY") == "k1"                                  # the monitor is untouched (it is the primary and may need its configuration)
+
+
+def test_scrub_env_is_an_allow_list_with_a_deny_overlay():
+    env = {"PATH": "/bin", "HOME": "/h", "LC_ALL": "C", "BYBIT_X": "1", "LIVE_Y": "1", "SUPABASE_Z": "1", "A_SECRET_B": "1", "A_TOKEN": "1", "A_KEY": "1",
+           "UNLISTED": "1", "SSL_CERT_FILE": "/c"}
+    out = RS.scrub_env(env)
+    assert out == {"PATH": "/bin", "HOME": "/h", "LC_ALL": "C", "SSL_CERT_FILE": "/c"}
+    assert RS.scrub_env({"PATH": "/bin", "MY_TOKEN": "x"}) == {"PATH": "/bin"}
+
+
+def test_the_deny_overlay_holds_even_if_a_secret_looking_name_were_allow_listed(monkeypatch):
+    monkeypatch.setattr(RS, "RECORDER_ENV_ALLOW", RS.RECORDER_ENV_ALLOW + ("BYBIT_API_KEY", "MY_TOKEN"))
+    assert RS.scrub_env({"PATH": "/bin", "BYBIT_API_KEY": "k", "MY_TOKEN": "t"}) == {"PATH": "/bin"}

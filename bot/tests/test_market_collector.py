@@ -352,7 +352,7 @@ def test_clock_skew_is_flagged_not_corrected(root):
     m = manifest_of(root, res)
     b = next(a for a in m["artifacts"] if a["kind"] == "book" and a["symbol"] == "BTCUSDT")
     assert b["skew_flag"] == "SKEW" and b["skew_ms"] > MC.SKEW_WARN_MS and m["counts"]["skew_flags"] >= 1 and m["clock"]["flagged"]
-    assert res["status"] == "OK" and (root / res["cycle"] / "COMPLETE").exists()                 # flagged, still recorded, nothing adjusted
+    assert res["status"] == "PARTIAL" and (root / res["cycle"] / "COMPLETE").exists()            # flagged (the cycle is PARTIAL, not OK), still recorded, nothing adjusted
     ok = cycle(root, Venue(), i=1)                                                            # positive control: no skew, nothing flagged
     assert manifest_of(root, ok)["counts"]["skew_flags"] == 0
 
@@ -786,3 +786,244 @@ def test_the_collector_builds_its_transport_from_the_public_collector_role_and_i
         elif isinstance(n, ast.ImportFrom):
             imps.add((n.module or "").split(".")[0])
     assert not imps & {"hmac", "bybit_connection", "carry_broker", "entry_authority", "requests", "http"}
+
+
+# ---------------------------------------------------------------- red-team round 2 (c8e6cbd)
+
+import hashlib  # noqa: E402
+
+
+def _plant(root, name, manifest_obj=None, raw=None, extra_files=None):
+    """A COMPLETE-looking directory: manifest + matching COMPLETE marker (what an attacker or a bug can write)."""
+    d = root / name
+    os.makedirs(d)
+    mb = raw if raw is not None else json.dumps(manifest_obj).encode()
+    (d / "manifest.json").write_bytes(mb)
+    (d / "COMPLETE").write_text(hashlib.sha256(mb).hexdigest() + "\n")
+    for rel, data in (extra_files or {}).items():
+        os.makedirs((d / rel).parent, exist_ok=True)
+        (d / rel).write_bytes(data)
+    return d
+
+
+def _fake_manifest(name, ms, **over):
+    m = {"schema_version": 1, "cycle": name, "cycle_ms": ms, "started_ms": ms, "finished_ms": ms, "status": "OK", "counts": {"fake": 1}, "gaps": [], "errors": [],
+         "artifacts": [], "files": {}, "selection": {}, "request": {}}
+    m.update(over)
+    return m
+
+
+def test_a_fabricated_complete_cycle_dir_is_not_adopted_into_the_chained_log(root):
+    """Reproduced: a self-consistent COMPLETE dir with a far-future cycle_ms and a different 'cycle' was appended to cycles.jsonl and wedged every later cycle."""
+    v = Venue()
+    cycle(root, v, 0)
+    d = _plant(root, "cycle-5", _fake_manifest("cycle-999", T0 + 10**12 - 1))
+    res = cycle(root, v, 1)
+    assert res["status"] == "OK" and [r["cycle"] for r in rows(root)] == [f"cycle-{T0}", f"cycle-{T0 + STEP}"]
+    assert any(s["cycle"] == "cycle-5" for s in res["set_aside"]) and not d.exists() and (root / "cycle-5.INCOMPLETE").is_dir()   # set aside, kept
+    assert cycle(root, v, 2)["status"] == "OK"                                                      # and the NEXT cycle is not wedged by a poisoned prev
+
+
+def _hostile_cases():
+    now = T0 + STEP
+    sha_x = MC._sha(b"x")
+    return {
+        "digits_differ_from_cycle_ms": (f"cycle-{T0 + 100}", _fake_manifest(f"cycle-{T0 + 100}", T0 + 200), None),            # in range and ordered; only the name disagrees
+        "cycle_key_is_not_the_dir_name": (f"cycle-{T0 + 100}", _fake_manifest("cycle-other", T0 + 100), None),
+        "future_cycle_ms": (f"cycle-{now + 10 * STEP}", _fake_manifest(f"cycle-{now + 10 * STEP}", now + 10 * STEP), None),
+        "not_after_previous": (f"cycle-{T0 - 1}", _fake_manifest(f"cycle-{T0 - 1}", T0 - 1), None),
+        "wrong_type_counts": (f"cycle-{T0 + 5}", _fake_manifest(f"cycle-{T0 + 5}", T0 + 5, counts="x"), None),
+        "bad_status": (f"cycle-{T0 + 6}", _fake_manifest(f"cycle-{T0 + 6}", T0 + 6, status="GREAT"), None),
+        "bool_cycle_ms": (f"cycle-{T0 + 7}", _fake_manifest(f"cycle-{T0 + 7}", True), None),
+        "listed_file_absent": (f"cycle-{T0 + 8}", _fake_manifest(f"cycle-{T0 + 8}", T0 + 8, files={"a": {"sha256": "0" * 64, "bytes": 1}}), None),
+        "artifact_hash_differs_from_listing": (f"cycle-{T0 + 9}", _fake_manifest(f"cycle-{T0 + 9}", T0 + 9, files={"a": {"sha256": sha_x, "bytes": 1}},
+                                               artifacts=[{"kind": "book", "symbol": "X", "file": "a", "sha256": "f" * 64, "bytes": 1}]), {"a": b"x"}),
+    }
+
+
+@pytest.mark.parametrize("case", sorted(_hostile_cases()))
+def test_each_resume_check_rejects_on_its_own(root, case):
+    """Each fabricated COMPLETE directory fails ONE check only, so removing any single check from the code makes exactly its case get adopted."""
+    name, m, extra = _hostile_cases()[case]
+    v = Venue()
+    cycle(root, v, 0)
+    _plant(root, name, m, extra_files=extra)
+    res = cycle(root, v, 1)                                                                      # must not raise
+    assert res["status"] == "OK"
+    assert [s["cycle"] for s in res["set_aside"]] == [name], res["set_aside"]
+    assert [r["cycle"] for r in rows(root)] == [f"cycle-{T0}", f"cycle-{T0 + STEP}"]
+    assert not (root / name).exists() and (root / (name + ".INCOMPLETE")).is_dir()               # kept, never deleted
+
+
+@pytest.mark.parametrize("raw", [b"[]", b"null", b'"x"', b"{", b'{"files": []}', b'{"files": {"a": 3}}', b"\xff\xfe"])
+def test_a_non_object_or_hostile_manifest_is_set_aside_not_a_crash(root, raw):
+    v = Venue()
+    cycle(root, v, 0)
+    _plant(root, "cycle-20", raw=raw)
+    res = cycle(root, v, 1)                                                                      # a [] manifest used to raise TypeError out of run_once
+    assert res["status"] == "OK" and [s["cycle"] for s in res["set_aside"]] == ["cycle-20"]
+
+
+def test_a_genuine_complete_unrecorded_cycle_is_still_adopted_positive_control(root):
+    v = Venue()
+    cycle(root, v, 0)
+    log = [n for n in os.listdir(root) if n.startswith(MC.LOG_NAME)]
+    for n in log:
+        os.remove(root / n)
+    res = cycle(root, v, 1)
+    assert res["set_aside"] == [] and rows(root)[0]["recovered"] is True
+
+
+def test_a_symlink_inside_a_cycle_dir_is_never_followed_or_adopted(root, tmp_path):
+    v = Venue()
+    res0 = cycle(root, v, 0)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"x")
+    name = f"cycle-{T0 + STEP}"
+    d = _plant(root, name, _fake_manifest(name, T0 + STEP, files={"a": {"sha256": MC._sha(b"x"), "bytes": 1}}))
+    os.symlink(outside, d / "a")
+    assert any("symlink" in p.lower() for p in MC.verify_cycle_dir(str(d)))
+    os.remove(d / "a")
+    os.symlink(tmp_path, d / "dirlink")
+    assert any("symlink" in p.lower() for p in MC.verify_cycle_dir(str(d)))
+    assert MC.verify_cycle_dir(str(root / res0["cycle"])) == []                                       # positive control: a genuine cycle verifies
+
+
+def test_verify_cycle_dir_never_raises_on_a_hostile_manifest(root):
+    for i, raw in enumerate((b"[]", b"1", b'{"files": []}', b'{"files": {"a": 3}}', b'{"files": {"a": {"bytes": "x"}}}', b'{"files": null}', b"\xff\xfe")):
+        d = _plant(root, f"cycle-{100 + i}", raw=raw)
+        assert MC.verify_cycle_dir(str(d)), raw
+
+
+def test_prev_is_the_max_cycle_ms_not_the_last_row(root):
+    v = Venue()
+    cycle(root, v, 3)
+    log = str(root / MC.LOG_NAME)
+    EC.append(log, {"at_ms": 1, "cycle": "cycle-1", "cycle_ms": T0, "manifest_sha256": "0" * 64, "status": "OK", "counts": {}, "gaps": []})   # an older row appended last
+    res = cycle(root, v, 2)                                                                          # earlier than the max recorded: refused
+    assert res["status"] == "REFUSED_CLOCK" and res["previous_cycle_ms"] == T0 + 3 * STEP
+
+
+# ---- item 4: a cycle is not OK while its evidence is empty or stale
+
+def test_empty_or_invalid_evidence_is_partial_not_ok(root, tmp_path):
+    res = cycle(root, Venue(pages={"": []}, tickers=[]))
+    assert res["status"] == "PARTIAL" and "instruments==0" in manifest_of(root, res)["partial_reasons"]
+    r2 = tmp_path / "c2"
+    res = cycle(r2, Venue(tickers=[tick(s, bid1Price="200") for s in SYMS]))                         # every ticker row crossed => rejected
+    m = manifest_of(r2, res)
+    assert res["status"] == "PARTIAL" and {"ticker_rows_valid==0", "symbols_selected==0"} <= set(m["partial_reasons"])
+    r3 = tmp_path / "c3"
+    assert cycle(r3, Venue(), max_symbols=0)["status"] == "OK"                                       # max_symbols=0 asked for no books: selecting none is not a defect
+    r4 = tmp_path / "c4"
+    res = cycle(r4, Venue())
+    assert res["status"] == "OK" and manifest_of(r4, res)["partial_reasons"] == []                   # positive control
+
+
+def _venue_with(mutate_book=None, mutate_trades=None):
+    v = Venue()
+    base = v.__call__
+
+    class W:
+        urls = v.urls
+
+        def __call__(self, url):
+            b = base(url)
+            if "orderbook" in url and mutate_book:
+                d = json.loads(b); mutate_book(d); return json.dumps(d).encode()
+            if "recent-trade" in url and mutate_trades:
+                d = json.loads(b); mutate_trades(d); return json.dumps(d).encode()
+            return b
+    w = W()
+    w.t = T0
+    return v, w
+
+
+def _run_w(root, v, w, i=0):
+    v.t = T0 + i * STEP
+    return MC.run_once(str(root), T0 + i * STEP, w, Clock(T0 + i * STEP), sleep=lambda s: None, max_symbols=3, free_bytes_fn=lambda p: 1 << 40)
+
+
+def test_a_stale_book_or_stale_trades_make_the_cycle_partial(root, tmp_path):
+    def old_book(d):                       # the envelope time is current (no skew flag) but the book itself is minutes old
+        d["result"]["ts"] = T0 - 600_000
+    v, w = _venue_with(mutate_book=old_book)
+    res = _run_w(root, v, w)
+    m = manifest_of(root, res)
+    assert res["status"] == "PARTIAL" and m["counts"]["books_stale"] == 3 and m["counts"]["skew_flags"] == 0 and "stale_books" in m["partial_reasons"]
+
+    def old_trades(d):
+        for r in d["result"]["list"]:
+            r["time"] = str(T0 - 3_600_000)
+    v2, w2 = _venue_with(mutate_trades=old_trades)
+    r2 = tmp_path / "c2"
+    res = _run_w(r2, v2, w2)
+    assert res["status"] == "PARTIAL" and manifest_of(r2, res)["counts"]["trades_stale"] == 3 and manifest_of(r2, res)["counts"]["skew_flags"] == 0
+
+
+def test_a_skew_flag_makes_the_cycle_partial(root):
+    def skewed(d):
+        d["time"] = 1
+    v, w = _venue_with(mutate_book=skewed)
+    res = _run_w(root, v, w)
+    m = manifest_of(root, res)
+    assert res["status"] == "PARTIAL" and m["counts"]["skew_flags"] >= 3 and "skew_flags" in m["partial_reasons"]
+
+
+# ---- item 5: UNCHAINED_TAIL after a benign crash: a clear diagnostic and an owner-invoked repair, never automatic
+
+def _crash_tail(root):
+    log = str(root / MC.LOG_NAME)
+    with open(log, "ab") as fh:
+        fh.write(EC.canonical({"at_ms": 1, "cycle": "cycle-x"}) + b"\n")       # the row line written, the chain line not
+    return log
+
+
+def test_unchained_tail_gives_a_clear_diagnostic_and_nothing_repairs_it_automatically(root):
+    v = Venue()
+    cycle(root, v, 0)
+    log = _crash_tail(root)
+    before = open(log, "rb").read()
+    res = cycle(root, v, 1)
+    assert res["status"] == "REFUSED_LOG" and "UNCHAINED_TAIL" in res["detail"] and "repair-log" in res["detail"], res
+    assert open(log, "rb").read() == before                                                      # run_once did not touch the log
+    assert not (root / f"cycle-{T0 + STEP}").exists()
+
+
+def test_repair_log_reseals_the_tail_visibly_and_the_next_cycle_runs(root, capsys):
+    v = Venue()
+    cycle(root, v, 0)
+    log = _crash_tail(root)
+    assert MC.main(["repair-log", "--out-root", str(root)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["rows_resealed"] == 1 and out["appendable"] is True and out["ok"] is True
+    assert EC.verify(log)["resealed_indices"] == [1]                                             # marked resealed in the chain, not silently adopted
+    assert cycle(root, v, 1)["status"] == "OK"
+    # a healthy log is not 'repaired' (nothing to do) and a missing log is an error
+    assert MC.main(["repair-log", "--out-root", str(root)]) == 1
+    assert "nothing to repair" in json.loads(capsys.readouterr().out)["reason"]
+    assert MC.main(["repair-log", "--out-root", str(root / "nope")]) == 2
+
+
+def test_repair_log_refuses_damage_that_is_not_a_crash_tail(root, capsys):
+    v = Venue()
+    cycle(root, v, 0); cycle(root, v, 1)
+    lp = root / MC.LOG_NAME
+    lines = lp.read_bytes().split(b"\n")
+    lp.write_bytes(lines[1] + b"\n" + lines[0] + b"\n")                                          # reordered rows: tamper, not a crash
+    assert MC.main(["repair-log", "--out-root", str(root)]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_repair_log_refuses_a_crash_tail_on_top_of_a_mutated_row(root, capsys):
+    v = Venue()
+    cycle(root, v, 0); cycle(root, v, 1)
+    lp = root / MC.LOG_NAME
+    data = lp.read_bytes()
+    assert b'"status":"OK"' in data
+    lp.write_bytes(data.replace(b'"status":"OK"', b'"status":"XX"', 1))                           # row 1 altered after it was chained
+    _crash_tail(root)
+    before = lp.read_bytes()
+    assert MC.main(["repair-log", "--out-root", str(root)]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False and "not a crash tail" in out["reason"] and lp.read_bytes() == before

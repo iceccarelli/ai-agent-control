@@ -45,6 +45,27 @@ def _atomic_write(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+#: The recorder only reads PUBLIC market data and needs no credential, so it is spawned with an ALLOW-LIST environment (the monitor keeps its own, it is the
+#: primary). A variable is passed only if it is named here (or starts with ``LC_``) AND matches no secret-looking pattern. Reproduced: the child inherited
+#: every BYBIT_* key, LIVE_* and SUPABASE_* value of the container.
+RECORDER_ENV_ALLOW = ("PATH", "HOME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "PYTHONPATH", "PYTHONHASHSEED", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE",
+                      "PYTHONIOENCODING", "PYTHONUTF8", "SSL_CERT_FILE", "SSL_CERT_DIR")
+RECORDER_ENV_ALLOW_PREFIX = ("LC_",)
+_DENY_PREFIX = ("BYBIT_", "LIVE_", "SUPABASE_")
+_DENY_SUBSTR = ("SECRET", "TOKEN", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL")
+
+
+def scrub_env(environ: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in environ.items():
+        up = k.upper()
+        if up.startswith(_DENY_PREFIX) or any(w in up for w in _DENY_SUBSTR):
+            continue
+        if k in RECORDER_ENV_ALLOW or k.startswith(RECORDER_ENV_ALLOW_PREFIX):
+            out[k] = v
+    return out
+
+
 class Supervisor:
     def __init__(self, monitor_cmd: Sequence[str], recorder_cmd: Optional[Sequence[str]], *,
                  status_dir: Optional[str] = None, grace_s: float = 30.0,
@@ -66,12 +87,14 @@ class Supervisor:
         self.started_wall = time.time()
 
     # -- children --------------------------------------------------------------------------------------
-    def _spawn(self, cmd: Sequence[str]) -> subprocess.Popen:
+    def _spawn(self, cmd: Sequence[str], *, scrub: bool = False) -> subprocess.Popen:
+        if scrub:
+            return subprocess.Popen(list(cmd), env=scrub_env(dict(os.environ)))
         return subprocess.Popen(list(cmd))
 
     def _start_recorder(self) -> None:
         try:
-            self.recorder = self._spawn(self.recorder_cmd or [])
+            self.recorder = self._spawn(self.recorder_cmd or [], scrub=True)
             self.recorder_started_at = self.mono()
         except OSError as exc:
             print(f"supervisor: the recorder could not be started ({type(exc).__name__}); "

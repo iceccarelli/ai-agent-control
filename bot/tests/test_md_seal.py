@@ -121,11 +121,12 @@ def test_the_manifest_may_not_live_inside_the_recorders_directory(world):
 def test_backup_copies_only_closed_days_verifies_and_is_restore_checked(world):
     dest = str(world["tmp"] / "offvol"); rec = str(world["tmp"] / "off" / "receipts.jsonl")
     os.makedirs(os.path.dirname(rec), exist_ok=True)
-    res = SL.backup(world["md"], dest, rec, now_ms=NOW)
+    seal(world); M = world["manifest"]
+    res = SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)
     assert [d["segment"] for d in res["backed_up"]] == [SL.segment_names(world["md"])[0]]
     assert any("still being written" in s for s in res["skipped"])
-    assert SL.restore_check(dest, rec)["ok"]
-    again = SL.backup(world["md"], dest, rec, now_ms=NOW)             # idempotent: nothing new, nothing overwritten
+    assert SL.restore_check(dest, rec, M)["ok"]
+    again = SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)             # idempotent: nothing new, nothing overwritten
     assert again["backed_up"] == [] and any("already backed up" in s for s in again["skipped"])
 
 
@@ -143,8 +144,9 @@ def test_a_corrupt_copy_is_rejected_and_set_aside_not_receipted(world):
     def flaky(src, dst):
         shutil.copyfile(src, dst)
         _flip(dst)
+    seal(world)
     with pytest.raises(SL.SealError, match="failed verification"):
-        SL.backup(world["md"], dest, rec, now_ms=NOW, copy_fn=flaky)
+        SL.backup(world["md"], dest, rec, manifest=world["manifest"], now_ms=NOW, copy_fn=flaky)
     assert not os.path.exists(rec) or not open(rec).read().strip()
     assert any(f.endswith(".REJECTED") for f in os.listdir(dest))
 
@@ -152,19 +154,20 @@ def test_a_corrupt_copy_is_rejected_and_set_aside_not_receipted(world):
 def test_restore_check_catches_a_backup_that_decayed_after_it_was_receipted(world):
     dest = str(world["tmp"] / "offvol"); rec = str(world["tmp"] / "off" / "receipts.jsonl")
     os.makedirs(os.path.dirname(rec), exist_ok=True)
-    SL.backup(world["md"], dest, rec, now_ms=NOW)
-    assert SL.restore_check(dest, rec)["ok"]
+    seal(world); M = world["manifest"]
+    SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW)
+    assert SL.restore_check(dest, rec, M)["ok"]
     name = SL.segment_names(dest)[0]
     _flip(os.path.join(dest, name))
-    bad = SL.restore_check(dest, rec)
+    bad = SL.restore_check(dest, rec, M)
     assert not bad["ok"] and bad["problems"]
     os.remove(os.path.join(dest, name))
-    assert any("missing from the backup" in p for p in SL.restore_check(dest, rec)["problems"])
+    assert any("missing from the backup" in p for p in SL.restore_check(dest, rec, M)["problems"])
 
 
 def test_a_backup_destination_inside_the_recorders_directory_is_refused(world):
     with pytest.raises(SL.SealError, match="beside the original"):
-        SL.backup(world["md"], os.path.join(world["md"], "bk"), str(world["tmp"] / "r.jsonl"), now_ms=NOW)
+        SL.backup(world["md"], os.path.join(world["md"], "bk"), str(world["tmp"] / "r.jsonl"), manifest=world["manifest"], now_ms=NOW)
 
 
 def test_the_tool_never_writes_into_the_recorders_directory(world):
@@ -174,7 +177,7 @@ def test_the_tool_never_writes_into_the_recorders_directory(world):
         return sorted(f for f in os.listdir(world["md"]) if not f.endswith(side))
     before = names()
     seal(world); SL.check(world["md"], world["manifest"])
-    SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off" / "r.jsonl"), now_ms=NOW)
+    SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off" / "r.jsonl"), manifest=world["manifest"], now_ms=NOW)
     assert names() == before
 
 
@@ -190,9 +193,11 @@ def test_backup_of_a_segment_the_writer_still_has_open_keeps_every_record(tmp_pa
             c = sqlite3.connect(os.path.join(str(md), SL.segment_names(str(md))[0])); c.execute("PRAGMA wal_checkpoint(PASSIVE)"); c.close()
     # the writer is deliberately NOT closed: yesterday's segment is still open in WAL mode
     dest = str(tmp_path / "offvol"); rec = str(tmp_path / "off" / "r.jsonl"); os.makedirs(str(tmp_path / "off"))
-    res = SL.backup(str(md), dest, rec, now_ms=DAY2 + 2 * 3_600_000)
+    M = str(tmp_path / "off" / "manifest.jsonl"); LATER = DAY2 + 2 * 3_600_000
+    SL.seal(str(md), M, now_ms=LATER)
+    res = SL.backup(str(md), dest, rec, manifest=M, now_ms=LATER)
     assert res["backed_up"][0]["records"] == 20
-    assert SL.restore_check(dest, rec)["ok"]
+    assert SL.restore_check(dest, rec, M)["ok"]
     # and a copy function that silently drops records is now caught by the content comparison
     def lossy(src, dst):
         SL.online_copy(src, dst)
@@ -201,14 +206,15 @@ def test_backup_of_a_segment_the_writer_still_has_open_keeps_every_record(tmp_pa
             c.execute(f'DROP TRIGGER "{n}"')
         c.execute("DELETE FROM log WHERE id > 10"); c.commit(); c.close()
     with pytest.raises(SL.SealError, match="records were lost"):
-        SL.backup(str(md), str(tmp_path / "off2"), str(tmp_path / "off" / "r2.jsonl"), now_ms=DAY2 + 2 * 3_600_000, copy_fn=lossy)
+        SL.backup(str(md), str(tmp_path / "off2"), str(tmp_path / "off" / "r2.jsonl"), manifest=M, now_ms=LATER, copy_fn=lossy)
     st.close()
 
 
 def test_a_day_that_ended_minutes_ago_is_not_yet_closed(world):
-    res = SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off_r.jsonl"), now_ms=DAY2 - (DAY2 % 86_400_000) + 60_000)
+    seal(world)
+    res = SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off_r.jsonl"), manifest=world["manifest"], now_ms=DAY2 - (DAY2 % 86_400_000) + 60_000)
     assert res["backed_up"] == [] and any("still being written" in x for x in res["skipped"])
-    later = SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off_r.jsonl"), now_ms=DAY2 + 3_600_000)     # an hour+ after midnight: now it is closed
+    later = SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off_r.jsonl"), manifest=world["manifest"], now_ms=DAY2 + 3_600_000)     # an hour+ after midnight: now it is closed
     assert [d["segment"] for d in later["backed_up"]] == [SL.segment_names(world["md"])[0]]
 
 
@@ -260,3 +266,127 @@ def test_a_bit_flipped_segment_is_reported_by_the_deep_check_not_raised(world):
     _flip(seg(world, 1))
     res = SL.check(world["md"], world["manifest"], deep=True)
     assert res["ok"] is False and any("unreadable" in p or "ALTERED" in p or "chain mismatch" in p for p in res["problems"])
+
+
+# ---------------------------------------------------------------- red-team round 2 (c8e6cbd)
+
+def _rec(world):
+    r = str(world["tmp"] / "off" / "receipts.jsonl")
+    os.makedirs(os.path.dirname(r), exist_ok=True)
+    return r
+
+
+def test_backup_of_a_truncated_sealed_day_is_refused_and_restore_check_would_not_pass(world):
+    """Reproduced: backup never consulted the manifest, so a truncated sealed closed day was copied, receipted and restore-checked OK."""
+    seal(world)
+    _truncate(seg(world, 1), keep=5)
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    with pytest.raises(SL.SealError, match="refusing to back up"):
+        SL.backup(world["md"], dest, rec, manifest=world["manifest"], now_ms=NOW)
+    assert not os.path.exists(rec) and (not os.path.isdir(dest) or os.listdir(dest) == [])
+    # positive control: the same call on an untouched directory works
+    ok = {"md": make_store(world["tmp"] / "md2"), "manifest": str(world["tmp"] / "off" / "m2.jsonl"), "tmp": world["tmp"]}
+    SL.seal(ok["md"], ok["manifest"], now_ms=NOW)
+    assert SL.backup(ok["md"], str(world["tmp"] / "bk2"), str(world["tmp"] / "off" / "r2.jsonl"), manifest=ok["manifest"], now_ms=NOW)["ok"]
+
+
+def test_backup_needs_a_manifest_and_skips_days_not_sealed_as_closed(world):
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    with pytest.raises(SL.SealError, match="refusing to back up"):
+        SL.backup(world["md"], dest, rec, manifest=world["manifest"], now_ms=NOW)              # no manifest at all
+    os.makedirs(os.path.dirname(world["manifest"]), exist_ok=True)
+    SL.seal(world["md"], world["manifest"], now_ms=DAY1 + 3_600_000)                            # sealed while day 1 was still open
+    res = SL.backup(world["md"], dest, rec, manifest=world["manifest"], now_ms=NOW)
+    assert res["ok"] is False and res["backed_up"] == [] and any("NOT SEALED" in x for x in res["skipped"])
+
+
+def test_restore_check_requires_a_matching_receipt_for_every_sealed_closed_day(world):
+    import evidence_chain as EC
+    seal(world); M = world["manifest"]
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    os.makedirs(dest)
+    # a valid-looking receipts file that covers nothing the manifest sealed
+    EC.append(rec, {"at_ms": 1, "segment": "md-19990101.db", "sha256": "0" * 64, "records": 0, "last_id": None, "last_chain": ""})
+    res = SL.restore_check(dest, rec, M)
+    assert not res["ok"] and any("NO receipt" in p for p in res["problems"])
+    # a receipt for the right day with the wrong count (a truncated copy that was receipted) is not enough either
+    name = SL.segment_names(world["md"])[0]
+    d = SL.describe(world["md"], name, closed=False)
+    EC.append(rec, {"at_ms": 2, "segment": name, "sha256": "0" * 64, "records": d["records"] - 5, "last_id": d["last_id"] - 5, "last_chain": d["last_chain"]})
+    res = SL.restore_check(dest, rec, M)
+    assert any("records" in p and "differs from the sealed value" in p for p in res["problems"])
+    # no manifest => not ok
+    assert not SL.restore_check(dest, rec, str(world["tmp"] / "nope.jsonl"))["ok"]
+
+
+def _fabricate(world, wall_ms):
+    import md_store as ST2
+    fd = str(world["tmp"] / "fab")
+    s = ST2.MarketStore(fd, commit_every=1, environment="mainnet")
+    for i in range(3):
+        s.append("frame", wall_ms=wall_ms + i, mono_s=float(i), category="linear", conn_id="c", topic="tickers.BTCUSDT", payload='{"fake":%d}' % i)
+    s.close()
+    day = ST2._utc_day(wall_ms)
+    shutil.copy(os.path.join(fd, f"md-{day}.db"), world["md"])
+    return f"md-{day}.db"
+
+
+def test_a_backdated_fabricated_segment_is_flagged_by_check_seal_and_backup(world):
+    """Reproduced: a segment copied in with its own chain_start (older than the newest sealed day) passed check/backup/restore-check and could be sealed over."""
+    seal(world)
+    assert SL.check(world["md"], world["manifest"], deep=True)["ok"]                          # positive control: the honest directory is clean
+    name = _fabricate(world, DAY1 - 5 * 86_400_000)
+    chk = SL.check(world["md"], world["manifest"], deep=True)
+    assert not chk["ok"] and any("UNSEALED" in p and name in p for p in chk["problems"]), chk
+    assert any("CHAIN BREAK" in p for p in chk["problems"])
+    with pytest.raises(SL.SealError):
+        SL.backup(world["md"], str(world["tmp"] / "bk"), _rec(world), manifest=world["manifest"], now_ms=NOW)
+    with pytest.raises(SL.SealError):
+        SL.seal(world["md"], world["manifest"], now_ms=NOW)
+
+
+def test_a_first_seal_refuses_segments_that_do_not_chain(world):
+    _fabricate(world, DAY1 - 5 * 86_400_000)
+    os.makedirs(os.path.dirname(world["manifest"]), exist_ok=True)
+    with pytest.raises(SL.SealError, match="do not chain"):
+        SL.seal(world["md"], world["manifest"], now_ms=NOW)
+
+
+def test_a_segment_with_a_foreign_chain_start_after_the_sealed_history_is_flagged(world):
+    seal(world)
+    _fabricate(world, DAY2 + 3 * 86_400_000)                                                   # newer than everything sealed, but its chain_start is its own
+    probs = SL.check(world["md"], world["manifest"])["problems"]
+    assert any("CHAIN BREAK" in p for p in probs) and any("ID GAP" in p for p in probs), probs
+
+
+def test_a_second_rejected_copy_does_not_overwrite_the_first(world):
+    """Reproduced: os.rename(dst, dst + '.REJECTED') replaced an earlier .REJECTED (the evidence of the first failure)."""
+    seal(world)
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+
+    def bad(payload):
+        def f(src, dst):
+            with open(dst, "wb") as fh:
+                fh.write(payload)
+        return f
+    for payload in (b"FIRST-REJECTED-EVIDENCE", b"SECOND"):
+        with pytest.raises(SL.SealError):
+            SL.backup(world["md"], dest, rec, manifest=world["manifest"], now_ms=NOW, copy_fn=bad(payload))
+    name = SL.segment_names(world["md"])[0]
+    assert open(os.path.join(dest, name + ".REJECTED"), "rb").read() == b"FIRST-REJECTED-EVIDENCE"
+    assert open(os.path.join(dest, name + ".REJECTED.2"), "rb").read() == b"SECOND"
+
+
+def test_seal_without_an_explicit_clock_never_closes_the_newest_day(world):
+    """A wall clock stepped forward would otherwise hash-pin a day the recorder is still writing (all of 2023 is 'long ago' to the real clock)."""
+    import evidence_chain as EC
+    os.makedirs(os.path.dirname(world["manifest"]), exist_ok=True)
+    SL.seal(world["md"], world["manifest"])                                                     # no now_ms: real clock, far in the future of the fixture data
+    s1, s2 = EC.rows_of(EC.read_lines(world["manifest"])[0])[0]["segments"]
+    assert s1["closed"] is True and "sha256" in s1 and s2["closed"] is False and "sha256" not in s2
+    st = ST.MarketStore(world["md"], commit_every=1, environment="mainnet")
+    st.append("frame", wall_ms=DAY2 + 99_000, mono_s=99.0, category="linear", conn_id="c1", topic="t", payload="{}"); st.close()
+    assert SL.check(world["md"], world["manifest"])["ok"]                                       # the writer's growth is not 'ALTERED'
+    # an explicit clock closes it (owner's decision after the recorder stopped)
+    SL.seal(world["md"], world["manifest"], now_ms=NOW + 2 * 86_400_000)
+    assert EC.rows_of(EC.read_lines(world["manifest"])[0])[-1]["segments"][-1]["closed"] is True

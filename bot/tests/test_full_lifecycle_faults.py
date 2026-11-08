@@ -479,24 +479,24 @@ def test_a_corrupted_market_data_backup_fails_restore_check_while_the_original_v
     os.makedirs(os.path.dirname(manifest))
     SL.seal(md, manifest, now_ms=NOW)
     dest, rec = str(tmp_path / "offvol"), str(tmp_path / "off" / "receipts.jsonl")
-    res = SL.backup(md, dest, rec, now_ms=NOW)
+    res = SL.backup(md, dest, rec, manifest=manifest, now_ms=NOW)
     assert [d["records"] for d in res["backed_up"]] == [10]                                   # day 1 (10 records) is closed; day 2 is still being written
-    assert SL.restore_check(dest, rec) == {"ok": True, "problems": [], "checked": 1}
+    assert SL.restore_check(dest, rec, manifest) == {"ok": True, "problems": [], "checked": 1}
     # two corrupted COPIES of the good backup; the receipts are shared
     flipped, cut = str(tmp_path / "copy_flipped"), str(tmp_path / "copy_cut")
     shutil.copytree(dest, flipped)
     shutil.copytree(dest, cut)
     name = SL.segment_names(dest)[0]
     _flip(os.path.join(flipped, name))
-    bad = SL.restore_check(flipped, rec)
+    bad = SL.restore_check(flipped, rec, manifest)
     assert bad["ok"] is False and any("hash differs from its receipt" in p or "chain" in p for p in bad["problems"])
     os.remove(os.path.join(cut, name))
-    gone = SL.restore_check(cut, rec)
+    gone = SL.restore_check(cut, rec, manifest)
     assert gone["ok"] is False and any("missing from the backup" in p for p in gone["problems"])
     # the ORIGINAL store and the intact backup are unaffected and still verify, deeply
     chk = SL.check(md, manifest, deep=True)
     assert chk["ok"] and chk["problems"] == []
-    assert SL.restore_check(dest, rec)["ok"] is True
+    assert SL.restore_check(dest, rec, manifest)["ok"] is True
     # a flipped ORIGINAL day is never "ok". DEFECT REPORTED (not fixed here): ``md_seal.check(deep=True)`` lets sqlite3.DatabaseError ("database disk image is
     # malformed") escape as a traceback instead of returning {"ok": False, "problems": [...]}; it fails closed, but a caller that does not expect the exception crashes.
     _flip(os.path.join(md, name))

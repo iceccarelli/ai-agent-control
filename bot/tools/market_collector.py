@@ -26,6 +26,14 @@ Cycle layout (a NEW directory per run, nothing overwritten, files 0600, director
     cycle-<now_ms>/COMPLETE       written LAST: the manifest's SHA-256. No COMPLETE => the cycle is set aside as ``.INCOMPLETE`` on the next run.
     <out_root>/cycles.jsonl       evidence_chain-hashed row per COMPLETE cycle (id, manifest sha, counts, gaps)
 
+STATUS. A cycle is ``OK`` only if its evidence is present and fresh: ``PARTIAL`` (with ``partial_reasons`` in the manifest) when there is any error, no universe, a failed book or
+trades artifact, a conflict, zero instruments, zero valid ticker rows, no selected symbol (with max_symbols > 0), any clock-skew flag, a book older than ``MAX_BOOK_AGE_MS`` or
+newest trades older than ``MAX_TRADE_AGE_MS`` at receive time.
+RESUME. A COMPLETE directory that is not in cycles.jsonl is adopted only if it is a genuine cycle (own name, cycle_ms == name, after every recorded cycle, not after this run,
+schema and file listing consistent, no symlink); anything else is set aside as ``.INCOMPLETE`` (numbered, never deleted).
+CRASH REPAIR. After a crash between a log row and its chain entry (UNCHAINED_TAIL) the run is refused with a diagnostic; the owner runs
+``python3 tools/market_collector.py repair-log --out-root R`` (evidence_chain.repair: the row is kept and marked resealed). It is never automatic.
+
 What it cannot show: that the bytes came from the exchange (a hash proves what was read, not who produced it), or that the venue's data is complete.
 """
 from __future__ import annotations
@@ -67,6 +75,8 @@ SKEW_WARN_MS = UC.SKEW_WARN_MS
 DEFAULT_MAX_SYMBOLS = 20
 MAX_TURNOVER = Decimal(10) ** 15                  # a 24h USDT turnover above this is a poisoned response, not a market (BTC is ~1e10)
 MAX_MS = 10 ** 14                                  # a millisecond clock below year ~5138; also keeps ``cycle-<ms>`` inside _CYCLE's 16 digits
+MAX_BOOK_AGE_MS = 10_000                           # a book whose own timestamp is older (or further ahead) than this at receive time is STALE evidence
+MAX_TRADE_AGE_MS = 600_000                         # the newest trade of a top-turnover symbol older than this at receive time is STALE evidence
 DEFAULT_DEPTH = 50
 DEFAULT_TRADES = 100
 MAX_DEPTH = 200
@@ -290,6 +300,8 @@ def validate_book(body: bytes, symbol: str, depth: int) -> Dict[str, Any]:
     ts = res.get("ts")
     if isinstance(ts, bool) or not (isinstance(ts, int) and ts > 0 or isinstance(ts, str) and _UINT.fullmatch(ts)):
         _bump(rej, "bad_ts")
+    else:
+        info["data_ts_ms"] = int(ts)
     sides: Dict[str, List[Tuple[Decimal, str]]] = {}
     for key, name in (("b", "bid"), ("a", "ask")):
         raw = res.get(key)
@@ -370,6 +382,7 @@ def validate_trades(body: bytes, symbol: str, limit: int, recv_ms: int) -> Dict[
                 _bump(rej, "conflicting_duplicate_execId")
             continue
         seen[eid] = key
+        info["data_ts_ms"] = max(info.get("data_ts_ms") or 0, tt)
         if tt > recv_ms + SKEW_WARN_MS:
             _bump(rej, "trade_time_in_the_future")
     info["rows"] = len(seen)
@@ -530,9 +543,82 @@ def _log_rows(log: str) -> List[Dict[str, Any]]:
     return [r for r in EC.rows_of(EC.read_lines(log)[0]) if isinstance(r, dict)]
 
 
+def _symlinks(cycle_dir: str) -> List[str]:
+    """Every symbolic link in (or being) the cycle directory. A link is never followed: it could make a 'verified' file be somebody else's bytes."""
+    out: List[str] = []
+    if os.path.islink(cycle_dir):
+        return [os.path.basename(cycle_dir)]
+    for dp, dn, fn in os.walk(cycle_dir):
+        for n in dn + fn:
+            full = os.path.join(dp, n)
+            if os.path.islink(full):
+                out.append(os.path.relpath(full, cycle_dir).replace(os.sep, "/"))
+    return sorted(out)
+
+
+def _is_uint(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def manifest_shape_problems(man: Any, dirname: str) -> List[str]:
+    """Is ``man`` a cycle manifest of THIS directory? Required keys with the right types, name == cycle == ``cycle-<cycle_ms>``, every artifact's hash equal to the
+    file listing's. Pure: no filesystem access (the files are compared separately)."""
+    if not isinstance(man, dict):
+        return ["manifest.json is not a cycle manifest (not an object)"]
+    probs: List[str] = []
+    if man.get("schema_version") != SCHEMA_VERSION or isinstance(man.get("schema_version"), bool):
+        probs.append("manifest: schema_version is not the expected version")
+    for k, t in (("counts", dict), ("gaps", list), ("errors", list), ("artifacts", list), ("files", dict), ("selection", dict), ("request", dict)):
+        if not isinstance(man.get(k), t):
+            probs.append(f"manifest: {k} is missing or not a {t.__name__}")
+    if man.get("status") not in ("OK", "PARTIAL"):
+        probs.append("manifest: status is not OK or PARTIAL")
+    ms = man.get("cycle_ms")
+    if not _is_uint(ms) or not 0 < ms < MAX_MS:
+        probs.append("manifest: cycle_ms is not a positive whole number")
+    elif dirname != f"cycle-{ms}":
+        probs.append(f"manifest: directory name {dirname!r} is not cycle-<cycle_ms> ({ms})")
+    if man.get("cycle") != dirname:
+        probs.append(f"manifest: cycle {man.get('cycle')!r} is not this directory's name")
+    for k in ("started_ms", "finished_ms"):
+        if not _is_uint(man.get(k)):
+            probs.append(f"manifest: {k} is not a whole number")
+    if probs:
+        return probs
+    files = man["files"]
+    for rel, ent in files.items():
+        if not (isinstance(rel, str) and isinstance(ent, dict) and isinstance(ent.get("sha256"), str) and _HEX.fullmatch(ent["sha256"]) and _is_uint(ent.get("bytes"))):
+            probs.append(f"manifest: files entry {str(rel)[:40]!r} is malformed")
+    if probs:
+        return probs
+    for a in man["artifacts"]:
+        if not isinstance(a, dict) or not isinstance(a.get("kind"), str):
+            probs.append("manifest: an artifact is not an object with a kind")
+            continue
+        f = a.get("file")
+        if f is None:
+            continue                                                       # a recorded gap (not fetched): no file to compare
+        if f not in files or files[f]["sha256"] != a.get("sha256") or files[f]["bytes"] != a.get("bytes"):
+            probs.append(f"manifest: artifact {a['kind']}/{a.get('symbol')} does not match the file listing for {f!r}")
+        d = a.get("derived_file")
+        if d is not None and (d not in files or files[d]["sha256"] != a.get("derived_sha256")):
+            probs.append(f"manifest: artifact {a['kind']}/{a.get('symbol')} derived file {d!r} does not match the file listing")
+    return probs
+
+
 def verify_cycle_dir(cycle_dir: str) -> List[str]:
-    """Problems found comparing a cycle directory with its own manifest and COMPLETE marker (independent of any log)."""
+    """Problems found comparing a cycle directory with its own manifest and COMPLETE marker (independent of any log). Never raises on a hostile directory."""
+    try:
+        return _verify_cycle_dir(cycle_dir)
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError, OSError, RecursionError) as exc:
+        return [f"manifest.json is not a valid cycle manifest ({type(exc).__name__})"]
+
+
+def _verify_cycle_dir(cycle_dir: str) -> List[str]:
     problems: List[str] = []
+    links = _symlinks(cycle_dir)
+    if links:
+        return [f"SYMLINK: {links[0]} is a symbolic link (never followed)"]
     mp, cp = os.path.join(cycle_dir, "manifest.json"), os.path.join(cycle_dir, COMPLETE)
     if not os.path.isfile(mp):
         return ["manifest.json is missing"]
@@ -546,9 +632,12 @@ def verify_cycle_dir(cycle_dir: str) -> List[str]:
     try:
         with open(mp, "rb") as fh:
             man = json.loads(fh.read().decode("utf-8"))
-        want = man["files"]
-    except (ValueError, KeyError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return problems + ["manifest.json is not a cycle manifest"]
+    shape = manifest_shape_problems(man, os.path.basename(os.path.normpath(cycle_dir)))
+    if shape:
+        return problems + shape
+    want = man["files"]
     have = set(_rel_files(cycle_dir)) - {"manifest.json", COMPLETE}
     for rel in sorted(set(want) - have):
         problems.append(f"MISSING: {rel}")
@@ -617,29 +706,47 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
     if os.path.isfile(log):
         ver = EC.verify(log)
         if not ver.get("ok", False):
-            return _refuse("REFUSED_LOG", reason="cycles.jsonl does not verify; a new cycle would be unrecordable", detail=str(ver.get("problems") or ver.get("state") or ver)[:300])
+            codes = sorted({str(i.get("code")) for i in ver.get("issues", []) if isinstance(i, dict)})
+            hint = ""
+            if "UNCHAINED_TAIL" in codes and ver.get("internally_consistent"):
+                hint = (f" UNCHAINED_TAIL: a crash left {ver.get('unchained_tail')} row(s) written but not chained. This is repairable and is NEVER repaired automatically: the owner "
+                        f"runs `python3 tools/market_collector.py repair-log --out-root {root}` (the row is kept and marked resealed).")
+            return _refuse("REFUSED_LOG", reason="cycles.jsonl does not verify; a new cycle would be unrecordable",
+                           detail=(f"{','.join(codes) or 'unknown'}: " + "; ".join(f"{i.get('code')}: {i.get('detail')}" for i in ver.get("issues", []) if isinstance(i, dict)))[:300] + hint)
     rows = _log_rows(log)
 
-    # resume: an interrupted cycle is set aside, never reused or overwritten; a COMPLETE-but-unrecorded one is recorded late
+    # resume: an interrupted cycle is set aside, never reused or overwritten; a COMPLETE-but-unrecorded one is recorded late ONLY if it is a genuine cycle of this
+    # collector: self-consistent is not enough (a fabricated dir with a far-future cycle_ms wedged the log), so it must also carry its own name, a cycle_ms strictly
+    # after everything already recorded and not after this run's clock, and agree with its file listing. Anything else is set aside (numbered, never deleted).
     set_aside: List[Dict[str, str]] = []
     recorded = {r.get("cycle") for r in rows}
-    for name in cycle_dirs(root, complete_only=False):
+    max_ms = max((r["cycle_ms"] for r in rows if _is_uint(r.get("cycle_ms"))), default=0)
+    for name in sorted(cycle_dirs(root, complete_only=False), key=lambda n: int(n[len("cycle-"):])):
         path = os.path.join(root, name)
+
+        def _aside_cycle(reason: str) -> None:
+            set_aside.append({"cycle": name, "moved_to": os.path.basename(_aside(path, ".INCOMPLETE")), "reason": reason})
         if not os.path.isfile(os.path.join(path, COMPLETE)):
-            set_aside.append({"cycle": name, "moved_to": os.path.basename(_aside(path, ".INCOMPLETE")), "reason": "no COMPLETE marker"})
+            _aside_cycle("no COMPLETE marker")
         elif name not in recorded:
             if verify_cycle_dir(path):
-                set_aside.append({"cycle": name, "moved_to": os.path.basename(_aside(path, ".INCOMPLETE")), "reason": "COMPLETE but failed verification"})
+                _aside_cycle("COMPLETE but failed verification")
+                continue
+            with open(os.path.join(path, "manifest.json"), "rb") as fh:
+                old = json.loads(fh.read())
+            if old["cycle_ms"] > now_ms:
+                _aside_cycle("COMPLETE but its cycle_ms is in the future of this run")
+            elif old["cycle_ms"] <= max_ms:
+                _aside_cycle("COMPLETE but its cycle_ms is not after the previous recorded cycle")
             else:
-                with open(os.path.join(path, "manifest.json"), "rb") as fh:
-                    old = json.loads(fh.read())
-                EC.append(log, {"at_ms": int(clock()), "cycle": name, "cycle_ms": old.get("cycle_ms"), "manifest_sha256": _file_sha(os.path.join(path, "manifest.json")),
-                                "status": old.get("status"), "counts": old.get("counts"), "gaps": old.get("gaps", []), "recovered": True})
+                EC.append(log, {"at_ms": int(clock()), "cycle": name, "cycle_ms": old["cycle_ms"], "manifest_sha256": _file_sha(os.path.join(path, "manifest.json")),
+                                "status": old["status"], "counts": old["counts"], "gaps": old["gaps"], "recovered": True})
+                max_ms = old["cycle_ms"]
     rows = _log_rows(log)
 
-    prev = rows[-1] if rows else None
+    prev = max((r for r in rows if _is_uint(r.get("cycle_ms"))), key=lambda r: r["cycle_ms"], default=None)
     gaps: List[Dict[str, Any]] = []
-    if prev is not None and isinstance(prev.get("cycle_ms"), int):
+    if prev is not None:
         if now_ms <= prev["cycle_ms"]:
             return _refuse("REFUSED_CLOCK", reason="now_ms does not advance past the previous recorded cycle", previous_cycle_ms=prev["cycle_ms"])
         delta = now_ms - prev["cycle_ms"]
@@ -719,6 +826,11 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
                     fname = f"{'books' if kind == 'book' else 'trades'}/{sym}.json"
                     _write(os.path.join(cdir, *fname.split("/")), body)          # unedited, before anything is concluded about it
                     info = validate_book(body, sym, lim) if kind == "book" else validate_trades(body, sym, lim, recv)
+                    ts = info.pop("data_ts_ms", None)
+                    if ts is not None:
+                        info["age_ms"] = recv - ts
+                    bound = MAX_BOOK_AGE_MS if kind == "book" else MAX_TRADE_AGE_MS
+                    info["stale"] = bool(info["ok"] and (ts is None or recv - ts > bound or (kind == "book" and ts - recv > bound)))
                     artifacts.append(_artifact(kind, sym, fname, body, url, recv, info))
                     sleep(PAUSE_S)
     except OSError as exc:                                  # e.g. disk full mid-cycle: the directory has no COMPLETE and is set aside next run
@@ -738,16 +850,25 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
               "ticker_rows_valid": next((a["validation"]["rows"] for a in artifacts if a["kind"] == "tickers"), 0),
               "symbols_selected": len(selection["selected"]), "books_ok": _n("book", True), "books_failed": _n("book", False),
               "trades_ok": _n("trades", True), "trades_failed": _n("trades", False), "requests": fx.requests,
+              "books_stale": sum(1 for a in artifacts if a["kind"] == "book" and a["validation"].get("stale")),
+              "trades_stale": sum(1 for a in artifacts if a["kind"] == "trades" and a["validation"].get("stale")),
               "rate_limit_events": len(fx.events), "skew_flags": len(skew_flags), "rejects_total": dict(sorted(rejects_total.items())),
               "duplicates_identical": sum(a["validation"].get("duplicates_identical", 0) for a in artifacts),
               "conflicts": sum(a["validation"].get("conflicts", 0) for a in artifacts)}
-    partial = bool(errors) or umanifest is None or counts["books_failed"] or counts["trades_failed"] or counts["conflicts"]
-    status = "PARTIAL" if partial else "OK"
+    reasons: List[str] = []
+    for cond, why in ((bool(errors), "errors"), (umanifest is None, "no_universe"), (bool(counts["books_failed"]), "books_failed"), (bool(counts["trades_failed"]), "trades_failed"),
+                      (bool(counts["conflicts"]), "conflicts"), (counts["instruments"] == 0, "instruments==0"), (counts["ticker_rows_valid"] == 0, "ticker_rows_valid==0"),
+                      (counts["symbols_selected"] == 0 and max_symbols > 0, "symbols_selected==0"), (counts["skew_flags"] > 0, "skew_flags"),
+                      (counts["books_stale"] > 0, "stale_books"), (counts["trades_stale"] > 0, "stale_trades")):
+        if cond:
+            reasons.append(why)
+    status = "PARTIAL" if reasons else "OK"
     manifest = {
         "schema_version": SCHEMA_VERSION, "cycle": cid, "cycle_ms": now_ms, "started_ms": started, "status": status,
-        "request": {"host": venues.host_of(_base()), "paths": list(PUBLIC_PATHS), "category": CATEGORY, "depth": depth, "trades_limit": trades_limit},
+        "request": {"host": venues.host_of(_base()), "paths": list(PUBLIC_PATHS), "category": CATEGORY, "depth": depth, "trades_limit": trades_limit,
+                    "max_book_age_ms": MAX_BOOK_AGE_MS, "max_trade_age_ms": MAX_TRADE_AGE_MS},
         "selection": selection, "artifacts": artifacts, "universe_manifest": {"file": "universe/manifest.json"} if umanifest else None,
-        "counts": counts, "errors": errors, "rate_limit_events": fx.events, "gaps": gaps, "set_aside": set_aside,
+        "counts": counts, "errors": errors, "partial_reasons": reasons, "rate_limit_events": fx.events, "gaps": gaps, "set_aside": set_aside,
         "clock": {"skew_warn_ms": SKEW_WARN_MS, "flagged": skew_flags},
         "note": "point-in-time; selection uses this cycle's tickers only; gaps and rejects are recorded, never filled or hidden; a hash shows what was read, not who produced it",
     }
@@ -761,7 +882,7 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
         EC.append(log, {"at_ms": int(clock()), "cycle": cid, "cycle_ms": now_ms, "manifest_sha256": msha, "status": status, "counts": counts, "gaps": gaps})
     except OSError as exc:
         return _refuse("ABORTED", cycle=cid, reason=f"{type(exc).__name__}: {exc}")
-    return {"status": status, "cycle": cid, "manifest_sha256": msha, "counts": counts, "gaps": gaps, "errors": errors, "set_aside": set_aside}
+    return {"status": status, "cycle": cid, "manifest_sha256": msha, "counts": counts, "gaps": gaps, "errors": errors, "partial_reasons": reasons, "set_aside": set_aside}
 
 
 # ---------------------------------------------------------------- seal / check (the outside memory; compare with EVERY earlier row)
@@ -940,6 +1061,27 @@ def restore_check(backup_dir: str, receipts: str) -> Dict[str, Any]:
     return {"ok": not problems, "problems": problems, "checked": n}
 
 
+# ---------------------------------------------------------------- owner-invoked repair of cycles.jsonl after a crash
+
+def repair_log(out_root: str) -> Dict[str, Any]:
+    """Owner-invoked, NEVER automatic: make ``cycles.jsonl`` appendable again after a crash between a row and its chain entry (UNCHAINED_TAIL) by using
+    ``evidence_chain.repair``: the row is kept and marked ``resealed`` in the chain, a torn final line goes to ``cycles.jsonl.torn``. Refuses (changes nothing)
+    when the file needs no repair or when anything before the tail fails to verify (that is tampering or loss, not a crash)."""
+    root = os.path.abspath(out_root)
+    log = os.path.join(root, LOG_NAME)
+    if not os.path.isfile(log):
+        raise CollectorError(f"{LOG_NAME} does not exist under {root}")
+    if not EC.needs_repair(log):
+        return {"ok": False, "reason": "nothing to repair: the log is already appendable", "verify_ok": bool(EC.verify(log).get("ok"))}
+    before = EC.verify(log)
+    serious = sorted({str(i["code"]) for i in before.get("issues", []) if i["code"] not in ("UNCHAINED_TAIL", "HEAD_MISMATCH", "HEAD_MISSING")})
+    if serious:
+        return {"ok": False, "reason": f"refusing to repair: the log has damage that is not a crash tail ({', '.join(serious)}); investigate, do not reseal", "issues": serious}
+    res = EC.repair(log)
+    after = EC.verify(log)
+    return {"ok": bool(res.get("appendable")) and bool(after.get("ok")), **res, "resealed_indices": after.get("resealed_indices", []), "verify_ok": bool(after.get("ok"))}
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -958,6 +1100,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     c = sub.add_parser("check"); c.add_argument("--root", required=True); c.add_argument("--manifest", required=True)
     b = sub.add_parser("backup"); b.add_argument("--root", required=True); b.add_argument("--to", required=True); b.add_argument("--receipts", required=True)
     k = sub.add_parser("restore-check"); k.add_argument("--backup", required=True); k.add_argument("--receipts", required=True)
+    g = sub.add_parser("repair-log", help="owner-invoked: reseal a crash's UNCHAINED_TAIL in cycles.jsonl (kept and marked resealed; never automatic)")
+    g.add_argument("--out-root", required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == "run-once":
@@ -971,6 +1115,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             res = check_cycles(a.root, a.manifest)
         elif a.cmd == "backup":
             res = backup_cycles(a.root, a.to, a.receipts)
+        elif a.cmd == "repair-log":
+            res = repair_log(a.out_root)
         else:
             res = restore_check(a.backup, a.receipts)
     except (CollectorError, UC.CaptureError, UC.AR.RecordError, OSError, EC.ChainDesync) as exc:
