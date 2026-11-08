@@ -50,7 +50,14 @@
   "holding_period": "registered number of settlements",
   "hypothesis": "The same perpetual pays different funding on two venues; short the higher, long the lower, and the gap exceeds costs.",
   "multiple_testing_family": "cross_venue_funding",
-  "prospective_protocol": "forward observation of the funding gap on both venues; no trading on a venue not qualified by the owner",
+  "prospective_protocol": {
+    "description": "forward observation of the funding gap on both venues; no trading on a venue not qualified by the owner",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "no second order-capable venue is qualified (hard stop: strategy is untradeable by this repo)",
     "gap net of two-venue costs and transfer friction not positive",

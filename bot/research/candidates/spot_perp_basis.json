@@ -50,7 +50,14 @@
   "holding_period": "hours to days (registered)",
   "hypothesis": "The perp-minus-spot basis mean-reverts after dislocations beyond costs.",
   "multiple_testing_family": "spot_perp_basis",
-  "prospective_protocol": "register thresholds then observe forward basis excursions and fills on testnet mechanics",
+  "prospective_protocol": {
+    "description": "register thresholds then observe forward basis excursions and fills on testnet mechanics",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "no synchronised spot/perp data of at least 1-minute resolution exists for the test window",
     "adjusted p-value above 0.05",

@@ -50,7 +50,14 @@
   "holding_period": "seconds to minutes",
   "hypothesis": "Order-book depth imbalance at the top levels predicts the next short-horizon mid move enough to trade after costs.",
   "multiple_testing_family": "liquidity_imbalance",
-  "prospective_protocol": "forward shadow signal log with measured latency before any order",
+  "prospective_protocol": {
+    "description": "forward shadow signal log with measured latency before any order",
+    "min_coverage": 0.9,
+    "min_duration_ms": 1209600000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "book data coarser than the signal's half-life: test refused",
     "predicted move net of spread and measured latency not positive",

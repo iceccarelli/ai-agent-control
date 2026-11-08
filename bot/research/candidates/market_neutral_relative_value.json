@@ -50,7 +50,14 @@
   "holding_period": "days (registered)",
   "hypothesis": "The log price ratio of two cointegrated assets mean-reverts; trade the spread dollar-neutral.",
   "multiple_testing_family": "market_neutral_relative_value",
-  "prospective_protocol": "register the pair rule then observe forward without re-selecting pairs",
+  "prospective_protocol": {
+    "description": "register the pair rule then observe forward without re-selecting pairs",
+    "min_coverage": 0.9,
+    "min_duration_ms": 5184000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "number of pairs examined is not recorded in the variant ledger",
     "adjusted p-value above 0.05",

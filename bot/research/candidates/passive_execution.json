@@ -50,7 +50,14 @@
   "holding_period": "seconds to minutes per order",
   "hypothesis": "Working entries/exits passively (post-only) instead of crossing saves more in avoided spread and fees than it loses in missed or adverse fills.",
   "multiple_testing_family": "passive_execution",
-  "prospective_protocol": "paired comparison on testnet mechanics then owner-account fills, same decisions executed both ways",
+  "prospective_protocol": {
+    "description": "paired comparison on testnet mechanics then owner-account fills, same decisions executed both ways",
+    "min_coverage": 0.9,
+    "min_duration_ms": 1209600000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "no measured fill outcomes exist for passive orders",
     "implementation shortfall vs immediate-cross benchmark not lower after counting unfilled orders as cost",

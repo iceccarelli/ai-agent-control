@@ -51,7 +51,14 @@
   "holding_period": "1 to 9 settlements (registered grid; every grid cell counts as a tested variant)",
   "hypothesis": "Across a point-in-time universe of perpetuals, the assets with the highest trailing funding keep paying more than the lowest, so short-high/long-low earns a funding spread net of costs.",
   "multiple_testing_family": "cross_sectional_funding",
-  "prospective_protocol": "register parameters and universe rule, then observe forward settlements via the trial journal; no parameter change during observation",
+  "prospective_protocol": {
+    "description": "register parameters and universe rule, then observe forward settlements via the trial journal; no parameter change during observation",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "adjusted p-value (Holm over every attempted variant) above 0.05 on historical_test or oos_test",
     "net edge after assumed costs not positive",

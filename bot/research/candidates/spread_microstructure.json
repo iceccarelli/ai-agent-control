@@ -50,7 +50,14 @@
   "holding_period": "seconds to minutes",
   "hypothesis": "A market maker quoting both sides captures the bid-ask spread net of adverse selection and inventory cost.",
   "multiple_testing_family": "spread_microstructure",
-  "prospective_protocol": "forward shadow quoting with measured fills before any order",
+  "prospective_protocol": {
+    "description": "forward shadow quoting with measured fills before any order",
+    "min_coverage": 0.9,
+    "min_duration_ms": 1209600000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "no trade tape: fills cannot be simulated honestly, the test is refused",
     "realised spread minus adverse selection at the modelled horizon not positive",

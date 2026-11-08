@@ -50,7 +50,14 @@
   "holding_period": "days to weeks",
   "hypothesis": "Holding spot against a short perpetual earns funding exceeding costs over the holding period (the delta-neutral carry this repo already runs for BTC).",
   "multiple_testing_family": "cash_and_carry",
-  "prospective_protocol": "only through tools/carry_prospective for BTC; other symbols require a new registration with new digests",
+  "prospective_protocol": {
+    "description": "only through tools/carry_prospective for BTC; other symbols require a new registration with new digests",
+    "min_coverage": 0.9,
+    "min_duration_ms": 7776000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
   "rejection_conditions": [
     "mean funding after the registered cost model is not above the hurdle in the closed window",
     "coverage below the registered floor",

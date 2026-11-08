@@ -104,6 +104,15 @@ def test_true_declaration_over_missing_data_is_rejected(name):
 
 
 @pytest.mark.parametrize("name", MECHANISMS)
+def test_prospective_protocol_is_machine_readable_and_claims_no_start(name):
+    pp = load(name)["prospective_protocol"]
+    assert isinstance(pp, dict) and pp["description"] and pp["start_ms"] is None                 # a template cannot have started observing
+    assert isinstance(pp["min_duration_ms"], int) and pp["min_duration_ms"] >= 14 * 86_400_000
+    assert pp["min_settlements"] >= SV.MIN_PROSPECTIVE_SETTLEMENTS and pp["min_coverage"] >= SV.MIN_PROSPECTIVE_COVERAGE
+    assert SV._prospective_floors({"prospective_period": pp})["min_duration_ms"] == pp["min_duration_ms"]       # the verdict layer reads it
+
+
+@pytest.mark.parametrize("name", MECHANISMS)
 def test_template_states_what_data_the_repo_lacks(name):
     s = load(name)
     for d in s["required_data"]:
