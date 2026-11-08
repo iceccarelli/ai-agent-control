@@ -24,7 +24,7 @@ What an order must satisfy (every refusal is a stable code; all are reported):
 TRANSPORT BINDING. The authority is bound to ONE transport (``bound_transport``); the client approves nothing on another. Construction is refused unless the transport is an
 in-process SIMULATION (``is_simulated_transport``: a WHITELIST of concrete classes, never a self-declared attribute) or ALL of: the owner's testnet capability is enabled (``ms_testnet_adapter.enabled()``, False unless an owner-set capability file with
 a signed-off manifest digest exists), the venue is the registry's ``testnet``, a dedicated testnet credential variable name is declared (generic Bybit names refused) and the
-transport is a ``runtime_capability.CapabilityTransport`` for the TESTNET_EXECUTOR role with the dedicated credential class. None of that exists in this repository state.
+transport is EXACTLY ``ms_testnet_transport.TestnetTransport`` (a ``CapabilityTransport`` for the TESTNET_EXECUTOR role, dedicated credential class) and the binding names its dedicated key variable ``BYBIT_TESTNET_API_KEY``. The capability file is created only by the owner; in this repository state it does not exist, so only simulated transports are admitted.
 """
 from __future__ import annotations
 
@@ -295,9 +295,16 @@ class MultiSymbolAuthority:
             why.append("TESTNET_BINDING_MISSING")
         else:
             why += credential_name_refusals(testnet.credential_env_name)
-        cap = getattr(transport, "capability", None)
-        if not (isinstance(transport, RC.CapabilityTransport) and cap is not None and cap.role == RC.TESTNET_EXECUTOR and cap.venue == "testnet"
-                and cap.credential_class == RC.TESTNET_CREDENTIAL_CLASS):
+        # ADMISSION SEAM: the real testnet transport is admitted ONLY as the exact ``ms_testnet_transport.TestnetTransport`` class (TESTNET_EXECUTOR capability, testnet registry host,
+        # dedicated credential class) AND with the binding naming exactly its dedicated key variable. A generic ``CapabilityTransport`` (any inner object) is no longer enough.
+        try:
+            import ms_testnet_transport as _tt
+            exact = _tt.is_testnet_executor_transport(transport)
+            if testnet is not None and testnet.credential_env_name != _tt.KEY_ENV:
+                why.append("CREDENTIAL_NAME_NOT_THE_DEDICATED_TESTNET_KEY")
+        except Exception:                                          # noqa: BLE001
+            exact = False
+        if not exact:
             why.append("TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY")
         if why:
             raise AuthorityConfigError("TRANSPORT_NOT_SIMULATED:" + ",".join(why))

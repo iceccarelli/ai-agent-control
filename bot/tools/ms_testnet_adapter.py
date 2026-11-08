@@ -113,7 +113,7 @@ def _ceilings() -> Dict[str, float]:
 
 
 def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], strategy: str = "multi_symbol_funding_carry",
-             lower: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
+             lower: Optional[Mapping[str, float]] = None, credential_env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """The manifest for ``symbols`` / one candidate. ``lower`` may LOWER bounds; it cannot raise them (a raised bound makes ``refusals`` non-empty). Authorisation: NOT_GRANTED."""
     bounds: Dict[str, Any] = dict(_ceilings())
     for k, v in (lower or {}).items():
@@ -122,7 +122,7 @@ def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], str
         bounds[k] = v
     m: Dict[str, Any] = {
         "schema": SCHEMA, "venue": "testnet", "category_scope": ["linear", "spot"], "mode": "multi_symbol_hedged_carry", "credential_class": RC.TESTNET_CREDENTIAL_CLASS,
-        "credential_env": {"api_key": TAM.DEFAULT_KEY_ENV, "api_secret": TAM.DEFAULT_SECRET_ENV},
+        "credential_env": dict(credential_env) if credential_env is not None else {"api_key": TAM.DEFAULT_KEY_ENV, "api_secret": TAM.DEFAULT_SECRET_ENV},
         "strategy_allowlist": [{"strategy": strategy, "candidate_id": candidate_id, "spec_digest": spec_digest}],
         "symbol_allowlist": list(symbols), "allowed_sides": {k: list(v) for k, v in SIDES.items()}, "allowed_order_types": list(ORDER_TYPES),
         "execution_styles": list(EXECUTION_STYLES), "bounds": bounds, "kill_switch": dict(KILL_SWITCH),
@@ -346,12 +346,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     g.add_argument("--candidate-id", required=True)
     g.add_argument("--spec-digest", required=True)
     g.add_argument("--symbols", required=True)
+    g.add_argument("--session-credentials", action="store_true",
+                   help="name the dedicated variables the owner session tool reads: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET (the names are part of the digest)")
     v = sub.add_parser("validate")
     v.add_argument("file")
     sub.add_parser("status")
     a = ap.parse_args(argv)
     if a.cmd == "generate":
-        m = generate(candidate_id=a.candidate_id, spec_digest=a.spec_digest, symbols=[s for s in a.symbols.split(",") if s])
+        m = generate(candidate_id=a.candidate_id, spec_digest=a.spec_digest, symbols=[s for s in a.symbols.split(",") if s],
+                     credential_env={"api_key": "BYBIT_TESTNET_API_KEY", "api_secret": "BYBIT_TESTNET_API_SECRET"} if a.session_credentials else None)
         rep = validate(m, env={})
         print(json.dumps(m, indent=2, sort_keys=True))
         return 0 if rep["valid"] else 1

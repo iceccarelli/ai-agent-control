@@ -303,6 +303,10 @@ EXPECTED_SITES: Dict[str, str] = {
     "ledger.py:LedgerBroker.place_market": "BROKER_CALLER",
     "ledger.py:LedgerBroker.place_post_only": "BROKER_CALLER",
     "backtest.py:SimulatedExchange.request": "SIMULATOR",
+    # TESTNET execution adapter (reviewed): names the create path as the module constant CREATE and sends it ONLY with ``self.client._request("POST", CREATE, ..., retries=0)`` -- the
+    # one transport where the signing, the TESTNET_EXECUTOR role capability, the exact-host check and the MultiSymbolAuthority sit. It builds no HTTP of its own (pinned below).
+    "tools/ms_testnet_executor.py:<module>": "GATEWAY",
+    "tools/ms_testnet_executor.py:TestnetExecutor.send_order": "GATEWAY",
     "tools/close_testnet_experiment.py:<module>": "GATEWAY",
     "tools/close_testnet_experiment.py:Gateway.request": "GATEWAY",
     "tools/close_testnet_experiment.py:Lab.place": "GATEWAY",
@@ -587,3 +591,44 @@ def test_market_history_and_the_corpus_audit_add_no_order_site_and_no_connection
         assert not {s for s in sites if s.startswith(rel + ":")}, f"{rel} became an order-capable or process-spawning site"
     assert "tools/market_collector.py" in EXPECTED_HTTP_FILES                      # the single transport the history tool reuses
     assert "tools/market_history.py" not in EXPECTED_HTTP_FILES and "tools/data_freshness_audit.py" not in EXPECTED_HTTP_FILES
+
+
+# ---- testnet execution path (ms_testnet_transport / ms_testnet_executor / ms_testnet_session) ---------------------------------------------------------------------
+def test_testnet_execution_modules_open_no_connection_of_their_own_and_send_only_through_the_client_request():
+    """Reason for these pins: the testnet executor is the one NEW order-create site. (1) It is pinned above as GATEWAY, not as a transport: none of the three new modules imports an
+    HTTP library (the real connection is ``bybit_connection.RequestsTransport``, subclassed without redirects / proxies in ``ms_testnet_transport``), so EXPECTED_HTTP_FILES and
+    ORDER_CAPABLE_HTTP_FILES do not change. (2) Its create is ``self.client._request`` and nothing else, so the entry authority and the role capability run first. (3) The session tool
+    and the transport name no order endpoint at all and are not order sites. (4) The signing code is NOT re-implemented: no ``hmac`` / ``hashlib.sha256`` signing in these modules."""
+    sites, http = _inventory()
+    for rel in ("tools/ms_testnet_transport.py", "tools/ms_testnet_executor.py", "tools/ms_testnet_session.py"):
+        assert rel not in http, f"{rel} opens its own connection"
+        mod = _tree(rel)
+        imported = {a.name for n in ast.walk(mod) if isinstance(n, ast.Import) for a in n.names} | {n.module for n in ast.walk(mod) if isinstance(n, ast.ImportFrom)}
+        assert "hmac" not in imported, f"{rel} re-implements request signing"
+        assert not [n for n in ast.walk(mod) if isinstance(n, ast.Attribute) and n.attr in ("_sign", "new")], rel       # BybitClient._sign / hmac.new are not called from here
+    assert {s for s in sites if s.startswith("tools/ms_testnet_transport.py:") or s.startswith("tools/ms_testnet_session.py:")} == set()
+    ex = _tree("tools/ms_testnet_executor.py")
+    sends = [_src(c) for c in _calls(ex, "_request") if "CREATE" in _src(c)]
+    assert sends and all(c.startswith("self.client._request('POST', CREATE") for c in sends), sends
+    assert not [n for n in ast.walk(ex) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("request", "post", "get") and "client" not in _src(n.func)
+                and "transport" in _src(n)]
+    # the only inner transport the session can build is the no-redirect subclass of the pinned RequestsTransport
+    tr = _tree("tools/ms_testnet_transport.py")
+    bases = [_src(b) for n in ast.walk(tr) if isinstance(n, ast.ClassDef) and n.name == "NoRedirectInner" for b in n.bases]
+    assert bases == ["bc.RequestsTransport"]
+
+
+def test_new_modules_are_not_order_capable_http_files_and_the_authority_admits_only_the_exact_transport():
+    assert "tools/ms_testnet_executor.py" not in EXPECTED_HTTP_FILES and "tools/ms_testnet_transport.py" not in EXPECTED_HTTP_FILES
+    src = open(os.path.join(BOT, "tools", "ms_authority.py"), encoding="utf-8").read()
+    assert "is_testnet_executor_transport" in src and "isinstance(transport, RC.CapabilityTransport) and cap is not None" not in src
+
+
+def test_collector_and_monitor_roles_remain_order_incapable_with_the_new_executor_present():
+    """Reason: adding an executor must not widen the other roles. They still cannot POST or sign an order path on the testnet host."""
+    import runtime_capability as RC
+    for role in (RC.PUBLIC_COLLECTOR, RC.READ_ONLY_MONITOR, RC.EVIDENCE_BACKUP):
+        cap = RC.Capability.for_role(role, venue="testnet")
+        for ep in ("/v5/order/create", "/v5/order/cancel", "/v5/position/set-leverage"):
+            assert cap.check("POST", ep, True, cap.host) is not None
+        assert cap.check("GET", "/v5/user/query-api", True, cap.host) in (None, "ENDPOINT_NOT_ALLOWED", "NO_VENUE_ACCESS: evidence_backup may not make any HTTP request") or role == RC.PUBLIC_COLLECTOR
