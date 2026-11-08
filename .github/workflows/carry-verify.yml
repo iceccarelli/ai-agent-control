@@ -127,6 +127,8 @@ jobs:
           tests/test_suite_isolation.py
           tests/test_ms_risk.py
           tests/test_ms_accounting.py
+          tests/test_ms_reconcile.py
+          tests/test_canonical_contracts.py
           tests/test_ms_economics.py
           tests/test_ms_authority.py
           tests/test_ms_testnet_adapter.py
