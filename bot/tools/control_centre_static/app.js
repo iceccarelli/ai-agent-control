@@ -298,7 +298,7 @@
     out.push(section("Components of the one net"));
     out.push(a.withheld ? errbox("Figures withheld: the artifacts are not from one run (INCONSISTENT_RUN).") : null);
     out.push(table([{ label: "Component", render: function (c) { return c.label; } }, { label: "Value", render: function (c) { return V(c.value); } }, { label: "Source field", render: function (c) { return c.value.src ? mono(c.value.src) : "—"; } }], a.components,
-      "Gross and net are different fields; net is never inferred from gross. Slippage, hedge cost and adverse selection have no backend source yet."));
+      "Gross and net are different fields; net is never inferred from gross. Slippage and adverse selection appear only when the ledger states them; hedge cost has no backend source yet."));
     out.push(section("Identity checks"));
     out.push(h("p", null, "Integrity: ", pill(a.integrity === "PASS" ? "OK" : a.integrity === "FAIL" ? "FAIL" : "NO_DATA", a.integrity)));
     out.push(a.checks.length ? table([{ label: "Check", render: function (c) { return c.label; } }, { label: "Result", render: function (c) { return pill(c.state === "PASS" ? "OK" : c.state === "FAIL" ? "FAIL" : "NO_DATA", c.state); } }, { label: "Detail", render: function (c) { return c.detail; } }], a.checks)
