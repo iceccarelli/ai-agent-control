@@ -94,7 +94,7 @@ jobs:
 
       - name: Carry correctness tests
         env:
-          # tests/test_entry_gate_parity.py SKIPS without a compiler locally; here
+          # the entry-gate parity test SKIPS without a compiler locally; here
           # a missing library must fail the job, never go green on half the parity.
           REQUIRE_NATIVE_CORE: "1"
         run: >
@@ -170,7 +170,6 @@ jobs:
           tests/test_entry_authority.py
           tests/test_universe_capture.py
           tests/test_funding_cap_event_path.py
-          tests/test_supabase_migrations.py
           tests/test_owner_import.py
           tests/test_strategy_verdict.py
           tests/test_runtime_capability.py
@@ -182,7 +181,6 @@ jobs:
           tests/test_market_collector.py
           tests/test_economic_model.py
           tests/test_economic_faults.py
-          tests/test_supabase_sync.py
           tests/test_research_harness.py
           tests/test_candidate_templates.py
           tests/test_owner_import_lineage.py
@@ -602,8 +600,51 @@ jobs:
           REQUIRE_NATIVE_CORE: "1"
         run: |
           set -eu
-          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' ../.github/workflows/carry-verify.yml | sort -u > "$RUNNER_TEMP/named.txt"
+          # Named = the files the `python -m pytest` COMMANDS in this workflow list (see the script's header). A
+          # test file merely mentioned in a comment or an echo is NOT named and so is not excluded from this job.
+          awk -f ../.github/scripts/named_tests.awk ../.github/workflows/carry-verify.yml | sort -u > "$RUNNER_TEMP/named.txt"
           ls tests/test_*.py | sort > "$RUNNER_TEMP/all.txt"
+          test -s "$RUNNER_TEMP/named.txt"
+          if [ -n "$(comm -13 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt")" ]; then
+            echo "the workflow names test files that do not exist:"; comm -13 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt"; exit 1
+          fi
           comm -23 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt" > "$RUNNER_TEMP/rest.txt"
           echo "test files the correctness gate does not name: $(wc -l < "$RUNNER_TEMP/rest.txt")"
           python -m pytest -q -rs -p no:cacheprovider -m "not data_freshness" $(cat "$RUNNER_TEMP/rest.txt")
+
+  # The RLS / append-only / anon-denied / trigger guarantees of supabase/migrations are EXECUTED against a throwaway
+  # local Postgres (the pinned `pgserver` wheel: a private data directory under pytest's tmp path, unix socket only,
+  # started as the unprivileged runner user). In the other jobs those tests SKIP when pgserver is not installed, which
+  # is how they went unrun in CI. Here REQUIRE_PG=1 turns "pgserver missing or Postgres will not start" into a FAILURE
+  # (in the migrations test itself), and the pin lives in bot/constraints.txt like every other test dependency.
+  # No Supabase project, no network service, no credential: the Supabase roles and auth.uid() are stubbed locally.
+  supabase-migrations:
+    name: supabase migrations executed on postgres (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install dependencies and the pinned disposable Postgres
+        run: python -m pip install -r requirements.txt -c constraints.txt pytest pgserver
+
+      - name: Run the Supabase tests against a real Postgres (cannot skip)
+        env:
+          REQUIRE_PG: "1"
+        run: >
+          python -m pytest -q -rs -p no:cacheprovider
+          tests/test_supabase_migrations.py
+          tests/test_supabase_sync.py

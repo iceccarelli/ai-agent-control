@@ -90,3 +90,98 @@ def test_a_reviewed_fixture_is_bound_to_its_CONTENT_not_only_its_count(tmp_path,
     monkeypatch.delitem(SS.REVIEWED_DIGESTS, key)                                                # a count with no content digest reviews nothing
     f.write_text(f'API_KEY = "{reviewed_value}"\n')
     assert SS.apply_reviewed(SS.scan_paths([str(f)]), str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# red-team round 2: bypasses of the scanner itself. Every literal is assembled at run time so this
+# file is not itself a finding.
+# ---------------------------------------------------------------------------
+R = "Zk3Qm9Xp2LdV7nBt5RwY8cHs1JfG4aEu"      # synthetic, random-looking, not a key
+
+
+def _rules(text):
+    return [r for _, r in SS.scan_text(text)]
+
+
+def test_non_utf8_text_is_still_scanned_and_a_unreadable_file_fails_the_scan(tmp_path, capsys):
+    f = tmp_path / "leak.txt"
+    f.write_bytes(b"AWS=" + FAKE_AWS.encode() + b"\n\xff\n")          # ONE invalid byte used to skip the whole file
+    assert [r for _p, _n, r in SS.scan_paths([str(f)])] == ["aws-access-key-id"]
+    assert SS.main([str(f)]) == 1
+    capsys.readouterr()
+    # positive control: the same file without the bad byte and without a key is clean and exits 0
+    g = tmp_path / "clean.txt"
+    g.write_bytes(b"nothing here\n\xff\n")
+    assert SS.main([str(g)]) == 0
+    capsys.readouterr()
+    # a non-binary file that cannot be scanned (here: over the size cap) must NOT read as a pass
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"a" * (SS.MAX_BYTES + 1))
+    assert SS.main([str(big)]) != 0
+    assert "NOT SCANNED" in capsys.readouterr().out
+
+
+def test_a_credential_after_column_2000_is_found():
+    assert _rules((" " * 2100) + FAKE_AWS) == ["aws-access-key-id"]
+    assert _rules(("a" * 5000)) == []                       # positive control: a long clean line stays clean
+
+
+def test_long_pathological_lines_scan_in_bounded_time():
+    import time
+    t = time.time()
+    SS.scan_text("api_key" * 20000 + "\n" + "A" * 200000 + "\n" + "=" * 100000)
+    assert time.time() - t < 5
+
+
+def test_new_credential_shapes_are_found():
+    cases = {
+        "sb-secret": "SUPABASE_KEY=sb_secret_" + R,
+        "slack-webhook": "u=https://hooks.slack.com/services/T01ABCDEF/B01ABCDEFG/" + R[:24],
+        "stripe-live-key": "STRIPE=sk_live_" + R,
+        "stripe-live-key": "STRIPE=rk_live_" + R,
+        "secret-literal": '{"secret": "%s"}' % R,
+        "client-secret": "client_secret = '%s'" % R,
+        "secret-assignment": "BYBIT_SECRET=" + R,
+        "secret-assignment2": "SUPABASE_SERVICE_ROLE_KEY=" + R,
+        "secret-assignment3": "TOKEN=" + R,
+        "secret-assignment4": "export SLACK_BOT_TOKEN=" + R,
+    }
+    for name, text in cases.items():
+        assert _rules(text), name
+
+
+def test_aws_secret_key_next_to_an_access_key_id_is_found_but_a_lone_40_char_token_is_not():
+    secret40 = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYq9Zk3Qm9X1"
+    assert len(secret40) == 40
+    text = f"aws_access_key_id = {FAKE_AWS}\naws_secret_access_key = {secret40}\n"
+    assert "aws-secret-near-key-id" in _rules(text)
+    bare = f"id = {FAKE_AWS}\n{secret40}\n"                    # no name on the secret line at all
+    assert "aws-secret-near-key-id" in _rules(bare)
+    assert "aws-secret-near-key-id" not in _rules(secret40 + "\n")        # not next to a key id: indistinguishable from a hash
+    sha1 = "a" * 40
+    assert "aws-secret-near-key-id" not in _rules(f"id = {FAKE_AWS}\n{sha1}\n")   # a hex digest is not a secret
+
+
+def test_code_that_merely_names_a_secret_is_not_a_finding():
+    for text in ('token = build_authorization_header(request)', "BYBIT_SECRET = os.environ['BYBIT_SECRET']",
+                 'client_secret = "<your client secret>"', 'secret = "..."', "TOKEN=${{ secrets_placeholder }}",
+                 "SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_xxxx", "SLACK_BOT_TOKEN=xoxb-your-token-here"):
+        assert _rules(text) == [], text
+
+
+def test_the_placeholder_filter_matches_the_WHOLE_value_not_a_substring():
+    # a real-looking value that merely CONTAINS a placeholder word used to be waved through
+    for word in ("test", "fake", "example", "dummy", "sample", "abcdef", "xxxx"):
+        v = R[:10] + word + R[10:24]
+        assert _rules(f"API_KEY={v}") == ["credential-assignment"], word
+        assert _rules(f"SERVICE_TOKEN={v}") == ["secret-assignment"], word
+    # positive control: values that are ONLY placeholder words are still ignored
+    for v in ("your_api_key_goes_here_xxxx", "changeme_changeme", "example_example_value", "xxxxxxxxxxxxxxxx",
+              "dummy-dummy-dummy-dummy", "test_test_test_test"):
+        assert _rules(f"API_KEY={v}") == [], v
+
+
+def test_rule_set_has_a_mutation_guard():
+    names = {n for n, _ in SS.RULES}
+    for needed in ("sb-secret-key", "slack-webhook", "stripe-live-key", "secret-literal", "secret-assignment"):
+        assert needed in names, needed

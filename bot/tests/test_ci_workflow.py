@@ -245,3 +245,141 @@ def test_the_rest_of_the_suite_excludes_only_the_documented_freshness_marker(tex
     for hidden in ("continue-on-error", "|| true", "--deselect", "--ignore",
                    "-k "):
         assert hidden not in job, hidden
+
+
+# ---------------------------------------------------------------------------
+# red-team round 2: the derived "rest of the suite" list must come from the pytest ARGUMENT BLOCKS only, never from
+# any text that happens to mention a test file (a comment, an echo, a doc line).
+# ---------------------------------------------------------------------------
+import shutil
+import subprocess
+
+REPO = os.path.dirname(BOT)
+AWK = os.path.join(REPO, ".github", "scripts", "named_tests.awk")
+TEST_TOKEN = re.compile(r"tests/(test_[A-Za-z0-9_]+\.py)")
+
+
+def _blocks_in_python(text):
+    """An independent (indentation based) parse: the `tests/test_*.py` tokens of every `python -m pytest` command,
+    i.e. the command line and its continuation lines up to the first blank line, comment, or new YAML key/item."""
+    named, inside = [], False
+    for line in text.splitlines():
+        start = re.match(r"\s*(?:run:\s*[>|]?\s*)?python -m pytest(?:\s|$)", line)
+        if not inside and start:
+            inside = True
+        elif inside and (not line.strip() or line.lstrip().startswith("#") or re.match(r"\s*-\s", line)
+                         or (re.match(r"\s*[A-Za-z_-]+:(\s|$)", line) and not line.lstrip().startswith("run:"))):
+            inside = False
+        if inside:
+            named += TEST_TOKEN.findall(line)
+    return sorted(set(named))
+
+
+def _awk(text, tmp_path):
+    assert shutil.which("awk"), "awk is needed (it is on every ubuntu runner)"
+    f = tmp_path / "wf.yml"
+    f.write_text(text, encoding="utf-8")
+    out = subprocess.run(["awk", "-f", AWK, str(f)], capture_output=True, text=True, check=True).stdout
+    return sorted({t[len("tests/"):] for t in out.split()})
+
+
+def _tests_in_blocks_named(text):
+    return sorted({m for m in _blocks_in_python(text)})
+
+
+def test_the_derived_rest_list_is_driven_by_the_pytest_blocks_not_by_the_whole_file(text, tmp_path):
+    assert os.path.exists(AWK), "the extractor script is missing"
+    from_awk = _awk(text, tmp_path)
+    assert from_awk == _blocks_in_python(text)
+    assert len(from_awk) > 300                              # the real gate list, not an empty match
+    # the rest job calls THAT extractor, not a grep over the file
+    job = _rest_job(text)
+    assert "named_tests.awk" in job
+    assert not re.search(r"grep -oE 'tests/test_", job), "the whole-file grep is back"
+    # it fails loudly if the workflow names a file that does not exist
+    assert "comm -13" in job
+
+
+def test_a_comment_or_echo_mentioning_a_test_file_does_not_exclude_it_from_the_rest_job(text, tmp_path):
+    victim = "test_carry_latency.py"
+    listed = f"          tests/{victim}\n"
+    assert listed in text
+    stripped = text.replace(listed, "", 1)
+    assert victim not in _awk(stripped, tmp_path)           # not listed: not named (positive control for the next lines)
+    decorated = (stripped.replace("      - name: Scope of this gate\n",
+                                  f"      # tests/{victim} is mentioned here in prose only\n"
+                                  f"      - name: Scope of this gate\n", 1)
+                 .replace('echo "### carry-verify', f'echo "see tests/{victim} ### carry-verify', 1)
+                 .replace("# WHAT THIS IS NOT", f"# tests/{victim}\n# WHAT THIS IS NOT", 1))
+    assert f"tests/{victim}" in decorated and decorated != stripped
+    assert victim not in _awk(decorated, tmp_path), "a mention in a comment/echo excluded the file from CI"
+    assert victim in _awk(text, tmp_path)                   # listed in the block: named
+    # a single-line `run: python -m pytest tests/x.py` is also a block
+    one = "      - run: x\n        run: python -m pytest -q tests/test_alpha.py tests/test_beta.py\n\n"
+    assert _awk(one, tmp_path) == ["test_alpha.py", "test_beta.py"]
+    two = "        run: |\n          echo python -m pytest tests/test_nope.py\n          grep tests/test_nope2.py x\n"
+    assert _awk(two, tmp_path) == []
+    # a block ends at a comment, a blank line, a new list item or a new key: text after it is not an argument
+    head = "        run: >\n          python -m pytest -q\n          tests/test_a.py\n"
+    for tail in ("          # tests/test_b.py\n", "\n          tests/test_b.py\n", "      - name: x\n        run: echo tests/test_b.py\n",
+                 "        env:\n          X: tests/test_b.py\n"):
+        assert _awk(head + tail, tmp_path) == ["test_a.py"], tail
+
+
+def test_each_test_file_is_listed_in_exactly_one_gate_line_and_the_old_comment_mention_is_gone(text):
+    lines = [l.strip() for l in text.splitlines() if re.fullmatch(r"\s+tests/test_[A-Za-z0-9_]+\.py", l)]
+    dupes = sorted({l for l in lines if lines.count(l) > 1})
+    assert dupes == [], dupes
+    assert "tests/test_entry_gate_parity.py SKIPS" not in text
+    assert text.count("test_entry_gate_parity") == 1
+
+
+def test_the_gate_list_equals_the_files_the_blocks_name_and_all_exist(text):
+    blocks = _blocks_in_python(text)
+    for name in blocks:
+        assert os.path.exists(os.path.join(HERE, name)), name
+    for needed in REQUIRED:
+        assert f"{needed}.py" in blocks, needed
+
+
+# ---- the executed-Postgres job -------------------------------------------------------------------------------
+
+def _pg_job(text):
+    m = re.search(r"^  supabase-migrations:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.M | re.S)
+    assert m, "the workflow has no supabase-migrations job: the RLS/append-only tests would only ever SKIP in CI"
+    return m.group(1)
+
+
+def test_a_dedicated_job_executes_the_supabase_tests_and_cannot_skip_them(text):
+    job = _pg_job(text)
+    assert 'REQUIRE_PG: "1"' in job
+    assert {"test_supabase_migrations.py", "test_supabase_sync.py"} <= set(_blocks_in_python(job))
+    # exactly one job runs them: the gate list must not also name them (a skipping copy is worse than none)
+    assert "test_supabase_migrations.py" not in _blocks_in_python(text.split("\n  supabase-migrations:")[0])
+    assert re.search(r"-c constraints\.txt[^\n]*\bpgserver\b", job), "pgserver must be installed under the constraints pin"
+    for hidden in ("continue-on-error", "|| true", "--deselect", "--ignore", "-k ", "secrets.", "if:"):
+        assert hidden not in job, hidden
+    assert re.search(r"timeout-minutes: \d+", job)
+    for py in ('"3.11"', '"3.12"'):
+        assert py in job
+    with open(os.path.join(BOT, "constraints.txt"), encoding="utf-8") as fh:
+        pins = fh.read()
+    assert re.search(r"^pgserver==\d+\.\d+\.\d+\s*$", pins, re.M)
+    assert re.search(r"^pytest==\d+\.\d+\.\d+\s*$", pins, re.M)
+
+
+def test_the_pg_requirement_is_enforced_by_the_supabase_test_itself():
+    with open(os.path.join(HERE, "test_supabase_migrations.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    assert "REQUIRE_PG" in src and 'importorskip("pgserver"' not in src
+
+
+def test_every_action_is_pinned_by_sha_and_every_workflow_is_read_only():
+    wf_dir = os.path.join(REPO, ".github", "workflows")
+    for name in sorted(os.listdir(wf_dir)):
+        body = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        for ref in re.findall(r"^\s*-?\s*uses:\s*(\S+)", body, re.M):
+            assert re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", ref), (name, ref)
+        assert re.search(r"^permissions:\n  contents: read\n", body, re.M), name
+    for name in ("carry-verify.yml", "security.yml"):
+        assert "secrets." not in open(os.path.join(wf_dir, name), encoding="utf-8").read().lower(), name

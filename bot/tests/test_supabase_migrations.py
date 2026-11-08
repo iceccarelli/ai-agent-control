@@ -4,11 +4,15 @@ Two layers:
   * STATIC tests (always run): parse supabase/migrations/*.sql.
   * EXECUTED tests: apply every migration in order into a DISPOSABLE local Postgres (the `pgserver` wheel,
     a private data dir under pytest's tmp path, unix-socket only) and exercise RLS, grants, triggers and
-    constraints. They SKIP cleanly when `pgserver` is not importable. They never contact any network service,
+    constraints. They SKIP cleanly when `pgserver` is not importable, UNLESS `REQUIRE_PG=1` (the CI job
+    `supabase-migrations` sets it): then a missing pgserver, a Postgres that will not start or a missing psql is a
+    FAILURE, so the guarantees cannot silently stop being executed. They never contact any network service,
     any Supabase project, or any existing database. Supabase's roles and auth.uid() are stubbed locally.
 """
 import hashlib
+import importlib
 import json
+import os
 import re
 import subprocess
 import uuid
@@ -114,17 +118,46 @@ def test_vocabularies_match_sources():
 
 # --------------------------------------------------------------------------- executed
 
+def _unavailable(reason, require):
+    """No disposable Postgres: SKIP, or FAIL when the environment promised one (REQUIRE_PG=1)."""
+    if require:
+        pytest.fail(f"REQUIRE_PG=1 but the executed Supabase tests cannot run: {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
+def _pgserver(require, importer=importlib.import_module):
+    try:
+        return importer("pgserver")
+    except ImportError:
+        _unavailable("no disposable Postgres (pip install pgserver): RLS not executed", require)
+
+
+def test_require_pg_turns_a_missing_pgserver_into_a_failure_not_a_skip():
+    def missing(name):
+        raise ImportError(name)
+
+    with pytest.raises(pytest.fail.Exception, match="REQUIRE_PG=1"):
+        _pgserver(True, missing)
+    with pytest.raises(pytest.skip.Exception):
+        _pgserver(False, missing)                       # positive control: without the promise it still skips
+    sentinel = object()
+    assert _pgserver(True, lambda name: sentinel) is sentinel
+    with pytest.raises(pytest.fail.Exception):
+        _unavailable("postgres will not start", True)
+
+
 @pytest.fixture(scope="module")
 def pg(tmp_path_factory):
-    pgserver = pytest.importorskip("pgserver", reason="no disposable Postgres (pip install pgserver): RLS not executed")
+    require = os.environ.get("REQUIRE_PG") == "1"
+    pgserver = _pgserver(require)
     d = tmp_path_factory.mktemp("pgdata")
     try:
         srv = pgserver.get_server(d, cleanup_mode="stop")
     except Exception as e:  # pragma: no cover
-        pytest.skip(f"cannot start disposable postgres: {e}")
+        _unavailable(f"cannot start disposable postgres: {e}", require)
     psql = Path(pgserver.__file__).parent / "pginstall" / "bin" / "psql"
     if not psql.exists():
-        pytest.skip("pgserver psql binary missing")
+        _unavailable("pgserver psql binary missing", require)
     uri = srv.get_uri()
 
     class PG:
@@ -267,7 +300,9 @@ def test_owner_import_status_vocabulary_and_rules(pg):
     ev = {"owner_id": A, "import_id": sha("imp"), "status": "RECONCILED", "recorded_utc": "2026-11-07T00:00:00Z",
           "source": "t", "content_sha256": sha("e1")}
     pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps(ev), "violates", role="service_role")  # no evidence_ref
-    assert put(pg, "owner_account_import_status_events", {**ev, "evidence_ref": "recon-1"}) == "t"
+    pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps({**ev, "evidence_ref": "recon-1"}),
+             "violates", role="service_role")  # free text is not evidence: it must be the import row's own hash
+    assert put(pg, "owner_account_import_status_events", {**ev, "evidence_ref": sha("imp")}) == "t"
     pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps({**ev, "status": "DISPUTED", "content_sha256": sha("e2")}),
              "violates", role="service_role")  # no reason
 
@@ -310,3 +345,162 @@ def test_manifest_constraints(pg):
     pg.fails("select carry.put_row('data_batches', $j$%s$j$::jsonb);" % json.dumps({**b, "window_end_utc": "2026-11-07T02:00:00Z", "segment_ids": []}), "violates", role="service_role")
     pg.fails("select carry.put_row('data_batches', $j$%s$j$::jsonb);" % json.dumps({**b, "window_end_utc": "2026-11-07T02:00:00Z", "byte_count": -1}), "violates", role="service_role")
     assert put(pg, "data_batches", {**b, "window_end_utc": "2026-11-07T02:00:00Z"}) == "t"
+
+
+# --------------------------------------------------------------------------- 20261107000900 write-path hardening
+# The executed form of the red-team probes (probe.sql / probe2.sql): every case has a positive control.
+
+HARDENING = MIG_DIR / "20261107000900_carry_write_path_hardening.sql"
+
+
+def test_hardening_migration_is_last_additive_and_documents_what_it_cannot_close():
+    assert FILES[-1] == HARDENING
+    raw = HARDENING.read_text()
+    code = strip_comments(raw).lower()
+    assert not re.search(r"\bcreate table\b|\bdrop\b|\bgrant\b[^;]*\b(insert|update|delete|truncate|all)\b|disable row level|security definer", code)
+    assert code.count("not valid;") + code.count("not valid\n") >= 2          # existing rows are never rescanned
+    assert "NOT CLOSABLE AT DATABASE LEVEL" in raw
+    for gap in ("forged owner approval", "content_sha256 correctness", "superuser"):
+        assert gap in raw, gap
+
+
+def test_the_sandbox_venue_list_is_the_registry_sandbox_set():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import venues
+    sandbox = sorted(v.name for v in venues._QUALIFIED.values() if v.kind == venues.SANDBOX)
+    listed = sorted(re.findall(r"'(\w+)'", re.search(r"venue in \(([^)]*)\)", strip_comments(HARDENING.read_text())).group(1)))
+    assert sandbox and listed == sorted(set(sandbox)), (sandbox, listed)
+    assert "mainnet" not in listed and "eu" not in listed
+    assert venues._QUALIFIED["mainnet"].kind == venues.LIVE and "eu" in venues._UNQUALIFIED
+
+
+def test_server_owns_id_and_created_at_and_a_forged_pair_is_ignored(pg):
+    owner = str(uuid.uuid4())
+    forged = {**hyp(owner, "H-forge"), "created_at": "2000-01-01T00:00:00Z", "id": "00000000-0000-0000-0000-000000000001"}
+    assert put(pg, "strategy_hypotheses", forged) == "t"
+    row = pg.scalar(f"select id::text || '|' || created_at::text from carry.strategy_hypotheses where owner_id='{owner}';")
+    rid, created = row.split("|")
+    assert rid != "00000000-0000-0000-0000-000000000001"
+    assert pg.scalar(f"select created_at > now() - interval '5 minutes' and created_at <= now() "
+                     f"from carry.strategy_hypotheses where owner_id='{owner}';") == "t"
+    assert not created.startswith("2000")
+    # an identical resend with a different forged stamp is still a quiet no-op
+    assert put(pg, "strategy_hypotheses", {**forged, "id": str(uuid.uuid4())}) == "f"
+    assert pg.scalar(f"select count(*) from carry.strategy_hypotheses where owner_id='{owner}';") == "1"
+    # every carry table carries the trigger
+    assert pg.scalar("select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='carry' and c.relkind='r' "
+                     "and not exists (select 1 from pg_trigger g where g.tgrelid=c.oid and g.tgname='carry_stamp_insert');") == "0"
+
+
+def test_future_dated_event_times_are_refused_but_the_present_and_the_past_are_not(pg):
+    owner = str(uuid.uuid4())
+    assert put(pg, "strategy_hypotheses", hyp(owner)) == "t"
+    imp = {"owner_id": owner, "import_id": sha("fi"), "source_sha256": sha("fsrc"), "kind": "statement", "storage_ref": "s3://x",
+           "status": "VERIFIED", "imported_utc": "2026-01-01T00:00:00Z", "source": "t", "content_sha256": sha("fi")}
+    assert put(pg, "owner_account_imports", imp) == "t"
+    ev = {"owner_id": owner, "import_id": sha("fi"), "status": "VERIFIED", "evidence_ref": sha("fi"), "source": "t"}
+    far = {**ev, "recorded_utc": "9999-01-01T00:00:00Z", "content_sha256": sha("fe1")}
+    pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps(far), "in the future", role="service_role")
+    soon = pg.scalar("select (now() + interval '1 hour')::text;")
+    pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps({**far, "recorded_utc": soon}), "in the future", role="service_role")
+    near = pg.scalar("select to_char(now() + interval '1 minute', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"');")
+    assert put(pg, "owner_account_import_status_events", {**ev, "recorded_utc": near, "content_sha256": sha("fe2")}) == "t"   # within the 5-minute skew
+    assert put(pg, "owner_account_import_status_events", {**ev, "recorded_utc": "2026-01-02T00:00:00Z", "content_sha256": sha("fe3")}) == "t"
+    # other event-time columns are covered too, and forward-looking ones are not
+    pg.fails("select carry.put_row('approval_records', $j$%s$j$::jsonb);" % json.dumps(
+        {"owner_id": owner, "approval_id": "APF", "subject_kind": "data_batch", "subject_ref": "b", "approved_by_owner": False,
+         "decided_utc": "9999-01-01T00:00:00Z", "source": "t", "content_sha256": sha("apf")}), "in the future", role="service_role")
+    sess = {"owner_id": owner, "session_id": "FUT", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1",
+            "started_utc": "9999-01-01T00:00:00Z", "source": "t", "content_sha256": sha("fut")}
+    pg.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(sess), "in the future", role="service_role")
+    assert put(pg, "execution_sessions", {**sess, "started_utc": "2026-11-07T00:00:00Z"}) == "t"                  # positive control
+    pol = {"owner_id": owner, "policy_name": "p", "version": 1, "policy": {"a": 1}, "effective_from_utc": "9999-01-01T00:00:00Z",
+           "source": "t", "content_sha256": sha("pol")}
+    assert put(pg, "risk_policy_versions", pol) == "t"
+
+
+def test_a_conflicting_resend_is_reported_false_and_never_overwrites(pg):
+    """Documented, NOT a DB-level error (see the migration header): put_row keeps returning false so the writer can classify
+    the conflict as CONFLICT. What the database does guarantee is that the stored row is untouched."""
+    owner = str(uuid.uuid4())
+    h = hyp(owner, "H-conf")
+    assert put(pg, "strategy_hypotheses", h) == "t"
+    assert put(pg, "strategy_hypotheses", h) == "f"
+    changed = {**h, "mechanism": "CHANGED", "content_sha256": sha("changed")}         # same (owner, hypothesis_id), other content
+    assert put(pg, "strategy_hypotheses", changed) == "f"
+    assert pg.scalar(f"select mechanism from carry.strategy_hypotheses where owner_id='{owner}' and hypothesis_id='H-conf';") == "funding"
+    assert pg.scalar(f"select count(*) from carry.strategy_hypotheses where owner_id='{owner}';") == "1"
+
+
+def test_execution_sessions_pair_only_with_a_registered_sandbox_venue(pg):
+    base = {"owner_id": A, "strategy": "x", "code_sha": "abcdef1", "started_utc": "2026-11-07T00:00:00Z", "source": "t"}
+    n = 0
+    for mode in ("PAPER", "TESTNET"):
+        for venue in ("mainnet", "eu", "Testnet", "bybit", "", "main net"):
+            n += 1
+            row = {**base, "mode": mode, "venue": venue, "session_id": f"V{n}", "content_sha256": sha(f"v{n}")}
+            pg.fails("select carry.put_row('execution_sessions', $j$%s$j$::jsonb);" % json.dumps(row), "violates", role="service_role")
+        for venue in ("testnet", "demo"):                                              # positive control
+            n += 1
+            row = {**base, "mode": mode, "venue": venue, "session_id": f"V{n}", "content_sha256": sha(f"v{n}")}
+            assert put(pg, "execution_sessions", row) == "t", (mode, venue)
+
+
+def test_order_fill_and_balance_tables_accept_no_writes_from_anyone(pg):
+    owner = A
+    sess = {"owner_id": owner, "session_id": "S-ro", "mode": "PAPER", "venue": "testnet", "strategy": "x", "code_sha": "abcdef1",
+            "started_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("s-ro")}
+    assert put(pg, "execution_sessions", sess) == "t"
+    order = {"owner_id": owner, "session_id": "S-ro", "venue_order_id": "o1", "symbol": "BTCUSDT", "side": "BUY", "reduce_only": False,
+             "venue_payload_sha256": sha("p"), "evidence_ref": "x", "observed_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("o1")}
+    snap = {"owner_id": owner, "snapshot_id": "z", "snapshot_kind": "VENUE_READ", "status": "VERIFIED", "taken_utc": "2026-11-07T00:00:00Z",
+            "payload_sha256": sha("pl"), "payload_ref": "r", "summary": {"balance_usd": 123456.78, "email": "a@b.co"}, "source": "t",
+            "content_sha256": sha("z")}
+    fill = {"owner_id": owner, "session_id": "S-ro", "venue_order_id": "o1", "venue_fill_id": "f1", "venue_payload_sha256": sha("p"),
+            "evidence_ref": "x", "observed_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("f1")}
+    for table, row in (("order_refs", order), ("account_snapshots", snap), ("fill_refs", fill)):
+        pg.fails("select carry.put_row('%s', $j$%s$j$::jsonb);" % (table, json.dumps(row)), "permission denied", role="service_role")
+        # the table owner / superuser path is closed by the trigger even if a later migration re-grants INSERT
+        pg.fails(f"grant insert on carry.{table} to service_role; set role service_role; "
+                 f"select carry.put_row('{table}', $j${json.dumps(row)}$j$::jsonb);", "accepts no writes")
+        pg.run(f"revoke insert on carry.{table} from service_role;")
+        pg.fails(f"insert into carry.{table} default values;", "accepts no writes")
+        assert pg.scalar(f"select has_table_privilege('service_role','carry.{table}','insert');") == "f"
+        assert pg.scalar(f"select count(*) from carry.{table};", role="service_role") == "0"             # still readable
+    # positive control: an ordinary table still takes the same session's other writes
+    assert put(pg, "execution_session_events", {"owner_id": owner, "session_id": "S-ro", "state": "STARTED",
+                                                 "recorded_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("ev-ro")}) == "t"
+
+
+def test_verified_and_reconciled_evidence_must_be_the_import_row_hash(pg):
+    owner = str(uuid.uuid4())
+    imp = {"owner_id": owner, "import_id": sha("ei"), "source_sha256": sha("esrc"), "kind": "statement", "storage_ref": "s3://x",
+           "status": "PROVISIONAL", "imported_utc": "2026-11-07T00:00:00Z", "source": "t", "content_sha256": sha("ei")}
+    assert put(pg, "owner_account_imports", imp) == "t"
+    ev = {"owner_id": owner, "import_id": sha("ei"), "recorded_utc": "2026-11-07T00:00:00Z", "source": "t"}
+    n = 0
+    for status in ("VERIFIED", "RECONCILED"):
+        for bad in (None, "", "   ", "recon-1", sha("some-other-hash")):
+            n += 1
+            row = {**ev, "status": status, "content_sha256": sha(f"b{n}")}
+            if bad is not None:
+                row["evidence_ref"] = bad
+            pg.fails("select carry.put_row('owner_account_import_status_events', $j$%s$j$::jsonb);" % json.dumps(row), "violates", role="service_role")
+        n += 1
+        assert put(pg, "owner_account_import_status_events", {**ev, "status": status, "evidence_ref": sha("ei"),
+                                                              "content_sha256": sha(f"g{n}")}) == "t", status
+    # the negative states need a reason, not the hash
+    assert put(pg, "owner_account_import_status_events", {**ev, "status": "DISPUTED", "reason": "mismatch",
+                                                          "evidence_ref": sha("anything"), "content_sha256": sha("disp")}) == "t"
+
+
+def test_the_service_role_still_cannot_tamper_with_the_guards(pg):
+    pg.fails("alter table carry.strategy_hypotheses disable trigger all;", "must be owner", role="service_role")
+    pg.fails("select pg_catalog.set_config('session_replication_role','replica',false);", "permission denied", role="service_role")
+    pg.fails("drop trigger carry_stamp_insert on carry.strategy_hypotheses;", "must be owner", role="service_role")
+    pg.fails("update carry.strategy_hypotheses set mechanism='x';", "permission denied", role="service_role")
+    pg.fails("delete from carry.strategy_hypotheses;", "permission denied", role="service_role")
+    pg.fails("truncate carry.strategy_hypotheses;", "permission denied", role="service_role")
+    pg.fails("select carry.put_row('strategy_hypotheses','{}'::jsonb);", "permission denied", role="authenticated")
+    pg.fails("select count(*) from carry.strategy_hypotheses;", "permission denied", role="anon")
