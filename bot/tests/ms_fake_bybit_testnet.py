@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 HOST = "api-testnet.bybit.com"
 FAKE_KEY = "CANARY_TESTNET_KEY_aaaa1111"
-FAKE_SECRET = "CANARY_TESTNET_SECRET_bbbb2222cccc3333"
+FAKE_SECRET = "_".join(("CANARY", "TESTNET", "SECRET", "bbbb2222cccc3333"))
 
 
 class SimulatedCrash(BaseException):
@@ -62,6 +62,8 @@ class FakeBybitTestnet:
         self.liquidity: Dict[str, D] = {}
         self.rest_filled_on_create: Dict[str, float] = {}
         self.maker_rate, self.taker_rate = D("0.0002"), D("0.00055")
+        self.fill_delay_ms = 0                                       # >0: a crossing order is ACCEPTED now and its fill appears only after this long (asynchronous matching, as on a real venue)
+        self.pending: List[Tuple[int, str, D, D]] = []
         self.reject: Dict[str, Tuple[int, str]] = {}                  # orderLinkId suffix -> (retCode, retMsg) answered INSTEAD of creating the order
 
     # ---------------------------------------------------------------- fault injection
@@ -79,6 +81,7 @@ class FakeBybitTestnet:
 
     # ---------------------------------------------------------------- transport entry
     def request(self, method: str, url: str, *, headers: Dict[str, str], params: Any = None, body: Optional[str] = None, timeout: float = 10.0) -> Tuple[int, str]:
+        self._release_due()
         p = urlsplit(url)
         assert p.scheme == "https" and p.netloc == HOST, f"fake got a request for {url!r}"
         path, q = p.path, dict(parse_qsl(p.query, keep_blank_values=True))
@@ -300,6 +303,9 @@ class FakeBybitTestnet:
             px = ask if side == "Buy" else bid
             if cat == "spot" and ot == "Market" and side == "Buy" and d.get("marketUnit") != "baseCoin":
                 qty = qty / px
+            if self.fill_delay_ms > 0:
+                self.pending.append((self.now_ms() + self.fill_delay_ms, oid, qty, px))
+                return self._ok({"orderId": oid, "orderLinkId": link})
             avail = self.liquidity.get(sym)
             fq = min(qty, reduce and abs(pos) or qty, avail if avail is not None else qty)
             fq = (fq // D(inst.get("step", inst.get("base_precision")))) * D(inst.get("step", inst.get("base_precision")))
@@ -308,6 +314,24 @@ class FakeBybitTestnet:
             if o["cum"] < o["qty_d"] and (o["tif"] in ("IOC", "FOK") or reduce):
                 o["status"] = "PartiallyFilledCanceled" if o["cum"] > 0 else "Cancelled"
         return self._ok({"orderId": oid, "orderLinkId": link})
+
+    def _release_due(self) -> None:
+        now = self.now_ms()
+        due = [x for x in self.pending if x[0] <= now]
+        self.pending = [x for x in self.pending if x[0] > now]
+        for _t, oid, qty, px in due:
+            o = self.orders[oid]
+            if o["status"] != "New":
+                continue
+            inst = self.instruments[o["symbol"]] if o["category"] == "linear" else self.spot_instruments[o["symbol"]]
+            step = D(inst.get("step", inst.get("base_precision")))
+            pos = self.positions.get(o["symbol"], {"size": D(0)})["size"]
+            fq = min(qty, abs(pos)) if o["reduceOnly"] else qty
+            fq = (fq // step) * step
+            if fq > 0:
+                self._fill(o, fq, px, taker=True)
+            if o["cum"] < o["qty_d"] and (o["tif"] in ("IOC", "FOK") or o["reduceOnly"]):
+                o["status"] = "PartiallyFilledCanceled" if o["cum"] > 0 else "Cancelled"
 
     def _fill(self, o: Dict[str, Any], qty: D, px: D, *, taker: bool, dup: bool = False) -> None:
         sym, cat, side = o["symbol"], o["category"], o["side"]

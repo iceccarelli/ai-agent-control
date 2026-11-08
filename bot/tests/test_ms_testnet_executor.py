@@ -2,6 +2,7 @@
 agree with the venue, the session record is consistent, nothing is sent after a halt."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 from dataclasses import replace
@@ -483,3 +484,101 @@ def test_install_binds_the_authority_to_this_transport_and_the_testnet_venue(w):
     with pytest.raises(MA.AuthorityConfigError, match="CLIENT_TRANSPORT_IS_NOT_THE_BOUND_TRANSPORT"):
         MA.install(other, run.authority)
     assert run.client.entry_authority is run.authority and run.authority.bound_transport is run.client.transport
+
+
+# ---------------------------------------------------------------- canonical ledger + reconciliation (worker F) and the asynchronous exit sequence
+def settle_view(w, run):
+    now = w.clock.now()
+    run.feed_ledger()
+    run.reconcile_step(now)
+
+
+def drive_full(w, run, n=6):
+    for _ in range(n):
+        w.clock.sleep(3)
+        now = w.clock.now()
+        run.engine.step(now, market_ts_ms=now, account_ts_ms=now)
+        run.bookkeep()
+        settle_view(w, run)
+    return run.state()
+
+
+def test_ledger_engine_venue_and_reservations_agree_through_the_whole_lifecycle(w):
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    assert run.recon_report.ok, run.recon_report.codes
+    assert run.venue_recon["venue_reconciled"] is True, run.venue_recon["findings"]
+    assert {k: float(v) for k, v in run.ledger.positions().items()} == {"BTCUSDT": pytest.approx(-0.001), "SPOT:BTCUSDT": pytest.approx(0.001)}
+    run.engine.request_exit(run.gid, w.clock.now(), "T")
+    assert drive_full(w, run, 4) == "CLOSED"
+    assert run.recon_report.ok, run.recon_report.codes
+    assert run.venue_recon["venue_reconciled"] is True, run.venue_recon["findings"]
+    assert all(abs(float(v)) < 1e-12 for v in run.ledger.positions().values())              # exits are booked into the entry leg's position: the pair reads flat
+    cn = run.ledger.canonical_net()
+    assert cn["fees"] == pytest.approx(sum(float(e["execFee"]) for e in w.fake.execs))
+    assert cn["funding"] is None and cn["net"] is None and cn["net_complete"] is False       # funding was not read: unknown, never zero
+    assert cn["price_leg"] is not None and run.ledger.integrity_flags() == []
+    assert {a for a in run.ledger._acks} == {(run.gid, l) for l in run.engine.groups[run.gid].legs}   # every journalled ack reached the ledger
+
+
+def test_a_ledger_that_disagrees_with_the_venue_halts_new_exposure(w):
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    from ms_types import Fill
+    run.ledger.record_fill(Fill("bogus-1", run.gid, "p", "BTCUSDT", "Sell", 0.5, 60000.0, 0.0, "USDT", "TAKER", w.clock.now(), "MEASURED"), category="linear")
+    settle_view(w, run)
+    assert not run.recon_report.ok and any(h.startswith("RECONCILE_DISAGREEMENT") for h in run.engine.halts) and run.ex.halted == "RECONCILE_DISAGREEMENT"
+    assert run.venue_recon["venue_reconciled"] is False
+    n = len(creates(w))
+    ack = run.ex.send_order(OrderRequest("gx", "c", "d", T.LegPlan("p", "BTCUSDT", "linear", "Sell", "0.001", "Market", None, False, False, "IOC"), "gx-p"))
+    assert ack.status == "REJECTED" and len(creates(w)) == n                                  # nothing new leaves after the halt
+
+
+def test_spot_exit_waits_for_the_perp_exit_fill_to_show_on_the_venue_read(w):
+    w.fake.fill_delay_ms = 2500                                                              # fills arrive ASYNCHRONOUSLY, after the ack
+    run, ctx, rec = begin(w)
+    assert run.state() == "SUBMITTED" and run.ex.venue_state()["positions"]["linear:BTCUSDT"] == 0
+    assert drive_full(w, run, 2) == "HEDGED"
+    run.engine.request_exit(run.gid, w.clock.now(), "T")
+    assert drive_full(w, run, 4) == "CLOSED"
+    assert run.authority.refusals == [], run.authority.refusals                              # the authority was never asked for a spot sell it had to refuse
+    legs = run.engine.groups[run.gid].legs
+    assert not [l for l in legs.values() if l.status == "REJECTED"]
+    exits = [e for e in w.fake.execs if e["orderLinkId"].split("-", 1)[1].startswith("x")]
+    assert [e["category"] for e in exits] == ["linear", "spot"]                              # perp exit filled BEFORE the spot exit traded
+    bodies = [json.loads(r[3]) for r in creates(w)]
+    assert [b["category"] for b in bodies[-2:]] == ["linear", "spot"]
+    consistent(w, run)
+    assert run.recon_report.ok and run.venue_recon["venue_reconciled"] is True
+
+
+def test_control_without_the_hold_the_same_sequence_is_refused_by_the_authority(w):
+    """Control: the fake really reproduces the hazard (otherwise the test above proves nothing). With the hold off, the spot sell is authorised while the perp still shows short."""
+    w.fake.fill_delay_ms = 2500
+    run, ctx, rec = begin(w)
+    run.hold_spot_exit = False
+    drive_full(w, run, 2)
+    run.engine.request_exit(run.gid, w.clock.now(), "T")
+    drive_full(w, run, 1)
+    codes = [r for _l, rs in run.authority.refusals for r in rs]
+    assert "SPOT_SELL_NOT_PROVEN_HEDGE_KEEPING" in codes, codes
+
+
+def test_a_spot_exit_whose_perp_never_closes_gives_up_after_the_hold_with_one_rejection(w):
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"                                                 # the perp is short on the venue
+    leg = T.LegPlan("xspot", "BTCUSDT", "spot", "Sell", "0.001", "Market", None, False, False, "IOC")
+    t0 = w.clock.now()
+    ack = run._await_perp_closed(OrderRequest(run.gid, "c", "d", leg, f"{run.gid}-xspot"))
+    assert ack.status == "REJECTED" and ack.reason == "SPOT_EXIT_HELD_PERP_NOT_CLOSED" and w.clock.now() - t0 >= 20_000
+    assert [b for b in (json.loads(r[3]) for r in creates(w)) if b["category"] == "spot" and b["side"] == "Sell"] == []
+
+
+def test_the_delayed_exit_sequence_end_to_end_through_the_session_tool(w):
+    w.fake.fill_delay_ms = 2500
+    d = w.ready()
+    assert w.execute(d) == 0, w.text()
+    rec = w.record()
+    assert rec["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+    assert rec["net"]["funding_usd"] is None and rec["net"]["fees_usd"] == pytest.approx(sum(float(e["execFee"]) for e in w.fake.execs))
+    assert S.record_refusals(rec) == [] and set(w.fake.create_calls.values()) == {1}

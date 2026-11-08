@@ -44,6 +44,9 @@ NOT_GRANTED = TAM.NOT_GRANTED
 _GRANTED = TAM._GRANTED
 DEFAULT_CAPABILITY_PATH = os.path.join(os.path.expanduser("~"), ".ai-agent-control", "ms_testnet_capability.json")
 
+#: The variable names the owner session tool (``ms_testnet_session``) reads: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET (derived from the manifest defaults; names only, never values).
+SESSION_CREDENTIAL_ENV = dict(api_key=TAM.DEFAULT_KEY_ENV.replace("DEDICATED_", ""), api_secret=TAM.DEFAULT_SECRET_ENV.replace("DEDICATED_", ""))
+
 AGGREGATE_CEILING_USD = float(shadow.SHADOW_MAX_NOTIONAL_USD)       # across ALL symbols, hedged pair counted once; never a per-symbol allowance
 MAX_SYMBOLS = 5
 MAX_ACTIVE_GROUPS = 2
@@ -354,7 +357,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "generate":
         m = generate(candidate_id=a.candidate_id, spec_digest=a.spec_digest, symbols=[s for s in a.symbols.split(",") if s],
-                     credential_env={"api_key": "BYBIT_TESTNET_API_KEY", "api_secret": "BYBIT_TESTNET_API_SECRET"} if a.session_credentials else None)
+                     credential_env=SESSION_CREDENTIAL_ENV if a.session_credentials else None)
         rep = validate(m, env={})
         print(json.dumps(m, indent=2, sort_keys=True))
         return 0 if rep["valid"] else 1

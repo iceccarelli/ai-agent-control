@@ -35,8 +35,10 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import ms_accounting as AC  # noqa: E402
 import ms_authority as MA  # noqa: E402
 import ms_execution as EX  # noqa: E402
+import ms_reconcile as MR  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_executor as TE  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
@@ -489,6 +491,14 @@ class Run:
         self._released: set = set()
         self._resolved = False
         self.killed = False
+        self.ledger = AC.Ledger(track_acks=True)                       # the canonical ledger (worker F): fills by venue execId, acks, exit-side valuation
+        self.ledger.set_exit_fee_bps(5.5, 10.0)
+        self.last_view: Optional[Mapping[str, Any]] = None             # the venue read the engine ACTED on in its last step
+        self.halter: Optional[Any] = None
+        self.recon_report: Optional[Any] = None
+        self.venue_recon: Optional[Dict[str, Any]] = None
+        self.hold_spot_exit = True                                     # sequence the spot exit AFTER the perp exit fill is confirmed on the venue read
+        self.hold_spot_exit_s = 20.0
 
     def _snapshots(self) -> Dict[str, T.MarketSnapshot]:
         snaps = self._snaps.get()
@@ -502,11 +512,80 @@ class Run:
             raise TE.ExecutorError("hedge read incomplete")
         return max(0.0, -pos.get(f"linear:{symbol}", 0.0)), max(0.0, spot - float(self.baseline.get(f"spot:{symbol}", 0.0)))
 
-    # the engine's send hook: release dead exit reservations before an exit is authorised (as ms_pipeline does), then the executor
+    def venue_state(self) -> Dict[str, Any]:
+        v = self.ex.venue_state()
+        self.last_view = v
+        return v
+
+    # the engine's send hook: release dead exit reservations before an exit is authorised (as ms_pipeline does), hold a spot exit until the perp is closed, then the executor
     def send(self, req: EX.OrderRequest) -> Any:
         if req.leg.leg_id.startswith("x"):
             self.release_dead_exits()
+            if req.leg.category == "spot" and req.leg.side == "Sell" and self.hold_spot_exit:
+                ack = self._await_perp_closed(req)
+                if ack is not None:
+                    return ack
         return self.ex.send_order(req)
+
+    def _await_perp_closed(self, req: EX.OrderRequest) -> Optional[EX.Ack]:
+        """A spot sell is an exit only once the perp it hedges is closed (``ms_authority.spot_sell_keeps_hedge``), and on a real exchange the perp exit's FILL arrives after its
+        ack: the authority would refuse the spot sell and five such rejections HALT the group. So the spot exit waits until a COMPLETE venue position read shows the perp flat.
+        None = go ahead; an Ack = give up (REJECTED, one rejection) after ``hold_spot_exit_s``."""
+        sym = req.leg.symbol
+        deadline = int(self.ctx.clock()) + int(self.hold_spot_exit_s * 1000)
+        while True:
+            v = self.ex.venue_state()
+            pos = v["positions"]
+            if v["complete"] and pos is not None and abs(pos.get(f"linear:{sym}", 0.0)) < 1e-12:
+                return None
+            if int(self.ctx.clock()) >= deadline:
+                return EX.Ack(req.link_id, "REJECTED", None, "SPOT_EXIT_HELD_PERP_NOT_CLOSED")
+            self.ctx.sleep(0.5)
+
+    # ---- canonical ledger + reconciliation, fed from the venue read the engine acted on
+    def feed_ledger(self) -> None:
+        v, g = self.last_view, (self.engine.groups.get(self.gid) if self.engine else None)
+        if v is None or g is None:
+            return
+        for l in g.legs.values():
+            if l.order_id:
+                self.ledger.acknowledge(self.gid, l.plan.leg_id, l.order_id)
+        for x in v["executions"]:
+            if not x["link_id"].startswith(self.gid + "-"):
+                continue
+            leg_id = x["link_id"][len(self.gid) + 1:]
+            leg = g.legs.get(leg_id)
+            pos_leg = leg.parent if (leg is not None and leg.kind == "EXIT" and leg.parent) else None          # an exit closes the ENTRY leg's position, not a leg of its own
+            self.ledger.record_fill(T.Fill(x["fill_id"], self.gid, leg_id, x["symbol"], x["side"], x["qty"], x["price"], x["fee_usd"], "USDT", x["liquidity"], int(x["ts_ms"]),
+                                           "MEASURED"), category=x["category"], position_leg=pos_leg)
+        try:
+            now = int(self.ctx.clock())
+            for sym, snap in self._snaps.get().items():
+                self.ledger.mark(sym, now, snap.mark, category="linear", bid=snap.bids[0].price if snap.bids else None, ask=snap.asks[0].price if snap.asks else None)
+                if snap.spot_mark is not None:
+                    self.ledger.mark(sym, now, snap.spot_mark, category="spot")
+        except (TE.ExecutorError, bc.BybitAPIError, AC.LedgerError):
+            pass                                                       # a mark that cannot be read leaves the valuation flagged, never guessed
+
+    def reconcile_step(self, now: int) -> None:
+        """The VENUE read is the reference position (never ``engine.positions()``): engine, ledger, reservations and the ledger-vs-venue executions are compared against it; a
+        disagreement HALTS new exposure (the engine's and the executor's)."""
+        v = self.last_view
+        if v is None or self.engine is None:
+            return
+        if self.halter is None:
+            self.halter = MR.HaltOnDisagreement.for_engine(self.engine)
+        rep = MR.reconcile(MR.collect_views(engine=self.engine, ledger=self.ledger, authority=self.authority, venue_read=v, now_ms=now))
+        self.recon_report = self.halter(rep, now)
+        if rep.halt_new_exposure:
+            self.ex.halt("RECONCILE_DISAGREEMENT")
+        sym = self.plan["symbol"]
+        mine = [x for x in v["executions"] if x["link_id"].startswith(self.gid + "-")]
+        pos = v["positions"]
+        venue_pos = None if pos is None else {sym: pos.get(f"linear:{sym}", 0.0), "SPOT:" + sym: pos.get(f"spot:{sym}", 0.0) - float(self.baseline.get(f"spot:{sym}", 0.0))}
+        rows = [{"execId": x["fill_id"], "execQty": x["qty"], "execPrice": x["price"], "execFee": x["fee_usd"], "side": x["side"], "symbol": x["symbol"], "orderLinkId": x["link_id"]}
+                for x in mine]
+        self.venue_recon = self.ledger.reconcile_with_venue(rows, venue_pos, None, sum(float(x["fee_usd"]) for x in mine) if v["complete"] else None, executions_complete=bool(v["complete"]))
 
     def release_dead_exits(self) -> None:
         g = self.engine.groups.get(self.gid) if self.engine else None
@@ -532,7 +611,7 @@ class Run:
 
     def make_engine(self, *, recover: bool) -> Any:
         store = EX.FileStore(self.ctx.path("journal"))
-        kw = dict(send_order=self.send, cancel_order=self.ex.cancel_order, venue_state=self.ex.venue_state, policy=EX.ExecPolicy(reconcile_every_step=True, max_account_age_ms=15_000,
+        kw = dict(send_order=self.send, cancel_order=self.ex.cancel_order, venue_state=self.venue_state, policy=EX.ExecPolicy(reconcile_every_step=True, max_account_age_ms=15_000,
                                                                                                                                   max_market_age_ms=15_000),
                   qty_steps=self.ex.qty_steps())
         self.engine = EX.ExecutionEngine.recover(store, int(self.ctx.clock()), **kw) if recover else EX.ExecutionEngine(store, **kw)
@@ -572,8 +651,11 @@ class Run:
                         and abs(pos.get(f"spot:{sym}", 0.0) - float(self.baseline.get(f"spot:{sym}", 0.0))) <= dust
                         and not view.get("foreign_open_orders") and not [o for o in view["orders"].values() if o["status"] in ("New", "PartiallyFilled")])
             rec["flat_verified"] = bool(flat)                          # None only before the final read; False when the read was incomplete or anything remains
-            n = net_from(rec["executions"])
-            rec["net"] = {"fees_usd": n["fees_usd"], "funding_usd": None, "price_pnl_usd": n["price_pnl_usd"] if flat else None, "note": NOTE}
+            self.last_view = view
+            self.feed_ledger()
+            self.reconcile_step(int(self.ctx.clock()))
+            cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
+            rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
         return view
 
 
@@ -584,6 +666,8 @@ def _step_once(ctx: Ctx, run: Run, rec: Dict[str, Any]) -> str:
     assert run.engine is not None
     run.engine.step(now, market_ts_ms=now, account_ts_ms=run.ex.last_view_ms or now)
     run.bookkeep()
+    run.feed_ledger()
+    run.reconcile_step(now)
     run.snapshot_record(rec)
     save_record(ctx, rec)
     return run.state()
