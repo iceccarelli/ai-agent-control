@@ -49,7 +49,7 @@ SESSION_CREDENTIAL_ENV = dict(api_key=TAM.DEFAULT_KEY_ENV.replace("DEDICATED_", 
 
 AGGREGATE_CEILING_USD = float(shadow.SHADOW_MAX_NOTIONAL_USD)       # across ALL symbols, hedged pair counted once; never a per-symbol allowance
 MAX_SYMBOLS = 5
-MAX_ACTIVE_GROUPS = 2
+MAX_ACTIVE_GROUPS = 1                                              # ONE active group (ceiling AND default); the session tool enforces it and refusals() rejects more
 MAX_ENTRIES_PER_UTC_DAY = 4
 MAX_LEVERAGE = 3.0
 MAX_MARKET_AGE_MS = 5000
@@ -264,7 +264,7 @@ def policy_from_manifest(m: Mapping[str, Any], *, strategy_index: int = 0) -> Di
             "allowed_symbols": list(m["symbol_allowlist"]), "allowed_sides": {k: list(v) for k, v in m["allowed_sides"].items()},
             "allowed_order_types": list(m["allowed_order_types"]), "max_notional_per_symbol_usd": b["max_notional_per_symbol_usd"],
             "max_aggregate_notional_usd": b["aggregate_max_notional_usd"], "max_gross_exposure_usd": b["max_gross_exposure_usd"], "max_net_exposure_usd": b["max_net_exposure_usd"],
-            "max_active_groups": b["max_active_groups"], "max_unhedged_usd": b["max_unhedged_usd"], "max_leverage": float(b["max_leverage"]),
+            "max_active_groups": b["max_active_groups"], "max_unhedged_usd": b["max_unhedged_usd"], "max_daily_loss_usd": float(b["max_loss_usd"]), "max_leverage": float(b["max_leverage"]),
             "max_market_age_ms": b["max_market_age_ms"], "max_account_age_ms": b["max_account_age_ms"], "execution_styles": list(m["execution_styles"])}
 
 

@@ -1024,6 +1024,9 @@ def test_venue_reconciled_needs_an_exchange_reported_ledger_a_venue_view_one_run
         files["ledger_pnl.json"].update(basis="EXCHANGE_REPORTED", net_usd=11.5)
         files["portfolio_state.json"]["basis"] = "EXCHANGE_REPORTED"
         files["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+        for name, f in files.items():                                        # a venue-reconciled TESTNET run: every run-family artifact names the one TESTNET run
+            if name != "testnet_session.json" and "identity" in f:
+                f["identity"] = {**f["identity"], "mode": "TESTNET", "run_id": "run_testnet_0001"}
         for k, v in kw.items():
             files[k.replace("__", ".")].update(v)
         return files
@@ -1039,6 +1042,38 @@ def test_venue_reconciled_needs_an_exchange_reported_ledger_a_venue_view_one_run
     files = venue_files()
     del files["reconcile_report.json"]
     assert build(tmp_path / "norec", files)["accounting"]["venue_reconciliation"]["status"] == "INTERNAL_CONSISTENCY_ONLY"
+
+
+def test_a_forged_venue_reconciliation_is_refused_when_the_artifacts_do_not_name_a_testnet_run(tmp_path):
+    """Red team: a REPLAY / PAPER run (or a SimVenue 'venue' view) that merely DECLARES basis EXCHANGE_REPORTED and a venue view must never count as venue reconciled. Both the ledger and the
+    reconcile report must carry identity.mode TESTNET."""
+    def forged(ledger_mode, rec_mode, same_run=True):
+        files = good_set()
+        del files["replay_report.json"]
+        files["ledger_pnl.json"].update(basis="EXCHANGE_REPORTED", net_usd=11.5)
+        files["portfolio_state.json"]["basis"] = "EXCHANGE_REPORTED"
+        files["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+        for name, f in files.items():
+            if name != "testnet_session.json" and "identity" in f:
+                f["identity"] = {**f["identity"], "mode": "TESTNET", "run_id": "run_testnet_0001"}
+        for name, mode in (("ledger_pnl.json", ledger_mode), ("reconcile_report.json", rec_mode)):
+            if mode is None:
+                files[name].pop("identity", None)
+            else:
+                files[name]["identity"] = {**files[name]["identity"], "mode": mode}
+        return files
+    ok = build(tmp_path / "ok", forged("TESTNET", "TESTNET"))["accounting"]["venue_reconciliation"]
+    assert ok["status"] == "VENUE_RECONCILED", ok                                                                   # positive control
+    for name, lm, rm in (("replay_ledger", "REPLAY", "TESTNET"), ("paper_rec", "TESTNET", "PAPER"), ("sim_both", "REPLAY", "REPLAY"), ("no_ident", None, None), ("no_rec_ident", "TESTNET", None)):
+        v = build(tmp_path / name, forged(lm, rm))["accounting"]["venue_reconciliation"]
+        assert v["status"] == "INTERNAL_CONSISTENCY_ONLY", (name, v)
+        assert v["why_not"], name
+    sim = good_set()                                                                                                 # a plain simulation that lies about its basis AND keeps its REPLAY identity
+    del sim["replay_report.json"]
+    sim["ledger_pnl.json"].update(basis="EXCHANGE_REPORTED")
+    sim["reconcile_report.json"]["views_compared"] = ["ledger", "venue_positions"]
+    v = build(tmp_path / "lie", sim)["accounting"]["venue_reconciliation"]
+    assert v["status"] == "INTERNAL_CONSISTENCY_ONLY" and any("TESTNET run identity" in w for w in v["why_not"])
 
 
 def test_environment_flags_are_presence_only_and_no_value_is_ever_in_the_state(tmp_path):

@@ -142,7 +142,7 @@ def authority_reservations(authority: Any) -> Dict[str, Any]:
     """The durable reservation view of a ``MultiSymbolAuthority`` (its group ledger + reservation links). Read-only; raises nothing the authority would not."""
     rows = authority._rows()
     registered = {r["group_id"]: [{"leg_id": l["leg_id"], "symbol": l["symbol"], "category": l["category"]} for l in r["plan"]["legs"]] for r in rows if r["event"] == "group"}
-    return {"registered": registered, "resolved": {r["group_id"] for r in rows if r["event"] == "resolve"}, "settled": {(r["group_id"], r["leg_id"]) for r in rows if r["event"] == "settle"},
+    return {"registered": registered, "resolved": authority._resolved_sets(rows)[1], "settled": {(r["group_id"], r["leg_id"]) for r in rows if r["event"] == "settle"},
             "reserved_links": set(l for l in authority._reserved_links() if isinstance(l, str))}
 
 
@@ -376,13 +376,25 @@ def release_candidates(views: Views) -> List[str]:
     return sorted(f.key for f in rep.findings if f.code == RESERVATION_LEAK and f.detail.startswith("GROUP_"))
 
 
-def release_leaked(authority: Any, engine: Any, group_ids: Iterable[str]) -> Dict[str, str]:
-    """Release (``authority.resolve_group``) a leaked reservation, ONLY when the group is terminal in the engine and the engine holds no position on any of the group's symbols. Everything
+def release_leaked(authority: Any, engine: Any, group_ids: Iterable[str], venue_read: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+    """Release (``authority.resolve_group``) a leaked reservation, ONLY when the group is terminal in the engine AND a COMPLETE VENUE position read (``venue_read``, the engine's venue view
+    shape) shows no position on any of the group's symbols (FLAT is the venue's own read, never ``engine.positions()``). Without a complete venue read nothing is released. Everything
     else is refused with the reason; nothing else is touched. Returns {group_id: 'RELEASED' | 'REFUSED:<why>'}."""
     out: Dict[str, str] = {}
     rs = authority_reservations(authority)
     states = {g: str(getattr(s, "value", s)) for g, s in engine.states().items()}
-    pos, _u = _fold(engine.positions())
+    vp = venue_read.get("positions") if isinstance(venue_read, Mapping) else None
+    venue_ok = isinstance(vp, Mapping) and bool(venue_read.get("complete", False))              # type: ignore[union-attr]
+    pos, unk = _fold(vp) if venue_ok else ({}, [])
+    if unk:
+        venue_ok = False
+    base: Dict[str, Decimal] = {}
+    if venue_ok:
+        for k, v in (getattr(engine, "spot_base", None) or {}).items():
+            ck = canon_key(k if str(k).startswith(("spot:", "SPOT:")) else "spot:" + str(k))
+            q = to_decimal(v)
+            if ck and q is not None:
+                base[ck] = q
     for gid in sorted(set(group_ids)):
         legs = rs["registered"].get(gid)
         if legs is None:
@@ -391,8 +403,11 @@ def release_leaked(authority: Any, engine: Any, group_ids: Iterable[str]) -> Dic
             out[gid] = "REFUSED:ALREADY_RESOLVED"
         elif states.get(gid) not in TERMINAL_STATES:
             out[gid] = f"REFUSED:ENGINE_STATE_{states.get(gid)}"
-        elif any(abs(pos.get(canon_key(("SPOT:" if l["category"] == "spot" else "") + l["symbol"]) or "", Decimal(0))) > QTY_TOL for l in legs):
-            out[gid] = "REFUSED:ENGINE_HOLDS_A_POSITION_ON_THE_GROUPS_SYMBOL"
+        elif not venue_ok:
+            out[gid] = "REFUSED:NO_COMPLETE_VENUE_READ"
+        elif any(abs(pos.get(k, Decimal(0)) - base.get(k, Decimal(0))) > QTY_TOL
+                 for k in (canon_key(("SPOT:" if l["category"] == "spot" else "") + l["symbol"]) or "" for l in legs)):
+            out[gid] = "REFUSED:VENUE_HOLDS_A_POSITION_ON_THE_GROUPS_SYMBOL"
         else:
             authority.resolve_group(gid)
             out[gid] = "RELEASED"

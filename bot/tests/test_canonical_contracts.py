@@ -272,20 +272,20 @@ def test_a_group_that_failed_after_registration_is_a_named_leak_until_released_a
     assert rep.codes() == (RC.RESERVATION_LEAK,) and rep.findings[0].key == plan.group_id and rep.halt_new_exposure
     v = s.views()
     assert RC.release_candidates(v) == [plan.group_id]
-    assert RC.release_leaked(s.authority, s.engine, ["nope"]) == {"nope": "REFUSED:NOT_REGISTERED"}
-    assert RC.release_leaked(s.authority, s.engine, [plan.group_id]) == {plan.group_id: "RELEASED"}
-    assert RC.release_leaked(s.authority, s.engine, [plan.group_id]) == {plan.group_id: "REFUSED:ALREADY_RESOLVED"}
+    assert RC.release_leaked(s.authority, s.engine, ["nope"], s.venue.venue_state()) == {"nope": "REFUSED:NOT_REGISTERED"}
+    assert RC.release_leaked(s.authority, s.engine, [plan.group_id], s.venue.venue_state()) == {plan.group_id: "RELEASED"}
+    assert RC.release_leaked(s.authority, s.engine, [plan.group_id], s.venue.venue_state()) == {plan.group_id: "REFUSED:ALREADY_RESOLVED"}
     assert s.check().ok
 
 
 def test_release_refuses_a_group_that_is_not_terminal_or_that_still_holds_a_position(stack):
     s = stack
     plan = s.enter()
-    assert RC.release_leaked(s.authority, s.engine, [plan.group_id])[plan.group_id].startswith("REFUSED:ENGINE_STATE_")
+    assert RC.release_leaked(s.authority, s.engine, [plan.group_id], s.venue.venue_state())[plan.group_id].startswith("REFUSED:ENGINE_STATE_")
     perp = next(l for l in plan.legs if l.category == "linear")
     s.fill(MA.link_id(plan.group_id, perp.leg_id), float(perp.qty), 100.0, NOW + 1000)
     s.engine._set_state(s.engine.groups[plan.group_id], G.FAILED, "FORCED_FOR_TEST", NOW + 1100)                 # terminal in name while the engine still holds the perp
-    assert RC.release_leaked(s.authority, s.engine, [plan.group_id]) == {plan.group_id: "REFUSED:ENGINE_HOLDS_A_POSITION_ON_THE_GROUPS_SYMBOL"}
+    assert RC.release_leaked(s.authority, s.engine, [plan.group_id], s.venue.venue_state()) == {plan.group_id: "REFUSED:VENUE_HOLDS_A_POSITION_ON_THE_GROUPS_SYMBOL"}
 
 
 # ================================================================================================ injected divergences HALT with the right finding

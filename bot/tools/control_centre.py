@@ -836,7 +836,7 @@ def _coherence(art: Mapping[str, Dict[str, Any]]) -> Dict[str, Any]:
         if len(vals) > 1:
             mism.append({"field": f, "values": {r["file"]: r[f] for r in idf}})
     for r in idf:
-        if r["mode"] == "TESTNET":
+        if r["mode"] == "TESTNET" and art[r["file"]]["basis"] == "SIMULATED":                    # a SIMULATED figure may never belong to a TESTNET run
             mism.append({"field": "mode", "values": {r["file"]: "TESTNET"}, "why": "a simulated-family artifact may not claim mode TESTNET"})
     for r in runs:
         if r["family"] == TESTNET_FAMILY and r["status"] == "IDENTIFIED" and r["mode"] != "TESTNET":
@@ -952,6 +952,11 @@ def _venue_recon(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any], inte
             why.append("the reconcile report halts new exposure")
         if [x for x in d["findings"] if x["severity"] != "INFO"]:
             why.append("the reconcile report has active findings")
+    for name, a in (("ledger_pnl.json", lg), ("reconcile_report.json", rc)):                 # self-attestation is not enough: both files must NAME a TESTNET run (a REPLAY / PAPER / SimVenue view never counts)
+        if a["state"] == "OK":
+            ident = a.get("identity")
+            if not ident or ident.get("mode") != "TESTNET":
+                why.append(f"{name} does not carry a TESTNET run identity (mode {ident.get('mode') if ident else 'absent'})")
     if coh["verdict"] != "CONSISTENT":
         why.append(f"run identity is {coh['verdict']}")
     if integrity != "PASS":

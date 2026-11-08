@@ -269,3 +269,20 @@ def test_a_mainnet_style_key_is_not_a_testnet_key_the_testnet_host_rejects_it():
     client, _ = TT.build_client(TT.TestnetCredentials.from_mapping(ENV), fake)
     ok, detail, _ = TT.check_api_key(client)
     assert not ok and "retCode=10003" in detail
+
+
+# ---- the transport's OWN checks, with the capability layer bypassed (a surviving mutant removed the /v5/ path-prefix check because the capability layer caught it first)
+@pytest.mark.parametrize("url", [
+    "https://api-testnet.bybit.com/other/market/time", "https://api-testnet.bybit.com/market/time", "https://api-testnet.bybit.com/", "https://api-testnet.bybit.com",
+    "https://api.bybit.com/v5/market/time", "https://api-testnet.bybit.com:8443/v5/market/time", "https://user:pw@api-testnet.bybit.com/v5/market/time",
+    "http://api-testnet.bybit.com/v5/market/time", "https://api-testnet.bybit.com.evil.example/v5/market/time", "https://API-TESTNET.BYBIT.COM/v5/market/time",
+])
+def test_the_transports_own_host_and_path_checks_hold_without_the_capability_layer(monkeypatch, url):
+    spy = Spy()
+    monkeypatch.setattr(RC.CapabilityTransport, "request", lambda self, method, url, **kw: self._inner.request(method, url, **{k: v for k, v in kw.items() if k != "timeout"}))
+    with pytest.raises(TT.TestnetTransportRefused):
+        tt(spy).request("GET", url, headers={}, timeout=1)
+    assert spy.calls == []
+    ok = tt(spy)
+    ok.request("GET", "https://api-testnet.bybit.com/v5/market/time", headers={}, timeout=1)          # positive control: the same bypass lets the right URL through
+    assert spy.calls

@@ -924,3 +924,19 @@ def test_admission_refuses_a_subclass_of_the_testnet_transport(env, tmp_path, mo
     cap = RC.Capability.for_role(RC.TESTNET_EXECUTOR, venue="testnet", credential_class=RC.TESTNET_CREDENTIAL_CLASS)
     with pytest.raises(MA.AuthorityConfigError, match="TRANSPORT_NOT_TESTNET_EXECUTOR_CAPABILITY"):
         _build_testnet(env, tmp_path, transport=Sub(SimT(), cap))
+
+
+# ---- reopen: a LATE FILL on a resolved group may be exited, never re-entered (red team: EXIT_GROUP_RESOLVED left real exposure with no authorised exit)
+def test_reopen_authorises_the_exit_of_a_resolved_group_and_nothing_else(env, tmp_path):
+    a, _t = make(env, tmp_path)
+    reg(a)
+    a.resolve_group("G1")
+    x = body("G1", "x1", side="Buy", reduceOnly=True)
+    assert a.is_resolved("G1") and a.exit_refusal(x) == "EXIT_GROUP_RESOLVED"                                      # resolved: no exit
+    assert a.reopen_group("nope") is False and a.reopen_group("G1") is True and a.reopen_group("G1") is False
+    assert not a.is_resolved("G1") and a.exit_refusal(x) is None                                                   # reopened: the reduce-only exit is authorised
+    assert a.exit_refusal(dict(x, qty="50")) in ("EXIT_QTY_EXCEEDS_ENTRY", "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY")    # the other exit bounds still apply
+    assert a.exit_refusal(dict(x, reduceOnly=False)) is not None
+    assert "GROUP_RESOLVED" in refused(a, body("G1", "P"))                                                         # an ENTRY of a resolved group stays refused even after reopen
+    a.resolve_group("G1")
+    assert a.is_resolved("G1")                                                                                     # resolve after reopen resolves again

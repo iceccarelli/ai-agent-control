@@ -481,7 +481,14 @@ class Run:
         policy = dict(plan["policy"])
         if MA.policy_digest(policy) != plan["policy_digest"] or policy != AD.policy_from_manifest(manifest):
             raise MA.AuthorityConfigError("PLAN_POLICY_NOT_THE_OWNER_MANIFEST_POLICY")
-        self._state = _Cached(lambda: self.ex.account_state(self.baseline, self.engine.open_groups() if self.engine else 0), ctx.clock)
+        b = manifest["bounds"]
+        self.max_loss_usd = float(b["max_loss_usd"])
+        self.lifecycle_ms = int(min(float(plan["bounds"]["max_lifecycle_hours"]), float(b["max_lifecycle_hours"])) * 3_600_000)
+        self.start_ms: Optional[int] = None
+        self.start_equity: Optional[float] = None
+        self.stopped: Optional[str] = None
+        self._load_start()
+        self._state = _Cached(self._read_state, ctx.clock)
         self._snaps = _Cached(lambda: {s: self.ex.snapshot(s) for s in syms}, ctx.clock)
         self.authority = MA.MultiSymbolAuthority(policy=policy, transport=self.transport, state_dir=ctx.dir, strategy=manifest["strategy_allowlist"][0]["strategy"],
                                                  state_provider=self._state.get, snapshot_provider=self._snapshots, kill_switch_reader=lambda: _kill(ctx), clock=lambda: ctx.clock() / 1000.0,
@@ -499,6 +506,28 @@ class Run:
         self.venue_recon: Optional[Dict[str, Any]] = None
         self.hold_spot_exit = True                                     # sequence the spot exit AFTER the perp exit fill is confirmed on the venue read
         self.hold_spot_exit_s = 20.0
+
+    def _load_start(self) -> None:
+        d = _read_json(os.path.join(self.ctx.dir, "run_limits.json"))
+        if isinstance(d, dict) and d.get("gid") == self.gid_hint():
+            self.start_ms, self.start_equity = d.get("start_ms"), d.get("start_equity_usd")
+
+    def gid_hint(self) -> str:
+        return str(self.plan["group"]["group_id"])
+
+    def _save_start(self) -> None:
+        _write_json(os.path.join(self.ctx.dir, "run_limits.json"), {"gid": self.gid_hint(), "start_ms": self.start_ms, "start_equity_usd": self.start_equity})
+
+    def _read_state(self) -> Dict[str, Any]:
+        # open_groups = the OTHER active groups: the authority adds the group being assessed itself (ms_risk counts og + 1), so counting it here would refuse its own legs at max_active_groups=1
+        others = sum(1 for gid, g in self.engine.groups.items() if gid != self.gid and g.state not in (T.GroupState.CLOSED, T.GroupState.FAILED)) if self.engine else 0
+        st = self.ex.account_state(self.baseline, others)
+        if self.start_equity is None:                                  # the loss limit is measured from the FIRST fresh account read of the session (persisted across a restart)
+            self.start_equity = float(st["equity_usd"])
+            self.start_ms = self.start_ms or int(self.ctx.clock())
+            self._save_start()
+        st["day_start_equity_usd"] = self.start_equity                 # -> ms_risk hard daily-loss limit (policy max_daily_loss_usd = the manifest's max_loss_usd)
+        return st
 
     def _snapshots(self) -> Dict[str, T.MarketSnapshot]:
         snaps = self._snaps.get()
@@ -521,6 +550,8 @@ class Run:
     def send(self, req: EX.OrderRequest) -> Any:
         if req.leg.leg_id.startswith("x"):
             self.release_dead_exits()
+            if self.authority.is_resolved(self.gid):                    # exposure exists (the engine is exiting): a group resolved earlier may be EXITED again, never re-entered
+                self.authority.reopen_group(self.gid)
             if req.leg.category == "spot" and req.leg.side == "Sell" and self.hold_spot_exit:
                 ack = self._await_perp_closed(req)
                 if ack is not None:
@@ -548,8 +579,10 @@ class Run:
         if v is None or g is None:
             return
         for l in g.legs.values():
-            if l.order_id:
-                self.ledger.acknowledge(self.gid, l.plan.leg_id, l.order_id)
+            vo = v["orders"].get(l.link)                                # the VENUE's own record of the order also acknowledges it (a crash between acceptance and the journalled ack)
+            oid = l.order_id or (vo.get("order_id") if vo else None)
+            if oid:
+                self.ledger.acknowledge(self.gid, l.plan.leg_id, oid)
         for x in v["executions"]:
             if not x["link_id"].startswith(self.gid + "-"):
                 continue
@@ -574,11 +607,13 @@ class Run:
         if v is None or self.engine is None:
             return
         if self.halter is None:
-            self.halter = MR.HaltOnDisagreement.for_engine(self.engine)
+            self.halter = MR.HaltOnDisagreement.for_engine(self.engine, auto_resume=True)    # clears ONLY on a later report that is clean, and a clean report needs a COMPLETE venue read
         rep = MR.reconcile(MR.collect_views(engine=self.engine, ledger=self.ledger, authority=self.authority, venue_read=v, now_ms=now))
         self.recon_report = self.halter(rep, now)
         if rep.halt_new_exposure:
             self.ex.halt("RECONCILE_DISAGREEMENT")
+        elif self.halter.active is None:
+            self.ex.unhalt("RECONCILE_DISAGREEMENT")
         sym = self.plan["symbol"]
         mine = [x for x in v["executions"] if x["link_id"].startswith(self.gid + "-")]
         pos = v["positions"]
@@ -596,6 +631,18 @@ class Run:
                 if left > 0:
                     self.authority.release_exit(l.link, format(left.normalize(), "f"))
 
+    def venue_flat(self, view: Optional[Mapping[str, Any]]) -> bool:
+        """FLAT for this group's symbols from a COMPLETE venue read: perp size zero, spot balance equal to the pre-session baseline within dust (<= max(step, 0.2% of the entry qty)), no
+        open order of the group and no foreign open order. Never from fill arithmetic."""
+        if not view or not view.get("complete") or view.get("positions") is None:
+            return False
+        pos = view["positions"]
+        for sym in sorted({l.symbol for l in self.group_plan.legs}):
+            dust = max(float(self.ex.filters("spot", sym).qty_step), 0.002 * max(float(l.qty) for l in self.group_plan.legs if l.symbol == sym))
+            if abs(pos.get(f"linear:{sym}", 0.0)) >= 1e-12 or abs(pos.get(f"spot:{sym}", 0.0) - float(self.baseline.get(f"spot:{sym}", 0.0))) > dust:
+                return False
+        return not view.get("foreign_open_orders") and not [o for o in view["orders"].values() if o["status"] in ("New", "PartiallyFilled")]
+
     def bookkeep(self) -> None:
         g = self.engine.groups.get(self.gid) if self.engine else None
         if g is None:
@@ -605,31 +652,72 @@ class Run:
                 self._settled.add(l.plan.leg_id)
                 self.authority.settle_leg(self.gid, l.plan.leg_id)
         self.release_dead_exits()
-        if g.state in (T.GroupState.CLOSED, T.GroupState.FAILED) and not self._resolved:
-            self._resolved = True
-            self.authority.resolve_group(self.gid)
+        terminal = g.state in (T.GroupState.CLOSED, T.GroupState.FAILED)
+        resolved = self.authority.is_resolved(self.gid)
+        if terminal and not resolved and self.venue_flat(self.last_view):
+            self.authority.resolve_group(self.gid)                      # released ONLY after a COMPLETE venue read shows the group's symbols flat
+        elif not terminal and resolved:
+            self.authority.reopen_group(self.gid)                       # a late fill: the engine is unwinding again, so its exits must be authorised
 
-    def make_engine(self, *, recover: bool) -> Any:
+    def make_engine(self, *, recover: bool, allow_exits: bool = True) -> Any:
         store = EX.FileStore(self.ctx.path("journal"))
         kw = dict(send_order=self.send, cancel_order=self.ex.cancel_order, venue_state=self.venue_state, policy=EX.ExecPolicy(reconcile_every_step=True, max_account_age_ms=15_000,
                                                                                                                                   max_market_age_ms=15_000),
                   qty_steps=self.ex.qty_steps())
-        self.engine = EX.ExecutionEngine.recover(store, int(self.ctx.clock()), **kw) if recover else EX.ExecutionEngine(store, **kw)
-        return self.engine
+        if not recover:
+            self.engine = EX.ExecutionEngine(store, **kw)
+            return self.engine
+        # RECOVERY never sends an ENTRY (a SENT/UNKNOWN entry leg with no venue order is REPORTED, not re-sent: that needs the full execute gates) and sends a reduce-only exit only
+        # when the owner confirmed the unwind. Cancel / adopt (executions, order status) are untouched.
+        eng = EX.ExecutionEngine(store, **kw)
+        real = eng._send_leg
+        self.suppressed: List[Tuple[str, str, str]] = []
+
+        def guarded(g: Any, lp: Any, kind: str, parent: Any, ts: int) -> bool:
+            if kind != "EXIT" or not allow_exits:
+                self.suppressed.append((g.plan.group_id, lp.leg_id, kind))
+                return False
+            return real(g, lp, kind, parent, ts)
+        eng._send_leg = guarded                                         # type: ignore[method-assign]
+        self.engine = eng
+        eng.reconcile(int(self.ctx.clock()))
+        return eng
+
+    def unresolved_entries(self) -> List[str]:
+        g = self.engine.groups.get(self.gid) if self.engine else None
+        return [l.link for l in (g.entry_legs() if g else []) if l.status in (EX.SENT, EX.UNKNOWN)]
 
     def state(self) -> str:
         g = self.engine.groups.get(self.gid) if self.engine else None
         return g.state.value if g else "NONE"
 
-    def on_kill(self) -> None:
+    def on_kill(self, reason: str = "KILL_SWITCH") -> None:
         if not self.killed:
             self.killed = True
+            self.stopped = reason
             now = int(self.ctx.clock())
-            self.ex.halt("KILL_SWITCH")
+            self.ex.halt(reason)
             assert self.engine is not None
-            self.engine.halt_new_exposure("KILL_SWITCH", now)
+            self.engine.halt_new_exposure(reason, now)
             if self.gid in self.engine.groups:
-                self.engine.request_exit(self.gid, now, "KILL_SWITCH")
+                self.engine.request_exit(self.gid, now, reason)
+
+    def enforce_limits(self, now: int) -> Optional[str]:
+        """Lifecycle (<= the manifest / plan hours from the session start) and the manifest's loss limit (equity fall since the session's first account read) are enforced DURING the run:
+        either one halts new exposure and unwinds reduce-only. Returns the reason that fired (once)."""
+        if self.killed:
+            return None
+        if self.start_ms is not None and now - self.start_ms >= self.lifecycle_ms:
+            self.on_kill("LIFECYCLE_EXCEEDED")
+            return "LIFECYCLE_EXCEEDED"
+        try:
+            eq = float(self._state.get()["equity_usd"])
+        except (TE.ExecutorError, bc.BybitAPIError, KeyError, TypeError):
+            return None                                                 # an unreadable account is not a loss; entries are refused by the authority's freshness check anyway
+        if self.start_equity is not None and self.start_equity - eq >= self.max_loss_usd:
+            self.on_kill("LOSS_LIMIT")
+            return "LOSS_LIMIT"
+        return None
 
     def snapshot_record(self, rec: Dict[str, Any], final: bool = False) -> Dict[str, Any]:
         view = self.ex.venue_state()
@@ -642,14 +730,7 @@ class Run:
             # {symbol: qty}: perp positions by symbol; the spot leg as "SPOT:<symbol>" = balance MINUS the owner's pre-session baseline (0 when flat)
             rec["final_position"] = ({k.split(":", 1)[1]: v for k, v in pos.items() if k.startswith("linear:")}
                                      | {"SPOT:" + k.split(":", 1)[1]: v - float(self.baseline.get(k, 0.0)) for k, v in pos.items() if k.startswith("spot:")}) if pos is not None else None
-            flat = False
-            if complete:
-                assert pos is not None
-                sym = self.plan["symbol"]
-                dust = max(float(self.ex.filters("spot", sym).qty_step), 0.002 * float(self.plan["legs"][0]["qty"]))
-                flat = (abs(pos.get(f"linear:{sym}", 0.0)) < 1e-12
-                        and abs(pos.get(f"spot:{sym}", 0.0) - float(self.baseline.get(f"spot:{sym}", 0.0))) <= dust
-                        and not view.get("foreign_open_orders") and not [o for o in view["orders"].values() if o["status"] in ("New", "PartiallyFilled")])
+            flat = self.venue_flat(view) if complete else False
             rec["flat_verified"] = bool(flat)                          # None only before the final read; False when the read was incomplete or anything remains
             self.last_view = view
             self.feed_ledger()
@@ -663,6 +744,10 @@ def _step_once(ctx: Ctx, run: Run, rec: Dict[str, Any]) -> str:
     now = int(ctx.clock())
     if _kill(ctx)[0]:
         run.on_kill()
+    else:
+        why = run.enforce_limits(now)
+        if why:
+            ctx.out(f"STOP: {why} -- new exposure halted, unwinding reduce-only")
     assert run.engine is not None
     run.engine.step(now, market_ts_ms=now, account_ts_ms=run.ex.last_view_ms or now)
     run.bookkeep()
@@ -683,6 +768,39 @@ def _drive(ctx: Ctx, run: Run, rec: Dict[str, Any], done: Sequence[str], timeout
         if now - t0 >= timeout_s * 1000:
             return "TIMEOUT"
         ctx.sleep(float(ctx.plan_poll))
+
+
+def _entries_path() -> str:
+    return os.path.join(os.path.dirname(AD.DEFAULT_CAPABILITY_PATH), "ms_testnet_entries.jsonl")
+
+
+def _utc_day(ms: int) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ms / 1000.0, _dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def entries_today(now_ms: int) -> int:
+    """Executes already started today (UTC), across state dirs: an append-only file next to the owner capability file. Unreadable = the cautious answer (a large number)."""
+    try:
+        n = 0
+        with open(_entries_path(), encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip() and json.loads(line).get("day") == _utc_day(now_ms):
+                    n += 1
+        return n
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError):
+        return 10 ** 6
+
+
+def record_entry(now_ms: int, gid: str) -> None:
+    fd = os.open(_entries_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.write(fd, (json.dumps({"day": _utc_day(now_ms), "group_id": gid, "at_ms": now_ms}) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -716,6 +834,8 @@ def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Option
         why.append("PREFLIGHT_IS_NOT_THE_ONE_THE_PLAN_WAS_BUILT_FROM")
     if _kill(ctx)[0]:
         why.append("KILL_SWITCH_ENGAGED")
+    if manifest is not None and entries_today(int(ctx.clock())) >= int(manifest["bounds"]["max_entries_per_utc_day"]):
+        why.append("MAX_ENTRIES_PER_UTC_DAY_REACHED")
     if os.path.exists(ctx.path("journal")) and os.path.getsize(ctx.path("journal")) > 0:
         why.append("SESSION_ALREADY_EXECUTED_USE_RECONCILE")
     if not why:
@@ -742,6 +862,9 @@ def cmd_execute(ctx: Ctx) -> int:
         return EXIT_REFUSED
     eng = run.make_engine(recover=False)
     sym, now = plan["symbol"], int(ctx.clock())
+    run.start_ms = run.start_ms or now
+    run._save_start()
+    record_entry(now, run.gid)                                          # counts against max_entries_per_utc_day from here on (even if the venue then refuses)
     # 1. fresh clean-slate re-check (reads only): flat, no open or foreign orders, clock in sync
     try:
         run.client.sync_time()
@@ -819,9 +942,25 @@ def cmd_reconcile(ctx: Ctx) -> int:
         ctx.out(f"reconcile REFUSED at admission: {str(exc)[:200]}")
         return EXIT_REFUSED
     run.client.sync_time()
-    eng = run.make_engine(recover=True)                                # journal fold + venue read: UNKNOWN legs adopted / resolved BEFORE any resend
+    eng = run.make_engine(recover=True, allow_exits=bool(ctx.args.unwind))   # adopt / cancel only: NO entry is ever re-sent here; an exit only with the confirmed --unwind
+    if eng.journal.entries and run.start_ms is None:
+        run.start_ms = int(eng.journal.entries[0]["ts_ms"])
+    run.feed_ledger()
     run.bookkeep()
+    stuck = run.unresolved_entries()
+    g = eng.groups.get(run.gid)
+    unsent = [l.leg_id for l in run.group_plan.legs if g is not None and l.leg_id not in g.legs]
+    if unsent and g is not None and g.legs:                             # the crash came between two legs: the engine only knows legs that were sent, so it can call a one-legged group HEDGED
+        ctx.out(f"UNSENT PLAN LEG(S) {unsent}: they were never sent, so the group is NOT hedged whatever its state says; they are not sent now. Unwind with --unwind --confirm-plan-digest.")
+    for link in stuck:
+        ctx.out(f"UNRESOLVED ENTRY LEG {link}: no venue order is known for it; it is NOT re-sent (a new entry needs the full execute gates)")
+    if run.start_ms is not None and int(ctx.clock()) - run.start_ms >= run.lifecycle_ms and run.state() not in ("CLOSED", "FAILED"):
+        ctx.out("LIFECYCLE_EXCEEDED: the session is past its lifecycle bound; unwind required (reconcile --unwind --confirm-plan-digest)")
     if ctx.args.unwind and run.state() not in ("CLOSED", "FAILED"):
+        view = run.last_view
+        for link in stuck:                                              # a leg the venue (COMPLETE read) has no order for never existed there: close it out so the unwind can proceed
+            if view and view.get("complete") and link not in view["orders"]:
+                eng.on_order_done(run.gid, link.split("-", 1)[1], int(ctx.clock()))
         eng.request_exit(run.gid, int(ctx.clock()), "RECONCILE_UNWIND")
         _drive(ctx, run, rec, ("CLOSED", "FAILED"), plan["timing"]["exit_wait_s"])
     run.snapshot_record(rec, final=True)

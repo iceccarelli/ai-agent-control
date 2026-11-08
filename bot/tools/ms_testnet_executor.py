@@ -133,6 +133,22 @@ def filter_violations(f: Filters, *, side: str, order_type: str, qty: str, price
     return out
 
 
+def parse_wallet(res: Any) -> Tuple[D, Dict[str, D]]:
+    """(totalEquity, {coin: walletBalance}) from a ``/v5/account/wallet-balance`` result, or ``ExecutorError``. An empty list, a missing ``coin`` list, a non-numeric figure or a
+    non-object row is MALFORMED, never 'no balance' (an empty answer must not read as a flat spot position)."""
+    try:
+        accts = res.get("list") if isinstance(res, Mapping) else None
+        if not isinstance(accts, list) or not accts or not isinstance(accts[0], Mapping):
+            raise ExecutorError("wallet answer has no account row")
+        acct = accts[0]
+        rows = acct["coin"]
+        if not isinstance(rows, list) or any(not isinstance(c, Mapping) for c in rows):
+            raise ExecutorError("wallet coin list malformed")
+        return _d(acct["totalEquity"], "totalEquity"), {str(c["coin"]): _d(c["walletBalance"], "walletBalance") for c in rows}
+    except (KeyError, TypeError, IndexError):
+        raise ExecutorError("wallet answer malformed") from None
+
+
 class TestnetExecutor:
     __test__ = False
 
@@ -150,6 +166,7 @@ class TestnetExecutor:
         self._filters: Dict[Tuple[str, str], Filters] = {}
         self.sent_creates: List[str] = []                              # every link id that left for /v5/order/create (a resend would repeat one)
         self.unattributed: List[Dict[str, Any]] = []
+        self._read_unattributed: List[Dict[str, Any]] = []
         self.foreign_open_orders: List[str] = []
         self.last_view_ms: Optional[int] = None
         self._seen_exec: set = set()
@@ -204,6 +221,13 @@ class TestnetExecutor:
     def halt(self, reason: str) -> None:
         """No NEW exposure leaves after this (reduce-only exits and cancels still do)."""
         self.halted = self.halted or reason
+
+    def unhalt(self, reason: str) -> bool:
+        """Lift ONE halt reason (only the reason that was raised; another stays)."""
+        if self.halted == reason:
+            self.halted = None
+            return True
+        return False
 
     @staticmethod
     def _is_exit(leg: T.LegPlan) -> bool:
@@ -343,6 +367,7 @@ class TestnetExecutor:
         orders: Dict[str, Dict[str, Any]] = {}
         execs: List[Dict[str, Any]] = []
         self.foreign_open_orders = []
+        self._read_unattributed = []
         try:
             prow = self._paged("/v5/position/list", {"category": "linear", "settleCoin": QUOTE}, 200)
             assert positions is not None
@@ -359,10 +384,12 @@ class TestnetExecutor:
             if positions is not None and self.spot_symbols:
                 coins = {self.filters("spot", s).base_coin for s in self.spot_symbols}
                 res = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": ",".join(sorted(coins))}, signed=True)
-                accts = res.get("list")
-                have = {c["coin"]: _d(c["walletBalance"], "walletBalance") for a in accts for c in a["coin"]} if isinstance(accts, list) and accts else {}
+                _eq, have = parse_wallet(res)
                 for s in self.spot_symbols:
-                    positions[f"spot:{s}"] = float(have.get(self.filters("spot", s).base_coin, D(0)))
+                    base = self.filters("spot", s).base_coin
+                    if base not in have:                                   # an asked-for coin the venue did not answer for is UNKNOWN, not zero
+                        raise ExecutorError(f"wallet answer has no row for {base}")
+                    positions[f"spot:{s}"] = float(have[base])
         except (ExecutorError, KeyError, TypeError):
             positions, complete = None, False
         self._fee_in_qty: Dict[str, D] = {}
@@ -383,7 +410,7 @@ class TestnetExecutor:
         if complete:
             self.last_view_ms = int(self.clock())
         return {"orders": orders, "executions": execs, "positions": positions, "complete": complete, "read_ms": int(self.clock()),
-                "foreign_open_orders": list(self.foreign_open_orders)}
+                "foreign_open_orders": list(self.foreign_open_orders), "unattributed": list(self._read_unattributed)}
 
     def _take_order(self, r: Mapping[str, Any], cat: str, out: Dict[str, Dict[str, Any]]) -> None:
         link, st = r.get("orderLinkId"), r.get("orderStatus")
@@ -402,9 +429,11 @@ class TestnetExecutor:
         typ, link = r.get("execType", "Trade"), r.get("orderLinkId") or ""
         qty, px, fee = _d(r["execQty"], "execQty"), _d(r["execPrice"], "execPrice"), _d(r.get("execFee") or "0", "execFee")
         side, sym = r["side"], r["symbol"]
-        if typ != "Trade" or not link:
-            if typ in ("BustTrade", "AdlTrade") or (typ == "Trade" and not link):
-                self.unattributed.append({"exec_id": eid, "type": typ, "symbol": sym})
+        if typ != "Trade" or not link:                                  # funding, ADL, bust, settle, or a trade under no client link id: SURFACED, never booked as our fill
+            row = {"exec_id": eid, "type": typ, "symbol": sym, "fee": str(fee)}
+            self._read_unattributed.append(row)
+            if not any(u["exec_id"] == eid for u in self.unattributed):
+                self.unattributed.append(row)
             return
         fee_ccy = r.get("feeCurrency") or QUOTE
         if cat == "spot" and fee_ccy != QUOTE:                           # fee taken from the received base coin: net quantity, fee in USD at the fill price
@@ -432,9 +461,8 @@ class TestnetExecutor:
                 raise ExecutorError(f"position {sym} cannot be valued")
             view_pos[sym] = {"category": "linear", "notional_usd": float(size * m * (1 if side == "Buy" else -1)), "qty": float(size)}
         w = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, signed=True)
-        acct = w["list"][0]
-        equity = float(_d(acct["totalEquity"], "totalEquity"))
-        coins = {c["coin"]: _d(c["walletBalance"], "walletBalance") for c in acct["coin"]}
+        eq, coins = parse_wallet(w)
+        equity = float(eq)
         for s in self.spot_symbols:
             f = self.filters("spot", s)
             held = coins.get(f.base_coin, D(0)) - D(str((baseline or {}).get(f"spot:{s}", 0)))

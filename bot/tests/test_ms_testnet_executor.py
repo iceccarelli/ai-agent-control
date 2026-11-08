@@ -582,3 +582,242 @@ def test_the_delayed_exit_sequence_end_to_end_through_the_session_tool(w):
     assert rec["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
     assert rec["net"]["funding_usd"] is None and rec["net"]["fees_usd"] == pytest.approx(sum(float(e["execFee"]) for e in w.fake.execs))
     assert S.record_refusals(rec) == [] and set(w.fake.create_calls.values()) == {1}
+
+
+# ================================================================================================ red-team regressions (cp-E2)
+import ms_reconcile as MR  # noqa: E402
+from decimal import Decimal  # noqa: E402
+
+
+def _steps(ctx, run, rec, n, dt=1):
+    for _ in range(n):
+        S._step_once(ctx, run, rec)
+        run.ctx.sleep(dt)
+
+
+# ---- 1 (HIGH) a group is resolved only after a COMPLETE venue read shows it flat; a late fill re-opens it so the unwind is authorised
+def test_late_fill_after_a_failed_group_is_unwound_not_refused_as_resolved(w):
+    run, ctx, rec = begin(w, submit=True, group_plan=resting_plan(w))
+    w.clock.sleep(3_700)                                                                  # past max_wait: the engine cancels the resting entries and the group FAILS
+    _steps(ctx, run, rec, 4)
+    assert run.state() in ("CLOSED", "FAILED") and run.authority.is_resolved("gr1")       # flat on the venue: resolved
+    w.fake.fill("gr1-p", "0.001")                                                         # the cancel RACED a fill: exposure after resolve_group
+    assert w.fake.positions["BTCUSDT"]["size"] != 0
+    _steps(ctx, run, rec, 40)
+    codes = [r for _l, rs in run.authority.refusals for r in rs]
+    assert "EXIT_GROUP_RESOLVED" not in codes, codes
+    assert w.fake.positions["BTCUSDT"]["size"] == 0                                       # the reduce-only unwind was authorised and the VENUE ends flat
+    assert run.state() in ("CLOSED", "FAILED")
+
+
+def test_a_group_is_not_resolved_while_the_venue_still_holds_a_position(w):
+    run, ctx, rec = begin(w, submit=True, group_plan=resting_plan(w))
+    g = run.engine.groups["gr1"]
+    run.engine._set_state(g, T.GroupState.FAILED, "FORCED_FOR_TEST", w.clock.now())          # terminal in the engine's arithmetic ...
+    w.fake.inject_position("BTCUSDT", "-0.001")                                              # ... while the VENUE still holds the perp
+    run.last_view = run.ex.venue_state()
+    run.bookkeep()
+    assert not run.authority.is_resolved("gr1")
+    w.fake.positions["BTCUSDT"]["size"] = Decimal(0)
+    for o in w.fake.orders.values():
+        o["status"] = "Cancelled"                                                            # the resting entries are gone too
+    run.last_view = run.ex.venue_state()
+    run.bookkeep()
+    assert run.authority.is_resolved("gr1")                                                  # a complete flat read releases it
+
+
+def test_resolving_needs_a_complete_read(w):
+    run, ctx, rec = begin(w, submit=True, group_plan=resting_plan(w))
+    w.clock.sleep(3_700)
+    _steps(ctx, run, rec, 1)
+    w.fake.inject("/v5/position/list", "timeout", times=999)
+    g = run.engine.groups["gr1"]
+    if g.state not in (T.GroupState.CLOSED, T.GroupState.FAILED):
+        run.engine._set_state(g, T.GroupState.FAILED, "FORCED_FOR_TEST", w.clock.now())
+    run.authority._groups.append({"event": "reopen", "group_id": "gr1", "at_ms": 1}) if run.authority.is_resolved("gr1") else None
+    run.last_view = run.ex.venue_state()                                                     # incomplete read
+    run.bookkeep()
+    assert not run.authority.is_resolved("gr1")
+
+
+def test_reconcile_unwind_authorises_the_exit_of_a_group_resolved_in_an_earlier_process(w):
+    d = w.ready()
+    run, ctx, rec = begin(w, submit=True)
+    assert drive(w, run, 2) == "HEDGED"
+    run.authority.resolve_group(run.gid)                                                  # what the old code did on a CLOSED/FAILED engine state
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+# ---- 2 (HIGH) reconcile never sends an entry; an unwind needs the digest
+def test_reconcile_without_flags_never_sends_an_entry_after_a_crash_before_the_send(w):
+    d = w.ready()
+    orig = w.fake.request
+    state = {"n": 0}
+
+    def req(method, url, **kw):
+        if url.endswith(CREATE) and state["n"] == 0:
+            state["n"] = 1
+            raise SimulatedCrash("before send")
+        return orig(method, url, **kw)
+    w.fake.request = req
+    with pytest.raises(SimulatedCrash):
+        w.run("execute", "--confirm-plan-digest", d, typed=d)
+    w.fake.request = orig
+    assert w.fake.create_calls == {}
+    w.clock.sleep(120)                                                                    # resend_after_ms has long elapsed
+    w.run("reconcile")
+    assert w.fake.create_calls == {} and w.requests_to(CREATE) == []                      # reconcile sent NOTHING (no entry, no exit)
+    assert "UNRESOLVED ENTRY" in w.text()
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()      # with the digest the never-sent leg is closed out; the venue is flat
+    assert w.fake.create_calls == {} and w.record()["flat_verified"] is True
+
+
+def test_reconcile_without_the_digest_sends_no_reduce_only_exit_either(w):
+    d = w.ready()
+    w.fake.inject(CREATE, "crash_after", match=lambda b: b["orderLinkId"].endswith("-p"))
+    with pytest.raises(SimulatedCrash):
+        w.run("execute", "--confirm-plan-digest", d, typed=d)
+    n = len(w.requests_to(CREATE))
+    assert w.run("reconcile") == 1
+    assert len(w.requests_to(CREATE)) == n and w.record()["flat_verified"] is False
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0
+    assert all(p["size"] == 0 for p in w.fake.positions.values()) and set(w.fake.create_calls.values()) == {1} | {1}
+
+
+# ---- 3 (MED) an empty / malformed wallet answer is incomplete, never flat
+def _wallet_answer(w, mutate):
+    orig = w.fake.request
+
+    def req(method, url, **kw):
+        st, txt = orig(method, url, **kw)
+        if "wallet-balance" in url:
+            d = json.loads(txt)
+            mutate(d)
+            txt = json.dumps(d)
+        return st, txt
+    w.fake.request = req
+
+
+@pytest.mark.parametrize("mutate", [lambda d: d["result"].update(list=[]), lambda d: d["result"].update(list="x"), lambda d: d["result"].update(list=[{}]),
+                                    lambda d: d["result"].update(list=[{"coin": []}]), lambda d: d["result"].update(list=[{"coin": [{"coin": "ETH", "walletBalance": "1"}]}]),
+                                    lambda d: d["result"].pop("list"), lambda d: d["result"].update(list=[None])])
+def test_an_empty_or_malformed_wallet_answer_makes_the_view_incomplete_never_flat(w, mutate):
+    run, ctx, rec = begin(w, submit=False)
+    w.fake.wallet["BTC"] = Decimal("0.5")
+    assert run.ex.venue_state()["positions"]["spot:BTCUSDT"] == 0.5                       # positive control
+    _wallet_answer(w, mutate)
+    v = run.ex.venue_state()
+    assert v["complete"] is False and v["positions"] is None
+
+
+@pytest.mark.parametrize("mutate", [lambda d: d["result"].update(list=[]), lambda d: d["result"]["list"][0].pop("totalEquity"), lambda d: d["result"]["list"][0].pop("coin"),
+                                    lambda d: d["result"]["list"][0].update(totalEquity="abc"), lambda d: d["result"].update(list=[None])])
+def test_account_state_raises_executor_error_on_a_malformed_wallet_answer(w, mutate):
+    run, ctx, rec = begin(w, submit=False)
+    run.ex.account_state({}, 0)                                                           # positive control
+    _wallet_answer(w, mutate)
+    with pytest.raises(TE.ExecutorError):
+        run.ex.account_state({}, 0)
+
+
+# ---- 4 (MED) release_leaked decides flat from the VENUE read
+def test_release_leaked_uses_the_venue_read_not_the_engine(w):
+    run, ctx, rec = begin(w, submit=True)
+
+    class Eng:
+        spot_base = {}
+
+        def states(self):
+            return {run.gid: "CLOSED"}
+
+        def positions(self):
+            return {}                                                                     # engine arithmetic says flat
+
+    w.fake.inject_position("BTCUSDT", "-0.001")
+    view = run.ex.venue_state()
+    assert view["positions"]["linear:BTCUSDT"] != 0
+    out = MR.release_leaked(run.authority, Eng(), [run.gid], view)
+    assert out[run.gid].startswith("REFUSED") and not run.authority.is_resolved(run.gid)
+    assert MR.release_leaked(run.authority, Eng(), [run.gid])[run.gid] == "REFUSED:NO_COMPLETE_VENUE_READ"             # no venue read: no release
+    assert MR.release_leaked(run.authority, Eng(), [run.gid], dict(view, complete=False))[run.gid] == "REFUSED:NO_COMPLETE_VENUE_READ"
+    w.fake.positions["BTCUSDT"]["size"] = Decimal(0)
+    w.fake.wallet["BTC"] = Decimal(0)
+    flat = run.ex.venue_state()
+    assert MR.release_leaked(run.authority, Eng(), [run.gid], flat)[run.gid] == "RELEASED"                             # positive control
+
+
+# ---- surviving mutants
+def test_flat_verified_is_false_when_spot_residue_exceeds_dust_and_true_within_it(w):
+    run, ctx, rec = begin(w)
+    assert drive(w, run, 2) == "HEDGED"
+    run.engine.request_exit(run.gid, w.clock.now(), "T")
+    assert drive(w, run, 4) == "CLOSED"
+    w.fake.wallet["BTC"] += Decimal("0.0000010")                                          # within dust (<= max(step, 0.2% of qty))
+    run.snapshot_record(rec, final=True)
+    assert rec["flat_verified"] is True
+    w.fake.wallet["BTC"] += Decimal("0.01")                                               # 10x the position: far beyond any dust
+    run.snapshot_record(rec, final=True)
+    assert rec["flat_verified"] is False
+
+
+def test_flat_verified_is_false_with_a_foreign_open_order_on_the_symbol(w):
+    run, ctx, rec = begin(w)
+    assert drive(w, run, 2) == "HEDGED"
+    run.engine.request_exit(run.gid, w.clock.now(), "T")
+    assert drive(w, run, 4) == "CLOSED"
+    run.snapshot_record(rec, final=True)
+    assert rec["flat_verified"] is True
+    w.fake._create({"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Limit", "qty": "0.001", "price": "70000.0", "orderLinkId": ""})     # an order that is not ours
+    run.snapshot_record(rec, final=True)
+    assert rec["flat_verified"] is False
+
+
+# ---- unconfirmed suspicions
+def test_non_trade_execution_types_are_surfaced_not_dropped(w):
+    run, ctx, rec = begin(w)
+    drive(w, run, 1)
+    w.fake.execs.append({"execId": "F000001", "orderId": "", "orderLinkId": "", "symbol": "BTCUSDT", "category": "linear", "side": "Sell", "execQty": "0", "execPrice": "60000",
+                         "execFee": "-0.05", "feeCurrency": "USDT", "isMaker": False, "execTime": str(w.clock.now()), "execType": "Funding"})
+    v = run.ex.venue_state()
+    assert any(u["type"] == "Funding" and u["exec_id"] == "F000001" for u in v["unattributed"])
+    assert all(x["fill_id"] != "F000001" for x in v["executions"])                        # still not booked as a fill
+
+
+def test_a_reconcile_disagreement_halt_clears_only_when_a_later_complete_venue_read_agrees(w):
+    from ms_types import Fill
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    run.ledger.record_fill(Fill("bogus-1", run.gid, "p", "BTCUSDT", "Sell", 0.5, 60000.0, 0.0, "USDT", "TAKER", w.clock.now(), "MEASURED"), category="linear")
+    settle_view(w, run)
+    assert any(h.startswith("RECONCILE_DISAGREEMENT") for h in run.engine.halts) and run.ex.halted == "RECONCILE_DISAGREEMENT"
+    w.fake.inject("/v5/position/list", "timeout", times=99)                               # the next venue read is incomplete: it can NOT clear the halt
+    settle_view(w, run)
+    assert any(h.startswith("RECONCILE_DISAGREEMENT") for h in run.engine.halts) and run.ex.halted
+    w.fake.faults.clear()
+    run.ledger.record_fill(Fill("bogus-2", run.gid, "p", "BTCUSDT", "Buy", 0.5, 60000.0, 0.0, "USDT", "TAKER", w.clock.now() + 1, "MEASURED"), category="linear")   # the books agree again
+    settle_view(w, run)
+    assert run.recon_report.ok and not [h for h in run.engine.halts if h.startswith("RECONCILE_DISAGREEMENT")] and run.ex.halted is None
+
+
+def test_recovery_after_a_crash_between_legs_names_the_unsent_leg_and_raises_no_orphan_fill_halt(w):
+    d = w.ready()
+    w.fake.inject(CREATE, "crash_after", match=lambda b: b["orderLinkId"].endswith("-p"))
+    with pytest.raises(SimulatedCrash):
+        w.run("execute", "--confirm-plan-digest", d, typed=d)
+    n = len(w.requests_to(CREATE))
+    assert w.run("reconcile") == 1
+    assert "UNSENT PLAN LEG" in w.text() and "'s'" in w.text()                             # the engine calls a one-legged group HEDGED; the tool says it is not
+    assert "ORPHAN_FILL" not in w.text()                                                   # the venue's own order record acknowledges the adopted perp order in the ledger
+    assert len(w.requests_to(CREATE)) == n and w.record()["flat_verified"] is False
+
+
+def test_an_exit_in_flight_at_the_crash_is_not_sent_by_reconcile_without_the_digest(w):
+    d = w.ready()
+    run, ctx, rec = begin(w, submit=True)
+    assert drive(w, run, 2) == "HEDGED"
+    run.engine._emit("EXIT_MODE", run.gid, w.clock.now(), {"mode": "EXIT", "reason": "T"})   # the exit decision was journalled; the process died before sending it
+    n = len(creates(w))
+    assert w.run("reconcile") == 1 and len(creates(w)) == n                                 # recovery did NOT continue the exit by itself
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0 and len(creates(w)) > n
+    assert all(p["size"] == 0 for p in w.fake.positions.values())

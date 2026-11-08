@@ -482,3 +482,70 @@ def test_a_conflicting_position_mid_session_ends_not_verified_flat_and_asks_for_
     # whatever happened, no ENTRY was sent after the mismatch halted new exposure: every create after the first mismatch is reduce-only
     bodies = [json.loads(r[3]) for r in w.requests_to(CREATE)]
     assert len([b for b in bodies if not b.get("reduceOnly") and not (b["category"] == "spot" and b["side"] == "Sell")]) == 2
+
+
+# ================================================================================================ red-team regressions (cp-E2): manifest bounds are ENFORCED, not just validated
+def test_the_plan_states_one_active_group_and_the_policy_enforces_it(w):
+    w.ready()
+    plan = w.plan_doc()
+    assert plan["bounds"]["one_active_group"] is True and plan["policy"]["max_active_groups"] == 1
+
+
+def test_max_entries_per_utc_day_is_enforced_across_state_dirs(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, lower={"max_entries_per_utc_day": 1})
+    assert w.execute(w.ready()) == 0
+    w.state_dir = str(tmp_path / "state2")                                              # a different session, the same UTC day
+    d = w.ready()
+    w.fake.requests.clear()
+    assert "MAX_ENTRIES_PER_UTC_DAY_REACHED" in refused_without_network(w, ["execute", "--confirm-plan-digest", d], typed=d)
+    w.clock.t += 86_400_000                                                             # the next UTC day
+    d = w.ready()
+    assert w.execute(d) == 0
+
+
+def test_the_manifest_loss_limit_stops_the_run_and_unwinds_reduce_only(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, lower={"max_loss_usd": 0.01})                      # the round-trip taker fees alone exceed one cent
+    d = w.ready(hold_seconds=30)
+    assert w.execute(d) == 0, w.text()
+    assert "STOP: LOSS_LIMIT" in w.text() and w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+    assert set(w.fake.create_calls.values()) == {1} and len(w.fake.create_calls) == 4                    # entries once, exits once: nothing re-entered
+
+
+def test_the_loss_limit_does_not_fire_inside_the_bound(w):
+    d = w.ready(hold_seconds=30)
+    assert w.execute(d) == 0 and "STOP:" not in w.text()
+
+
+def test_the_lifecycle_bound_is_enforced_during_the_run(w):
+    w.ready()
+    run, ctx, rec = begin(w, submit=True)
+    for _ in range(2):
+        w.clock.sleep(1)
+        S._step_once(ctx, run, rec)
+    assert run.state() == "HEDGED" and run.stopped is None
+    run.start_ms = w.clock.now() - run.lifecycle_ms - 1                                 # the session has outlived its bound
+    for _ in range(6):
+        w.clock.sleep(1)
+        S._step_once(ctx, run, rec)
+    assert run.stopped == "LIFECYCLE_EXCEEDED" and "STOP: LIFECYCLE_EXCEEDED" in w.text()
+    assert run.state() == "CLOSED" and all(p["size"] == 0 for p in w.fake.positions.values())
+    assert "LIFECYCLE_EXCEEDED" in run.engine.halts or any("LIFECYCLE" in h for h in run.engine.halts)
+
+
+def test_the_lifecycle_is_the_lower_of_the_plan_and_the_manifest(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, lower={"max_lifecycle_hours": 2.0})
+    w.run("preflight")
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "90", "--max-lifecycle-hours", "3") == 2 and "LIFECYCLE_ABOVE_BOUND" in w.text()
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "90", "--max-lifecycle-hours", "1.5") == 0
+    run, ctx, rec = begin(w, submit=False)
+    assert run.lifecycle_ms == 1.5 * 3_600_000
+
+
+def test_reconcile_past_the_lifecycle_says_unwind_required(w):
+    d = w.ready()
+    w.fake.inject(CREATE, "crash_after", match=lambda b: b["orderLinkId"].endswith("-p"))
+    with pytest.raises(SimulatedCrash):
+        w.run("execute", "--confirm-plan-digest", d, typed=d)
+    w.clock.t += 2 * 3_600_000
+    w.run("reconcile")
+    assert "LIFECYCLE_EXCEEDED" in w.text()
