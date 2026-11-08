@@ -359,7 +359,11 @@ def test_fee_sum_is_exact_and_floats_appear_only_at_the_boundary():
     L = A.Ledger()
     for i in range(10):
         L.record_fill(fill(f"f{i}", "Buy" if i % 2 == 0 else "Sell", 1, 100, 0.1, ts=1000 + i))
-    assert L.pnl_exact()["fees"] == D("1.0") and sum([0.1] * 10) != 1.0
+    assert L.pnl_exact()["fees"] == D("1.0")
+    naive = 0.0
+    for _ in range(10):
+        naive += 0.1                                  # plain float accumulation drifts on every Python version (sum() is compensated on 3.12)
+    assert naive != 1.0
     out = L.pnl()
     assert isinstance(out["fees"], float) and isinstance(out["per_leg"]["G1/P"]["qty"], float) and out["fees"] == 1.0
 
