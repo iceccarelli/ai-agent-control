@@ -1290,7 +1290,7 @@ def test_only_closed_rows_actually_observed_credit_delistings(closed):
 def test_mutation_the_sibling_finding_removed_leaves_the_empty_list_silent():
     m = _mutant('    if res["sibling_universe_captures_outside_scanned_root"] and not res["universe_capture_dirs"]:', '    if False:')
     import tempfile
-    d = tempfile.mkdtemp(dir="/tmp/claude-0")
+    d = tempfile.mkdtemp()
     try:
         os.makedirs(os.path.join(d, "md"))
         os.makedirs(os.path.join(d, "u"))
