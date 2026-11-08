@@ -564,3 +564,14 @@ def test_cost_chain_digest_is_stamped_on_both_evidence_items_and_binds_the_cost_
     assert EM.cost_chain_digest(other) != d                                                      # a different cost chain is a different digest
     same = copy.deepcopy(SPEC); same["hypothesis"] = "reworded"
     assert EM.cost_chain_digest(same) == d                                                       # prose does not move it
+
+
+def test_position_closed_exactly_at_a_settlement_is_not_held_for_it_and_every_cost_key_moves_the_digest():
+    fills = [EM.Fill("a", "BTCUSDT", "sell", D(2), D(50000), D(0), "USDT", 1), EM.Fill("b", "BTCUSDT", "buy", D(2), D(50000), D(0), "USDT", 16 * H)]
+    r = EM.realised_result(fills=fills, expected_fill_ids="ab", funding=EM.reconcile_funding(P, [settle(8 * H)], 0, 16 * H), venue_net_qty={"BTCUSDT": D(0)}, marks={})
+    assert r.flags == () and r.pnl_usd.value == D("10")                  # flat at 16H (same rule as the position cross-check): only 8H is owed
+    import copy
+    base = EM.cost_chain_digest(SPEC)
+    for k in EM.COST_CHAIN_SPEC_KEYS:
+        s = copy.deepcopy(SPEC); s[k] = "changed" if not isinstance(s.get(k), dict) else {"x": 1}
+        assert EM.cost_chain_digest(s) != base, k
