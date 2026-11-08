@@ -1424,7 +1424,7 @@ def capture_universe(out_dir: str, *, fetch: Callable[[str], bytes] = http_fetch
 # ---------------------------------------------------------------- verification (everything re-derived from the raw bytes)
 
 def verify_capture_dir(path: str, *, _legacy: Optional[List[str]] = None, history_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None,
-                       _entries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                       _entries: Optional[List[Dict[str, Any]]] = None, _uni_sink: Optional[List[bytes]] = None) -> Dict[str, Any]:
     """Strict re-verification of a schema-v2 capture directory. Re-reads and re-hashes EVERY file against the manifest, re-parses every raw page, and
     re-derives row counts, partition outcomes, status coverage, delisting observability, rejected lists, conflicts, the universe jsonl and the dataset
     status from the bytes, never trusting a manifest assertion. Returns
@@ -1434,7 +1434,7 @@ def verify_capture_dir(path: str, *, _legacy: Optional[List[str]] = None, histor
     problems: List[str] = []
     out: Dict[str, Any] = {"ok": False, "problems": problems, "coverage": {}, "manifest_sha256": None}
     try:
-        _verify(path, problems, out, _legacy, history_evidence, _entries)
+        _verify(path, problems, out, _legacy, history_evidence, _entries, _uni_sink)
     except (OSError, AR.RecordError, CaptureError, KeyError, TypeError, ValueError, AttributeError, IndexError, RecursionError) as exc:
         problems.append(f"verification aborted: {type(exc).__name__}: {str(exc)[:120]}")
     if problems:
@@ -1446,7 +1446,7 @@ def verify_capture_dir(path: str, *, _legacy: Optional[List[str]] = None, histor
 
 
 def _verify(path: str, problems: List[str], out: Dict[str, Any], legacy: Optional[List[str]] = None,
-            history_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None, sink: Optional[List[Dict[str, Any]]] = None) -> None:
+            history_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None, sink: Optional[List[Dict[str, Any]]] = None, uni_sink: Optional[List[bytes]] = None) -> None:
     """``legacy`` (describe_scope only): a list that receives every CLAIM-vs-derivation difference instead of ``problems``. Hash, listing, structure and file problems
     are always problems. The verdict is always derived from the raw bytes."""
     claim = problems.append if legacy is None else legacy.append
@@ -1606,6 +1606,10 @@ def _verify(path: str, problems: List[str], out: Dict[str, Any], legacy: Optiona
     if srv and not (min(srv) - START_BIND_MS <= started <= max(srv) + START_BIND_MS):
         problems.append(f"started_ms {started} (the snapshot stamp) is not within {START_BIND_MS} ms of the raw pages' server time span [{min(srv)}, {max(srv)}]: the point-in-time stamp is not bound to the hashed bytes")
     uni = build_universe(derived_parts, tick["map"] if tick else {}, snapshot)
+    if uni_sink is not None:
+        uni_sink.append(uni["jsonl"])                                  # the universe RE-DERIVED from the raw pages: the only rows a reader may believe
+    current = m.get("rules_version") == RULES_VERSION
+    uclaim = problems.append if current else claim                      # under the current rules a rewritten universe file is tampering, not a stale claim
     uf = m["universe_file"]
     if uf.get("file") != f"universe-{snapshot}.jsonl":
         problems.append("universe file name does not match started_ms")
@@ -1614,9 +1618,9 @@ def _verify(path: str, problems: List[str], out: Dict[str, Any], legacy: Optiona
         if _sha(ub) != uf.get("sha256"):
             problems.append(f"{uf.get('file')}: modified (sha256 differs from the manifest)")
         if ub != uni["jsonl"]:
-            claim(f"{uf.get('file')}: differs from the universe re-derived from the raw pages")
+            uclaim(f"UNIVERSE_FILE_DIFFERS {uf.get('file')}: differs from the universe re-derived from the raw pages")
     if uf.get("rows") != uni["rows"]:
-        claim(f"universe rows {uf.get('rows')!r} != re-derived {uni['rows']}")
+        uclaim(f"UNIVERSE_FILE_DIFFERS universe rows {uf.get('rows')!r} != re-derived {uni['rows']}")
     if m["rejected_instruments"] != uni["rejected"]:
         claim("rejected_instruments differs from the re-derivation of the raw pages")
     rec = reconcile_tickers(tick, uni, tick["rej_symbols"] if tick else [])
@@ -1809,20 +1813,25 @@ def _row_key(r: Dict[str, Any]) -> str:
 
 def load_universe(path: str) -> Dict[str, Dict[str, Any]]:
     real = AR._refuse_protected(path)
-    out: Dict[str, Dict[str, Any]] = {}
     with open(real, "rb") as fh:
-        for i, line in enumerate(fh, 1):
+        return parse_universe_bytes(fh.read(), os.path.basename(path))
+
+
+def parse_universe_bytes(raw: bytes, name: str = "universe") -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if True:
+        for i, line in enumerate(raw.splitlines(True), 1):
             try:
                 r = json.loads(line.decode("utf-8", "strict"))
             except (UnicodeDecodeError, ValueError) as exc:
-                raise CaptureError(f"{os.path.basename(path)} line {i}: not JSON") from exc
+                raise CaptureError(f"{name} line {i}: not JSON") from exc
             if not isinstance(r, dict) or r.get("schema") not in (SCHEMA_VERSION, ROW_SCHEMA_V2) or not isinstance(r.get("symbol"), str):
-                raise CaptureError(f"{os.path.basename(path)} line {i}: not a schema-{SCHEMA_VERSION}/{ROW_SCHEMA_V2} universe row")
+                raise CaptureError(f"{name} line {i}: not a schema-{SCHEMA_VERSION}/{ROW_SCHEMA_V2} universe row")
             if r["schema"] == ROW_SCHEMA_V2 and r.get("category") not in CATEGORIES:
-                raise CaptureError(f"{os.path.basename(path)} line {i}: schema-2 row without a category")
+                raise CaptureError(f"{name} line {i}: schema-2 row without a category")
             k = _row_key(r)
             if k in out:
-                raise CaptureError(f"{os.path.basename(path)} line {i}: duplicate symbol {k} (a conflicted capture is never diffed)")
+                raise CaptureError(f"{name} line {i}: duplicate symbol {k} (a conflicted capture is never diffed)")
             out[k] = r
     return out
 

@@ -132,7 +132,7 @@ def classify_record(rec: Mapping[str, Any], win_from: int, win_to: int, include_
 
 def symbol_range(rec: Mapping[str, Any], win_from: int, win_to: int) -> Tuple[int, int]:
     launch, delivery = _int(rec.get("launchTime")), _int(rec.get("deliveryTime"))
-    return max(win_from, launch or win_from), min(win_to, delivery) if delivery and rec.get("status") in ENDED else win_to
+    return max(win_from, launch or win_from), MH.clamp_end_to_delivery(delivery, win_to)
 
 
 def classify_universe(recs: Mapping[str, Mapping[str, Any]], win_from: int, win_to: int, include_statuses: Sequence[str], quote_coins: Optional[Sequence[str]],

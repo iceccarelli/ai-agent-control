@@ -827,3 +827,29 @@ def test_resume_does_not_re_ask_a_symbol_that_already_ended_on_an_empty_page(tmp
     v2 = _venue_for_plan(uni, doc)
     assert _run(pf, out, uni, v2)["status"] == "DONE"
     assert not any("symbol=AMIDUSDT" in u for u in v2.urls if MH.DATASETS[MH.FUNDING]["path"] in u) and not (set(v1.urls) & set(v2.urls))
+
+
+# ---------------------------------------------------------------- red team: a subset resume must not forget the datasets already collected
+
+def test_a_subset_rerun_keeps_the_other_datasets_in_the_progress_file(tmp_path):
+    uni = make_universe(tmp_path)
+    doc, pf = _sealed(tmp_path, uni)
+    out = tmp_path / "new"
+    assert _run(pf, out, uni, _venue_for_plan(uni, doc))["status"] == "DONE"                      # 1. full run
+    v = _venue_for_plan(uni, doc)
+    assert _run(pf, out, uni, v, datasets=["funding"])["status"] == "DONE" and v.urls == []        # 2. subset resume
+    prog = json.loads((out / MH.PROGRESS_NAME).read_text())
+    assert sorted(prog["datasets"]) == ["funding", "mark-kline"] and prog["datasets"]["mark-kline"]["status"] == "DONE"
+    v3 = _venue_for_plan(uni, doc)
+    assert _run(pf, out, uni, v3)["status"] == "DONE" and v3.urls == []                            # 3. full rerun: no "does not own" refusal, zero requests
+
+
+def test_the_funnel_range_and_the_collection_range_use_one_delivery_rule_for_every_status():
+    for status in ("Trading", "PendingOpen", "Closed", "Delivering"):
+        rec = {"symbol": "XXXUSDT", "status": status, "launchTime": W0 - DAY, "deliveryTime": T - 2 * DAY}
+        lo, hi = BP.symbol_range(rec, W0, T)
+        spec = MH.build_specs(MH.FUNDING, None, ["XXXUSDT"], W0, T, {"XXXUSDT": rec}, {"XXXUSDT": 480})[0]
+        assert hi == spec["end_ms"] == T - 2 * DAY, status                        # the same end whatever the status says
+        assert lo == W0
+    live = {"symbol": "XXXUSDT", "status": "Trading", "launchTime": W0 - DAY, "deliveryTime": 0}
+    assert BP.symbol_range(live, W0, T)[1] == T == MH.build_specs(MH.FUNDING, None, ["XXXUSDT"], W0, T, {"XXXUSDT": live}, {"XXXUSDT": 480})[0]["end_ms"]

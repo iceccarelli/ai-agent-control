@@ -970,12 +970,13 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
                 problems.append("universe file hash differs from its manifest")
     ds = man.get("dataset_status")
     derived: Dict[str, Any] = {}
+    rederived: List[bytes] = []
     if v2:
         # schema 2: ``verify_capture_dir`` re-derives every claim from the raw bytes. Integrity must hold AND the RE-DERIVED dataset_status must be COMPLETE or PARTIAL
         # (never the manifest's own claim); the answer is recorded in the manifest of every dataset built from it.
         # ``describe_scope`` judges the capture from its RAW bytes (a manifest written under older rules fails the strict claim comparison of ``verify_capture_dir`` yet is sound): raw
         # integrity must hold; the RE-DERIVED dataset_status must be COMPLETE or PARTIAL, or the capture must be research-usable (COMPLETE_WITH_EXPLAINED_MISMATCH: every mismatched row explained).
-        vres = UC.verify_capture_dir(path)
+        vres = UC.verify_capture_dir(path, _uni_sink=rederived)
         derived = vres.get("coverage") or {}
         ds = derived.get("dataset_status")
         usable = False
@@ -995,7 +996,13 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
         problems.append(f"universe dataset_status is {ds}")
     if problems:
         raise HistoryError("universe capture does not verify: " + "; ".join(problems[:5]))
-    recs = {k: r for k, r in UC.load_universe(upath).items() if r.get("category", "linear") == "linear"}
+    if v2:                                                               # records come from the universe RE-DERIVED from the raw pages, never from the unverified jsonl
+        if not rederived:
+            raise HistoryError("universe capture does not verify: the universe could not be re-derived from its raw pages")
+        allrecs = UC.parse_universe_bytes(rederived[0], "re-derived universe")
+    else:
+        allrecs = UC.load_universe(upath)
+    recs = {k: r for k, r in allrecs.items() if r.get("category", "linear") == "linear"}
     if only_trading and include_statuses:
         raise HistoryError("give --only-trading or --include-statuses, not both")
     wanted = {"Trading"} if only_trading else (set(include_statuses) if include_statuses else None)
@@ -1008,6 +1015,11 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
                   "schema": man.get("schema_version", man.get("schema")), "dataset_status": ds, "symbols": len(recs),
                   "statuses_in_capture": dict(sorted(seen_statuses.items())), "capture_schema": 2 if v2 else 1,
                   "status_coverage": derived.get("status_coverage"), "delisting_observability": derived.get("delisting_observability"), "included_statuses": sorted(wanted) if wanted is not None else "ALL"}
+
+
+def clamp_end_to_delivery(delivery_ms: Optional[int], end_ms: int) -> int:
+    """THE end-of-range rule, shared by collection (``build_specs``) and the funnel (``backfill_plan.symbol_range``): never past a stated delivery time, whatever the status says."""
+    return min(end_ms, delivery_ms) if isinstance(delivery_ms, int) and not isinstance(delivery_ms, bool) and delivery_ms > 0 else end_ms
 
 
 def build_specs(dataset: str, interval: Optional[str], symbols: Sequence[str], start_ms: int, end_ms: int, records: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -1031,7 +1043,7 @@ def build_specs(dataset: str, interval: Optional[str], symbols: Sequence[str], s
         elif spec["launch_ms"] and spec["launch_ms"] > end_ms:
             spec["skip"] = "launched_after_window"
         elif spec["delivery_ms"] and spec["delivery_ms"] < end_ms:
-            spec["end_ms"] = spec["delivery_ms"]          # a Closed contract is asked up to its delisting (venue-observed: pre-delisting history IS served); never past it
+            spec["end_ms"] = clamp_end_to_delivery(spec["delivery_ms"], end_ms)          # a Closed contract is asked up to its delisting (venue-observed: pre-delisting history IS served); never past it
         if dataset == FUNDING:
             if s in imap:
                 spec.update(interval_ms=imap[s] * 60_000, interval_source="operator_declared")
@@ -1485,6 +1497,9 @@ def run_plan(plan_path: str, out_root: str, *, universe_dir: Optional[str] = Non
     est = {d: (plan_doc.get("datasets", {}).get(d, {}).get("estimate") or {}).get("requests_total", 0) for d in RUN_ORDER}
     base: Dict[str, Any] = {"schema": PROGRESS_SCHEMA, "plan_digest": plan_doc["plan_digest"], "plan_path": os.path.abspath(plan_path), "out_root": root, "status": "RUNNING",
                             "started_ms": int(clock()), "window": {"start_ms": start_ms, "end_ms": end_ms}, "workers": workers, "rate_per_s": rate, "last_error": None, "datasets": {}}
+    for ds, entry in ((prior or {}).get("datasets") or {}).items():
+        if ds not in want and isinstance(entry, dict):
+            base["datasets"][ds] = entry                        # a subset resume leaves every other dataset's record exactly as it was
     for ds in want:
         interval = None if ds == FUNDING else ivs.get(ds)
         old = ((prior or {}).get("datasets") or {}).get(ds) or {}

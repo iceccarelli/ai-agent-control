@@ -1476,8 +1476,9 @@ def test_describe_scope_never_trusts_the_manifest_and_blocks_on_raw_tampering(tm
         refresh_sha(dd, f)
     r, dst = retarget(tmp_path, d, lie, "lie")
     s = UC.describe_scope(dst)
-    assert r["ok"] is False and s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and "Closed" in s["statuses"]["refused_or_failed"]
-    assert {"STATUS_Closed_REFUSED_BY_VENUE", "DELISTING_NOT_OBSERVED"} <= {b["code"] for b in s["blockers"]}
+    assert r["ok"] is False and s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and ("Closed" in s["statuses"]["refused_or_failed"] or any("UNIVERSE_FILE_DIFFERS" in x for x in s["integrity_problems"]))        # the universe file no longer matches the re-derived pages: a hard integrity failure
+    codes = {b["code"] for b in s["blockers"]}
+    assert {"STATUS_Closed_REFUSED_BY_VENUE", "DELISTING_NOT_OBSERVED"} <= codes or "RAW_INTEGRITY" in codes          # the stale universe file no longer matches the pages: integrity blocks first
     open(os.path.join(dst, "linear_Closed_page0001.json"), "ab").write(b" ")                     # hash now differs from the manifest: integrity blocker
     s = UC.describe_scope(dst)
     assert s["raw_integrity_ok"] is False and s["blockers"][0]["code"] == "RAW_INTEGRITY" and s["dataset_status"] == "UNVERIFIED"
