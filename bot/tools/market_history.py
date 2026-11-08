@@ -49,6 +49,10 @@ THE SEVEN TIMESTAMPS (all epoch ms; one definition, tested in ``check_time_invar
 Ordering: exchange_event_time <= observation_time;  local_receive_time <= collection_time <= normalization_time;  source_server_time >= exchange_event_time - skew.
 Per-row page-level times (server/receive/collection) are in the ledger, joined by the row's ``page``.
 
+Symbol source. ``--symbols`` (explicit), ``--universe-capture`` (+ ``--include-statuses``) or ``--symbols-from-plan PLAN.json``: the sealed symbol list (and window) of a
+``tools/backfill_plan.py plan --out`` document (its ``plan_digest`` must re-hash; the universe capture must be the one it was made from; the window must equal the plan's). Every dataset
+collected with the same plan has the same symbols.
+
 Network note: ``urllib`` honours HTTPS_PROXY / https_proxy / NO_PROXY from the environment, so a collector run behind a proxy sends its (unsigned, public) requests through it and that
 proxy sees them; the pinned host and path allow-list is enforced on the URL before the request, not on the route. Unset the variables if that is not what you want.
 
@@ -1337,6 +1341,40 @@ def hedge_availability(records: Mapping[str, Mapping[str, Any]], spot_dir: str) 
 
 # ---------------------------------------------------------------- CLI
 
+PLAN_SCHEMA = "backfill_plan/v1"
+MAX_PLAN_BYTES = 16 << 20
+
+
+def plan_digest(doc: Mapping[str, Any]) -> str:
+    """The digest a ``backfill_plan`` document seals itself with (everything but ``plan_digest``)."""
+    return _sha(_canon({k: v for k, v in doc.items() if k != "plan_digest"}))
+
+
+def load_plan(path: str) -> Dict[str, Any]:
+    """A ``tools/backfill_plan.py plan --out`` document, refused unless it re-hashes: the SYMBOL SET of every dataset comes from one sealed list, so the datasets cannot diverge."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise HistoryError("--symbols-from-plan: no such file (or a link)")
+    with open(path, "rb") as fh:
+        raw = fh.read(MAX_PLAN_BYTES + 1)
+    if len(raw) > MAX_PLAN_BYTES:
+        raise HistoryError("--symbols-from-plan: file too large")
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise HistoryError("--symbols-from-plan: not JSON") from exc
+    if not isinstance(doc, dict) or doc.get("schema") != PLAN_SCHEMA:
+        raise HistoryError("--symbols-from-plan: not a backfill_plan/v1 document")
+    if doc.get("plan_digest") != plan_digest(doc):
+        raise HistoryError("--symbols-from-plan: plan_digest does not match the plan's content (edited after it was made?)")
+    syms = doc.get("eligible_symbols")
+    if not isinstance(syms, list) or not syms or not all(isinstance(s, str) and _SYMBOL.fullmatch(s) for s in syms) or len(set(syms)) != len(syms) or doc.get("eligible_count") != len(syms):
+        raise HistoryError("--symbols-from-plan: eligible_symbols is empty, malformed or does not match eligible_count")
+    uni, win = doc.get("universe"), doc.get("window")
+    if not isinstance(uni, dict) or not isinstance(uni.get("dir"), str) or not isinstance(uni.get("manifest_sha256"), str) or not isinstance(win, dict):
+        raise HistoryError("--symbols-from-plan: the plan names no universe or window")
+    return doc
+
+
 def _parse_overrides(items: Sequence[str]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for it in items or []:
@@ -1376,9 +1414,11 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
     for name in DATASETS:
         p = sub.add_parser(name)
         p.add_argument("--out-root", required=True, help="data root OUTSIDE the git work tree (0700)")
-        g = p.add_mutually_exclusive_group(required=True)
+        g = p.add_mutually_exclusive_group(required=False)
         g.add_argument("--symbols", help="comma-separated, e.g. BTCUSDT,ETHUSDT")
         g.add_argument("--universe-dir", "--universe-capture", dest="universe_dir", help="a universe_capture directory (verified before any symbol is taken from it)")
+        p.add_argument("--symbols-from-plan", metavar="PLAN.json", help="the symbol list (and window) of a sealed tools/backfill_plan.py plan: every dataset collected with the same plan has the same symbols. "
+                       "Combine with --universe-capture/--include-statuses only to point at the same capture; the plan's universe sha256 must match")
         p.add_argument("--include-statuses", help="with --universe-capture: comma-separated instrument statuses, e.g. Trading,Closed (Closed contracts are asked up to their deliveryTime)")
         p.add_argument("--only-trading", action="store_true", help="with --universe-dir: only status Trading (default: every accepted instrument, delisted history included)")
         p.add_argument("--start-ms", type=int, help="window start (epoch ms)")
@@ -1424,6 +1464,11 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
             print(json.dumps(res, indent=2, sort_keys=True))
             return 0 if res["ok"] else 1
         interval = getattr(a, "interval", None)
+        plan_doc = load_plan(a.symbols_from_plan) if a.symbols_from_plan else None
+        if plan_doc is None and (a.symbols is None) == (a.universe_dir is None):
+            raise HistoryError("give exactly one of --symbols / --universe-capture, or --symbols-from-plan")
+        if plan_doc is not None and a.symbols is not None:
+            raise HistoryError("--symbols-from-plan replaces --symbols: give one")
         if a.end_ms is not None:
             end_ms, end_basis = a.end_ms, "OPERATOR_END_MS"
         elif a.cmd == FUNDING:
@@ -1434,7 +1479,23 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
             raise HistoryError("give exactly one of --start-ms / --days")
         start_ms = a.start_ms if a.start_ms is not None else end_ms - a.days * 86_400_000
         records = uinfo = None
-        if a.universe_dir:
+        if plan_doc is not None:
+            pw = plan_doc["window"]
+            if (start_ms, end_ms) != (pw.get("effective_from_ms"), pw.get("effective_to_ms")):
+                raise HistoryError(f"the window ({start_ms}..{end_ms}) differs from the plan's ({pw.get('effective_from_ms')}..{pw.get('effective_to_ms')}): "
+                                   f"use --days {pw.get('effective_days')} --end-ms {pw.get('effective_to_ms')}")
+            sts = [x for x in a.include_statuses.split(",") if x] if a.include_statuses else list(plan_doc["parameters"].get("include_statuses") or [])
+            if sorted(sts) != sorted(plan_doc["parameters"].get("include_statuses") or []):
+                raise HistoryError("--include-statuses differs from the plan's")
+            records, uinfo = load_universe_dir(a.universe_dir or plan_doc["universe"]["dir"], include_statuses=sts)
+            if uinfo["manifest_sha256"] != plan_doc["universe"]["manifest_sha256"]:
+                raise HistoryError("the universe capture is not the one the plan was made from (manifest sha256 differs)")
+            symbols = list(plan_doc["eligible_symbols"])
+            absent = sorted(set(symbols) - set(records))
+            if absent:
+                raise HistoryError(f"plan symbols absent from the universe capture: {absent[:5]}")
+            uinfo = dict(uinfo, symbols=len(symbols), symbols_from_plan={"plan_digest": plan_doc["plan_digest"], "eligible": len(symbols)})
+        elif a.universe_dir:
             records, uinfo = load_universe_dir(a.universe_dir, only_trading=a.only_trading,
                                                include_statuses=[x for x in a.include_statuses.split(",") if x] if a.include_statuses else None)
             symbols = sorted(records)

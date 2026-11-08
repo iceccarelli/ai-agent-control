@@ -18,6 +18,11 @@ Three separate axes in the output (they are never merged into one green light):
                                 ``--history-max-age-ms``; a window that ended long ago can never be HEALTHY). ``health.json`` is UNAUTHENTICATED (anyone with the directory
                                 can write it): an ok record in it that was not confirmed by a live check is reported as ``*_CLAIMED_NOT_VERIFIED`` (PARTIAL) and can never make
                                 HEALTHY; a failure it admits to is believed (that direction is safe). Anything else is not HEALTHY.
+  readiness_vocabulary  (additive; the verdicts above are unchanged) three SEPARATE claims: data_ready = every history dataset COMPLETE, re-hashed here and not stale (a property of
+                      files; NO_DATA is never DATA_READY); research_ready = RESEARCH_READY | NOT_RESEARCH_READY | NOT_ASSESSED, decided ONLY by re-deriving a sealed
+                      ``tools/backfill_plan.py`` plan (``--plan``) against this root (same universe capture, same symbol set, required window COMPLETE and verified); without
+                      ``--plan`` it is NOT_ASSESSED, never inferred; strategy_ready = always NOT_ASSESSED. Each history section also reports the symbols, dates and
+                      intervals it covers and does not cover (``coverage``).
   research_readiness  NO_DATA | NOT_READY | READY. READY needs every declared research-universe symbol COMPLETE in every history dataset present, the status partitions
                       present, and no dataset UNVERIFIED/CONFLICTED. It is independent of backup state and of freshness.
 Exit code: 0 only for HEALTHY; 1 PARTIAL; 3 STALE; 4 NO_DATA; 2 refusal (root inside Git, not a directory). ``--require-ready`` makes a non-READY readiness a non-zero exit too.
@@ -38,6 +43,7 @@ BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BOT)
 sys.path.insert(0, os.path.join(BOT, "tools"))
 
+import backfill_plan as BP  # noqa: E402
 import evidence_chain as EC  # noqa: E402
 import market_collector as MC  # noqa: E402
 import market_history as MH  # noqa: E402
@@ -156,7 +162,7 @@ def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, 
             last = cov.get("last_ts")
             iv = cov.get("observed_interval_ms") or cov.get("interval_ms")
             delivery = cov.get("delivery_ms")
-            entry = {"status": rec.get("status"), "latest_observed_ts": last, "expected_cadence_ms": iv, "rows": cov.get("rows"), "gap_count": rec.get("gap_count"),
+            entry = {"status": rec.get("status"), "first_ts": cov.get("first_ts"), "latest_observed_ts": last, "expected_cadence_ms": iv, "rows": cov.get("rows"), "gap_count": rec.get("gap_count"),
                      "age_ms": (now - last) if isinstance(last, int) else None}
             sec["symbols"][sym] = entry
             if _future(issues, now, f"{name}/{sym} last_ts", last):
@@ -189,8 +195,57 @@ def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, 
             have = {s for s, r in sec["symbols"].items() if r["status"] == "COMPLETE"}
             sec["research_universe"] = {"declared": len(universe), "complete": len(have & set(universe)), "missing": sorted(set(universe) - have)[:200],
                                         "missing_count": len(set(universe) - have)}
+        sec["coverage"] = _dataset_coverage(sec)
         out[name] = sec
     return out
+
+
+def _dataset_coverage(sec: Mapping[str, Any]) -> Dict[str, Any]:
+    """What one history dataset covers and what it does not: symbols, dates, intervals. Pure over the section built from its manifest."""
+    syms = sec["symbols"]
+    firsts = [r["first_ts"] for r in syms.values() if isinstance(r.get("first_ts"), int)]
+    lasts = [r["latest_observed_ts"] for r in syms.values() if isinstance(r.get("latest_observed_ts"), int)]
+    ivs: Dict[str, int] = {}
+    for r in syms.values():
+        k = str(r.get("expected_cadence_ms"))
+        ivs[k] = ivs.get(k, 0) + 1
+    notc = sorted(s for s, r in syms.items() if r.get("status") != "COMPLETE")
+    return {"symbols_total": len(syms), "symbols_complete": len(syms) - len(notc), "symbols_not_complete": notc[:200], "symbols_not_complete_count": len(notc),
+            "first_ts_min": min(firsts) if firsts else None, "last_ts_max": max(lasts) if lasts else None, "intervals_ms": dict(sorted(ivs.items())),
+            "symbols_without_rows": sorted(s for s, r in syms.items() if not r.get("rows"))[:200]}
+
+
+def _readiness_vocabulary(history: Mapping[str, Any], has_rows: bool, plan_assessment: Mapping[str, Any]) -> Dict[str, Any]:
+    """Three separate claims, never merged: DATA_READY (these datasets are whole, re-hash and are not stale: a property of FILES), RESEARCH_READY (a backfill_plan, re-derived here,
+    says the required window and symbol set are verified COMPLETE: a property of COVERAGE) and strategy readiness (never assessed here)."""
+    per: Dict[str, Any] = {}
+    for name, h in history.items():
+        ok = h.get("dataset_status") == "COMPLETE" and h["verify"] == "OK" and not h["stale_symbols"]
+        per[name] = {"data_ready": ok, "dataset_status": h.get("dataset_status"), "verify": h["verify"], "stale_symbols": len(h["stale_symbols"]), "incomplete_symbols": len(h["incomplete_symbols"])}
+    if not has_rows or not history:
+        data = "NO_DATA"
+    else:
+        data = "DATA_READY" if all(p["data_ready"] for p in per.values()) else "NOT_DATA_READY"
+    return {"data_ready": {"verdict": data, "per_dataset": per,
+                           "note": "dataset-level only: every history dataset COMPLETE, re-hashed here and not stale. Backups and the cycle stream are the data_freshness axis, not this one. NO_DATA is never DATA_READY."},
+            "research_ready": plan_assessment,
+            "strategy_ready": {"verdict": "NOT_ASSESSED", "note": "no strategy-level readiness is claimed by this tool; a READY on the research_readiness axis is declared-universe COVERAGE only"}}
+
+
+def _plan_assessment(plan_file: Optional[str], root: str) -> Dict[str, Any]:
+    """RESEARCH_READY only from a freshly re-derived ``backfill_plan``: the sealed plan file is loaded (its digest must hold), re-run against THIS root, and must agree on the universe
+    capture and the symbol set. A plan file's own readiness claim is never read. No plan = NOT_ASSESSED, never inferred."""
+    if not plan_file:
+        return {"verdict": "NOT_ASSESSED", "reason": "no --plan given: coverage of the required window and symbol set is not judged without a backfill_plan"}
+    try:
+        doc = MH.load_plan(plan_file)
+        fresh = BP.replan(doc, root)
+    except Exception as exc:                          # noqa: BLE001 - an unreadable plan / vanished universe is a stated non-answer, not a traceback
+        return {"verdict": "NOT_ASSESSED", "reason": f"the plan could not be re-derived: {type(exc).__name__}: {str(exc)[:200]}"}
+    ok = bool(fresh["readiness"]["research_ready"]) and fresh["same_universe_as_sealed_plan"] and fresh["same_symbol_set_as_sealed_plan"]
+    return {"verdict": "RESEARCH_READY" if ok else "NOT_RESEARCH_READY", "plan_digest": doc["plan_digest"], "window_days": fresh["window"]["effective_days"], "eligible_symbols": fresh["eligible_count"],
+            "unmet": fresh["readiness"]["unmet"], "blockers": fresh["blockers"], "same_universe_as_sealed_plan": fresh["same_universe_as_sealed_plan"],
+            "same_symbol_set_as_sealed_plan": fresh["same_symbol_set_as_sealed_plan"], "basis": "backfill_plan re-derived now from the sealed plan's parameters against this root"}
 
 
 def _status_partitions(root: str, explicit: Optional[str], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -290,7 +345,7 @@ def _backup_section(root: str, health: Optional[Mapping[str, Any]], live: Mappin
 
 def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[str] = None, universe_capture: Optional[str] = None, verify: bool = True, history_max_age_ms: Optional[int] = None,
           backup_dir: Optional[str] = None, receipts: Optional[str] = None, seal_manifest: Optional[str] = None, ops_max_age_ms: Optional[int] = None,
-          clock: Callable[[], int] = lambda: int(time.time() * 1000)) -> Dict[str, Any]:
+          plan_file: Optional[str] = None, clock: Callable[[], int] = lambda: int(time.time() * 1000)) -> Dict[str, Any]:
     now = int(clock()) if now_ms is None else now_ms
     root = os.path.abspath(root)
     problems = MC.root_guard(root, 0)
@@ -344,10 +399,11 @@ def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[st
             reasons.append({"code": "NO_HISTORY_DATASETS", "detail": "no market_history dataset in the root"})
         readiness = "READY" if not reasons else "NOT_READY"
         ready_issues = reasons
-    return {"schema": SCHEMA, "root": root, "now_ms": now,
+    vocab = _readiness_vocabulary(history, has_rows, _plan_assessment(plan_file, root))
+    return {"schema": SCHEMA, "root": root, "now_ms": now, "readiness_vocabulary": vocab,
             "axes": {"code_correctness": {"verdict": "NOT_ASSESSED", "note": "not assessed by this tool; see the CI correctness gate"},
                      "data_freshness": {"verdict": freshness, "issues": [i for i in issues if i["axis"] == "data_freshness" or i.get("level") == "STALE"]},
-                     "research_readiness": {"verdict": readiness, "issues": ready_issues}},
+                     "research_readiness": {"verdict": readiness, "issues": ready_issues, "scope": "coverage of a declared symbol list by COMPLETE history datasets; NOT strategy readiness (see readiness_vocabulary)"}},
             "cycles": cycles, "history": history, "status_partitions": parts, "backups": backups, "collector_health": health,
             "note": "read-only; HEALTHY needs real complete fresh data AND a passing backup and restore-check; NO_DATA is never healthy"}
 
@@ -362,11 +418,12 @@ def main(argv: Optional[Sequence[str]] = None, *, clock: Callable[[], int] = lam
     ap.add_argument("--now-ms", type=int)
     ap.add_argument("--history-max-age-ms", type=int, help="a history dataset whose requested window ended longer ago than this is STALE (default: 3 days)")
     ap.add_argument("--ops-max-age-ms", type=int, help="the newest seal / backup receipt / restore-check older than this is STALE (default: 3 days, tightened by the collector's recorded cadence)")
+    ap.add_argument("--plan", help="a sealed backfill_plan --out file: RESEARCH_READY is judged by re-deriving that plan against --root (never from the file's own claim)")
     ap.add_argument("--require-ready", action="store_true")
     a = ap.parse_args(argv)
     try:
         rep = audit(a.root, now_ms=a.now_ms, universe_file=a.research_universe, universe_capture=a.universe_capture, verify=not a.skip_verify, history_max_age_ms=a.history_max_age_ms, ops_max_age_ms=a.ops_max_age_ms, backup_dir=a.backup_dir,
-                    receipts=a.receipts, seal_manifest=a.seal_manifest, clock=clock)
+                    receipts=a.receipts, seal_manifest=a.seal_manifest, plan_file=a.plan, clock=clock)
     except Exception as exc:                          # noqa: BLE001 - damaged input is a clean message and a non-zero exit, never a traceback
         print(f"data_freshness_audit: {type(exc).__name__}: {str(exc)[:300]}", file=sys.stderr)
         return 2

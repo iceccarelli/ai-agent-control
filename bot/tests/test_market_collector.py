@@ -5,6 +5,7 @@ import ast
 import json
 import os
 import random
+from decimal import Decimal
 import socket
 import stat
 import sys
@@ -1467,3 +1468,197 @@ def test_the_collector_still_cannot_sign_post_or_name_an_account_path_after_the_
     calls = " ".join(ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call))
     assert "subprocess" not in calls and "environ" not in calls and "getenv" not in calls
     assert {"subprocess", "socket", "requests", "hmac"}.isdisjoint({a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names})
+
+
+# ---------------------------------------------------------------- cohort_v2: the execution-data cohort
+
+def ctick(sym, turnover="5000000", **over):
+    """A liquid ticker: 2 bps spread, 5000 USDT on the thin side, 2M open interest."""
+    base = dict(openInterestValue="2000000", bid1Price="100.49", ask1Price="100.51", bid1Size="50", ask1Size="60", fundingRate="0.0001")
+    base.update(over)
+    return tick(sym, turnover, **base)
+
+
+def crec(sym, **over):
+    r = {"symbol": sym, "status": "Trading", "fundingInterval_min": 480, "tickSize": "0.10", "qtyStep": "0.001", "minOrderQty": "0.001"}
+    r.update(over)
+    return r
+
+
+def cohort_world(n=6):
+    syms = [f"C{i:02d}USDT" for i in range(n)]
+    tickers = {s: dict(ctick(s, str(5_000_000 + 1_000_000 * i), openInterestValue=str(2_000_000 + 100_000 * i)), symbol=s) for i, s in enumerate(syms)}
+    for t in tickers.values():
+        t.pop("symbol")
+    return tickers, {s: crec(s) for s in syms}, syms
+
+
+def test_cohort_v2_selects_by_the_recorded_rule_and_lists_inputs_and_rejections():
+    tickers, uni, syms = cohort_world()
+    uni["CLOSEDUSDT"] = crec("CLOSEDUSDT", status="Closed")
+    tickers["CLOSEDUSDT"] = ctick("CLOSEDUSDT", "99999999")                  # the biggest turnover of all, but not Trading
+    res = MC.select_cohort_v2(tickers, uni, 3)
+    assert res["rule"] == "cohort_v2" == MC.COHORT_RULE and res["params"] == MC.COHORT_PARAMS_V2 and res["eligible_count"] == 6
+    assert [s["symbol"] for s in res["selected"]] == ["C05USDT", "C04USDT", "C03USDT"]          # every input is monotone in i here, so the order is by rank
+    assert res["selected"][0]["rank"] == 1 and set(res["selected"][0]["rank_components"]) == set(MC.COHORT_PARAMS_V2["weights"])
+    assert {"turnover24h", "openInterestValue", "fundingRate", "spread_bps", "top_depth_usdt", "score"} <= set(res["selected"][0])
+    assert res["rejected"] == [{"symbol": "CLOSEDUSDT", "reasons": ["status:Closed"]}] and res["rejected_by_reason"] == {"status:Closed": 1}
+    assert [b["symbol"] for b in res["ranked_below_cut"]] == ["C02USDT", "C01USDT", "C00USDT"]
+    assert len(res["inputs_sha256"]) == 64
+
+
+def test_cohort_v2_is_deterministic_and_independent_of_input_order():
+    tickers, uni, syms = cohort_world(8)
+    for s in syms[:4]:
+        tickers[s].update(turnover24h="7000000", openInterestValue="3000000")          # exact ties on two inputs: broken by the total order, not by arrival
+    base = MC.select_cohort_v2(tickers, uni, 5)
+    again = MC.select_cohort_v2(tickers, uni, 5)
+    assert base == again
+    for seed in range(15):
+        ti, ui = list(tickers.items()), list(uni.items())
+        random.Random(seed).shuffle(ti)
+        random.Random(seed + 99).shuffle(ui)
+        assert MC.select_cohort_v2(dict(ti), dict(ui), 5) == base
+    tie = MC.select_cohort_v2({s: dict(tickers[syms[0]]) for s in ("ZZZUSDT", "AAAUSDT")}, {s: crec(s) for s in ("ZZZUSDT", "AAAUSDT")}, 2)
+    assert [x["symbol"] for x in tie["selected"]] == ["AAAUSDT", "ZZZUSDT"]               # identical inputs: symbol ascending
+
+
+@pytest.mark.parametrize("sym_over,tick_over,reason", [
+    ({"status": "PreLaunch"}, {}, "status:PreLaunch"),
+    ({"tickSize": None}, {}, "instrument_rule_missing:tickSize"),
+    ({"qtyStep": "0"}, {}, "instrument_rule_missing:qtyStep"),
+    ({"minOrderQty": ""}, {}, "instrument_rule_missing:minOrderQty"),
+    ({}, {"turnover24h": "10"}, "turnover_below_min"),
+    ({}, {"turnover24h": "0"}, "turnover_invalid_or_zero"),
+    ({}, {"openInterestValue": "10"}, "open_interest_below_min"),
+    ({}, {"bid1Price": "100.0", "ask1Price": "101.0"}, "spread_above_max"),
+    ({}, {"bid1Size": "0.01"}, "top_depth_below_min"),
+    ({}, {"ask1Size": "0.01"}, "top_depth_below_min"),
+    ({}, {"bid1Size": None}, "depth_unknown"),
+    ({"fundingInterval_min": None}, {}, "funding_unknown"),
+])
+def test_a_symbol_failing_any_eligibility_gate_is_never_selected(sym_over, tick_over, reason):
+    tickers, uni, syms = cohort_world(4)
+    bad = "BADUSDT"
+    uni[bad] = crec(bad, **sym_over)
+    t = ctick(bad, "99999999", openInterestValue="9000000", bid1Size="500", ask1Size="500")      # it would WIN on every scored input if it were allowed in
+    t.update(tick_over)
+    tickers[bad] = {k: v for k, v in t.items() if v is not None}
+    res = MC.select_cohort_v2(tickers, uni, 10)
+    assert bad not in [s["symbol"] for s in res["selected"]] and bad not in [s["symbol"] for s in res["ranked_below_cut"]]
+    rej = {r["symbol"]: r["reasons"] for r in res["rejected"]}
+    assert reason in rej[bad]
+    # positive control: the same symbol with healthy inputs is selected FIRST (so the gate, not the scoring, kept it out)
+    uni[bad], tickers[bad] = crec(bad), ctick(bad, "99999999", openInterestValue="9000000", bid1Size="500", ask1Size="500")
+    assert MC.select_cohort_v2(tickers, uni, 10)["selected"][0]["symbol"] == bad
+
+
+def test_symbols_without_a_ticker_or_a_universe_record_are_rejected_not_dropped_silently():
+    tickers, uni, _ = cohort_world(3)
+    uni["NOTICKUSDT"] = crec("NOTICKUSDT")
+    tickers["ORPHANUSDT"] = ctick("ORPHANUSDT")
+    res = MC.select_cohort_v2(tickers, uni, 10)
+    rej = {r["symbol"]: r["reasons"] for r in res["rejected"]}
+    assert "no_valid_ticker" in rej["NOTICKUSDT"] and "not_in_universe" in rej["ORPHANUSDT"]
+    assert res["eligible_count"] == 3 and res["rejected_count"] == 2
+
+
+def test_no_selected_symbol_ever_fails_a_gate_over_random_worlds():
+    rnd = random.Random(7)
+    for trial in range(40):
+        syms = [f"R{trial}{i:02d}USDT"[:12] for i in range(12)]
+        tickers, uni = {}, {}
+        for s in syms:
+            uni[s] = crec(s, status=rnd.choice(["Trading", "Trading", "Closed", "PreLaunch"]), tickSize=rnd.choice(["0.1", "0.1", None]) or "")
+            tickers[s] = {k: v for k, v in ctick(s, str(rnd.choice([10, 900_000, 1_000_000, 8_000_000])), openInterestValue=str(rnd.choice([1, 400_000, 500_000, 9_000_000])),
+                                                 bid1Price="100.0", ask1Price=str(rnd.choice(["100.05", "100.2"])), bid1Size=str(rnd.choice([1, 100])), ask1Size="100").items()}
+        res = MC.select_cohort_v2(tickers, uni, rnd.randint(0, 12))
+        for sel in res["selected"]:
+            t, u = tickers[sel["symbol"]], uni[sel["symbol"]]
+            assert u["status"] == "Trading" and u["tickSize"] and int(t["turnover24h"]) >= 1_000_000 and int(t["openInterestValue"]) >= 500_000
+            assert Decimal(t["ask1Price"]) - Decimal(t["bid1Price"]) <= Decimal("0.1") and Decimal(t["bid1Size"]) * Decimal(t["bid1Price"]) >= 2000
+
+
+def test_cohort_params_are_validated_and_recorded():
+    tickers, uni, _ = cohort_world(3)
+    custom = json.loads(json.dumps(MC.COHORT_PARAMS_V2))
+    custom["min_turnover24h_usdt"] = "5500000"
+    res = MC.select_cohort_v2(tickers, uni, 10, custom)
+    assert res["params"]["min_turnover24h_usdt"] == "5500000" and res["eligible_count"] == 2
+    assert res["inputs_sha256"] != MC.select_cohort_v2(tickers, uni, 10)["inputs_sha256"]
+    for bad in ({"min_turnover24h_usdt": "x"}, {"weights": {"turnover24h": 1}}, {"weights": {**custom["weights"], "top_depth": -1}}, {"weights": {**custom["weights"], "top_depth": True}}):
+        with pytest.raises(MC.CollectorError):
+            MC.select_cohort_v2(tickers, uni, 3, {**custom, **bad})
+    with pytest.raises(MC.CollectorError):
+        MC.select_cohort_v2(tickers, uni, -1)
+    assert MC.select_cohort_v2(tickers, uni, 0)["selected"] == []
+
+
+def test_the_default_rule_is_unchanged_and_both_are_selectable(root):
+    assert MC.SELECTION_RULE == "turnover24h_desc_symbol_asc_v1" and MC.SELECTION_RULES == ("turnover24h_desc_symbol_asc_v1", "cohort_v2")
+    v = Venue()
+    assert manifest_of(root, cycle(root, v, max_symbols=2))["selection"]["rule"] == "turnover24h_desc_symbol_asc_v1"
+    with pytest.raises(MC.CollectorError):
+        cycle(root, Venue(), i=1, selection_rule="made_up_v9")
+
+
+def test_a_cohort_cycle_records_rule_inputs_selected_and_rejected_and_captures_books_only_for_the_cohort(root):
+    syms = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "THINUSDT", "XRPUSDT")
+    rows = [inst(s) for s in syms]
+    rows[4]["status"] = "PreLaunch"                                              # not Trading: rejected
+    tickers = [ctick("BTCUSDT", "9000000"), ctick("ETHUSDT", "8000000"), ctick("SOLUSDT", "7000000"), ctick("THINUSDT", "6000000", bid1Size="0.01"), ctick("XRPUSDT", "5000000")]
+    v = Venue(pages={"": rows}, tickers=tickers)
+    res = cycle(root, v, max_symbols=2, selection_rule="cohort_v2")
+    assert res["status"] == "OK", res
+    m = manifest_of(root, res)
+    sel = m["selection"]
+    assert sel["rule"] == "cohort_v2" and sel["params"] == MC.COHORT_PARAMS_V2 and sel["max_symbols"] == 2
+    assert [s["symbol"] for s in sel["selected"]] == ["BTCUSDT", "ETHUSDT"]
+    rej = {r["symbol"]: r["reasons"] for r in sel["rejected"]}
+    assert rej["THINUSDT"] == ["top_depth_below_min"] and rej["XRPUSDT"] == ["status:PreLaunch"]
+    assert sel["as_of_ms"] == m["artifacts"][0]["recv_ms"] and sel["source"]["sha256"] == m["artifacts"][0]["sha256"] and len(sel["inputs_sha256"]) == 64
+    booked = {u.split("symbol=")[1].split("&")[0] for u in v.urls if "orderbook" in u or "recent-trade" in u}
+    assert booked == {"BTCUSDT", "ETHUSDT"}                                           # the wider universe gets no book / trade capture
+    assert MC.verify_cycle_dir(os.path.join(str(root), m["cycle"])) == []
+
+
+def test_a_cohort_cycle_with_an_empty_cohort_is_partial_not_ok(root):
+    v = Venue(tickers=[tick(s) for s in SYMS])                                         # the default fixture tickers are all too thin / too wide for cohort_v2
+    m = manifest_of(root, cycle(root, v, max_symbols=3, selection_rule="cohort_v2"))
+    assert m["selection"]["selected"] == [] and m["status"] == "PARTIAL" and "symbols_selected==0" in m["partial_reasons"]
+    assert m["selection"]["rejected_count"] == 5 and "spread_above_max" in m["selection"]["rejected"][0]["reasons"]
+
+
+def test_cohort_cli_flag_is_wired(root, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(MC, "run_once", lambda *a, **k: seen.update(k) or {"status": "OK"})
+    assert MC.main(["run-once", "--out-root", str(root), "--selection-rule", "cohort_v2"]) == 0
+    assert seen["selection_rule"] == "cohort_v2"
+    monkeypatch.setattr(MC, "run_continuous", lambda *a, **k: seen.update(k) or {"status": "STOPPED"})
+    assert MC.main(["run-continuous", "--out-root", str(root), "--max-cycles", "1", "--selection-rule", "cohort_v2"]) == 0
+    assert seen["selection_rule"] == "cohort_v2"
+
+
+def test_the_cohort_function_reads_nothing_but_its_arguments():
+    src = open(os.path.join(BOT, "tools", "market_collector.py")).read()
+    fn = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "select_cohort_v2")
+    assert [a.arg for a in fn.args.args] == ["tickers", "universe", "max_symbols", "params"]
+    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)} | {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert not names & {"time", "clock", "open", "os", "previous", "prev", "history", "returns", "price24hPcnt", "fetch", "random"}
+
+
+def test_cohort_score_ties_break_on_turnover_then_symbol():
+    # ZZZ leads on turnover (+4); AAA leads on funding and depth (+2 +2): equal scores, so turnover decides, not the alphabet
+    tickers = {"ZZZUSDT": ctick("ZZZUSDT", "9000000", fundingRate="0.0001", bid1Size="50"), "AAAUSDT": ctick("AAAUSDT", "8000000", fundingRate="0.0009", bid1Size="90")}
+    res = MC.select_cohort_v2(tickers, {s: crec(s) for s in tickers}, 2)
+    assert [x["score"] for x in res["selected"]] == [4, 4] and [x["symbol"] for x in res["selected"]] == ["ZZZUSDT", "AAAUSDT"]
+
+
+def test_cohort_funding_opportunity_is_per_day_not_per_print():
+    # AAA pays more per print but settles every 8h; ZZZ pays less per print but settles hourly: ZZZ is the larger opportunity per day
+    tickers = {"AAAUSDT": ctick("AAAUSDT", fundingRate="0.0003"), "ZZZUSDT": ctick("ZZZUSDT", fundingRate="0.0002")}
+    uni = {"AAAUSDT": crec("AAAUSDT", fundingInterval_min=480), "ZZZUSDT": crec("ZZZUSDT", fundingInterval_min=60)}
+    res = MC.select_cohort_v2(tickers, uni, 2)
+    assert [x["symbol"] for x in res["selected"]] == ["ZZZUSDT", "AAAUSDT"] and res["selected"][0]["funding_per_day_abs"] == "0.00480000"
+    assert MC.select_cohort_v2({"AAAUSDT": ctick("AAAUSDT", fundingRate="-0.0009"), "ZZZUSDT": ctick("ZZZUSDT", fundingRate="0.0001")}, {s: crec(s) for s in ("AAAUSDT", "ZZZUSDT")}, 1)[
+        "selected"][0]["symbol"] == "AAAUSDT"                                                   # a large NEGATIVE funding rate is an opportunity too (absolute value)

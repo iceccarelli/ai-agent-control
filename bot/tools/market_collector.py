@@ -18,6 +18,12 @@ THIS cycle's universe with status ``Trading`` and a valid ticker row with ``turn
 ASCENDING; take the first ``max_symbols``. It reads no other cycle, no price history and no return. The rule id, the as-of time (the ticker receive time), the
 source file hash and the chosen symbols with their turnover are written to the manifest, so the choice is auditable and not retroactive.
 
+EXECUTION-DATA COHORT (``cohort_v2``, ``--selection-rule cohort_v2``; the default stays ``turnover24h_desc_symbol_asc_v1``). Which symbols get order-book and recent-trade capture:
+hard gates (status Trading, instrument rules present, valid ticker, minimum turnover / open interest / top-of-book depth, maximum spread) then an integer weighted-rank score over
+turnover, open interest, |funding| per day, depth and spread, total order score desc / turnover desc / symbol asc. The rule id, its thresholds and weights, an inputs digest, the
+selected symbols with their inputs and the rejected symbols with every reason are written to each cycle manifest. Funding and price research covers the wider universe through
+``market_history``; the cohort is NOT a performance claim and funding is one of its inputs, so never evaluate an edge on cohort-selected rows.
+
 Cycle layout (a NEW directory per run, nothing overwritten, files 0600, directories 0700):
     cycle-<now_ms>/universe/...   universe_capture's own output (raw pages, tickers.json, universe-*.jsonl, manifest.json)
     cycle-<now_ms>/tickers.jsonl  validated ticker rows (derived; the raw bytes are universe/tickers.json)
@@ -69,6 +75,8 @@ PATH_TRADES = "/v5/market/recent-trade"
 PUBLIC_PATHS = (UC.PATH_INSTRUMENTS, UC.PATH_TICKERS, PATH_BOOK, PATH_TRADES)
 CATEGORY = "linear"
 SELECTION_RULE = "turnover24h_desc_symbol_asc_v1"
+COHORT_RULE = "cohort_v2"
+SELECTION_RULES = (SELECTION_RULE, COHORT_RULE)
 RATE_LIMIT_RETCODE = 10006
 MAX_BODY_BYTES = UC.MAX_BODY_BYTES
 TIMEOUT_S = 15.0
@@ -483,6 +491,130 @@ def select_symbols(tickers: Mapping[str, Mapping[str, Any]], eligible: Set[str],
     return [{"symbol": s, "turnover24h": tickers[s]["turnover24h"]} for _, s in cand[:max_symbols]]
 
 
+# ---------------------------------------------------------------- execution-data cohort (cohort_v2): which symbols get order-book / recent-trade capture
+
+COHORT_PARAMS_V2: Dict[str, Any] = {
+    "min_turnover24h_usdt": "1000000", "min_open_interest_value_usdt": "500000", "max_spread_bps": "10", "min_top_depth_usdt": "2000",
+    "weights": {"turnover24h": 4, "open_interest_value": 3, "funding_per_day_abs": 2, "top_depth": 2, "spread_tightness": 1},
+    "required_instrument_rules": ["tickSize", "qtyStep", "minOrderQty"],
+}
+MAX_REJECTED_LISTED = 2000
+
+
+def _cohort_dec(v: Any) -> Optional[Decimal]:
+    return _dec(v, nonneg=True, bounded=True) if isinstance(v, str) else None
+
+
+def select_cohort_v2(tickers: Mapping[str, Mapping[str, Any]], universe: Mapping[str, Mapping[str, Any]], max_symbols: int,
+                     params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """``cohort_v2``: the symbols that get ORDER-BOOK and RECENT-TRADE capture (execution data). Funding and price research covers the whole eligible universe through
+    ``market_history``; this cohort is only where depth is worth paying for. A pure function of THIS cycle's tickers and universe records and of ``params`` (all recorded).
+
+    HARD GATES (a symbol failing ANY is rejected with every reason and can never be selected): instrument status ``Trading``; instrument rules present (tickSize, qtyStep,
+    minOrderQty: positive decimals); a valid ticker row; turnover24h >= min; open interest value >= min; top-of-book spread <= max bps; top-of-book depth (the thinner side's
+    size x price) known and >= min. SCORE among the survivors: an integer sum of weighted competition ranks (rank = how many survivors are strictly worse) over turnover24h,
+    open interest value, |funding| per day (fundingRate x 24 / interval hours; interval from the instrument record), top depth and spread tightness. Order: score desc, turnover
+    desc, symbol asc: a total order, so the result is identical for any input ordering. Weights and thresholds are in ``params`` and in the manifest.
+    This is an execution-data cohort, NOT a performance claim: funding is one input, so a cohort-selected sample must never be used to evaluate an edge."""
+    if isinstance(max_symbols, bool) or not isinstance(max_symbols, int) or max_symbols < 0:
+        raise CollectorError("max_symbols must be a non-negative whole number")
+    prm = json.loads(json.dumps(dict(params) if params is not None else COHORT_PARAMS_V2))
+    for k in ("min_turnover24h_usdt", "min_open_interest_value_usdt", "max_spread_bps", "min_top_depth_usdt"):
+        if _cohort_dec(prm.get(k)) is None:
+            raise CollectorError(f"cohort params: {k} must be a non-negative decimal string")
+    w = prm.get("weights")
+    if not isinstance(w, dict) or set(w) != set(COHORT_PARAMS_V2["weights"]) or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in w.values()):
+        raise CollectorError("cohort params: weights must be non-negative integers for exactly the five scored inputs")
+    mt, moi, msp, mdp = (Decimal(prm[k]) for k in ("min_turnover24h_usdt", "min_open_interest_value_usdt", "max_spread_bps", "min_top_depth_usdt"))
+    need_rules = list(prm.get("required_instrument_rules") or [])
+    cand: Dict[str, Dict[str, Any]] = {}
+    rejected: List[Dict[str, Any]] = []
+    for sym in sorted(set(universe) | set(tickers)):
+        if not isinstance(sym, str) or not _SYMBOL.fullmatch(sym):
+            raise CollectorError("refusing to consider a symbol that is not a short upper-case token")
+        rec, t = universe.get(sym), tickers.get(sym)
+        why: List[str] = []
+        if rec is None:
+            why.append("not_in_universe")
+        elif rec.get("status") != "Trading":
+            why.append(f"status:{rec.get('status')}")
+        if rec is not None:
+            for r in need_rules:
+                d = _cohort_dec(rec.get(r)) if isinstance(rec.get(r), str) else None
+                if d is None or d <= 0:
+                    why.append(f"instrument_rule_missing:{r}")
+        if t is None:
+            why.append("no_valid_ticker")
+        row: Dict[str, Any] = {}
+        if t is not None:
+            turn, oi = _cohort_dec(t.get("turnover24h")), _cohort_dec(t.get("openInterestValue"))
+            bid, ask = _cohort_dec(t.get("bid1Price")), _cohort_dec(t.get("ask1Price"))
+            bsz, asz = _cohort_dec(t.get("bid1Size")), _cohort_dec(t.get("ask1Size"))
+            fr = _dec(t.get("fundingRate"), signed=True)
+            if turn is None or turn <= 0:
+                why.append("turnover_invalid_or_zero")
+            elif turn < mt:
+                why.append("turnover_below_min")
+            if oi is None:
+                why.append("open_interest_value_unknown")
+            elif oi < moi:
+                why.append("open_interest_below_min")
+            spread = depth = None
+            if bid is None or ask is None or bid <= 0 or ask <= bid:
+                why.append("spread_unknown")
+            else:
+                spread = (ask - bid) * 20000 / (ask + bid)                 # (ask-bid)/mid in bps, mid = (ask+bid)/2
+                if spread > msp:
+                    why.append("spread_above_max")
+            if bsz is None or asz is None or bid is None or ask is None or bid <= 0 or ask <= 0:
+                why.append("depth_unknown")
+            else:
+                depth = min(bsz * bid, asz * ask)
+                if depth < mdp:
+                    why.append("top_depth_below_min")
+            ihr = None
+            if rec is not None and isinstance(rec.get("fundingInterval_min"), int) and not isinstance(rec.get("fundingInterval_min"), bool) and rec["fundingInterval_min"] > 0:
+                ihr = Decimal(rec["fundingInterval_min"]) / 60
+            if fr is None or ihr is None:
+                why.append("funding_unknown")
+            row = {"turnover24h": t.get("turnover24h"), "openInterestValue": t.get("openInterestValue"), "fundingRate": t.get("fundingRate"), "_turn": turn, "_oi": oi, "_spread": spread,
+                   "_depth": depth, "_fund": (abs(fr) * 24 / ihr) if (fr is not None and ihr is not None) else None}
+        if why:
+            rejected.append({"symbol": sym, "reasons": sorted(set(why))})
+        else:
+            cand[sym] = row
+    syms = sorted(cand)
+
+    def comp_rank(key: str, higher_is_better: bool = True) -> Dict[str, int]:
+        vals = {s: cand[s][key] for s in syms}
+        return {s: sum(1 for o in syms if (vals[o] < vals[s] if higher_is_better else vals[o] > vals[s])) for s in syms}
+    ranks = {"turnover24h": comp_rank("_turn"), "open_interest_value": comp_rank("_oi"), "funding_per_day_abs": comp_rank("_fund"), "top_depth": comp_rank("_depth"),
+             "spread_tightness": comp_rank("_spread", higher_is_better=False)}
+    scored = []
+    for s in syms:
+        comps = {k: ranks[k][s] for k in ranks}
+        score = sum(w[k] * comps[k] for k in comps)
+        scored.append((-score, -cand[s]["_turn"], s, comps, score))
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    selected = []
+    for i, (_a, _b, s, comps, score) in enumerate(scored[:max_symbols], 1):
+        c = cand[s]
+        selected.append({"symbol": s, "turnover24h": c["turnover24h"], "rank": i, "score": score, "rank_components": comps, "openInterestValue": c["openInterestValue"],
+                         "fundingRate": c["fundingRate"], "spread_bps": format(c["_spread"].quantize(Decimal("0.0001")), "f"), "top_depth_usdt": format(c["_depth"].quantize(Decimal("0.01")), "f"),
+                         "funding_per_day_abs": format(c["_fund"].quantize(Decimal("0.00000001")), "f")})
+    by_reason: Dict[str, int] = {}
+    for r in rejected:
+        for x in r["reasons"]:
+            by_reason[x] = by_reason.get(x, 0) + 1
+    # the not-selected survivors are listed too: ranked below the cut, not rejected
+    below = [{"symbol": s, "score": sc, "rank": i} for i, (_a, _b, s, _c, sc) in enumerate(scored[max_symbols:], max_symbols + 1)]
+    inputs = [{"symbol": s, **{k: cand[s][k] for k in ("turnover24h", "openInterestValue", "fundingRate")}} for s in syms]
+    return {"rule": COHORT_RULE, "params": prm, "selected": selected, "eligible_count": len(syms), "rejected_count": len(rejected), "rejected_by_reason": dict(sorted(by_reason.items())),
+            "rejected": rejected[:MAX_REJECTED_LISTED], "rejected_truncated": len(rejected) > MAX_REJECTED_LISTED, "ranked_below_cut": below[:MAX_REJECTED_LISTED],
+            "inputs_sha256": _sha(json.dumps([inputs, prm], sort_keys=True, separators=(",", ":")).encode()),
+            "note": "execution-data cohort: depth capture only; funding/price research covers the wider universe via market_history; never evaluate an edge on cohort-selected rows"}
+
+
 # ---------------------------------------------------------------- filesystem helpers
 
 def _write(path: str, data: bytes) -> None:
@@ -732,12 +864,14 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
              sleep: Callable[[float], None] = time.sleep, max_symbols: int = DEFAULT_MAX_SYMBOLS, depth: int = DEFAULT_DEPTH,
              trades_limit: int = DEFAULT_TRADES, interval_ms: int = DEFAULT_INTERVAL_MS, reserve_bytes: int = DEFAULT_RESERVE_BYTES,
              max_bytes: int = DEFAULT_MAX_BYTES, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free,
-             max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S) -> Dict[str, Any]:
+             max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S, selection_rule: str = SELECTION_RULE) -> Dict[str, Any]:
     """ONE capture cycle into a NEW directory. Returns a report; refusals (storage, a broken log, a non-advancing clock) are reported, not raised."""
     for name, v in (("now_ms", now_ms), ("interval_ms", interval_ms)):
         _check_ms(name, v)
     if not 0 <= max_symbols <= 500 or not 1 <= depth <= MAX_DEPTH or not 1 <= trades_limit <= MAX_TRADES:
         raise CollectorError("max_symbols/depth/trades_limit out of bounds")
+    if selection_rule not in SELECTION_RULES:
+        raise CollectorError(f"selection_rule must be one of {SELECTION_RULES}")
     root = os.path.abspath(out_root)
     parent = os.path.dirname(root)
     if os.path.islink(root) or os.path.islink(parent) or not os.path.isdir(parent):
@@ -746,13 +880,14 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
     os.makedirs(root, mode=0o700, exist_ok=True)
     try:
         with _locked(root):
-            return _run_locked(root, now_ms, fetch, clock, sleep, max_symbols, depth, trades_limit, interval_ms, reserve_bytes, max_bytes, free_bytes_fn, max_retries, backoff_s)
+            return _run_locked(root, now_ms, fetch, clock, sleep, max_symbols, depth, trades_limit, interval_ms, reserve_bytes, max_bytes, free_bytes_fn, max_retries, backoff_s, selection_rule)
     except Locked as exc:
         return _refuse("REFUSED_LOCKED", reason=str(exc))
 
 
 def _run_locked(root: str, now_ms: int, fetch: Callable[[str], bytes], clock: Callable[[], int], sleep: Callable[[float], None], max_symbols: int, depth: int,
-                trades_limit: int, interval_ms: int, reserve_bytes: int, max_bytes: int, free_bytes_fn: Callable[[str], int], max_retries: int, backoff_s: float) -> Dict[str, Any]:
+                trades_limit: int, interval_ms: int, reserve_bytes: int, max_bytes: int, free_bytes_fn: Callable[[str], int], max_retries: int, backoff_s: float,
+                selection_rule: str = SELECTION_RULE) -> Dict[str, Any]:
     # storage budget: refuse BEFORE anything is created, and report
     used, free = _tree_bytes(root), int(free_bytes_fn(root))
     if free < reserve_bytes or used > max_bytes:
@@ -820,7 +955,7 @@ def _run_locked(root: str, now_ms: int, fetch: Callable[[str], bytes], clock: Ca
     errors: List[str] = []
     artifacts: List[Dict[str, Any]] = []
     counts: Dict[str, Any] = {}
-    selection: Dict[str, Any] = {"rule": SELECTION_RULE, "as_of_ms": None, "source": None, "max_symbols": max_symbols, "selected": []}
+    selection: Dict[str, Any] = {"rule": selection_rule, "as_of_ms": None, "source": None, "max_symbols": max_symbols, "selected": []}
     umanifest: Optional[Dict[str, Any]] = None
     try:
         # (a) universe + (b) ticker snapshot: universe_capture's own capture (raw bytes, cursor chain, duplicates, skew)
@@ -850,8 +985,12 @@ def _run_locked(root: str, now_ms: int, fetch: Callable[[str], bytes], clock: Ca
             uni = UC.load_universe(ufile)
             eligible = {s for s, r in uni.items() if r.get("status") == "Trading"}
             selection.update({"as_of_ms": umanifest["tickers"]["recv_ms"], "source": {"file": "universe/tickers.json", "sha256": umanifest["tickers"]["sha256"]}})
-            selection["selected"] = select_symbols(tickers, eligible, max_symbols)
-            selection["eligible_count"] = sum(1 for s in tickers if s in eligible and Decimal(tickers[s]["turnover24h"]) > 0)
+            if selection_rule == COHORT_RULE:
+                coh = select_cohort_v2(tickers, uni, max_symbols)
+                selection.update({k: v for k, v in coh.items() if k != "rule"})
+            else:
+                selection["selected"] = select_symbols(tickers, eligible, max_symbols)
+                selection["eligible_count"] = sum(1 for s in tickers if s in eligible and Decimal(tickers[s]["turnover24h"]) > 0)
 
             # (c) order books, (d) recent trades: same bounded symbols, in selection order
             os.makedirs(os.path.join(cdir, "books"), mode=0o700)
@@ -1321,7 +1460,7 @@ def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, dur
                    reserve_bytes: int = DEFAULT_RESERVE_BYTES, max_bytes: int = DEFAULT_MAX_BYTES, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free,
                    seal_manifest: Optional[str] = None, backup_to: Optional[str] = None, receipts: Optional[str] = None, seal_every: int = 60, backup_every: int = 60,
                    restore_check_every: int = 0, max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES, health_path: Optional[str] = None,
-                   max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S) -> Dict[str, Any]:
+                   max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S, selection_rule: str = SELECTION_RULE) -> Dict[str, Any]:
     """Repeat ``run_once`` every ``interval_ms`` until a duration/``until_ms``/``max_cycles`` limit, an explicit ``stop_file``, the disk guard, a refusal that needs the owner
     (broken log, held lock, storage budget) or ``max_consecutive_failures``. Restart-safe: every cycle is a new directory and ``run_once`` itself sets aside an interrupted one and
     adopts a COMPLETE-but-unrecorded one, so killing and restarting this loop loses at most the cycle in flight. Seal / backup / restore-check hooks run every N cycles when
@@ -1396,7 +1535,7 @@ def run_continuous(out_root: str, *, interval_ms: int = DEFAULT_INTERVAL_MS, dur
             t_cycle = now
             try:
                 res = run_once(root, t_cycle, fetch, clock, sleep=sleep, max_symbols=max_symbols, depth=depth, trades_limit=trades_limit, interval_ms=interval_ms,
-                               reserve_bytes=reserve_bytes, max_bytes=max_bytes, free_bytes_fn=free_bytes_fn, max_retries=max_retries, backoff_s=backoff_s)
+                               reserve_bytes=reserve_bytes, max_bytes=max_bytes, free_bytes_fn=free_bytes_fn, max_retries=max_retries, backoff_s=backoff_s, selection_rule=selection_rule)
             except CollectorError as exc:
                 res = {"status": "ABORTED", "reason": f"{type(exc).__name__}: {exc}"}
             cycles += 1
@@ -1457,6 +1596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     r = sub.add_parser("run-once")
     r.add_argument("--out-root", required=True)
     r.add_argument("--max-symbols", type=int, default=DEFAULT_MAX_SYMBOLS)
+    r.add_argument("--selection-rule", choices=SELECTION_RULES, default=SELECTION_RULE, help="which symbols get book/trade capture (cohort_v2: turnover, OI, funding, depth, spread, eligibility)")
     r.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
     r.add_argument("--trades-limit", type=int, default=DEFAULT_TRADES)
     r.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
@@ -1470,6 +1610,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cn.add_argument("--stop-file", help="the run stops cleanly when this path exists (touch it)")
     cn.add_argument("--max-cycles", type=int)
     cn.add_argument("--max-symbols", type=int, default=DEFAULT_MAX_SYMBOLS)
+    cn.add_argument("--selection-rule", choices=SELECTION_RULES, default=SELECTION_RULE)
     cn.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
     cn.add_argument("--trades-limit", type=int, default=DEFAULT_TRADES)
     cn.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES)
@@ -1492,13 +1633,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if a.cmd == "run-once":
             res = run_once(a.out_root, int(time.time() * 1000), max_symbols=a.max_symbols, depth=a.depth, trades_limit=a.trades_limit,
-                           interval_ms=a.interval_ms, reserve_bytes=a.reserve_bytes, max_bytes=a.max_bytes)
+                           interval_ms=a.interval_ms, reserve_bytes=a.reserve_bytes, max_bytes=a.max_bytes, selection_rule=a.selection_rule)
             ok = res["status"] in ("OK", "PARTIAL")
             res = {**res, "ok": ok}
         elif a.cmd == "run-continuous":
             res = run_continuous(a.out_root, interval_ms=a.interval_ms, duration_ms=a.duration_s * 1000 if a.duration_s else None, until_ms=a.until_ms, stop_file=a.stop_file,
                                  max_cycles=a.max_cycles, max_symbols=a.max_symbols, depth=a.depth, trades_limit=a.trades_limit, reserve_bytes=a.reserve_bytes,
-                                 max_bytes=a.max_bytes, seal_manifest=a.seal_manifest, seal_every=a.seal_every, backup_to=a.backup_to, receipts=a.receipts,
+                                 max_bytes=a.max_bytes, selection_rule=a.selection_rule, seal_manifest=a.seal_manifest, seal_every=a.seal_every, backup_to=a.backup_to, receipts=a.receipts,
                                  backup_every=a.backup_every, restore_check_every=a.restore_check_every, max_consecutive_failures=a.max_consecutive_failures,
                                  health_path=a.health)
             res = {**res, "ok": res["status"] == "STOPPED"}
