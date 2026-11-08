@@ -1587,3 +1587,131 @@ def test_mutation_scope_that_ignores_partial_would_call_a_partial_capture_comple
         return r
     monkeypatch.setattr(UC, "verify_capture_dir", cosmetic)
     assert UC.describe_scope(d)["verdict"] == "COMPLETE_FOR_SCOPE"                                      # cosmetic manipulation is what the real derivation prevents
+
+
+# ================================================================ red-team round 8: empty capture, unbound time stamp, probe rows
+def _all_empty_parts(trading_echo="OMIT"):
+    p = {("linear", None): {"": empty_body("linear")}, ("linear", "Trading"): {"": empty_body(trading_echo)}}
+    for st in ("PendingOpen", "PreLaunch", "Closed"):
+        p[("linear", st)] = {"": empty_body("OMIT")}
+    p[("linear", "Delivering")] = {"": empty_body("")}
+    return p
+
+
+@pytest.mark.parametrize("trading_echo,default_echo", [("OMIT", "linear"), ("", "linear"), ("linear", "linear"), ("OMIT", "OMIT"), ("", "")])
+def test_an_all_empty_capture_is_never_complete_for_scope(tmp_path, trading_echo, default_echo):
+    parts = _all_empty_parts(trading_echo)
+    parts[("linear", None)] = {"": empty_body(default_echo)}
+    m = run2(tmp_path, V2Venue(parts, tickers=[]), name="empty")
+    d = str(tmp_path / "empty")
+    assert m["dataset_status"] != "COMPLETE" and m["universe_file"]["rows"] == 0
+    s = UC.describe_scope(d)
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and "EMPTY_UNIVERSE" in {b["code"] for b in s["blockers"]}
+
+
+def test_the_empty_category_anomaly_is_refused_for_trading_and_the_default_control_but_kept_for_rare_partitions():
+    for st in ("Trading", None):
+        d = UC.derive_partition("linear", st, [empty_body("OMIT")])
+        assert d["outcome"].startswith("TRANSPORT_ERROR") and d["complete"] is False
+        d = UC.derive_partition("linear", st, [empty_body("")])
+        assert d["outcome"].startswith("TRANSPORT_ERROR") and d["complete"] is False
+    for st in ("PendingOpen", "PreLaunch", "Delivering", "Closed"):
+        d = UC.derive_partition("linear", st, [empty_body("OMIT")])
+        assert d["outcome"] == "OBSERVED_EMPTY" and d["anomalies"] == ["category_echo_missing"]
+
+
+def test_an_empty_universe_with_a_correct_echo_is_still_not_complete(tmp_path):
+    parts = _all_empty_parts("linear")
+    parts[("linear", None)] = {"": empty_body("linear")}
+    m = run2(tmp_path, V2Venue(parts, tickers=[]), name="echoed")
+    assert part_of(m, "Trading")["outcome"] == "OBSERVED_EMPTY" and m["dataset_status"] == "PARTIAL"                  # the rule is on emptiness, not only on the echo
+
+
+def test_mutation_without_the_empty_universe_rule_an_empty_capture_is_complete(tmp_path, monkeypatch):
+    real = UC._dataset_status
+    monkeypatch.setattr(UC, "_dataset_status", lambda parts, conflicts, timing, universe_rows=None: real([dict(p, rows_total=1) for p in parts], conflicts, timing, None))
+    parts = _all_empty_parts("linear")
+    m = run2(tmp_path, V2Venue(parts, tickers=[]), name="mut")
+    assert m["dataset_status"] == "COMPLETE"                                                                          # the pre-fix verdict this mutation restores
+
+
+def _forge_start(src_dir, new_started, dst):
+    shutil.copytree(src_dir, dst)
+    mp = os.path.join(dst, "manifest.json")
+    mm = json.load(open(mp))
+    old = mm["started_ms"]
+    oldf, newf = f"universe-{old}.jsonl", f"universe-{new_started}.jsonl"
+    lines = [json.loads(x) for x in open(os.path.join(dst, oldf))]
+    for r in lines:
+        r["snapshot_ms"] = new_started
+    b = b"".join((json.dumps(r, sort_keys=True, allow_nan=False, separators=(",", ":")) + "\n").encode() for r in lines)
+    os.remove(os.path.join(dst, oldf))
+    open(os.path.join(dst, newf), "wb").write(b)
+    mm["started_ms"], mm["capture_id"] = new_started, f"uc2-{new_started}"
+    mm["universe_file"] = {"file": newf, "sha256": hashlib.sha256(b).hexdigest(), "rows": len(lines)}
+    json.dump(mm, open(mp, "w"), indent=2, sort_keys=True)
+    return dst
+
+
+def test_a_backdated_started_ms_with_a_renamed_rehashed_universe_file_no_longer_verifies(tmp_path):
+    _m, d = owner_run(tmp_path, name="orig")
+    assert UC.verify_capture_dir(d)["ok"] is True
+    forged = _forge_start(d, NOW - 100_000_000_000, str(tmp_path / "forged"))
+    v = UC.verify_capture_dir(forged)
+    assert v["ok"] is False and any("not bound" in p for p in v["problems"])
+    s = UC.describe_scope(forged)
+    assert s["verdict"] == "NOT_COMPLETE_FOR_SCOPE" and s["raw_integrity_ok"] is False
+    near = _forge_start(d, _m["started_ms"] - 60_000, str(tmp_path / "near"))                   # within the stated bound: still anchored by the server times
+    assert UC.verify_capture_dir(near)["ok"] is True
+    far = _forge_start(d, NOW - UC.START_BIND_MS - 1, str(tmp_path / "far"))
+    assert UC.verify_capture_dir(far)["ok"] is False
+
+
+def test_finished_before_started_is_a_verification_problem(tmp_path):
+    _m, d = owner_run(tmp_path, name="fin")
+    retarget_fn = edit_manifest(lambda x: x.update(finished_ms=x["started_ms"] - 1))
+    dst = str(tmp_path / "fin2")
+    shutil.copytree(d, dst)
+    retarget_fn(dst)
+    v = UC.verify_capture_dir(dst)
+    assert v["ok"] is False and any("finished_ms" in p for p in v["problems"])
+
+
+def test_the_manifest_note_says_recv_ms_is_self_reported_and_server_time_is_the_anchor(tmp_path):
+    m, _d = owner_run(tmp_path, name="note")
+    assert "self-reported" in m["coverage_note"] and "server `time`" in m["coverage_note"]
+
+
+def test_mutation_without_the_start_binding_the_forged_capture_verifies(tmp_path, monkeypatch):
+    _m, d = owner_run(tmp_path, name="orig2")
+    forged = _forge_start(d, NOW - 100_000_000_000, str(tmp_path / "forged2"))
+    monkeypatch.setattr(UC, "START_BIND_MS", 10 ** 15)
+    assert UC.verify_capture_dir(forged)["ok"] is True                                                                # the pre-fix behaviour the test above rejects
+
+
+def test_settling_probe_rows_are_recorded_but_never_enter_the_universe_nor_earn_coverage(tmp_path):
+    probe = inst("SETUSDT", status="Settling")
+    m, d = owner_run(tmp_path, name="probe", over={("linear", "Settling"): chain([[probe]])})
+    p = part_of(m, "Settling")
+    assert p["outcome"] == "UNDOCUMENTED_STATUS_ROWS" and p["rows_total"] == 1 and p["pages"][0]["rows"] == 1               # raw page kept and counted
+    assert os.path.exists(os.path.join(d, "linear_Settling_page0001.json"))
+    assert "SETUSDT" not in {r["symbol"] for r in uni2(m, d)} and m["universe_file"]["rows"] == len(TRD) + len(PRE) + 1        # BTC ETH SOL NEW OLD only
+    assert "Settling" not in m["required_status_coverage"]["covered"] and m["required_status_coverage"]["excluded_undocumented"] == {"Settling": "UNDOCUMENTED_STATUS_ROWS"}
+    s = UC.describe_scope(d)
+    assert s["undocumented_status_rows_excluded"] == {"Settling": {"outcome": "UNDOCUMENTED_STATUS_ROWS", "rows": 1}}
+    assert s["statuses"]["empty_undocumented"] == ["Settling"] and "Settling" not in s["statuses"]["complete_with_anomaly"]
+    assert any("EXCLUDED from the universe" in x for x in s["limits"])
+    assert UC.verify_capture_dir(d)["ok"] is True
+
+
+def test_mutation_probe_rows_made_usable_again_would_enter_the_universe(tmp_path, monkeypatch):
+    src = open(UC.__file__, encoding="utf-8").read()
+    old = 'if not (outcome in ("OBSERVED_ROWS", "PARTIAL") or'
+    assert src.count(old) == 1
+    import types
+    mod = types.ModuleType("uc_mut_probe")
+    mod.__file__ = UC.__file__
+    sys.modules[mod.__name__] = mod
+    exec(compile(src.replace(old, 'if not (outcome in ("OBSERVED_ROWS", "PARTIAL", "UNDOCUMENTED_STATUS_ROWS") or'), UC.__file__, "exec"), mod.__dict__)
+    assert [r["symbol"] for r in mod.derive_partition("linear", "Settling", [env([inst("SETUSDT", status="Settling")])])["usable_rows"]] == ["SETUSDT"]
+    assert UC.derive_partition("linear", "Settling", [env([inst("SETUSDT", status="Settling")])])["usable_rows"] == []

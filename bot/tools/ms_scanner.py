@@ -6,8 +6,8 @@ No I/O, no clock, no network, no credential, no randomness: the same inputs give
 ``decision_ms`` (a snapshot stamped after the decision is refused, never read). It places nothing and promotes nothing: it estimates, and says what it could not.
 
 Rules that hold for every row
-  * Interval-normalised funding: a print is converted with the interval IN FORCE at the decision (``snapshot.funding_interval_min``); an unknown/unusable interval excludes the
-    symbol (FUNDING_INTERVAL_UNKNOWN); 480 is never assumed. The robust level is ``min(mean, median)`` of the trailing per-day rates (a single spike cannot lift it).
+  * Interval-normalised funding: each trailing print is converted with ITS OWN interval (``trailing_funding_intervals_min``); an unknown/unusable current interval excludes the
+    symbol (FUNDING_INTERVAL_UNKNOWN), and missing/mismatched per-print intervals exclude it (FUNDING_INTERVAL_PER_PRINT_UNKNOWN); 480 and the current interval are never assumed for a print. Persistence defaults to a MODELLED 0.5 decay of the trailing funding received; a stronger provenance always ranks above a weaker one. The robust level is ``min(mean, median)`` of the trailing per-day rates (a single spike cannot lift it).
   * Tradability: a NEW entry is opened only in status ``Trading`` (ms_types.TRADABLE_STATUS). PreLaunch / PendingOpen / Settling / Delivering / Closed / any unknown status
     is excluded with NOT_TRADING:<status>; a launch in the future, or a delivery inside the hold, is excluded too.
   * Instrument rules: tick size, quantity step and minimum quantity must be known (else RULES_UNKNOWN); the order quantity is rounded DOWN to the step and must reach
@@ -45,12 +45,12 @@ from ms_types import BookLevel, CostLine, Instrument, MarketSnapshot, Opportunit
 SCHEMA = "ms_scanner/v1"
 EXCLUSIONS = (
     "NO_INSTRUMENT", "NO_SNAPSHOT", "SNAPSHOT_FROM_FUTURE", "STALE_SNAPSHOT", "NEXT_FUNDING_IN_PAST", "NOT_TRADING", "NOT_LAUNCHED", "DELIVERY_WITHIN_HOLD",
-    "NO_SPOT_HEDGE", "HEDGE_UNKNOWN", "NO_MARK", "FUNDING_INTERVAL_UNKNOWN", "INSUFFICIENT_FUNDING_HISTORY", "NO_BOOK", "BOOK_CROSSED", "BOOK_AGE_UNKNOWN", "BOOK_STALE",
+    "NO_SPOT_HEDGE", "HEDGE_UNKNOWN", "NO_MARK", "FUNDING_INTERVAL_UNKNOWN", "FUNDING_INTERVAL_PER_PRINT_UNKNOWN", "INSUFFICIENT_FUNDING_HISTORY", "NO_BOOK", "BOOK_CROSSED", "BOOK_AGE_UNKNOWN", "BOOK_STALE",
     "SPREAD_TOO_WIDE", "LOW_TURNOVER", "LOW_OPEN_INTEREST", "RULES_UNKNOWN", "BELOW_MIN_ORDER_QTY", "BELOW_MIN_NOTIONAL", "DEPTH_INSUFFICIENT", "CAPACITY_BELOW_MIN",
     "NO_SPOT_MARK", "BASIS_TOO_WIDE", "VOL_UNKNOWN", "NET_BELOW_MIN", "NET_UNKNOWN", "FUNDING_NOT_POSITIVE", "NO_PAIR")
 DEFAULT_PARAMS: Dict[str, Any] = {
     "hold_days": 7.0, "formation_days": 3.0, "min_prints": 3, "notional_usd": 10_000.0, "max_book_age_ms": 5_000, "max_snapshot_age_ms": 60_000, "max_spread_bps": 10.0,
-    "min_turnover24h_usd": None, "min_open_interest_usd": None, "min_net_bps": 0.0, "persistence": 1.0, "margin_frac": 0.2, "oi_participation": 0.01, "risk_floor_bps": 1.0,
+    "min_turnover24h_usd": None, "min_open_interest_usd": None, "min_net_bps": 0.0, "persistence": 0.5, "margin_frac": 0.2, "oi_participation": 0.01, "risk_floor_bps": 1.0,
     "spot_slippage_bps_per_leg": 1.0, "basis_floor_bps": 2.0, "max_entry_basis_bps": 50.0, "opportunity_cost_apr": CC.DEFAULT_OPPORTUNITY_COST_APR, "p_missed_fill": 0.25,
     "top_k": 3, "price_vol_bps_per_day": {}, "pair_corr": 0.0,
 }
@@ -69,6 +69,8 @@ def _params(params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         if k not in DEFAULT_PARAMS:
             raise ScanError(f"unknown scanner parameter {k!r}")
         p[k] = v
+    if isinstance(p["persistence"], (int, float)) and not isinstance(p["persistence"], bool) and p["persistence"] > 1.0:
+        raise ScanError("persistence is a haircut in (0, 1]: trailing funding cannot be assumed to grow over the hold")
     for k in ("hold_days", "formation_days", "notional_usd", "max_spread_bps", "margin_frac", "oi_participation", "risk_floor_bps", "persistence"):
         v = p[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
@@ -172,19 +174,31 @@ def _book_exclusions(snap: MarketSnapshot, p: Mapping[str, Any]) -> List[str]:
 
 
 def _funding(snap: MarketSnapshot, p: Mapping[str, Any]) -> Tuple[Optional[Dict[str, float]], List[str]]:
-    """Robust interval-normalised funding from the trailing prints known at the decision. (stats, exclusions)."""
+    """Robust interval-normalised funding from the trailing prints known at the decision. (stats, exclusions).
+
+    EVERY print is normalised with ITS OWN interval (``trailing_funding_intervals_min``, the interval in force at that print): bps_per_day = bps * 1440 / interval_i. Empty or
+    length-mismatched / unusable per-print intervals mean the per-print interval is UNKNOWN: FUNDING_INTERVAL_PER_PRINT_UNKNOWN, never the current interval as a default (a
+    480 -> 240 change would otherwise overstate every older print up to 2x). The formation window is the newest prints covering ``formation_days`` of interval time."""
     iv = snap.funding_interval_min
     if funding_bps_per_day(1.0, iv) is None:
         return None, ["FUNDING_INTERVAL_UNKNOWN"]
-    per_print_per_day = 1440.0 / iv
-    n_window = max(1, int(round(float(p["formation_days"]) * per_print_per_day)))
     xs = [x for x in (snap.trailing_funding_bps_per_print or ())]
+    ivs = list(snap.trailing_funding_intervals_min or ())
+    if len(ivs) != len(xs) or (xs and any(funding_bps_per_day(1.0, v) is None for v in ivs)):
+        return None, ["FUNDING_INTERVAL_PER_PRINT_UNKNOWN"]
     if any(_fin(x) is None for x in xs):
         return None, ["INSUFFICIENT_FUNDING_HISTORY"]
-    xs = xs[-n_window:]
+    need_min = float(p["formation_days"]) * 1440.0
+    got, k = 0.0, 0
+    for v in reversed(ivs):                      # newest first, until the window's interval time is covered
+        k += 1
+        got += float(v)
+        if got >= need_min - 1e-9:
+            break
+    xs, ivs = xs[len(xs) - k:], ivs[len(ivs) - k:]
     if len(xs) < int(p["min_prints"]):
         return None, ["INSUFFICIENT_FUNDING_HISTORY"]
-    day = [x * per_print_per_day for x in xs]
+    day = [x * 1440.0 / v for x, v in zip(xs, ivs)]
     mean, med = statistics.fmean(day), statistics.median(day)
     sd = statistics.stdev(day) if len(day) > 1 else 0.0
     return {"mean_bps_per_day": mean, "median_bps_per_day": med, "sd_bps_per_day": sd, "n_prints": float(len(xs)), "interval_min": float(iv)}, []
@@ -260,6 +274,7 @@ def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, Marke
     for (inst, snap, side), f in zip(legs_inst, f_leg_day):
         funding_day += w * leg_funding_bps_per_day(f, side, float(p["persistence"]))
     funding_h = funding_day * hold
+    reasons.append(f"funding persistence {float(p['persistence'])} (MODELLED): the trailing per-day funding RECEIVED is scaled by this over the hold; what is paid is never scaled")
     if kind != "PERP_FUNDING_SPREAD" and funding_day <= 0:
         ex.append("FUNDING_NOT_POSITIVE")
     # --- fees (carry_costs names, provenance)
@@ -454,7 +469,7 @@ def scan(instruments: Union[Mapping[str, Instrument], Sequence[Instrument]], sna
             out.append(_excluded(kind, sym, candidate_id, spec_digest, decision_ms, float(p["hold_days"]), ex, "" if kind == "PERP_FUNDING_SPREAD" else None))
     if kind == "PERP_FUNDING_SPREAD":
         out += _pairs(singles, style, candidate_id, spec_digest, decision_ms, p)
-    rankable = sorted((o for o in out if o.rank_score is not None and not o.exclusions), key=lambda o: (-o.rank_score, o.legs))        # type: ignore[operator]
+    rankable = sorted((o for o in out if o.rank_score is not None and not o.exclusions), key=lambda o: (T.PROVS.index(o.prov) if o.prov in T.PROVS else len(T.PROVS), -o.rank_score, o.legs))        # type: ignore[operator]
     rest = sorted((o for o in out if o.rank_score is None or o.exclusions), key=lambda o: (o.legs, o.exclusions))
     return rankable + rest
 

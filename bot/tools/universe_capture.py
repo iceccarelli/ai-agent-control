@@ -83,9 +83,12 @@ BACKOFF_S = 1.0
 MAX_BACKOFF_S = 30.0
 RATE_LIMIT_CODES = (10006,)
 MAX_REJECT_LIST = 200                      # rejected rows listed (hashed) in a manifest; the count is always complete
+START_BIND_MS = 300_000                    # started_ms must lie within this of the span of the raw pages' server `time` values (the only anchor inside the hashed bytes)
 MAX_SPAN_MS = 300_000                      # first to last response further apart than this is not one point in time (STALE)
 COVERAGE_NOTE = ("History before the first capture is NOT point-in-time verified. A status=Closed partition shows only the instruments the venue still serves; "
-                 "it may omit old delistings, so an absent symbol is not proof it never existed or was never delisted.")
+                 "it may omit old delistings, so an absent symbol is not proof it never existed or was never delisted. "
+                 "TIME ANCHOR: only the venue's server `time` inside the hashed raw pages is evidence of when the capture happened; recv_ms, started_ms and finished_ms are "
+                 "self-reported by the capturing host, and started_ms (the snapshot stamp) is accepted only within a bounded distance of the pages' server time.")
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,24}\Z", re.ASCII)
 _DEC = re.compile(r"^[0-9]+(\.[0-9]+)?\Z", re.ASCII)
@@ -523,7 +526,7 @@ def _clean_msg(v: Any) -> str:
 
 def _parse_page(body: bytes, category: str, *, allow_empty_anomaly: bool = False) -> Dict[str, Any]:
     """Pure. ``kind`` is ok | refused (retCode != 0) | malformed. Never raises. ``echo`` is the category the venue echoed: the requested one, ``''`` or ``'MISSING'``.
-    The last two are accepted ONLY with ``allow_empty_anomaly`` and an empty list (the venue is known to answer an empty status partition that way); a non-empty
+    The last two are accepted ONLY with ``allow_empty_anomaly`` and an empty list (the venue is known to answer an EMPTY RARE status partition that way: never the Trading partition, never the default control); a non-empty
     list, or any other category, is malformed. The echo is recorded, never rewritten to the requested category."""
     try:
         doc = json.loads(body.decode("utf-8", "strict"))
@@ -585,7 +588,7 @@ def derive_partition(category: str, status: Optional[str], bodies: Sequence[byte
         if exhausted:
             problems.append(f"page {i} follows the end of the cursor chain")
             break
-        pg = _parse_page(body, category, allow_empty_anomaly=(i == 1 and category == "linear" and status in QUERIED_STATUSES))
+        pg = _parse_page(body, category, allow_empty_anomaly=(i == 1 and category == "linear" and status in QUERIED_STATUSES and status != "Trading"))
         if pg["kind"] != "ok":
             infos.append({"rows": 0, "cursor_out": "", "server_time_ms": pg.get("time"), "ret_code": pg.get("ret_code"), "category_echo": None})
             pending = ""
@@ -664,7 +667,7 @@ def derive_partition(category: str, status: Optional[str], bodies: Sequence[byte
             outcome = "UNDOCUMENTED_STATUS_ROWS" if rows else "UNDOCUMENTED_STATUS_EMPTY"        # the venue answered, but the docs do not list this status: no coverage credit
         else:
             outcome = "OBSERVED_ROWS" if rows else "OBSERVED_EMPTY"
-    if not (outcome in ("OBSERVED_ROWS", "PARTIAL", "UNDOCUMENTED_STATUS_ROWS") or outcome.startswith(("PARTIAL:", "CONFLICTED:"))):
+    if not (outcome in ("OBSERVED_ROWS", "PARTIAL") or outcome.startswith(("PARTIAL:", "CONFLICTED:"))):        # rows of an undocumented probe status are recorded (raw pages) but never usable
         usable = []
     ct: Dict[str, int] = {}
     for r in rows:
@@ -1022,8 +1025,9 @@ def describe_delisting_observability(observability: Any, closed_outcome: Any) ->
             "the universe is survivors only")
 
 
-def _dataset_status(parts: Sequence[Dict[str, Any]], conflicts: Sequence[Any], timing: Sequence[Tuple[Optional[int], Optional[int]]]) -> str:
-    """CONFLICTED > PARTIAL > STALE > UNVERIFIED > COMPLETE. ``timing`` is (recv_ms, venue time ms) per response."""
+def _dataset_status(parts: Sequence[Dict[str, Any]], conflicts: Sequence[Any], timing: Sequence[Tuple[Optional[int], Optional[int]]], universe_rows: Optional[int] = None) -> str:
+    """CONFLICTED > PARTIAL > STALE > UNVERIFIED > COMPLETE. ``timing`` is (recv_ms, venue time ms) per response. An EMPTY universe (no universe rows, or a linear Trading
+    partition with no rows) is never complete: PARTIAL."""
     if conflicts or any(p["outcome"].startswith("CONFLICTED") for p in parts):
         return "CONFLICTED"
     have = {(p["category"], p["status"] or "default"): p for p in parts}
@@ -1034,6 +1038,8 @@ def _dataset_status(parts: Sequence[Dict[str, Any]], conflicts: Sequence[Any], t
             if q is None or not q["complete"]:
                 return "PARTIAL"
     if any(p["outcome"].startswith(("PARTIAL", "TRANSPORT_ERROR")) for p in parts):
+        return "PARTIAL"
+    if universe_rows == 0 or any(p["category"] == "linear" and p["status"] == "Trading" and p["rows_total"] == 0 for p in parts):
         return "PARTIAL"
     recvs = [r for r, _v in timing if isinstance(r, int)]
     if recvs and max(recvs) - min(recvs) > MAX_SPAN_MS:
@@ -1215,7 +1221,7 @@ def capture_universe(out_dir: str, *, fetch: Callable[[str], bytes] = http_fetch
         "status_coverage": derived["status_coverage"], "status_coverage_by_category": derived["status_coverage_by_category"],
         "delisting_observability": derived["delisting_observability"], "coverage_note": COVERAGE_NOTE,
         "rules_version": RULES_VERSION, "status_enum": _status_enum(), "required_status_coverage": derived["required_status_coverage"],
-        "dataset_status": _dataset_status(derived["parts"], uni["conflicts"], timing),
+        "dataset_status": _dataset_status(derived["parts"], uni["conflicts"], timing, uni["rows"]),
     }
     _create_exclusive(os.path.join(out_dir, "manifest.json"), (json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8"))
     return manifest
@@ -1397,6 +1403,12 @@ def _verify(path: str, problems: List[str], out: Dict[str, Any], legacy: Optiona
             if m["rejected_tickers"] != tick["rejected"]:
                 problems.append("rejected_tickers differs from the re-derivation of tickers.json")
             timing.append((tc.get("recv_ms") if isinstance(tc.get("recv_ms"), int) else None, tp["time"]))
+    finished = m.get("finished_ms")
+    if not isinstance(finished, int) or isinstance(finished, bool) or finished < started:
+        problems.append(f"finished_ms {finished!r} is not an integer >= started_ms {started}")
+    srv = [v for _r, v in timing if isinstance(v, int)]
+    if srv and not (min(srv) - START_BIND_MS <= started <= max(srv) + START_BIND_MS):
+        problems.append(f"started_ms {started} (the snapshot stamp) is not within {START_BIND_MS} ms of the raw pages' server time span [{min(srv)}, {max(srv)}]: the point-in-time stamp is not bound to the hashed bytes")
     uni = build_universe(derived_parts, tick["map"] if tick else {}, snapshot)
     uf = m["universe_file"]
     if uf.get("file") != f"universe-{snapshot}.jsonl":
@@ -1426,7 +1438,7 @@ def _verify(path: str, problems: List[str], out: Dict[str, Any], legacy: Optiona
                      ("status_enum", _status_enum())):
         if m.get(key) != val:
             claim(f"{key} claim is not supported by the raw pages (claimed {m.get(key)!r}, derived {val!r})")
-    ds = _dataset_status(derived_parts, uni["conflicts"], timing)
+    ds = _dataset_status(derived_parts, uni["conflicts"], timing, uni["rows"])
     if m.get("dataset_status") != ds:
         claim(f"dataset_status claim {m['dataset_status']!r} != re-derived {ds!r}")
     if not isinstance(m.get("coverage_note"), str) or "NOT point-in-time" not in m["coverage_note"]:
@@ -1470,7 +1482,7 @@ def describe_scope(path: str) -> Dict[str, Any]:
         "manifest_sha256": r["manifest_sha256"], "raw_integrity_ok": not integrity_problems, "integrity_problems": integrity_problems,
         "legacy_manifest": bool(legacy) and any("rules_version" in x for x in legacy), "legacy_claim_differences": legacy[:50],
         "statuses": {"complete": [], "complete_with_anomaly": [], "partial": [], "conflicted": [], "empty_undocumented": [], "refused_or_failed": [], "not_queried": []},
-        "status_outcomes": {}, "mismatched_rows": [], "reasons": [], "blockers": [], "limits": [COVERAGE_NOTE],
+        "status_outcomes": {}, "mismatched_rows": [], "undocumented_status_rows_excluded": {}, "reasons": [], "blockers": [], "limits": [COVERAGE_NOTE],
     }
     blockers: List[Dict[str, str]] = res["blockers"]
     if integrity_problems or not cov or "partitions" not in cov:
@@ -1497,6 +1509,8 @@ def describe_scope(path: str) -> Dict[str, Any]:
             res["statuses"]["conflicted"].append(st)
         elif o.startswith("UNDOCUMENTED_STATUS"):
             res["statuses"]["empty_undocumented"].append(st)
+            if p["rows_total"]:
+                res["undocumented_status_rows_excluded"][st] = {"outcome": o, "rows": p["rows_total"]}      # recorded in the raw pages, never in the universe, never coverage
         else:
             res["statuses"]["refused_or_failed"].append(st)
         sm = p["status_mismatch"]
@@ -1515,6 +1529,9 @@ def describe_scope(path: str) -> Dict[str, Any]:
             sm = p["status_mismatch"]
             extra = f"; {sm['count']} rows with another status ({sm['by_actual_status']}), reconciliation {sm['by_verdict']}" if sm["count"] else ""
             blockers.append(_blocker(f"STATUS_{st}_{p['outcome'].split(':')[0].split('(')[0]}", f"required status {st}: {p['outcome']}{extra}"))
+    trading = byst.get("Trading")
+    if cov["universe_rows"] == 0 or (trading is not None and trading["rows_total"] == 0):
+        blockers.append(_blocker("EMPTY_UNIVERSE", f"the universe has {cov['universe_rows']} rows and the Trading partition {trading['rows_total'] if trading else 'n/a'} rows: an empty capture proves nothing about the scope"))
     for c in cov["conflicts"]:
         blockers.append(_blocker("CONFLICT", json.dumps({k: c[k] for k in c if k != "variants"}, sort_keys=True)[:200]))
     if cov["delisting_observability"] != "OBSERVED":
@@ -1530,6 +1547,8 @@ def describe_scope(path: str) -> Dict[str, Any]:
                verdict="COMPLETE_FOR_SCOPE" if not blockers else "NOT_COMPLETE_FOR_SCOPE")
     if res["statuses"]["complete_with_anomaly"]:
         res["limits"].append(f"empty answers with no/empty category echo, recorded as such (not 'linear'): {res['statuses']['complete_with_anomaly']}")
+    if res["undocumented_status_rows_excluded"]:
+        res["limits"].append(f"rows answered for statuses the docs do not define were EXCLUDED from the universe and earn no coverage: {res['undocumented_status_rows_excluded']}")
     res["reasons"] = ([f"all {len(STATUSES)} documented statuses, the default control and the tickers snapshot are complete and consistent for scope {SCOPE!r}"]
                       if not blockers else [b["detail"] for b in blockers])
     return res

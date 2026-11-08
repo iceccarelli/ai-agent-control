@@ -33,7 +33,7 @@ def inst(sym="AAAUSDT", **kw):
 
 def snap(sym="AAAUSDT", *, mark=100.0, spot=99.98, bid=99.995, ask=100.005, bid_qty=DEEP, ask_qty=DEEP, fund=(4.0,) * 9, iv=480, age=100, decision_ms=NOW, oi=None, **kw):
     d = dict(symbol=sym, decision_ms=decision_ms, mark=mark, index=mark, bids=(BookLevel(bid, bid_qty),), asks=(BookLevel(ask, ask_qty),), book_age_ms=age,
-             last_funding_bps_per_print=fund[-1] if fund else None, trailing_funding_bps_per_print=tuple(fund), funding_interval_min=iv, next_funding_ms=NOW + 3_600_000,
+             last_funding_bps_per_print=fund[-1] if fund else None, trailing_funding_bps_per_print=tuple(fund), trailing_funding_intervals_min=(iv,) * len(fund) if isinstance(iv, int) else (), funding_interval_min=iv, next_funding_ms=NOW + 3_600_000,
              open_interest_usd=oi, turnover24h_usd=1e9, spot_mark=spot)
     d.update(kw)
     return MarketSnapshot(**d)
@@ -42,7 +42,8 @@ def snap(sym="AAAUSDT", *, mark=100.0, spot=99.98, bid=99.995, ask=100.005, bid_
 def run(i=None, s=None, *, kind="SPOT_PERP_CARRY", style="TAKER", params=None, decision_ms=NOW):
     i = i if i is not None else [inst()]
     s = s if s is not None else [snap()]
-    return S.scan(i, s, spec={"kind": kind, "style": style}, candidate_id="c@1", spec_digest="d" * 8, decision_ms=decision_ms, params=params)
+    return S.scan(i, s, spec={"kind": kind, "style": style}, candidate_id="c@1", spec_digest="d" * 8, decision_ms=decision_ms,
+                  params={"persistence": 1.0, **(params or {})})        # the economics tests pin persistence 1.0 (the default 0.5 is tested on its own)
 
 
 def cost(o, name):
@@ -95,7 +96,7 @@ def test_maker_first_is_modelled_and_the_spot_leg_stays_taker():
 def test_net_not_gross_decides_the_rank():
     # X has twice the gross funding but a thin book (slippage eats the edge); Y is modest and deep
     thin_x = MarketSnapshot("XXXUSDT", NOW, 100.0, 100.0, (BookLevel(99.995, 5.0), BookLevel(95.0, 3000.0)), (BookLevel(100.005, 5.0), BookLevel(105.0, 3000.0)), 100, 24.0, (24.0,) * 9, 480,
-                            NOW + 3_600_000, None, 1e9, 99.98)
+                            NOW + 3_600_000, None, 1e9, 99.98, trailing_funding_intervals_min=(480,) * 9)
     rows = run([inst("XXXUSDT"), inst("YYYUSDT")], [thin_x, snap("YYYUSDT", fund=(6.0,) * 9)])
     by = {o.legs[1][0]: o for o in rows}
     assert by["XXXUSDT"].expected_funding_bps_horizon > by["YYYUSDT"].expected_funding_bps_horizon
@@ -209,7 +210,7 @@ def test_depth_walk_matches_the_hand_computed_vwap():
 def test_capacity_is_the_size_where_slippage_equals_the_remaining_edge():
     levels_b = (BookLevel(99.995, 20.0),) + tuple(BookLevel(99.995 - 0.05 * k, 20.0) for k in range(1, 60))
     levels_a = (BookLevel(100.005, 20.0),) + tuple(BookLevel(100.005 + 0.05 * k, 20.0) for k in range(1, 60))
-    s_ = MarketSnapshot("AAAUSDT", NOW, 100.0, 100.0, levels_b, levels_a, 100, 4.0, (4.0,) * 9, 480, NOW + 3_600_000, None, 1e9, 99.98)
+    s_ = MarketSnapshot("AAAUSDT", NOW, 100.0, 100.0, levels_b, levels_a, 100, 4.0, (4.0,) * 9, 480, NOW + 3_600_000, None, 1e9, 99.98, trailing_funding_intervals_min=(480,) * 9)
     o = run(s=[s_], params={"notional_usd": 1e9, "margin_frac": 0.2})[0]
     edge_pre = o.expected_funding_bps_horizon - sum(c.bps for c in o.costs if c.name != "slippage")
     assert o.capacity_usd > 0
@@ -355,7 +356,7 @@ def _mutant(old, new):
 
 
 def _mrun(m, i=None, s=None, **kw):
-    return m.scan(i or [inst()], s or [snap()], spec={"kind": kw.pop("kind", "SPOT_PERP_CARRY"), "style": kw.pop("style", "TAKER")}, candidate_id="c", spec_digest="d", decision_ms=NOW, params=kw.pop("params", None))
+    return m.scan(i or [inst()], s or [snap()], spec={"kind": kw.pop("kind", "SPOT_PERP_CARRY"), "style": kw.pop("style", "TAKER")}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": 1.0, **(kw.pop("params", None) or {})})
 
 
 def test_mutation_trading_status_check_removed():
@@ -370,13 +371,14 @@ def test_mutation_future_snapshot_check_removed():
 
 def test_mutation_interval_defaulting_to_480_is_caught():
     m = _mutant("    iv = snap.funding_interval_min\n    if funding_bps_per_day(1.0, iv) is None:", "    iv = snap.funding_interval_min or 480\n    if funding_bps_per_day(1.0, iv) is None:")
-    assert _mrun(m, s=[snap(iv=None)])[0].net_bps_horizon is not None and run(s=[snap(iv=None)])[0].net_bps_horizon is None
+    sn = snap(iv=None, trailing_funding_intervals_min=(480,) * 9)
+    assert _mrun(m, s=[sn])[0].net_bps_horizon is not None and run(s=[sn])[0].net_bps_horizon is None
 
 
 def test_mutation_rank_on_gross_funding_instead_of_net_is_caught():
     m = _mutant("        rank = (net / capital_factor) / max(risk, float(p[\"risk_floor_bps\"]))", "        rank = (funding_h / capital_factor) / max(risk, float(p[\"risk_floor_bps\"]))")
     thin = MarketSnapshot("XXXUSDT", NOW, 100.0, 100.0, (BookLevel(99.995, 5.0), BookLevel(95.0, 3000.0)), (BookLevel(100.005, 5.0), BookLevel(105.0, 3000.0)), 100, 24.0, (24.0,) * 9, 480,
-                          NOW + 3_600_000, None, 1e9, 99.98)
+                          NOW + 3_600_000, None, 1e9, 99.98, trailing_funding_intervals_min=(480,) * 9)
     ins, sn = [inst("XXXUSDT"), inst("YYYUSDT")], [thin, snap("YYYUSDT", fund=(6.0,) * 9)]
     assert _mrun(m, ins, sn)[0].legs[1][0] == "XXXUSDT" and run(ins, sn)[0].legs[1][0] == "YYYUSDT"
 
@@ -401,5 +403,78 @@ def test_mutation_long_leg_charged_the_favourable_statistic_is_caught():
 def test_mutation_slippage_ignored_is_caught():
     m = _mutant("            costs.append(CostLine(\"slippage\", slippage, \"DERIVED\"))", "            costs.append(CostLine(\"slippage\", 0.0, \"DERIVED\"))")
     thin = MarketSnapshot("AAAUSDT", NOW, 100.0, 100.0, (BookLevel(99.995, 5.0), BookLevel(95.0, 3000.0)), (BookLevel(100.005, 5.0), BookLevel(105.0, 3000.0)), 100, 4.0, (4.0,) * 9, 480,
-                          NOW + 3_600_000, None, 1e9, 99.98)
+                          NOW + 3_600_000, None, 1e9, 99.98, trailing_funding_intervals_min=(480,) * 9)
     assert _mrun(m, s=[thin], params={"notional_usd": 100_000.0})[0].net_bps_horizon > run(s=[thin], params={"notional_usd": 100_000.0})[0].net_bps_horizon
+
+
+# ------------------------------------------------------------------ per-print intervals (red-team sc1) and persistence
+def _mixed_snap(**kw):
+    prints = tuple([5.0] * 9 + [2.5] * 3)                                   # 9 x 480m at 5 bps + 3 x 240m at 2.5 bps: a flat 15 bps/day throughout
+    ivs = tuple([480] * 9 + [240] * 3)
+    return snap(fund=prints, iv=240, trailing_funding_intervals_min=ivs, **kw)
+
+
+def test_a_480_to_240_change_does_not_inflate_the_old_prints_poc():
+    f, ex = S._funding(_mixed_snap(), S._params({"formation_days": 3.0}))
+    assert ex == [] and f["mean_bps_per_day"] == pytest.approx(15.0) and f["median_bps_per_day"] == pytest.approx(15.0) and f["sd_bps_per_day"] == pytest.approx(0.0)
+    o = run(i=[inst(funding_interval_min=240)], s=[_mixed_snap()], params={"formation_days": 3.0})[0]
+    assert o.expected_funding_bps_horizon == pytest.approx(15.0 * 7)         # interval-normalised per-day figure x hold days
+
+
+@pytest.mark.parametrize("ivs", [(), (480,) * 11, (480,) * 13, (480,) * 8 + (0, 480, 480, 240), (480,) * 8 + (7, 480, 480, 240)])
+def test_missing_or_mismatched_or_unusable_per_print_intervals_exclude(ivs):
+    o = run(i=[inst(funding_interval_min=240)], s=[snap(fund=tuple([5.0] * 9 + [2.5] * 3), iv=240, trailing_funding_intervals_min=ivs)])[0]
+    assert "FUNDING_INTERVAL_PER_PRINT_UNKNOWN" in o.exclusions and o.net_bps_horizon is None and o.rank_score is None and o.expected_funding_bps_horizon is None
+
+
+def test_the_formation_window_covers_interval_time_not_a_print_count():
+    prints = tuple([50.0] * 6 + [5.0] * 9)                                  # 6 old 480m prints (2 days, 150/day) then 9 x 480m = 3 days at 15/day
+    f, _ = S._funding(snap(fund=prints, iv=480, trailing_funding_intervals_min=(480,) * 15), S._params({"formation_days": 3.0}))
+    assert f["n_prints"] == 9.0 and f["mean_bps_per_day"] == pytest.approx(15.0)
+    mixed = tuple([50.0] * 4 + [2.5] * 3)                                   # the newest 3 x 240m prints cover 0.5 day of a 0.5-day window
+    f2, _ = S._funding(snap(fund=mixed, iv=240, trailing_funding_intervals_min=(480,) * 4 + (240,) * 3), S._params({"formation_days": 0.5, "min_prints": 3}))
+    assert f2["n_prints"] == 3.0 and f2["mean_bps_per_day"] == pytest.approx(15.0)
+
+
+def test_default_persistence_is_a_stated_modelled_decay_recorded_in_the_reasons():
+    assert S.DEFAULT_PARAMS["persistence"] == 0.5
+    o = S.scan([inst()], [snap()], spec={"kind": "SPOT_PERP_CARRY", "style": "TAKER"}, candidate_id="c", spec_digest="d", decision_ms=NOW, params=None)[0]
+    assert o.expected_funding_bps_horizon == pytest.approx(12.0 * 7 * 0.5)
+    assert any("persistence 0.5" in r and "MODELLED" in r for r in o.reasons)
+    with pytest.raises(S.ScanError):
+        S.scan([inst()], [snap()], spec={"kind": "SPOT_PERP_CARRY", "style": "TAKER"}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": 1.5})
+
+
+def test_a_higher_persistence_assumption_cannot_rank_an_assumed_result_above_a_measured_one():
+    # AAA: wide book -> MEASURED spread (weakest cost prov MODELLED). BBB: tight book -> ASSUMED spread. BBB has far more funding, so under persistence 1.0 it out-scores AAA on rank_score.
+    ins = [inst("AAAUSDT", spot_hedge="PERP_ONLY"), inst("BBBUSDT", spot_hedge="PERP_ONLY")]
+    sn = [snap("AAAUSDT", bid=99.95, ask=100.05, fund=(5.0,) * 9, iv=480), snap("BBBUSDT", bid=99.999, ask=100.001, fund=(20.0,) * 9, iv=480)]
+    vol = {"AAAUSDT": 50.0, "BBBUSDT": 50.0}
+    for pers in (0.5, 1.0):
+        rows = S.scan(ins, sn, spec={"kind": "PERP_DIRECTIONAL_FUNDING", "style": "TAKER"}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": pers, "price_vol_bps_per_day": vol})
+        by = {o.legs[0][0]: o for o in rows}
+        assert by["AAAUSDT"].prov == "MODELLED" and by["BBBUSDT"].prov == "ASSUMED" and by["BBBUSDT"].rank_score > by["AAAUSDT"].rank_score
+        assert [o.legs[0][0] for o in rows[:2]] == ["AAAUSDT", "BBBUSDT"]
+
+
+def test_mutation_per_print_interval_replaced_by_the_current_interval_is_caught():
+    m = _mutant("day = [x * 1440.0 / v for x, v in zip(xs, ivs)]", "day = [x * 1440.0 / iv for x in xs]")
+    assert m._funding(_mixed_snap(), m._params(None))[0]["mean_bps_per_day"] != pytest.approx(15.0)
+    assert S._funding(_mixed_snap(), S._params(None))[0]["mean_bps_per_day"] == pytest.approx(15.0)
+
+
+def test_mutation_per_print_unknown_guard_removed_is_caught():
+    m = _mutant("if len(ivs) != len(xs) or (xs and", "if False and (xs and")
+    sn = snap(fund=(5.0,) * 9, iv=480, trailing_funding_intervals_min=())
+    assert S._funding(sn, S._params(None))[1] == ["FUNDING_INTERVAL_PER_PRINT_UNKNOWN"]
+    assert m._funding(sn, m._params(None))[1] != ["FUNDING_INTERVAL_PER_PRINT_UNKNOWN"]
+
+
+def test_mutation_provenance_ranking_removed_is_caught():
+    m = _mutant("key=lambda o: (T.PROVS.index(o.prov) if o.prov in T.PROVS else len(T.PROVS), -o.rank_score, o.legs))", "key=lambda o: (0, -o.rank_score, o.legs))")
+    ins = [inst("AAAUSDT", spot_hedge="PERP_ONLY"), inst("BBBUSDT", spot_hedge="PERP_ONLY")]
+    sn = [snap("AAAUSDT", bid=99.95, ask=100.05, fund=(5.0,) * 9, iv=480), snap("BBBUSDT", bid=99.999, ask=100.001, fund=(20.0,) * 9, iv=480)]
+    params = {"persistence": 1.0, "price_vol_bps_per_day": {"AAAUSDT": 50.0, "BBBUSDT": 50.0}}
+    sp = {"kind": "PERP_DIRECTIONAL_FUNDING", "style": "TAKER"}
+    assert m.scan(ins, sn, spec=sp, candidate_id="c", spec_digest="d", decision_ms=NOW, params=params)[0].legs[0][0] == "BBBUSDT"
+    assert S.scan(ins, sn, spec=sp, candidate_id="c", spec_digest="d", decision_ms=NOW, params=params)[0].legs[0][0] == "AAAUSDT"
