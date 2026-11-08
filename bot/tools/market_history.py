@@ -107,6 +107,7 @@ KLINE_INTERVALS_MS = {"1": 60_000, "3": 180_000, "5": 300_000, "15": 900_000, "3
                       "360": 21_600_000, "720": 43_200_000, "D": 86_400_000, "W": 604_800_000}      # "M" (calendar month) has no fixed grid: refused
 OI_INTERVALS_MS = {"5min": 300_000, "15min": 900_000, "30min": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 TIME_FIELDS = ("exchange_event_time", "source_server_time", "local_receive_time", "collection_time", "normalization_time", "observation_time", "decision_time")
+SELECTION_MODES = ("EXPLICIT_SYMBOLS", "FROM_PLAN", "UNIVERSE")            # how a dataset's symbol set was chosen (manifest ``selection.mode``); a manifest without the block is UNKNOWN_LEGACY
 STATUS_ORDER = ("CONFLICTED", "UNVERIFIED", "PARTIAL", "STALE", "COMPLETE")
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,24}\Z", re.ASCII)
@@ -1039,7 +1040,8 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
                 clock: Callable[[], int] = lambda: int(time.time() * 1000), sleep: Callable[[float], None] = time.sleep, mono: Callable[[], float] = time.monotonic,
                 workers: int = DEFAULT_WORKERS, rate: float = DEFAULT_RATE, max_pages: int = DEFAULT_MAX_PAGES, reserve_bytes: int = MC.DEFAULT_RESERVE_BYTES,
                 free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free, universe: Optional[Mapping[str, Any]] = None,
-                max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S, window_end_basis: str = "OPERATOR_END_MS") -> Dict[str, Any]:
+                max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S, window_end_basis: str = "OPERATOR_END_MS",
+                selection: Optional[Mapping[str, Any]] = None, on_symbol: Optional[Callable[[str, Mapping[str, Any]], None]] = None) -> Dict[str, Any]:
     """Collect every spec'd symbol (bounded concurrency, shared token bucket), then write the dataset manifest. Returns the manifest (or a refusal)."""
     if not 1 <= workers <= MAX_WORKERS:
         raise HistoryError(f"workers must be 1..{MAX_WORKERS}")
@@ -1067,7 +1069,10 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
             def disk_check() -> Optional[str]:
                 f = int(free_bytes_fn(root))
                 return f"disk_floor: {f} bytes free is below the reserve {reserve_bytes}; stopped before the next page (rerun resumes)" if f < reserve_bytes else None
-            return spec["symbol"], collect_symbol(spec, sdir, fetch, clock, sleep, bucket, max_pages, max_retries, backoff_s, disk_check)
+            res = collect_symbol(spec, sdir, fetch, clock, sleep, bucket, max_pages, max_retries, backoff_s, disk_check)
+            if on_symbol is not None:
+                on_symbol(spec["symbol"], res)               # a checkpoint after EVERY symbol (run-plan's progress file); the pages themselves are already durable
+            return spec["symbol"], res
         except HistoryError as exc:
             return spec["symbol"], {"errors": [str(exc)], "stop_reason": None, "fatal": True, "pages_fetched": 0, "pages_resumed": 0, "quarantined": [], "rate_limit_events": 0, "requests": 0}
         except (OSError, UC.CaptureError, MC.CollectorError) as exc:
@@ -1100,12 +1105,17 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
             summ["run"] = run
             symbols[sym] = summ
         statuses = [s["status"] for s in symbols.values()]
+        sel = dict(selection) if selection else {"mode": "EXPLICIT_SYMBOLS" if not universe else ("FROM_PLAN" if universe.get("symbols_from_plan") else "UNIVERSE"),
+                                                 "plan_digest": ((universe or {}).get("symbols_from_plan") or {}).get("plan_digest")}
+        sel["symbols_n"] = len(specs) + len(excluded)               # the symbols the operator ASKED for (those skipped by lifecycle included)
+        if sel.get("mode") not in SELECTION_MODES:
+            raise HistoryError(f"selection.mode must be one of {SELECTION_MODES}")
         by_status = {k: statuses.count(k) for k in STATUS_ORDER if k in statuses}
         man = {"schema": SCHEMA, "dataset": dataset, "interval": interval, "request": {"host": venues.host_of(venues.rest_for("mainnet")), "path": DATASETS[dataset]["path"],
                "category": CATEGORY, "limit": DATASETS[dataset]["limit"], "start_ms": specs[0]["start_ms"], "end_ms": specs[0]["window_end_ms"],
                "window_end_basis": window_end_basis},
                "started_ms": started, "finished_ms": int(clock()), "dataset_status": _worst(statuses), "counts": {"symbols": len(symbols), "by_status": by_status},
-               "universe": dict(universe) if universe else None, "excluded": excluded, "time_fields": list(TIME_FIELDS), "symbols": symbols,
+               "universe": dict(universe) if universe else None, "selection": sel, "excluded": excluded, "time_fields": list(TIME_FIELDS), "symbols": symbols,
                "note": "raw pages are the evidence; gaps/rejects/conflicts are reported, never filled; a hash shows what was read, not who produced it"}
         man["manifest_digest"] = _sha(_canon({k: v for k, v in man.items() if k != "manifest_digest"}))
         _write_atomic(os.path.join(ddir, "manifest.json"), (json.dumps(man, indent=1, sort_keys=True, allow_nan=False) + "\n").encode())
@@ -1339,6 +1349,212 @@ def hedge_availability(records: Mapping[str, Mapping[str, Any]], spot_dir: str) 
             "note": "answered from raw bytes that re-hash; a multiplier contract is never assumed hedgeable"}
 
 
+
+# ---------------------------------------------------------------- run-plan: execute a SEALED plan dataset by dataset, resumable, into a NEW root
+
+RUN_ORDER = (FUNDING, MARK, INDEX, KLINE, OI)                   # == backfill_plan.DATASET_ORDER (a test pins it): funding fixes the symbol set, mark follows for the SAME symbols
+PROGRESS_NAME = "run-plan.progress.json"
+PROGRESS_SCHEMA = "market_history/run_plan_progress/v1"
+PROGRESS_LIST_CAP = 1000
+
+
+def _plan_universe(plan_doc: Mapping[str, Any], universe_dir: Optional[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[str]]:
+    """(records, uinfo, symbols) of a sealed plan: the capture it names (or the same one passed again), whose manifest sha256 must equal the plan's."""
+    sts = list(plan_doc["parameters"].get("include_statuses") or [])
+    records, uinfo = load_universe_dir(universe_dir or plan_doc["universe"]["dir"], include_statuses=sts)
+    if uinfo["manifest_sha256"] != plan_doc["universe"]["manifest_sha256"]:
+        raise HistoryError("the universe capture is not the one the plan was made from (manifest sha256 differs)")
+    symbols = list(plan_doc["eligible_symbols"])
+    absent = sorted(set(symbols) - set(records))
+    if absent:
+        raise HistoryError(f"plan symbols absent from the universe capture: {absent[:5]}")
+    return records, dict(uinfo, symbols=len(symbols), symbols_from_plan={"plan_digest": plan_doc["plan_digest"], "eligible": len(symbols)}), symbols
+
+
+class _Progress:
+    """The machine-readable progress file of one run-plan: per dataset symbols done/remaining, request counts, an ETA LOWER bound (remaining planned requests / the shared rate; retries and
+    backoff excluded) and the last error. Written atomically (0600) after every symbol and at every state change."""
+
+    def __init__(self, path: str, doc: Dict[str, Any], clock: Callable[[], int], rate: float) -> None:
+        self.path, self.doc, self.clock, self.rate = path, doc, clock, rate
+        self.lock = threading.Lock()
+
+    def flush(self) -> None:
+        with self.lock:
+            self._derive()
+            _write_atomic(self.path, (json.dumps(self.doc, indent=1, sort_keys=True, allow_nan=False) + "\n").encode())
+
+    def _derive(self) -> None:
+        d = self.doc
+        d["updated_ms"] = int(self.clock())
+        rem = 0
+        for ds, e in d["datasets"].items():
+            e["symbols_remaining"] = sorted(set(e["symbols_all"]) - set(e["symbols_done"]))[:PROGRESS_LIST_CAP]
+            e["symbols_remaining_count"] = len(set(e["symbols_all"]) - set(e["symbols_done"]))
+            e["symbols_done_count"] = len(e["symbols_done"])
+            if e["status"] != "DONE":
+                rem += max(0, e["requests_planned"] - e["requests_made"])
+        d["totals"] = {"requests_made": sum(e["requests_made"] for e in d["datasets"].values()), "pages_fetched": sum(e["pages_fetched"] for e in d["datasets"].values()),
+                       "rate_limit_events": sum(e["rate_limit_events"] for e in d["datasets"].values()), "requests_planned_remaining": rem,
+                       "eta_lower_bound_s": round(rem / self.rate, 1) if self.rate > 0 else None,
+                       "eta_note": "LOWER bound: remaining planned requests / the shared token-bucket rate; retries, backoff and server latency are not in it"}
+
+    def symbol_done(self, ds: str, sym: str, res: Mapping[str, Any]) -> None:
+        with self.lock:
+            e = self.doc["datasets"][ds]
+            e["requests_made"] += int(res.get("requests") or 0)
+            e["pages_fetched"] += int(res.get("pages_fetched") or 0)
+            e["rate_limit_events"] += int(res.get("rate_limit_events") or 0)
+            if res.get("stop_reason") and not res.get("errors"):
+                if sym not in e["symbols_done"]:
+                    e["symbols_done"].append(sym)
+            elif res.get("errors"):
+                self.doc["last_error"] = {"dataset": ds, "symbol": sym, "error": str(res["errors"][0])[:300], "at_ms": int(self.clock())}
+        self.flush()
+
+
+def run_plan(plan_path: str, out_root: str, *, universe_dir: Optional[str] = None, datasets: Optional[Sequence[str]] = None, fetch: Callable[[str], bytes] = http_fetch,
+             clock: Callable[[], int] = lambda: int(time.time() * 1000), sleep: Callable[[float], None] = time.sleep, mono: Callable[[], float] = time.monotonic,
+             workers: int = DEFAULT_WORKERS, rate: float = DEFAULT_RATE, max_pages: int = DEFAULT_MAX_PAGES, reserve_bytes: int = MC.DEFAULT_RESERVE_BYTES,
+             free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free, max_retries: int = MC.MAX_RETRIES, backoff_s: float = MC.BACKOFF_S,
+             stop_after_requests: Optional[int] = None) -> Dict[str, Any]:
+    """Collect every dataset of a SEALED ``backfill_plan`` into ``out_root`` (a NEW directory: an existing non-empty root is accepted only to RESUME this same plan).
+
+    * Resumable with no refetch: each symbol directory is an append-only, hash-chained ledger of raw pages; a symbol whose ledger ended (``stop``) costs zero requests on a re-run, a symbol
+      interrupted mid-window resumes at its last verified page. The progress file records which symbols are done.
+    * Never overwrites: refuses a root inside a git work tree or behind a link, a dataset directory that this plan's progress file does not own, a progress file of a different plan, and a window
+      whose end a forming candle could still change. All writes stay under ``out_root``.
+    * Same symbols everywhere: every dataset is built from the plan's ``eligible_symbols``; a finished dataset whose manifest holds a different symbol set stops the run (SYMBOL_SET_MISMATCH).
+    * Respects the shared token bucket, bounded backoff and 429 handling of ``run_dataset``; funding-interval regime handling (``unproven_regime_change``) is untouched.
+    A dataset with any non-COMPLETE symbol ends the run (exit non-zero, ``last_error`` set): re-running resumes it. ``stop_after_requests`` is a test hook."""
+    plan_doc = load_plan(plan_path)
+    par = plan_doc["parameters"]
+    want = [d for d in RUN_ORDER if d in (datasets if datasets is not None else par.get("required_datasets") or (FUNDING, MARK))]
+    if not want:
+        raise HistoryError("run-plan: no dataset selected")
+    if not 1 <= workers <= MAX_WORKERS or not rate > 0:
+        raise HistoryError(f"workers must be 1..{MAX_WORKERS} and rate > 0")
+    root = os.path.abspath(out_root)
+    pdoc = plan_doc["window"]
+    start_ms, end_ms = int(pdoc["effective_from_ms"]), int(pdoc["effective_to_ms"])
+    ivs = par.get("intervals") or {}
+    for ds in want:
+        interval = None if ds == FUNDING else ivs.get(ds)
+        if ds != FUNDING and interval_ms_of(ds, interval) is None:
+            raise HistoryError(f"run-plan: the plan names no usable interval for {ds}")
+        limit_end = int(clock()) if ds == FUNDING else last_closed_end_ms(int(clock()), interval, ds)
+        if end_ms > limit_end:
+            raise HistoryError(f"WINDOW_END_NOT_CLOSED: the plan's window end {end_ms} is later than the last closed {'moment' if ds == FUNDING else 'candle boundary'} {limit_end} for {ds}: "
+                               "a candle the venue has not closed would be requested; re-plan with an earlier --study-to-ms")
+    guard = MC.root_guard(root, reserve_bytes, free_bytes_fn)
+    if guard:
+        raise HistoryError("run-plan: refused root: " + "; ".join(guard))
+    ppath = os.path.join(root, PROGRESS_NAME)
+    prior: Optional[Dict[str, Any]] = None
+    if os.path.isdir(root):
+        existing = sorted(n for n in os.listdir(root) if n not in (MC.LOCK_NAME,))
+        if existing:
+            if os.path.islink(ppath) or not os.path.isfile(ppath):
+                raise HistoryError(f"run-plan: {root} is not empty and holds no {PROGRESS_NAME} of this plan: refusing to write beside (or over) an existing dataset; give a NEW directory")
+            try:
+                with open(ppath, "rb") as fh:
+                    prior = json.loads(fh.read())
+            except ValueError as exc:
+                raise HistoryError("run-plan: the progress file is not JSON") from exc
+            if not isinstance(prior, dict) or prior.get("schema") != PROGRESS_SCHEMA or prior.get("plan_digest") != plan_doc["plan_digest"]:
+                raise HistoryError("run-plan: the progress file belongs to a different plan: refusing to mix two plans in one root; give a NEW directory")
+            owned = set((prior.get("datasets") or {}))
+            foreign = [n for n in existing if n not in (PROGRESS_NAME,) and n not in {dataset_dirname(d, None if d == FUNDING else ivs.get(d)) for d in owned}]
+            if foreign:
+                raise HistoryError(f"run-plan: {root} holds {foreign[:3]} that this plan's progress file does not own: refusing")
+    else:
+        os.makedirs(root, mode=0o700)
+    os.chmod(root, 0o700)
+    records, uinfo, symbols = _plan_universe(plan_doc, universe_dir)
+    est = {d: (plan_doc.get("datasets", {}).get(d, {}).get("estimate") or {}).get("requests_total", 0) for d in RUN_ORDER}
+    base: Dict[str, Any] = {"schema": PROGRESS_SCHEMA, "plan_digest": plan_doc["plan_digest"], "plan_path": os.path.abspath(plan_path), "out_root": root, "status": "RUNNING",
+                            "started_ms": int(clock()), "window": {"start_ms": start_ms, "end_ms": end_ms}, "workers": workers, "rate_per_s": rate, "last_error": None, "datasets": {}}
+    for ds in want:
+        interval = None if ds == FUNDING else ivs.get(ds)
+        old = ((prior or {}).get("datasets") or {}).get(ds) or {}
+        base["datasets"][ds] = {"dirname": dataset_dirname(ds, interval), "interval": interval, "status": old.get("status", "PENDING"), "symbols_all": sorted(symbols),
+                                "symbols_done": list(old.get("symbols_done", [])), "requests_planned": int(est.get(ds) or 0), "requests_made": int(old.get("requests_made", 0)),
+                                "pages_fetched": int(old.get("pages_fetched", 0)), "rate_limit_events": int(old.get("rate_limit_events", 0)), "manifest_digest": old.get("manifest_digest"),
+                                "dataset_status": old.get("dataset_status")}
+    if prior and prior.get("started_ms"):
+        base["started_ms"] = prior["started_ms"]
+        base["resumed"] = int(prior.get("resumed", 0)) + 1
+    prog = _Progress(ppath, base, clock, rate)
+    with MC._locked(root):
+        prog.flush()
+        sel = {"mode": "FROM_PLAN", "plan_digest": plan_doc["plan_digest"]}
+        n_requests = [0]
+        for ds in want:
+            e = base["datasets"][ds]
+            interval = e["interval"]
+            ddir = os.path.join(root, e["dirname"])
+            if e["status"] == "DONE":
+                v = verify_dataset(ddir)
+                man_path = os.path.join(ddir, "manifest.json")
+                digest = None
+                if os.path.isfile(man_path):
+                    with open(man_path, "rb") as fh:
+                        digest = json.loads(fh.read()).get("manifest_digest")
+                if v["ok"] and digest == e["manifest_digest"]:
+                    continue                                    # already finished and re-verified: zero requests
+                raise HistoryError(f"run-plan: dataset {e['dirname']} is marked DONE but no longer verifies / matches its recorded digest: refusing to touch it")
+            specs = build_specs(ds, interval, symbols, start_ms, end_ms, records)
+            e["status"] = "RUNNING"
+            prog.flush()
+
+            def hook(sym: str, res: Mapping[str, Any], _ds: str = ds) -> None:
+                prog.symbol_done(_ds, sym, res)
+
+            fetch_w = fetch
+            if stop_after_requests is not None:
+                def fetch_w(url: str, _f: Callable[[str], bytes] = fetch) -> bytes:        # noqa: E306 - test hook: simulate an interruption after N requests
+                    if n_requests[0] >= stop_after_requests:
+                        raise KeyboardInterrupt("stop_after_requests")
+                    n_requests[0] += 1
+                    return _f(url)
+            try:
+                man = run_dataset(root, ds, interval, specs, fetch=fetch_w, clock=clock, sleep=sleep, mono=mono, workers=workers, rate=rate, max_pages=max_pages, reserve_bytes=reserve_bytes,
+                                  free_bytes_fn=free_bytes_fn, universe=uinfo, window_end_basis="PLAN_WINDOW", max_retries=max_retries, backoff_s=backoff_s, selection=sel, on_symbol=hook)
+            except BaseException as exc:                        # noqa: BLE001 - an interruption is recorded, then re-raised: the progress file must say where it stopped
+                e["status"] = "INTERRUPTED"
+                base["status"] = "INTERRUPTED"
+                base["last_error"] = {"dataset": ds, "error": f"{type(exc).__name__}: {str(exc)[:200]}", "at_ms": int(clock())}
+                prog.flush()
+                raise
+            if man.get("status") == "REFUSED_ROOT":
+                e["status"] = "FAILED"
+                base["status"] = "FAILED"
+                base["last_error"] = {"dataset": ds, "error": "root refused: " + "; ".join(man.get("problems", []))[:200], "at_ms": int(clock())}
+                prog.flush()
+                return base
+            got = set(man["symbols"])
+            if got != set(symbols):
+                e["status"] = "FAILED"
+                base["status"] = "FAILED"
+                base["last_error"] = {"dataset": ds, "error": f"SYMBOL_SET_MISMATCH: dataset holds {len(got)} symbols, the plan {len(symbols)} (only in dataset {sorted(got - set(symbols))[:3]}, "
+                                      f"only in plan {sorted(set(symbols) - got)[:3]}; lifecycle skips {sorted(man.get('excluded', {}))[:3]})", "at_ms": int(clock())}
+                prog.flush()
+                return base
+            e["dataset_status"], e["manifest_digest"] = man["dataset_status"], man["manifest_digest"]
+            e["symbols_done"] = sorted(s for s, r in man["symbols"].items() if r.get("status") == "COMPLETE")
+            if man["dataset_status"] != "COMPLETE":
+                e["status"] = "INCOMPLETE"
+                base["status"] = "INCOMPLETE"
+                bad = {s: r.get("reasons") for s, r in man["symbols"].items() if r.get("status") != "COMPLETE"}
+                base["last_error"] = base["last_error"] or {"dataset": ds, "error": f"{len(bad)} symbol(s) not COMPLETE (first: {dict(list(bad.items())[:3])}); re-run resumes", "at_ms": int(clock())}
+                prog.flush()
+                return base                                      # stop: later datasets are not started until this one is whole (a 429 storm must not be fanned out)
+            e["status"] = "DONE"
+            prog.flush()
+        base["status"] = "DONE"
+        prog.flush()
+    return base
+
 # ---------------------------------------------------------------- CLI
 
 PLAN_SCHEMA = "backfill_plan/v1"
@@ -1434,6 +1650,15 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
         p.add_argument("--rate", type=float, default=DEFAULT_RATE, help="shared requests/second")
         p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
         p.add_argument("--reserve-bytes", type=int, default=MC.DEFAULT_RESERVE_BYTES)
+    rp = sub.add_parser("run-plan", help="execute a SEALED backfill_plan dataset by dataset into a NEW root: resumable (no refetch), rate-limited, progress file, never overwrites")
+    rp.add_argument("--plan", required=True, metavar="PLAN.json")
+    rp.add_argument("--out-root", required=True, help="a NEW directory outside the git work tree (an existing one is accepted only to resume this same plan)")
+    rp.add_argument("--universe-capture", default=None, help="the capture the plan was made from (default: the plan's own path); its manifest sha256 must match")
+    rp.add_argument("--datasets", default=None, help="comma-separated subset/order source (default: the plan's required datasets); 'all' = every dataset")
+    rp.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    rp.add_argument("--rate", type=float, default=DEFAULT_RATE, help="shared requests/second")
+    rp.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+    rp.add_argument("--reserve-bytes", type=int, default=MC.DEFAULT_RESERVE_BYTES)
     sp = sub.add_parser("spot-instruments", help="one spot instruments-info snapshot (category=spot, single request, no pagination)")
     sp.add_argument("--out-root", required=True)
     sp.add_argument("--reserve-bytes", type=int, default=MC.DEFAULT_RESERVE_BYTES)
@@ -1450,6 +1675,13 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
             res = capture_spot_instruments(a.out_root, fetch=fetch, clock=clock, sleep=sleep, reserve_bytes=a.reserve_bytes, free_bytes_fn=free_bytes_fn)
             print(json.dumps({k: res[k] for k in res if k not in ("page",)}, indent=2, sort_keys=True))
             return 0 if res.get("dataset_status") == "COMPLETE" else (2 if res.get("status") in ("FAILED", "REFUSED_ROOT") else 1)
+        if a.cmd == "run-plan":
+            res = run_plan(a.plan, a.out_root, universe_dir=a.universe_capture, datasets=(list(RUN_ORDER) if a.datasets == "all" else [x for x in a.datasets.split(",") if x]) if a.datasets else None,
+                           fetch=fetch, clock=clock, sleep=sleep, mono=mono, workers=a.workers, rate=a.rate, max_pages=a.max_pages, reserve_bytes=a.reserve_bytes, free_bytes_fn=free_bytes_fn)
+            print(json.dumps({"status": res["status"], "out_root": res["out_root"], "totals": res["totals"], "last_error": res["last_error"],
+                              "datasets": {d: {k: e.get(k) for k in ("status", "dataset_status", "symbols_done_count", "symbols_remaining_count", "requests_made")} for d, e in res["datasets"].items()},
+                              "progress_file": os.path.join(res["out_root"], PROGRESS_NAME)}, indent=2, sort_keys=True))
+            return 0 if res["status"] == "DONE" else 1
         if a.cmd == "hedge-availability":
             recs, _info = load_universe_dir(a.universe_capture, include_statuses=[x for x in a.include_statuses.split(",") if x] if a.include_statuses else None)
             print(json.dumps(hedge_availability(recs, a.spot_dir), indent=2, sort_keys=True))
@@ -1503,8 +1735,9 @@ def main(argv: Optional[Sequence[str]] = None, *, fetch: Callable[[str], bytes] 
             symbols = [s for s in a.symbols.split(",") if s]
         ov = _parse_overrides(getattr(a, "funding_interval_min", []))
         specs = build_specs(a.cmd, interval, symbols, start_ms, end_ms, records, ov, _parse_accepts(getattr(a, "accept_regime_change", [])))
+        selection = {"mode": "FROM_PLAN", "plan_digest": plan_doc["plan_digest"]} if plan_doc is not None else {"mode": "UNIVERSE" if a.universe_dir else "EXPLICIT_SYMBOLS", "plan_digest": None}
         man = run_dataset(a.out_root, a.cmd, interval, specs, fetch=fetch, clock=clock, sleep=sleep, mono=mono, workers=a.workers, rate=a.rate, max_pages=a.max_pages,
-                          reserve_bytes=a.reserve_bytes, free_bytes_fn=free_bytes_fn, universe=uinfo, window_end_basis=end_basis)
+                          reserve_bytes=a.reserve_bytes, free_bytes_fn=free_bytes_fn, universe=uinfo, window_end_basis=end_basis, selection=selection)
     except (HistoryError, MC.CollectorError, UC.CaptureError, OSError) as exc:
         print(f"market_history: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

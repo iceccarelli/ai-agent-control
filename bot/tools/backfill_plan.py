@@ -41,6 +41,7 @@ ENDED = ("Closed", "Delivering")                      # research_harness.ENDED_S
 DEFAULT_STATUSES = ("Trading", "Closed")
 DEFAULT_QUOTES = ("USDT",)
 DEFAULT_INTERVALS = {MH.KLINE: "240", MH.MARK: "240", MH.INDEX: "240", MH.OI: "4h"}     # defaults, operator-overridable; stated in the plan, never implied
+EXCLUDED_SYMBOL_STATUSES = ("CONFLICTED", "UNVERIFIED")                 # candidate_readiness.EXCLUDED_SYMBOL_STATUSES (a test pins the equality)
 DATASET_ORDER = (MH.FUNDING, MH.MARK, MH.INDEX, MH.KLINE, MH.OI)        # funding first (it fixes the symbol set), then mark for the SAME symbols, then the rest
 DEFAULT_REQUIRED = (MH.FUNDING, MH.MARK)                                # what the ranked-funding evaluator reads
 NAMES_CAP = 25
@@ -134,12 +135,13 @@ def symbol_range(rec: Mapping[str, Any], win_from: int, win_to: int) -> Tuple[in
     return max(win_from, launch or win_from), min(win_to, delivery) if delivery and rec.get("status") in ENDED else win_to
 
 
-def classify_universe(recs: Mapping[str, Mapping[str, Any]], win_from: int, win_to: int, include_statuses: Sequence[str], quote_coins: Optional[Sequence[str]]) -> Dict[str, Any]:
+def classify_universe(recs: Mapping[str, Mapping[str, Any]], win_from: int, win_to: int, include_statuses: Sequence[str], quote_coins: Optional[Sequence[str]],
+                      classifier: Optional[Any] = None) -> Dict[str, Any]:
     eligible: Dict[str, Dict[str, Any]] = {}
     excluded: Dict[str, str] = {}
     notes: Dict[str, List[str]] = {}
     for s in sorted(recs):
-        ok, why, nt = classify_record(recs[s], win_from, win_to, include_statuses, quote_coins)
+        ok, why, nt = (classifier or classify_record)(recs[s], win_from, win_to, include_statuses, quote_coins)
         if ok:
             eligible[s] = recs[s]
             if nt:
@@ -214,6 +216,16 @@ def assess_symbol(rec: Mapping[str, Any], man_sym: Optional[Mapping[str, Any]], 
     return {"status": status, "missing_ranges": miss[:RANGES_PER_SYMBOL_CAP], "missing_ranges_truncated": len(miss) > RANGES_PER_SYMBOL_CAP, "reasons": reasons}
 
 
+def selection_of(man: Mapping[str, Any]) -> Dict[str, Any]:
+    """How a dataset's symbol set was chosen, from its manifest alone: the recorded ``selection`` block, else (a legacy manifest) UNKNOWN_LEGACY with what the old fields allow us to say."""
+    sel = man.get("selection")
+    if isinstance(sel, dict) and sel.get("mode") in MH.SELECTION_MODES:
+        return {"mode": sel["mode"], "symbols_n": sel.get("symbols_n"), "plan_digest": sel.get("plan_digest"), "recorded": True}
+    u = man.get("universe") if isinstance(man.get("universe"), dict) else None
+    hint = "no universe recorded (an explicit --symbols list looks likely)" if not u else ("symbols_from_plan recorded" if u.get("symbols_from_plan") else "universe recorded")
+    return {"mode": "UNKNOWN_LEGACY", "symbols_n": len(man.get("symbols") or {}), "plan_digest": ((u or {}).get("symbols_from_plan") or {}).get("plan_digest"), "recorded": False, "legacy_hint": hint}
+
+
 def read_dataset(root: str, dirname: str, verify: bool) -> Dict[str, Any]:
     ddir = os.path.join(root, dirname)
     mp = os.path.join(ddir, "manifest.json")
@@ -237,6 +249,200 @@ def read_dataset(root: str, dirname: str, verify: bool) -> Dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------- THE FUNNEL (one function; plan, diagnose, the loader and the audit all call it)
+
+FUNNEL_SCHEMA = "backfill_plan/funnel/v1"
+WINDOW_FROM_REQUIRED = "REQUIRED_SPAN"
+WINDOW_FROM_EXPLICIT = "EXPLICIT"
+WINDOW_FROM_FUNDING_MANIFEST = "FUNDING_MANIFEST_REQUEST"
+Classifier = Callable[[Mapping[str, Any], int, int, Sequence[str], Optional[Sequence[str]]], Tuple[bool, str, List[str]]]
+
+
+#: lifecycle exclusion reasons that PROVE an ended contract is out of the study scope (not a perpetual of the selected quote, never traded, outside the window, ...). Any other reason an ended
+#: (Closed/Delivering) contract is not in the evaluated series (closed_without_delivery, funding_interval_unknown, an unknown classifier class) leaves it UNACCOUNTED: survivors-only.
+EXPLAINED_EXCLUSION_PREFIXES = ("not_perpetual", "quote_not_selected", "prelaunch_no_history", "delivered_before_window", "launched_after_window", "never_trading", "status_not_included")
+
+
+def exclusion_is_explained(reason: str) -> bool:
+    return _reason_key(reason) in EXPLAINED_EXCLUSION_PREFIXES
+
+
+def default_classifier() -> Classifier:
+    """The lifecycle classifier every consumer shares. ``universe_capture.classify_lifecycle`` (the scope verdict ``eligible_perpetual_lifecycle_universe``) is the authority when this tree
+    has it; until then ``classify_record`` (perpetual, quote, status, launch/delivery overlap, funding interval known). Injectable so a test can stand in any class."""
+    return classify_record
+
+
+def window_of_funding_manifest(history_root: str) -> Optional[Tuple[int, int]]:
+    """The window the funding dataset itself says it requested (manifest ``request.start_ms/end_ms``): the loader's default when it is given no required span."""
+    rd = read_dataset(os.path.abspath(history_root), MH.FUNDING, False)
+    req = (rd.get("manifest") or {}).get("request") if rd.get("present") else None
+    if isinstance(req, dict) and _int(req.get("start_ms")) and _int(req.get("end_ms")) and req["start_ms"] < req["end_ms"]:
+        return int(req["start_ms"]), int(req["end_ms"])
+    return None
+
+
+class Funnel:
+    """Captured universe -> eligible lifecycle instruments -> required datasets (funding, mark, ...) -> status / interval checks -> complete historical coverage.
+
+    Built ONLY by :func:`funnel`; ``loadable`` is what ``candidate_readiness.load_history_root`` turns into series (it loads exactly this list), ``complete`` is the subset COMPLETE over
+    the whole required range in every required dataset. ``report()`` is the one JSON-able view every reader embeds, so counts, reasons and symbol lists cannot differ between tools."""
+
+    def __init__(self, **kw: Any) -> None:
+        self.__dict__.update(kw)
+
+    def report(self) -> Dict[str, Any]:
+        return self._report
+
+    def reasons_for_symbols_in_datasets(self) -> Dict[str, str]:
+        return self._dataset_symbol_reasons
+
+
+def funnel(universe_dir: str, history_root: Optional[str], *, window: Optional[Tuple[int, int]] = None, window_source: str = WINDOW_FROM_REQUIRED,
+           include_statuses: Sequence[str] = DEFAULT_STATUSES, quote_coins: Optional[Sequence[str]] = DEFAULT_QUOTES, required_datasets: Sequence[str] = DEFAULT_REQUIRED,
+           intervals: Optional[Mapping[str, str]] = None, report_datasets: Optional[Sequence[str]] = None, verify: bool = True, classifier: Optional[Classifier] = None,
+           universe: Optional[Tuple[Mapping[str, Mapping[str, Any]], Mapping[str, Any]]] = None, pre_verified: Sequence[str] = ()) -> Funnel:
+    """The ONE funnel. ``window`` = (from_ms, to_ms) the history must cover; None = the window the funding manifest itself requested. Raises PlanError when the universe capture does not
+    verify (``market_history.load_universe_dir``) or no window can be determined."""
+    classifier = classifier or default_classifier()
+    iv = dict(DEFAULT_INTERVALS)
+    iv.update(intervals or {})
+    required = [d for d in DATASET_ORDER if d in required_datasets]
+    bad = [d for d in required_datasets if d not in MH.DATASETS]
+    if bad:
+        raise PlanError(f"unknown required dataset(s) {bad}")
+    shown = [d for d in DATASET_ORDER if d in (report_datasets if report_datasets is not None else DATASET_ORDER) or d in required]
+    root_abs = os.path.abspath(history_root) if history_root is not None else None
+    if window is None:
+        window = window_of_funding_manifest(root_abs) if root_abs else None
+        window_source = WINDOW_FROM_FUNDING_MANIFEST
+        if window is None:
+            raise PlanError("no study window given and the funding dataset records none (manifest request.start_ms/end_ms): pass the required window")
+    w0, w1 = int(window[0]), int(window[1])
+    include = effective_statuses(list(include_statuses))
+    try:
+        recs, uinfo = universe if universe is not None else MH.load_universe_dir(universe_dir)               # refuses anything that does not verify (integrity ok AND re-derived COMPLETE|PARTIAL)
+    except (MH.HistoryError, OSError, UC.CaptureError) as exc:
+        raise PlanError(f"universe capture refused: {exc}") from exc
+    cl = classify_universe(recs, w0, w1, include, list(quote_coins) if quote_coins else None, classifier)
+    eligible: Dict[str, Dict[str, Any]] = cl["eligible"]
+    esyms = sorted(eligible)
+    dirs = dataset_dirs(iv)
+    ds_view: Dict[str, Dict[str, Any]] = {}
+    sets: Dict[str, set] = {}
+    for ds in shown:
+        interval = None if ds == MH.FUNDING else iv[ds]
+        need = {s: (*symbol_range(eligible[s], w0, w1), _iv_ms(ds, interval, eligible[s])) for s in esyms}
+        rd = read_dataset(root_abs, dirs[ds], verify and dirs[ds] not in pre_verified) if root_abs is not None else {"present": False}
+        if rd["present"] and dirs[ds] in pre_verified:
+            rd["verified"] = True
+        per: Dict[str, Dict[str, Any]] = {}
+        if rd["present"]:
+            man = rd["manifest"]
+            sets[ds] = set(man["symbols"])
+            for s in esyms:
+                per[s] = assess_symbol(eligible[s], man["symbols"].get(s), (need[s][0], need[s][1]), need[s][2], rd["verified"] is not False)
+        else:
+            for s in esyms:
+                per[s] = {"status": "MISSING", "missing_ranges": [[need[s][0], need[s][1]]], "reasons": ["dataset_absent" if root_abs is not None else "no_history_root"]}
+        ds_view[ds] = {"dataset": ds, "interval": interval, "dirname": dirs[ds], "required": ds in required, "rd": rd, "need": need, "per": per}
+    # ---- staged exclusions of ELIGIBLE symbols, in the loader's order (first failing check names the reason)
+    stage_excluded: Dict[str, str] = {}
+    stages: List[Dict[str, Any]] = [{"stage": "1_universe_rows_linear", "count": len(recs), "symbols": _cap(sorted(recs))},
+                                    {"stage": "2_eligible_lifecycle", "count": len(esyms), "symbols": _cap(esyms)}]
+    alive = list(esyms)
+    for i, ds in enumerate(required, 3):
+        view = ds_view[ds]
+        keep = []
+        for s in alive:
+            if not view["rd"]["present"] or s not in sets.get(ds, set()):
+                stage_excluded[s] = f"not_in_{ds.replace('-kline', '')}_dataset" if ds in (MH.MARK, MH.INDEX) else f"not_in_{ds}_dataset"
+            else:
+                keep.append(s)
+        alive = keep
+        stages.append({"stage": f"{i}_in_{ds}_dataset", "count": len(alive), "symbols": _cap(alive)})
+    n = len(required) + 3
+    mans = {ds: ds_view[ds]["rd"].get("manifest") for ds in required}
+    names = {ds: ("funding" if ds == MH.FUNDING else ds_view[ds]["dirname"]) for ds in required}
+    keep = []
+    for s in alive:
+        sts = {names[ds]: mans[ds]["symbols"][s].get("status") for ds in required}
+        badst = {k: v for k, v in sts.items() if v in EXCLUDED_SYMBOL_STATUSES or v is None}
+        if badst:
+            stage_excluded[s] = "symbol_status:" + ",".join(f"{k}={v}" for k, v in sorted(badst.items()))
+        else:
+            keep.append(s)
+    alive = keep
+    stages.append({"stage": f"{n}_status_not_conflicted_or_unverified", "count": len(alive), "symbols": _cap(alive)})
+    keep = []
+    for s in alive:
+        if any(not (mans[ds]["symbols"][s].get("coverage") or {}).get("rows") for ds in required):
+            stage_excluded[s] = "no_rows"
+        else:
+            keep.append(s)
+    alive = keep
+    stages.append({"stage": f"{n + 1}_has_rows", "count": len(alive), "symbols": _cap(alive)})
+    keep = []
+    if MH.FUNDING in required and alive:
+        import candidate_readiness as CR            # lazy: candidate_readiness imports this module lazily too
+        fdir = ds_view[MH.FUNDING]["rd"]["dir"]
+        for s in alive:
+            segs, why = CR.funding_interval_segments(mans[MH.FUNDING]["symbols"][s], _row_ts(os.path.join(fdir, s, "rows.jsonl")))
+            if segs is None:
+                stage_excluded[s] = why or "funding_interval_unknown"
+            else:
+                keep.append(s)
+        alive = keep
+    stages.append({"stage": f"{n + 2}_funding_interval_known_for_every_print", "count": len(alive), "symbols": _cap(alive)})
+    loadable = sorted(alive)
+    complete = sorted(s for s in loadable if all(ds_view[ds]["per"][s]["status"] == "COMPLETE" and ds_view[ds]["rd"].get("verified") is True for ds in required))
+    stages.append({"stage": f"{n + 3}_loadable", "count": len(loadable), "symbols": _cap(loadable)})
+    stages.append({"stage": f"{n + 4}_complete_over_the_required_window", "count": len(complete), "symbols": _cap(complete)})
+    # why every symbol that sits in a required dataset but is not loadable is out
+    in_any = set().union(*(sets.get(ds, set()) for ds in required)) if required else set()
+    ds_reasons: Dict[str, str] = {}
+    for s in sorted(in_any - set(loadable)):
+        ds_reasons[s] = "not_in_universe" if s not in recs else (cl["excluded"][s] if s in cl["excluded"] else stage_excluded.get(s, "unknown"))
+    lc_ex = cl["excluded"]
+    ended_unaccounted = {s: (stage_excluded.get(s) or lc_ex.get(s) or "not_loaded") for s, r in sorted(recs.items())
+                         if r.get("status") in ENDED and s not in set(loadable) and (s in stage_excluded or (s in lc_ex and not exclusion_is_explained(lc_ex[s])))}
+    mismatch: Dict[str, Any] = {}
+    ref_name = MH.FUNDING if MH.FUNDING in sets else (next(iter(sets)) if sets else None)
+    plan_set = set(esyms)
+    for ds, st in sets.items():
+        d: Dict[str, Any] = {}
+        if ref_name and ds != ref_name:
+            only_ref, only_ds = sorted(sets[ref_name] - st), sorted(st - sets[ref_name])
+            if only_ref:
+                d[f"only_in_{ref_name}"] = _cap(only_ref)
+            if only_ds:
+                d["only_in_this_dataset"] = _cap(only_ds)
+        outside = sorted(st - plan_set)
+        if outside:
+            d["not_in_plan"] = _cap(outside)
+        if d:
+            mismatch[ds] = d
+    by_reason: Dict[str, List[str]] = {}
+    for s, why in {**cl["excluded"], **stage_excluded}.items():
+        by_reason.setdefault(_reason_key(why), []).append(s)
+    rep = {"schema": FUNNEL_SCHEMA, "window": {"from_ms": w0, "to_ms": w1}, "universe_manifest_sha256": uinfo.get("manifest_sha256"),
+           "include_statuses": include, "quote_coins": list(quote_coins) if quote_coins else None, "required_datasets": required,
+           "stages": stages, "eligible": esyms, "excluded_lifecycle": dict(sorted(cl["excluded"].items())), "excluded_stage": dict(sorted(stage_excluded.items())),
+           "excluded_by_reason": {r: sorted(v) for r, v in sorted(by_reason.items())}, "loadable": loadable, "complete": complete,
+           "symbols_in_datasets_not_loaded": dict(sorted(ds_reasons.items())), "ended_unaccounted": ended_unaccounted, "symbol_set_mismatch_datasets": sorted(mismatch)}
+    rep["funnel_digest"] = MH._sha(MH._canon(rep))              # the digest covers WHAT the funnel decided, not how the window was named: the same inputs give the same digest in every tool
+    rep["window_source"] = window_source
+    rep["datasets"] = {ds: {"dirname": v["dirname"], "interval": v["interval"], "present": bool(v["rd"]["present"]), "verified": v["rd"].get("verified"), "required": v["required"],
+                            "symbols_in_dataset": len(sets.get(ds, ())) if v["rd"]["present"] else None} for ds, v in ds_view.items()}
+    return Funnel(window=(w0, w1), window_source=window_source, records=recs, uinfo=uinfo, lifecycle=cl, eligible=esyms, datasets=ds_view, symbol_sets=sets, symbol_set_mismatch=mismatch,
+                  stage_excluded=stage_excluded, ended_unaccounted=ended_unaccounted, loadable=loadable, complete=complete, required=required, include_statuses=include, intervals=iv, _report=rep, _dataset_symbol_reasons=ds_reasons)
+
+
+def _reason_key(why: str) -> str:
+    return why.split("(")[0].split(":")[0]
+
+
+
 def _estimate(dataset: str, interval: Optional[str], need_by_symbol: Mapping[str, Tuple[int, int, Optional[int]]], not_complete: Sequence[str], workers: int, rate: float) -> Dict[str, Any]:
     limit = MH.DATASETS[dataset]["limit"]
 
@@ -256,7 +462,7 @@ def _estimate(dataset: str, interval: Optional[str], need_by_symbol: Mapping[str
 def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms: Optional[int], study_to_ms: int, formation_days: int, hold_days: int, min_holding_rows: int = 60,
          warmup_days: int = 7, include_statuses: Sequence[str] = DEFAULT_STATUSES, quote_coins: Optional[Sequence[str]] = DEFAULT_QUOTES, intervals: Optional[Mapping[str, str]] = None,
          required_datasets: Sequence[str] = DEFAULT_REQUIRED, workers: int = MH.DEFAULT_WORKERS, rate: float = MH.DEFAULT_RATE, verify: bool = True,
-         plan_path: Optional[str] = None, out_root: Optional[str] = None, now_ms: Optional[int] = None) -> Dict[str, Any]:
+         plan_path: Optional[str] = None, out_root: Optional[str] = None, now_ms: Optional[int] = None, classifier: Optional[Any] = None) -> Dict[str, Any]:
     iv = dict(DEFAULT_INTERVALS)
     iv.update(intervals or {})
     if MH.interval_ms_of(MH.MARK, iv[MH.MARK]) is None or MH.interval_ms_of(MH.KLINE, iv[MH.KLINE]) is None or MH.interval_ms_of(MH.INDEX, iv[MH.INDEX]) is None \
@@ -271,13 +477,9 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
     w0, w1 = win["effective_from_ms"], win["effective_to_ms"]
     requested_statuses = list(include_statuses)
     include_statuses = effective_statuses(requested_statuses)
-    try:
-        recs, uinfo = MH.load_universe_dir(universe_dir)               # refuses anything that does not verify (integrity ok AND re-derived COMPLETE|PARTIAL)
-    except (MH.HistoryError, OSError, UC.CaptureError) as exc:
-        raise PlanError(f"universe capture refused: {exc}") from exc
-    cl = classify_universe(recs, w0, w1, list(include_statuses), list(quote_coins) if quote_coins else None)
-    eligible: Dict[str, Dict[str, Any]] = cl["eligible"]
-    esyms = sorted(eligible)
+    fn = funnel(universe_dir, history_root, window=(w0, w1), window_source=WINDOW_FROM_REQUIRED, include_statuses=requested_statuses, quote_coins=quote_coins, required_datasets=required_datasets,
+                intervals=iv, verify=verify, classifier=classifier)
+    recs, uinfo, cl, eligible, esyms = fn.records, fn.uinfo, fn.lifecycle, {s: fn.records[s] for s in fn.eligible}, fn.eligible
     blockers: List[Dict[str, str]] = []
     caveats: List[str] = []
     if not esyms:
@@ -296,29 +498,17 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
         caveats.append("study_to_ms is not behind the clock by the safety margin: the newest candle may be unclosed (reported PARTIAL by the collector)")
     dirs = dataset_dirs(iv)
     datasets: Dict[str, Any] = {}
-    sets: Dict[str, set] = {}
     for ds in DATASET_ORDER:
-        interval = None if ds == MH.FUNDING else iv[ds]
-        need = {s: (*symbol_range(eligible[s], w0, w1), _iv_ms(ds, interval, eligible[s])) for s in esyms}
-        entry: Dict[str, Any] = {"dataset": ds, "interval": interval, "dirname": dirs[ds], "required": ds in required_datasets, "present": False}
-        if history_root is not None:
-            rd = read_dataset(os.path.abspath(history_root), dirs[ds], verify)
-            entry["present"] = bool(rd["present"])
-        else:
-            rd = {"present": False}
+        v = fn.datasets[ds]
+        rd, per, need, interval = v["rd"], v["per"], v["need"], v["interval"]
+        entry: Dict[str, Any] = {"dataset": ds, "interval": interval, "dirname": dirs[ds], "required": ds in required_datasets, "present": bool(rd["present"])}
         counts = {k: 0 for k in ("COMPLETE", "PARTIAL", "STALE", "CONFLICTED", "UNVERIFIED", "MISSING")}
-        per: Dict[str, Dict[str, Any]] = {}
         if rd["present"]:
             man = rd["manifest"]
             entry.update(dataset_status=man.get("dataset_status"), manifest_digest=man.get("manifest_digest"), verified=rd["verified"], verify_problems=rd["verify_problems"],
                          request=man.get("request"), collected_with_universe=(man.get("universe") or {}).get("dir") if isinstance(man.get("universe"), dict) else None,
-                         collected_with_included_statuses=(man.get("universe") or {}).get("included_statuses") if isinstance(man.get("universe"), dict) else None)
-            sets[ds] = set(man["symbols"])
-            for s in esyms:
-                per[s] = assess_symbol(eligible[s], man["symbols"].get(s), (need[s][0], need[s][1]), need[s][2], rd["verified"] is not False)
-        else:
-            for s in esyms:
-                per[s] = {"status": "MISSING", "missing_ranges": [[need[s][0], need[s][1]]], "reasons": ["dataset_absent" if history_root is not None else "no_history_root"]}
+                         collected_with_included_statuses=(man.get("universe") or {}).get("included_statuses") if isinstance(man.get("universe"), dict) else None,
+                         selection=selection_of(man))
         for s, a in per.items():
             counts[a["status"]] += 1
         todo = sorted(s for s, a in per.items() if a["status"] != "COMPLETE")
@@ -327,23 +517,7 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
         entry.update(counts=counts, symbols_by_status=by_status, to_collect=_cap(todo), missing_ranges=listed, missing_ranges_truncated=len(todo) > SYMBOLS_WITH_RANGES_CAP,
                      estimate=_estimate(ds, interval, need, todo, workers, rate))
         datasets[ds] = entry
-    # symbol-set coherence: every present dataset against funding (the dataset that fixes the set) and against the plan
-    mismatch: Dict[str, Any] = {}
-    ref_name = MH.FUNDING if MH.FUNDING in sets else (next(iter(sets)) if sets else None)
-    plan_set = set(esyms)
-    for ds, st in sets.items():
-        d: Dict[str, Any] = {}
-        if ref_name and ds != ref_name:
-            only_ref, only_ds = sorted(sets[ref_name] - st), sorted(st - sets[ref_name])
-            if only_ref:
-                d[f"only_in_{ref_name}"] = _cap(only_ref)
-            if only_ds:
-                d["only_in_this_dataset"] = _cap(only_ds)
-        outside = sorted(st - plan_set)
-        if outside:
-            d["not_in_plan"] = _cap(outside)
-        if d:
-            mismatch[ds] = d
+    mismatch = fn.symbol_set_mismatch
     if mismatch:
         blockers.append({"code": "SYMBOL_SET_MISMATCH", "detail": "datasets were collected for different symbol sets: " + ", ".join(sorted(mismatch)) + " (re-collect with --symbols-from-plan)"})
     # readiness
@@ -374,7 +548,7 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
            "eligible_by_status": {k: sum(1 for s in esyms if eligible[s].get("status") == k) for k in sorted({eligible[s].get("status") for s in esyms}, key=str)},
            "eligible_notes": {k: v for k, v in sorted(cl["notes"].items())},
            "excluded_count": len(cl["excluded"]), "excluded_by_reason": {r: _cap(v) for r, v in sorted(cl["by_reason"].items())}, "excluded_detail": dict(sorted(cl["excluded"].items())),
-           "history_root": os.path.abspath(history_root) if history_root else None, "datasets": datasets, "symbol_set_mismatch": mismatch,
+           "funnel": fn.report(), "history_root": os.path.abspath(history_root) if history_root else None, "datasets": datasets, "symbol_set_mismatch": mismatch,
            "estimate": {"required_datasets_requests_total": total_req, "required_datasets_requests_remaining": rem_req, "all_datasets_requests_remaining": rem_all,
                         "required_datasets_wall_clock_lower_bound_s_remaining": round(rem_req / rate, 1), "all_datasets_wall_clock_lower_bound_s_remaining": round(rem_all / rate, 1)},
            "commands": commands, "blockers": blockers, "caveats": caveats,
@@ -445,7 +619,7 @@ def _scan_notes(history_root: str, data_root: Optional[str]) -> Dict[str, Any]:
 
 def diagnose(universe_dir: Optional[str], history_root: str, *, study_from_ms: Optional[int], study_to_ms: int, formation_days: int, hold_days: int, min_holding_rows: int = 60,
              warmup_days: int = 7, include_statuses: Sequence[str] = DEFAULT_STATUSES, quote_coins: Optional[Sequence[str]] = DEFAULT_QUOTES, mark_interval: Optional[str] = None,
-             data_root: Optional[str] = None) -> Dict[str, Any]:
+             data_root: Optional[str] = None, classifier: Optional[Any] = None) -> Dict[str, Any]:
     import candidate_readiness as CR
     import research_harness as RH
     res: Dict[str, Any] = {"schema": SCHEMA + "/diagnose", "history_root": os.path.abspath(history_root), "blockers": [], "steps": [], "explanation": []}
@@ -479,88 +653,115 @@ def diagnose(universe_dir: Optional[str], history_root: str, *, study_from_ms: O
             recs, uinfo = MH.load_universe_dir(universe_dir)
         except (MH.HistoryError, OSError, UC.CaptureError) as exc:
             blockers.append({"code": "UNIVERSE_REFUSED", "detail": str(exc)[:300]})
-    steps = res["steps"]
-
-    def step(name: str, syms: Sequence[str], note: str = "") -> None:
-        steps.append({"step": name, "count": len(syms), "symbols": _cap(sorted(syms)), "note": note})
     include_statuses = effective_statuses(include_statuses)
     if recs:
         w0, w1 = win["effective_from_ms"], win["effective_to_ms"]
-        cl = classify_universe(recs, w0, w1, list(include_statuses), list(quote_coins) if quote_coins else None)
-        elig = set(cl["eligible"])
-        step("1_universe_rows_linear", list(recs), f"statuses: {uinfo.get('statuses_in_capture')}")
-        step("2_eligible_by_status_and_lifecycle", list(elig), "excluded: " + json.dumps({r: len(v) for r, v in sorted(cl["by_reason"].items())}))
-        fsyms = set(fund["manifest"]["symbols"]) if fund["present"] else set()
-        msyms = set(mark["manifest"]["symbols"]) if mark["present"] else set()
-        s3 = elig & fsyms
-        step("3_eligible_in_funding_dataset", list(s3), f"funding dataset holds {len(fsyms)} symbols in total")
-        s4 = s3 & msyms
-        step("4_and_in_mark_dataset", list(s4), f"mark dataset holds {len(msyms)} symbols in total")
-        # the loader's own view: (funding U mark) symbols, filtered in the loader's order
-        loader: Dict[str, str] = {}
-        series_ok: List[str] = []
-        non_complete: List[str] = []
+        required = [MH.FUNDING, MH.MARK] if mark_name else [MH.FUNDING]
+        ivs = {MH.MARK: mark_name[len(MH.MARK) + 1:]} if mark_name else {}
+        fn = funnel(universe_dir, history_root, window=(w0, w1), window_source=WINDOW_FROM_REQUIRED, include_statuses=include_statuses, quote_coins=quote_coins, required_datasets=required,
+                    intervals=ivs, report_datasets=required, classifier=classifier)
+        res["funnel"] = fn.report()
+        elig = set(fn.eligible)
+        res["steps"] = [{"step": st["stage"], "count": st["count"], "symbols": st["symbols"], "note": ""} for st in fn.report()["stages"]]
+        res["steps"][0]["note"] = f"statuses: {uinfo.get('statuses_in_capture')}"
+        res["steps"][1]["note"] = "excluded: " + json.dumps({r: len(v) for r, v in sorted(fn.lifecycle["by_reason"].items())})
+        non_complete = sorted(s for s in fn.loadable if s not in fn.complete)
+        res["steps"][-2]["note"] = f"the loader loads exactly this list; PARTIAL/STALE symbols are KEPT and warned (not COMPLETE over the required window: {len(non_complete)})"
+        res["steps"][-1]["note"] = "COMPLETE over the whole required window in every required dataset (verified datasets only)"
+        loader = {**fn.lifecycle["excluded"], **fn.stage_excluded}
+        res["loader_exclusions"] = {"by_reason": _tally(loader.values()), "examples": {r: _cap(sorted(s for s, w in loader.items() if _reason_key(w) == r)) for r in sorted({_reason_key(w) for w in loader.values()})}}
+        res["predicted_symbols_loaded"] = len(fn.loadable)
+        res["selection"] = {"funding": selection_of(fund["manifest"]) if fund["present"] else None, mark_name or "mark-kline": selection_of(mark["manifest"]) if mark["present"] else None}
         if fund["present"] and mark["present"]:
-            fm, mm = fund["manifest"]["symbols"], mark["manifest"]["symbols"]
-            for sym in sorted(set(fm) | set(mm)):
-                if sym not in recs:
-                    loader[sym] = "not_in_universe"
-                elif sym not in fm:
-                    loader[sym] = "not_in_funding_dataset"
-                elif sym not in mm:
-                    loader[sym] = "not_in_mark_dataset"
-                else:
-                    sts = {"f": fm[sym].get("status"), "m": mm[sym].get("status")}
-                    if any(v in CR.EXCLUDED_SYMBOL_STATUSES or v is None for v in sts.values()):
-                        loader[sym] = "symbol_status:" + ",".join(f"{k}={v}" for k, v in sorted(sts.items()))
-                    else:
-                        if any(v != "COMPLETE" for v in sts.values()):
-                            non_complete.append(sym)
-                        cf, cm = (fm[sym].get("coverage") or {}).get("rows"), (mm[sym].get("coverage") or {}).get("rows")
-                        if not cf or not cm:
-                            loader[sym] = "no_rows"
-                            continue
-                        ts = _row_ts(os.path.join(fund["dir"], sym, "rows.jsonl"))
-                        segs, why = CR.funding_interval_segments(fm[sym], ts)
-                        if segs is None:
-                            loader[sym] = why or "funding_interval_unknown"
-                            continue
-                        r = recs[sym]
-                        if r.get("status") in RH.ENDED_STATUSES and not _int(r.get("deliveryTime")):
-                            loader[sym] = "closed_without_delivery"
-                            continue
-                        series_ok.append(sym)
-            step("5_loader_status_filter_kept_symbols", [s for s in set(fm) & set(mm) if s in recs and s not in {k for k, v in loader.items() if v.startswith("symbol_status")}],
-                 "the loader drops only CONFLICTED/UNVERIFIED; PARTIAL/STALE symbols are KEPT and warned (non_complete: %d)" % len(non_complete))
-            step("6_complete_in_both", [s for s in s4 if fm[s].get("status") == "COMPLETE" and mm[s].get("status") == "COMPLETE"], "informational: the loader does not require COMPLETE")
-            no_iv = [s for s, w in loader.items() if w.startswith("funding_interval_unknown")]
-            step("7_funding_interval_known", [s for s in series_ok], f"dropped for unknown interval: {len(no_iv)}")
-            step("8_not_excluded_loaded", series_ok, "excluded by reason: " + json.dumps(_tally(loader.values())))
-            res["loader_exclusions"] = {"by_reason": _tally(loader.values()), "examples": {r: _cap(sorted(s for s, w in loader.items() if w.split("(")[0].split(":")[0] == r))
-                                                                                      for r in sorted({w.split("(")[0].split(":")[0] for w in loader.values()})}}
-            res["predicted_symbols_loaded"] = len(series_ok)
-            # cross-check with the real loader
-            res["loader_run"] = _run_loader(CR, RH, history_root, universe_dir or "", mark_interval if mark_interval is not None else (mark_name[len(MH.MARK) + 1:] if mark_name else None))
+            res["loader_run"] = _run_loader(CR, RH, history_root, universe_dir or "", mark_name[len(MH.MARK) + 1:] if mark_name else None, (w0, w1))
             actual = res["loader_run"].get("symbols_loaded")
-            res["funnel_matches_loader"] = (actual == len(series_ok)) if actual is not None else None
+            same = res["loader_run"].get("symbols") == fn.loadable if res["loader_run"].get("symbols") is not None else None
+            res["funnel_matches_loader"] = ((actual == len(fn.loadable)) and same is not False) if actual is not None else None
             if res["funnel_matches_loader"] is False:
-                blockers.append({"code": "FUNNEL_DISAGREES_WITH_LOADER", "detail": f"predicted {len(series_ok)} but candidate_readiness.load_history_root loaded {actual}: do not trust this funnel"})
-            # coverage vs eligible
-            missing_f = sorted(elig - fsyms)
-            if missing_f:
-                u = fund["manifest"].get("universe") if fund["present"] else None
-                how = ("collected with an explicit --symbols list (the manifest records no universe)" if not u else
-                       f"collected from universe {u.get('dir')} with included_statuses={u.get('included_statuses')}")
-                blockers.append({"code": "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS", "detail": f"{len(missing_f)} of {len(elig)} eligible symbols have no funding history; the funding dataset was {how}"})
-            span = _span_days(fund, mark)
-            res["history_span_days"] = span
-            res["holding_rows_estimate"] = _holding_rows(fund, formation_days, hold_days)
-            if res["holding_rows_estimate"] is not None and res["holding_rows_estimate"] < min_holding_rows:
-                blockers.append({"code": "TOO_FEW_HOLDING_ROWS", "detail": f"history supports ~{res['holding_rows_estimate']} non-overlapping {hold_days}d holding rows after a {formation_days}d formation lead-in; need {min_holding_rows} "
-                                 f"(window needed: {win['needed_days']}d)"})
+                blockers.append({"code": "FUNNEL_DISAGREES_WITH_LOADER", "detail": f"predicted {len(fn.loadable)} but candidate_readiness.load_history_root loaded {actual}: do not trust this funnel"})
+        fsyms = fn.symbol_sets.get(MH.FUNDING, set())
+        missing_f = sorted(elig - fsyms)
+        if missing_f:
+            u = fund["manifest"].get("universe") if fund["present"] else None
+            sel = selection_of(fund["manifest"]) if fund["present"] else {"mode": "UNKNOWN_LEGACY"}
+            how = (f"collected with selection mode {sel['mode']}" + (" (an explicit --symbols list)" if sel["mode"] == "EXPLICIT_SYMBOLS" else "") +
+                   ("" if not u else f"; universe {u.get('dir')} with included_statuses={u.get('included_statuses')}"))
+            blockers.append({"code": "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS", "detail": f"{len(missing_f)} of {len(elig)} eligible symbols have no funding history; the funding dataset was {how}"})
+        span = _span_days(fund, mark)
+        res["history_span_days"] = span
+        res["holding_rows_estimate"] = _holding_rows(fund, formation_days, hold_days)
+        if res["holding_rows_estimate"] is not None and res["holding_rows_estimate"] < min_holding_rows:
+            blockers.append({"code": "TOO_FEW_HOLDING_ROWS", "detail": f"history supports ~{res['holding_rows_estimate']} non-overlapping {hold_days}d holding rows after a {formation_days}d formation lead-in; need {min_holding_rows} "
+                             f"(window needed: {win['needed_days']}d)"})
+    params = dict(study_to_ms=study_to_ms, study_from_ms=study_from_ms, formation_days=formation_days, hold_days=hold_days, min_holding_rows=min_holding_rows, warmup_days=warmup_days,
+                  include_statuses=list(include_statuses), quote_coins=list(quote_coins) if quote_coins else None, mark_interval=(mark_name[len(MH.MARK) + 1:] if mark_name else None))
+    res["why_few_symbols"] = why_few_symbols(res, fund, mark, universe_dir, history_root, params)
     res["explanation"] = _explain(res)
     res["first_blocker"] = blockers[0] if blockers else None
     return res
+
+
+def _cli_params(params: Mapping[str, Any]) -> str:
+    out = [f"--study-to-ms {params['study_to_ms']}", f"--formation-days {params['formation_days']}", f"--hold-days {params['hold_days']}", f"--min-holding-rows {params['min_holding_rows']}",
+           f"--warmup-days {params['warmup_days']}", "--include-statuses " + ",".join(x for x in params["include_statuses"] if x != "Delivering" or "Closed" not in params["include_statuses"])]
+    if params.get("study_from_ms"):
+        out.insert(1, f"--study-from-ms {params['study_from_ms']}")
+    out.append("--quote-coins " + (",".join(params["quote_coins"]) if params.get("quote_coins") else ""))
+    return " ".join(out)
+
+
+def why_few_symbols(res: Mapping[str, Any], fund: Mapping[str, Any], mark: Mapping[str, Any], universe_dir: Optional[str], history_root: str, params: Mapping[str, Any]) -> Dict[str, Any]:
+    """From the manifests alone: which of the four causes explains a small loaded cross-section, and the exact command sequence to reproduce it and to fix it into a NEW root.
+    (a) the history was collected from an explicit --symbols list, (b) the universe dir was not supplied / not recognised, (c) lifecycle filtering, (d) dataset status.
+    Each cause is APPLIES / DOES_NOT_APPLY / SUSPECTED (legacy manifest, no ``selection`` block) / UNKNOWN, with its evidence."""
+    fr = res.get("funnel") or {}
+    stages = {st["stage"].split("_", 1)[0]: st for st in fr.get("stages", [])}
+    n_univ = (fr.get("stages") or [{"count": 0}])[0]["count"]
+    n_elig = len(fr.get("eligible", []))
+    n_load = len(fr.get("loadable", []))
+    fsel = selection_of(fund["manifest"]) if fund.get("present") else {"mode": "UNKNOWN_LEGACY", "symbols_n": None}
+    fman_u = fund["manifest"].get("universe") if fund.get("present") else None
+    causes: List[Dict[str, Any]] = []
+    sel_mode = fsel["mode"]
+    if sel_mode == "EXPLICIT_SYMBOLS":
+        a = "APPLIES"
+    elif sel_mode == "UNKNOWN_LEGACY":
+        a = "SUSPECTED" if not fman_u and fund.get("present") else ("DOES_NOT_APPLY" if fund.get("present") else "UNKNOWN")
+    else:
+        a = "DOES_NOT_APPLY"
+    causes.append({"cause": "a_explicit_symbols_list", "verdict": a, "evidence": {"selection": fsel, "funding_symbols": len((fund.get("manifest") or {}).get("symbols") or {}) if fund.get("present") else None,
+                                                                                      "eligible_symbols": n_elig, "universe_recorded_in_manifest": bool(fman_u)}})
+    scan = res.get("data_scan") or {}
+    ub = [b["code"] for b in res.get("blockers", []) if b["code"] in ("UNIVERSE_DIR_NOT_SUPPLIED", "UNIVERSE_REFUSED", "DATA_SCAN_FOUND_NO_UNIVERSE_CAPTURE")]
+    causes.append({"cause": "b_universe_dir_not_supplied_or_recognised", "verdict": "APPLIES" if ub else "DOES_NOT_APPLY",
+                   "evidence": {"blockers": ub, "scan_found_universe_capture_dirs": scan.get("universe_capture_dirs"), "sibling_manifests": [x["dir"] for x in scan.get("sibling_manifests_outside_scanned_root", [])]}})
+    lc = (fr.get("excluded_by_reason") or {})
+    lifecycle_n = len(fr.get("excluded_lifecycle", {}))
+    lc_in_ds = sorted(x for x in fr.get("symbols_in_datasets_not_loaded", {}) if x in fr.get("excluded_lifecycle", {}))
+    causes.append({"cause": "c_lifecycle_filtering", "verdict": "UNKNOWN" if not fr else ("APPLIES" if lc_in_ds else "DOES_NOT_APPLY"),
+                   "evidence": {"universe_rows": n_univ, "eligible": n_elig, "excluded_lifecycle": lifecycle_n, "by_reason": {r: len(v) for r, v in sorted(lc.items())},
+                                "collected_but_lifecycle_excluded": _cap(lc_in_ds),
+                                "note": "APPLIES only when symbols that ARE in the datasets were dropped by the lifecycle rule; lifecycle exclusion of never-collected symbols shrinks the plan, not the loader"}})
+    st_ex = fr.get("excluded_stage", {})
+    causes.append({"cause": "d_dataset_status", "verdict": "UNKNOWN" if not fr else ("APPLIES" if st_ex else "DOES_NOT_APPLY"),
+                   "evidence": {"stage_exclusions_by_reason": _tally(st_ex.values()), "datasets": {k: {"present": v["present"], "verified": v["verified"]} for k, v in (fr.get("datasets") or {}).items()},
+                                "examples": dict(list(st_ex.items())[:NAMES_CAP])}})
+    primary = next((c["cause"] for c in causes if c["verdict"] == "APPLIES"), next((c["cause"] for c in causes if c["verdict"] == "SUSPECTED"), None))
+    new_root = f"{history_root.rstrip('/')}-full-{params['study_to_ms']}"
+    plan_path = f"{new_root}/plan.json"
+    uni = universe_dir or "<UNIVERSE_CAPTURE_DIR>"
+    cp = _cli_params(params)
+    seq = [{"order": 1, "purpose": "reproduce this diagnosis (read-only, offline)", "command": f"python3 tools/backfill_plan.py diagnose --universe-capture {uni} --history-root {history_root} {cp}"},
+           {"order": 2, "purpose": "seal a plan for the FULL eligible universe (read-only, offline; writes only PLAN.json under a NEW directory)",
+            "command": f"mkdir -m 700 {new_root} && python3 tools/backfill_plan.py plan --universe-capture {uni} --history-root {history_root} {cp} --out {plan_path}"},
+           {"order": 3, "purpose": "collect it dataset by dataset into the NEW root, resumable and rate-limited (PUBLIC read-only GETs, no credential; refuses an existing dataset)",
+            "command": f"python3 tools/market_history.py run-plan --plan {plan_path} --out-root {new_root}/data --universe-capture {uni}"},
+           {"order": 4, "purpose": "re-plan against the new root: research_ready and the funnel counts are decided here (offline)",
+            "command": f"python3 tools/backfill_plan.py plan --universe-capture {uni} --history-root {new_root}/data {cp} --out {new_root}/replan.json"},
+           {"order": 5, "purpose": "evaluate (offline) against the new root",
+            "command": f"python3 tools/candidate_readiness.py --history-root {new_root}/data --universe-dir {uni}" + (f" --mark-interval {params['mark_interval']}" if params.get("mark_interval") else "")}]
+    return {"primary_cause": primary, "causes": causes, "loaded_symbols": n_load, "eligible_symbols": n_elig, "universe_rows": n_univ, "command_sequence": seq,
+            "note": "primary_cause is the first APPLIES (else SUSPECTED); SUSPECTED means a legacy manifest without a selection block: only a re-collection with this tree records the mode"}
 
 
 def _row_ts(path: str) -> List[int]:
@@ -584,14 +785,14 @@ def _tally(vals: Sequence[str]) -> Dict[str, int]:
     return dict(sorted(out.items()))
 
 
-def _run_loader(CR: Any, RH: Any, root: str, universe_dir: str, mark_interval: Optional[str]) -> Dict[str, Any]:
+def _run_loader(CR: Any, RH: Any, root: str, universe_dir: str, mark_interval: Optional[str], window: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
     try:
-        series, info = CR.load_history_root(root, universe_dir=universe_dir, mark_interval=mark_interval)
+        series, info = CR.load_history_root(root, universe_dir=universe_dir, mark_interval=mark_interval, window=window)
     except RH.HarnessError as exc:
         return {"refused": str(exc)[:300], "symbols_loaded": None}
     except Exception as exc:                          # noqa: BLE001 - a diagnosis reports a loader crash, it does not die with it
         return {"refused": f"{type(exc).__name__}: {str(exc)[:200]}", "symbols_loaded": None}
-    return {"symbols_loaded": len(series), "excluded": len(info.get("excluded", [])), "warnings": list(info.get("warnings", []))[:5]}
+    return {"symbols_loaded": len(series), "symbols": sorted(x.symbol for x in series), "funnel_digest": (info.get("funnel") or {}).get("funnel_digest"), "excluded": len(info.get("excluded", [])), "warnings": list(info.get("warnings", []))[:5]}
 
 
 def _span_days(fund: Mapping[str, Any], mark: Mapping[str, Any]) -> Optional[float]:

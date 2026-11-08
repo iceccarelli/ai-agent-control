@@ -781,12 +781,15 @@ def test_mutation_without_the_key_basis_check_hand_built_series_would_be_accepte
 def test_mutation_without_the_closed_without_delivery_exclusion_the_symbol_would_load(tmp_path, offline):
     m = _mutant("if rec.get(\"status\") in RH.ENDED_STATUSES and not (", "if False and not (")
     root, uni, _ = _hist(tmp_path, spot=False, old_delivery=0)
-    series, _info = m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    approve_all = lambda rec, w0, w1, st, q: (True, "", [])            # noqa: E731 - a classifier that wrongly lets the Closed contract without a delivery time through
+    with pytest.raises(CR.RH.HarnessError, match="closed_without_delivery"):
+        CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV, classifier=approve_all)            # defence in depth: the loader itself still refuses it
+    series, _info = m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV, classifier=approve_all)
     assert "OLDUSDT" in {x.symbol for x in series}
 
 
 def test_mutation_without_the_closed_in_series_check_survivors_would_be_labelled_delistings(tmp_path, offline):
-    m = _mutant("closed_missing = sorted(sy for sy, r in recs.items() if", "closed_missing = [] if True else sorted(sy for sy, r in recs.items() if")
+    m = _mutant("closed_missing = sorted(fn.ended_unaccounted)", "closed_missing = []")
     root, uni, _ = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",))
     assert m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[1]["survivorship"] == "DELISTINGS_OBSERVED"
 

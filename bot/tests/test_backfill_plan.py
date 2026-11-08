@@ -410,8 +410,8 @@ def test_diagnose_funnel_matches_the_real_loader_and_names_the_cause(root, tmp_p
     full_history(root, uni, syms=("AAAUSDT", "OLDUSDT"))        # 3 are eligible; history was collected for 2
     res = diag(uni, root)
     steps = {s["step"]: s["count"] for s in res["steps"]}
-    assert steps["1_universe_rows_linear"] == 8 and steps["2_eligible_by_status_and_lifecycle"] == 3
-    assert steps["3_eligible_in_funding_dataset"] == 2 and steps["4_and_in_mark_dataset"] == 2 and steps["8_not_excluded_loaded"] == 2
+    assert steps["1_universe_rows_linear"] == 8 and steps["2_eligible_lifecycle"] == 3
+    assert steps["3_in_funding_dataset"] == 2 and steps["4_in_mark-kline_dataset"] == 2 and steps["8_loadable"] == 2 and steps["9_complete_over_the_required_window"] == 2
     assert res["predicted_symbols_loaded"] == 2 and res["loader_run"]["symbols_loaded"] == 2 and res["funnel_matches_loader"] is True
     codes = [b["code"] for b in res["blockers"]]
     assert "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" in codes and "UNIVERSE_DIR_NOT_SUPPLIED" not in codes
