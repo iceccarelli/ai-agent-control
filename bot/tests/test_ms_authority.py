@@ -831,7 +831,8 @@ def test_released_quantity_can_be_exited_again_and_a_filled_part_stays_consumed(
     assert a.exit_refusal(exit_b("X2", "4")) is None                                # the 4 can be exited again, under a fresh link
     assert a.exit_refusal(exit_b("X3", "0.5")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"      # the filled 6 stayed consumed
     assert a.release_exit("G1-X1", "7") is False and a.release_exit("G1-NOPE") is False     # cannot release more than is outstanding, or an unknown link
-    assert a.release_exit("G1-X1") is True                                          # the rest (6 -> remaining outstanding is 6): whole remainder
+    a.record_exit_fill("G1-X1", "6")                                                # the venue filled 6 of it: that part is consumed for good
+    assert a.release_exit("G1-X1") is False                                         # nothing unfilled is left: a bare release never gives back fill-consumed quantity
     assert a.exit_refusal(exit_b("X1", "10")) == "EXIT_LINK_RELEASED"               # a released link is spent
 
 
@@ -888,3 +889,17 @@ def test_unsent_legs_of_an_earlier_group_count_but_a_later_groups_never_count_ag
     a.authorize(body("GB", "S", sym="ETHUSDT", cat="spot", side="Buy"), venue="testnet")
     a.authorize(body("GA", "P"), venue="testnet")
     a.authorize(body("GA", "S", cat="spot", side="Buy"), venue="testnet")
+
+
+def test_release_exit_needs_an_open_reservation_and_never_gives_back_fill_consumed_quantity(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    opened(a, env)
+    assert a.release_exit("G1-X1") is False                                         # never reserved
+    assert a.exit_refusal(exit_b("X1", "10")) is None
+    assert a.exit_refusal(exit_b("X1", "9")) == "EXIT_LINK_CONFLICT"                # refused: the reservation of the first order stands
+    assert a.exit_reserved("G1-X1") is True and a.exit_reserved("G1-X9") is False
+    a.record_exit_fill("G1-X1", "4")
+    assert a.release_exit("G1-X1") is True                                          # only the unfilled 6 comes back
+    assert a.exit_refusal(exit_b("X2", "6")) is None
+    assert a.exit_refusal(exit_b("X3", "0.3")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"      # 4 consumed + 6 re-reserved + 0.3 > 10.2: the cumulative exit never exceeds the entry
+    assert a.release_exit("G1-X1") is False                                         # the unfilled part is already back: a second release is a no-op

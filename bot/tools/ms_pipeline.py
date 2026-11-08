@@ -275,17 +275,25 @@ class AuthorityGates:
                 if left > 0 and self.authority.release_exit(l.link, format(left.normalize(), "f")):
                     self.exit_releases.append((l.link, format(left.normalize(), "f")))
 
+    def _exit_reserved(self, link: str) -> bool:
+        try:
+            return bool(self.authority.exit_reserved(link))
+        except Exception:                                                  # noqa: BLE001 - unknown means "do not release"
+            return True
+
     def on_order(self, req: EX.OrderRequest) -> Optional[str]:
         self._current_group = req.group_id
         if self.probe is not None and req.link_id.split("-", 1)[-1].startswith("x"):
             self.release_dead_exits(req.group_id)
+        is_exit = req.link_id.split("-", 1)[-1].startswith("x")
+        held_before = bool(is_exit and self._exit_reserved(req.link_id))     # an earlier call's reservation (a live order may stand behind it) is not this call's to give back
         try:
             body = body_from_request(req)
             self.authority.authorize(body, venue=self.policy["venue"])
         except EA.EntryRefused as exc:
             self.refusals.append((req.link_id, tuple(exc.reasons)))
-            if req.link_id.split("-", 1)[-1].startswith("x"):
-                self.authority.release_exit(req.link_id)                    # an exit refused after its quantity was reserved gives it back (False when nothing was reserved)
+            if is_exit and not held_before and self._exit_reserved(req.link_id):
+                self.authority.release_exit(req.link_id)                    # THIS call reserved the quantity and a later gate refused: give it back (never on CONFLICT / RELEASED / a duplicate)
             return ",".join(exc.reasons)[:300]
         except Exception as exc:                                           # noqa: BLE001 - an authority that cannot decide refuses
             self.refusals.append((req.link_id, (f"AUTHORITY_ERROR:{type(exc).__name__}",)))

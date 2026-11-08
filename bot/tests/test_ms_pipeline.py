@@ -1100,3 +1100,49 @@ def test_mutation_reading_the_future_is_caught(tmp_path, monkeypatch):
     b2 = go(tmp_path, altered_future(base, cut), name="b2")
     fails(check_no_look_ahead, a2, b2, cut)
     assert real is not peek
+
+
+class _StubAuthority:
+    """Stands in for the authority: records release calls, refuses with a fixed reason, and says whether the link was reserved before / after the call."""
+
+    def __init__(self, reason, reserved_before, reserved_after):
+        self.reason, self.reserved = reason, reserved_before
+        self.after = reserved_after
+        self.released = []
+
+    def exit_reserved(self, link):
+        return self.reserved
+
+    def authorize(self, body, venue):
+        self.reserved = self.after
+        raise EA.EntryRefused([self.reason])
+
+    def release_exit(self, link, unfilled_qty=None):
+        self.released.append(link)
+        return True
+
+
+def _gates_with(stub):
+    g = MP.AuthorityGates.__new__(MP.AuthorityGates)
+    g.policy, g.probe, g._current_group = {"venue": "testnet"}, None, None
+    g.refusals, g.authorized, g.authority = [], [], stub
+    return g
+
+
+def _exit_req():
+    lp = T.LegPlan("x1", "BTCUSDT", "linear", "Buy", "10", "Market", None, True, False, "IOC")
+    return EX.OrderRequest("G1", CAND, DIGEST, lp, "G1-x1")
+
+
+@pytest.mark.parametrize("reason,before,after,released", [
+    ("EXIT_LINK_CONFLICT", True, True, False),            # a conflicting resend of an already-reserved live link must not free the first order's reservation
+    ("EXIT_LINK_RELEASED", False, False, False),
+    ("EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY", False, False, False),   # refused before anything was reserved by this call
+    ("SOME_LATER_GATE", True, True, False),               # a duplicate of an open reservation refused later: still not this call's reservation
+    ("SOME_LATER_GATE", False, True, True),               # this call reserved it and a later gate refused: give it back (positive control)
+])
+def test_a_refused_exit_releases_only_a_reservation_this_call_made(reason, before, after, released):
+    stub = _StubAuthority(reason, before, after)
+    g = _gates_with(stub)
+    assert g.on_order(_exit_req()) == reason
+    assert stub.released == (["G1-x1"] if released else [])

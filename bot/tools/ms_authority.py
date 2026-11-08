@@ -521,16 +521,48 @@ class MultiSymbolAuthority:
         except OSError:
             return "EXIT_RESERVATION_LEDGER_UNAVAILABLE"
 
+    def exit_reserved(self, order_link_id: str) -> bool:
+        """True while the link holds an OPEN exit reservation (reserved minus released is positive). A read; False when the ledger cannot be read."""
+        try:
+            rows = self._rows()
+        except (OSError, ValueError):
+            return False
+        res = [r for r in rows if r["event"] == "exit" and r["link"] == order_link_id]
+        return bool(res) and self._exit_left(rows, order_link_id, res[0]) > 0
+
+    @staticmethod
+    def _exit_left(rows: Sequence[Mapping[str, Any]], link: str, res: Mapping[str, Any]) -> Decimal:
+        return Decimal(res["qty"]) - sum((Decimal(r["qty"]) for r in rows if r["event"] == "exit_release" and r["link"] == link), Decimal(0))
+
+    def record_exit_fill(self, order_link_id: str, qty: str) -> bool:
+        """Record that ``qty`` of the link's reservation FILLED: it stays consumed and a bare ``release_exit`` will never give it back. Never records more than is still open."""
+        def decide(rows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+            res = [r for r in rows if r["event"] == "exit" and r["link"] == order_link_id]
+            if not res:
+                return "NO_SUCH_EXIT", None
+            q = Decimal(str(qty))
+            filled = sum((Decimal(r["qty"]) for r in rows if r["event"] == "exit_fill" and r["link"] == order_link_id), Decimal(0))
+            if not q.is_finite() or q <= 0 or q > self._exit_left(rows, order_link_id, res[0]) - filled:
+                return "FILL_QTY_INVALID", None
+            return None, {"event": "exit_fill", "group_id": res[0]["group_id"], "link": order_link_id, "symbol": res[0]["symbol"], "category": res[0]["category"], "qty": str(q),
+                          "at_ms": self._now_ms()}
+        try:
+            return self._groups.append_if(decide) is None
+        except (OSError, ValueError, ArithmeticError):
+            return False
+
     def release_exit(self, order_link_id: str, unfilled_qty: Optional[str] = None) -> bool:
-        """Give back exit quantity that did NOT fill (order rejected, cancelled, expired; or the unfilled remainder of a partial fill). ``unfilled_qty`` None = the whole
-        reservation. The filled part stays consumed. Never gives back more than is outstanding for the link. False if there was nothing to release."""
+        """Give back exit quantity that did NOT fill (order rejected, cancelled, expired; or the unfilled remainder of a partial fill). Only a link that currently holds an OPEN
+        reservation can release anything. ``unfilled_qty`` None = the whole UNFILLED remainder (reserved - released - recorded fills); a stated quantity may not exceed that either:
+        fill-consumed quantity is never given back. False if there was nothing to release."""
         done: List[bool] = []
 
         def decide(rows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
             res = [r for r in rows if r["event"] == "exit" and r["link"] == order_link_id]
             if not res:
                 return "NO_SUCH_EXIT", None
-            left = Decimal(res[0]["qty"]) - sum((Decimal(r["qty"]) for r in rows if r["event"] == "exit_release" and r["link"] == order_link_id), Decimal(0))
+            filled = sum((Decimal(r["qty"]) for r in rows if r["event"] == "exit_fill" and r["link"] == order_link_id), Decimal(0))
+            left = self._exit_left(rows, order_link_id, res[0]) - filled
             want = left if unfilled_qty is None else Decimal(str(unfilled_qty))
             if not want.is_finite() or want <= 0 or want > left:
                 return "RELEASE_QTY_INVALID", None
