@@ -43,13 +43,17 @@ THE SEVEN TIMESTAMPS (all epoch ms; one definition, tested in ``check_time_invar
   observation_time     the EARLIEST instant the value can be used without look-ahead: funding = exchange_event_time (the settled print); open interest = its timestamp;
                        klines = candle start + interval (the candle is only final at its close). Always >= exchange_event_time. Stored per row.
   decision_time        the instant a consumer decides. It is supplied by the CONSUMER, never stored here. A row is usable only at decision_time >= observation_time, and
-                       decision_time is never earlier than local_receive_time (what we had not yet received cannot have driven a decision): ``usable_at`` enforces both.
+                       decision_time is never earlier than local_receive_time (what we had not yet received cannot have driven a decision): ``usable_at`` checks both. It is provided as a
+                       LIBRARY check; enforced where a consumer calls it (the ranked-funding evaluator is the only verdict-path consumer), not by the stored rows themselves.
                        ``mode='replay'`` relaxes ONLY the second rule for a historical backfill and says so; a research claim must name the mode it used.
 Ordering: exchange_event_time <= observation_time;  local_receive_time <= collection_time <= normalization_time;  source_server_time >= exchange_event_time - skew.
 Per-row page-level times (server/receive/collection) are in the ledger, joined by the row's ``page``.
 
+Network note: ``urllib`` honours HTTPS_PROXY / https_proxy / NO_PROXY from the environment, so a collector run behind a proxy sends its (unsigned, public) requests through it and that
+proxy sees them; the pinned host and path allow-list is enforced on the URL before the request, not on the route. Unset the variables if that is not what you want.
+
 What it cannot show: that the bytes came from the exchange (a hash proves what was read, not who produced it); the funding interval of the PAST (the universe record gives
-the current one; a change shows up as an off-grid step and makes the symbol PARTIAL, it is not guessed); that nothing is missing before a symbol's recorded launch time.
+the current one; a change shows up as a regime change only when it is a sustained run of >= 3 equal spacings that divides a day and is not a whole multiple of the interval before it; runs of whole-multiple spacings are GAPS, never regimes); that nothing is missing before a symbol's recorded launch time.
 """
 from __future__ import annotations
 
