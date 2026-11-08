@@ -2372,7 +2372,7 @@ ENTRY_MARK_MAX_FUTURE_S = 5.0
 ENTRY_MARK_MAX_LEG_DEVIATION_PCT = 5.0
 
 
-def _entry_mark(bot: Any, symbol: str, now_s: Optional[Callable[[], float]] = None) -> Optional[float]:
+def _entry_mark(bot: Any, symbol: str, now_s: Optional[Callable[[], float]] = None, category: Optional[str] = None) -> Optional[float]:
     """The book's own current mark for the symbol an order names (a market order carries no price). None = unknown = the authority refuses.
 
     Unknown unless: the snapshot states a finite ``observed_at_s`` no more than ``ENTRY_MARK_MAX_AGE_S`` before the (injectable) clock and not in its future; both legs' marks are
@@ -2395,11 +2395,18 @@ def _entry_mark(bot: Any, symbol: str, now_s: Optional[Callable[[], float]] = No
         return None
     if abs(perp - spot) / min(perp, spot) * 100.0 > ENTRY_MARK_MAX_LEG_DEVIATION_PCT:
         return None
-    if symbol == getattr(bot.carry, "perp_symbol", None):
-        return perp
-    if symbol == getattr(bot.carry, "spot_symbol", None):
-        return spot
-    return None
+    # Production names BOTH legs BTCUSDT, so the symbol alone cannot say which mark applies: the ORDER'S category does (linear/inverse = the perp leg, spot = the spot leg).
+    # Where the category is not known, the larger of the marks of the legs that carry this symbol is the conservative size.
+    is_perp = symbol == getattr(bot.carry, "perp_symbol", None)
+    is_spot = symbol == getattr(bot.carry, "spot_symbol", None)
+    if category is not None:
+        if category in ("linear", "inverse"):
+            return perp if is_perp else None
+        if category == "spot":
+            return spot if is_spot else None
+        return None
+    marks = ([perp] if is_perp else []) + ([spot] if is_spot else [])
+    return max(marks) if marks else None
 
 
 def _entry_hedge_read(bot: Any) -> "Tuple[float, float]":
@@ -2664,7 +2671,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             venue=bot.client.venue, store=bot.store,
             state_dir=(os.path.dirname(os.path.abspath(str(cfg.STATE_DB_PATH))) if cfg.STATE_DB_PATH else None),
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD) * _EA.NOTIONAL_TOLERANCE,
-            mark_provider=lambda symbol: _entry_mark(bot, symbol),
+            mark_provider=lambda symbol, category=None: _entry_mark(bot, symbol, category=category),
             policy_path=(str(cfg.RISK_POLICY_PATH) or None),
             state_provider=lambda pending_notional_usd=None: _entry_risk_state(bot, pending_notional_usd),
             require_risk_policy=True,

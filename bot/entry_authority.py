@@ -170,6 +170,9 @@ def intent_from_body(body: Mapping[str, Any]) -> OrderIntent:
     order_type = body["orderType"]
     if order_type not in ORDER_TYPES:
         raise EntryRefused([f"ORDER_TYPE_UNKNOWN:{order_type[:20]}"])
+    for k in ("qty", "price"):                                          # the exit path's strict grammar: Decimal() alone accepts '1_0', non-ASCII digits, exponents, NaN
+        if k in body and body[k] not in (None, "") and not (type(body[k]) is str and _PLAIN_DECIMAL.fullmatch(body[k])):
+            raise EntryRefused([f"ORDER_{k.upper()}_NOT_PLAIN_DECIMAL"])
     price = None if body.get("price") in (None, "") else str(body["price"])
     if order_type == "Market" and price is not None:
         raise EntryRefused(["MARKET_ORDER_WITH_PRICE"])                 # a Market order has no limit price; one stated here was being used to size the notional
@@ -218,7 +221,7 @@ def kill_switch_check(reader: Callable[[], Tuple[bool, str]]) -> Check:
     return check
 
 
-def order_notional(i: OrderIntent, mark_provider: Optional[Callable[[str], Optional[float]]] = None) -> Tuple[Optional[Decimal], Optional[str]]:
+def order_notional(i: OrderIntent, mark_provider: Optional[Callable[..., Optional[float]]] = None) -> Tuple[Optional[Decimal], Optional[str]]:
     """(worst-case notional in USD, refusal code). The worst case: a MARKET order (either side) at max(mark, any stated price): it has no limit semantics, so a price field on it
     must never LOWER the notional (reproduced: Market 1 BTC + price '1' read as $1); a limit SELL at max(limit, mark) (a limit of '1' for 100 BTC must not read as $100); a limit
     BUY at its own limit (it cannot fill above it). No usable price = a refusal, never a guess."""
@@ -232,7 +235,7 @@ def order_notional(i: OrderIntent, mark_provider: Optional[Callable[[str], Optio
     mark: Optional[Decimal] = None
     if mark_provider is not None:
         try:
-            m = mark_provider(i.symbol)
+            m = mark_provider(i.symbol, i.category)            # category-aware: a spot Buy is sized at the SPOT mark even when both legs are named BTCUSDT
         except Exception:                                          # noqa: BLE001
             m = None
         if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
@@ -253,7 +256,7 @@ def order_notional(i: OrderIntent, mark_provider: Optional[Callable[[str], Optio
     return qty * px, None
 
 
-def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[[str], Optional[float]]] = None) -> Check:
+def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[..., Optional[float]]] = None) -> Check:
     """The order's notional must be finite and within the cap (see ``order_notional``)."""
     def check(i: OrderIntent, _v: str) -> Optional[str]:
         notional, why = order_notional(i, mark_provider)
@@ -482,7 +485,7 @@ def load_policy(path: Optional[str]) -> Optional[RP.Policy]:
         return None
 
 
-def build_for_book(*, venue: str, store: Any, state_dir: Optional[str], max_notional_usd: float, mark_provider: Optional[Callable[[str], Optional[float]]] = None,
+def build_for_book(*, venue: str, store: Any, state_dir: Optional[str], max_notional_usd: float, mark_provider: Optional[Callable[..., Optional[float]]] = None,
                    policy_path: Optional[str] = None, state_provider: Optional[Callable[[], RP.State]] = None,
                    require_risk_policy: bool = True, strategy: str = "btcusdt_funding_carry_overlay", perp_symbol: Optional[str] = None,
                    spot_symbol: Optional[str] = None, hedge_reader: Optional[Callable[[], Tuple[float, float]]] = None) -> EntryAuthority:

@@ -32,7 +32,7 @@ def approve(w: World, tmp_path, *, state=GOOD):
     path.write_text(json.dumps(dataclasses.asdict(POLICY)))
     w.bot.client.entry_authority = EA.build_for_book(
         venue="testnet", store=w.store, state_dir=os.path.dirname(w.path), max_notional_usd=102.0,
-        mark_provider=lambda s: 50_000.0, policy_path=str(path), state_provider=lambda: state, require_risk_policy=True,
+        mark_provider=lambda s, c=None: 50_000.0, policy_path=str(path), state_provider=lambda: state, require_risk_policy=True,
         perp_symbol=w.bot.carry.perp_symbol, spot_symbol=w.bot.carry.spot_symbol, hedge_reader=lambda: _entry_hedge_read(w.bot))
 
 
@@ -120,7 +120,7 @@ class _Bot:
 
 def _mark(snap, symbol="BTCUSDT", now=1_005.0):
     from main import _entry_mark
-    return _entry_mark(_Bot(snap), symbol, now_s=lambda: now)
+    return _entry_mark(_Bot(snap), symbol, now_s=lambda: now, category="linear")
 
 
 def test_entry_mark_positive_control_a_fresh_plausible_snapshot_gives_the_mark():
@@ -153,8 +153,56 @@ def test_a_stale_snapshot_makes_a_market_entry_unsizeable_and_refused(tmp_path):
     from main import _entry_mark
     bot = _Bot(_Snap(at=1_000.0 - 3600))
     a = EA.build_for_book(venue="testnet", store=type("S", (), {"is_kill_switch_engaged": staticmethod(lambda: (False, ""))})(), state_dir=str(tmp_path / "s"),
-                          max_notional_usd=102.0, mark_provider=lambda s: _entry_mark(bot, s, now_s=lambda: 1_005.0), require_risk_policy=False,
+                          max_notional_usd=102.0, mark_provider=lambda s, c=None: _entry_mark(bot, s, now_s=lambda: 1_005.0), require_risk_policy=False,
                           perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
     with pytest.raises(EA.EntryRefused) as e:
         a.authorize({"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Market", "qty": "0.001", "orderLinkId": "S1"}, venue="testnet")
     assert "NO_PRICE_FOR_NOTIONAL" in e.value.reasons
+
+
+# ---- round 4: both legs are named BTCUSDT in production; the order's category picks the mark
+
+def _mark_cat(snap, category, symbol="BTCUSDT"):
+    from main import _entry_mark
+    return _entry_mark(_Bot(snap), symbol, now_s=lambda: 1_005.0, category=category)
+
+
+def test_entry_mark_is_category_aware_when_both_legs_share_a_symbol():
+    s = _Snap(perp=100_000.0, spot=104_000.0)
+    assert _mark_cat(s, "linear") == 100_000.0                      # positive control: perp leg
+    assert _mark_cat(s, "spot") == 104_000.0
+    assert _mark_cat(s, None) == 104_000.0                          # unknown category: the conservative (larger) mark
+    assert _mark_cat(s, "option") is None
+
+
+def test_a_spot_buy_is_sized_at_the_spot_mark_not_the_perp_mark(tmp_path):
+    from main import _entry_mark
+    bot = _Bot(_Snap(perp=100_000.0, spot=104_000.0))
+    a = EA.build_for_book(venue="testnet", store=type("S", (), {"is_kill_switch_engaged": staticmethod(lambda: (False, ""))})(), state_dir=str(tmp_path / "s"),
+                          max_notional_usd=102.0, mark_provider=lambda s, c=None: _entry_mark(bot, s, now_s=lambda: 1_005.0, category=c), require_risk_policy=False,
+                          perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
+    qty = "0.00101"                                                 # 0.00101*100000 = 101 <= 102 < 0.00101*104000 = 105.04
+    perp = {"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Market", "qty": qty, "orderLinkId": "P1"}
+    a.authorize(perp, venue="testnet")                              # positive control: within the cap at the perp mark
+    with pytest.raises(EA.EntryRefused) as e:
+        a.authorize({"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "qty": qty, "orderLinkId": "S1"}, venue="testnet")
+    assert "NOTIONAL_ABOVE_CAP" in e.value.reasons
+
+
+@pytest.mark.parametrize("field,val", [("qty", "1_0"), ("qty", "١٠"), ("qty", "1e1"), ("qty", " 1"), ("price", "1_0"), ("price", "١٠.5"), ("qty", 0.001)])
+def test_opening_order_numbers_must_be_plain_ascii_decimal_strings(field, val):
+    body = {"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Limit", "qty": "0.001", "price": "100000", "orderLinkId": "N1"}
+    EA.intent_from_body(body)                                       # positive control
+    body[field] = val
+    with pytest.raises(EA.EntryRefused) as e:
+        EA.intent_from_body(body)
+    assert f"ORDER_{field.upper()}_NOT_PLAIN_DECIMAL" in e.value.reasons
+
+
+def test_entry_mark_category_must_match_the_leg_that_carries_the_symbol():
+    from main import _entry_mark
+    bot = _Bot(_Snap(perp=100_000.0, spot=104_000.0))
+    bot.carry.perp_symbol, bot.carry.spot_symbol = "BTCUSDT", "ETHUSDT"      # instance override: distinct legs
+    mk = lambda sym, cat: _entry_mark(bot, sym, now_s=lambda: 1_005.0, category=cat)   # noqa: E731
+    assert mk("BTCUSDT", "linear") == 100_000.0 and mk("ETHUSDT", "spot") == 104_000.0   # positive controls
+    assert mk("ETHUSDT", "linear") is None and mk("BTCUSDT", "spot") is None

@@ -516,3 +516,67 @@ def test_pruning_is_not_excused_by_receipts_whose_own_chain_does_not_verify(worl
     assert not SL.check(world["md"], M, receipts=rec)["ok"]
     open(rec, "wb").write(raw)
     assert SL.check(world["md"], M, receipts=rec)["ok"]
+
+
+# ---------------------------------------------------------------- round 4: seal and check must agree; a receipt is not the copy
+
+DAY3 = DAY2 + 86_400_000
+NOW3 = DAY3 + 2 * 3_600_000
+
+
+def _pruned_world_without_pruned_jsonl(world, backup_first=True):
+    """The red-team scenario: days 1 and 2 are sealed closed (and backed up), day 3 starts AFTER the seal, retention prunes days 1-2, pruned.jsonl is absent. The oldest
+    remaining day (3) was never sealed, so only the receipts can vouch for its chain_start."""
+    M = world["manifest"]
+    os.makedirs(os.path.dirname(M), exist_ok=True)
+    SL.seal(world["md"], M, now_ms=NOW3)
+    dest, rec = str(world["tmp"] / "bk"), _rec(world)
+    if backup_first:
+        SL.backup(world["md"], dest, rec, manifest=M, now_ms=NOW3)
+    st = ST.MarketStore(world["md"], commit_every=1, environment="mainnet")
+    for i in range(3):
+        st.append("frame", wall_ms=DAY3 + i * 1000, mono_s=float(i), category="linear", conn_id="c1", topic="tickers.BTCUSDT", payload=f'{{"i":{i},"d":3}}')
+    assert st.prune_segments_before(ST._utc_day(DAY3))
+    st.close()
+    pj = os.path.join(world["md"], "pruned.jsonl")
+    if os.path.exists(pj):
+        os.remove(pj)                                   # the recorder's own note is absent (restored dir / lost): only the receipts can vouch
+    return M, dest, rec
+
+
+def test_seal_agrees_with_check_after_retention_when_pruned_jsonl_is_absent(world):
+    M, dest, rec = _pruned_world_without_pruned_jsonl(world)
+    assert SL.check(world["md"], M, receipts=rec, now_ms=NOW3)["ok"]                           # positive control: check passes
+    SL.seal(world["md"], M, now_ms=NOW3, receipts=rec)                                          # and so must seal (was a permanent refusal)
+    assert SL.check(world["md"], M, receipts=rec, now_ms=NOW3)["ok"]
+
+
+def test_seal_still_refuses_a_pruned_day_without_a_verified_receipt(world):
+    M, dest, rec = _pruned_world_without_pruned_jsonl(world, backup_first=False)             # no backup ever made: no receipt
+    assert not SL.check(world["md"], M, receipts=rec, now_ms=NOW3)["ok"]
+    with pytest.raises(SL.SealError):
+        SL.seal(world["md"], M, now_ms=NOW3, receipts=rec)
+
+
+def test_a_receipt_alone_says_so_and_a_named_backup_must_hold_the_copy(world):
+    M, dest, rec = _pruned_world_without_pruned_jsonl(world)
+    plain = SL.check(world["md"], M, receipts=rec, now_ms=NOW3)
+    assert plain["ok"] and "RECEIPTS ALONE" in " ".join(plain["notes"]) and "restore-check" in " ".join(plain["notes"])
+    good = SL.check(world["md"], M, receipts=rec, backup=dest, now_ms=NOW3)                                  # positive control: the copy is there
+    assert good["ok"] and "RECEIPTS ALONE" not in " ".join(good["notes"])
+    name = SL.segment_names(dest)[0]
+    with open(os.path.join(dest, name), "ab") as fh:
+        fh.write(b"x")                                                                          # the copy no longer hashes as receipted
+    assert not SL.check(world["md"], M, receipts=rec, backup=dest, now_ms=NOW3)["ok"]
+    os.remove(os.path.join(dest, name))                                                         # the copy is gone altogether
+    bad = SL.check(world["md"], M, receipts=rec, backup=dest, now_ms=NOW3)
+    assert not bad["ok"] and "NOT excused" in " ".join(bad["problems"])
+    with pytest.raises(SL.SealError):
+        SL.seal(world["md"], M, receipts=rec, backup=dest, now_ms=NOW3)
+
+
+def test_cli_check_accepts_backup(world, capsys):
+    M, dest, rec = _pruned_world_without_pruned_jsonl(world)
+    assert SL.main(["check", "--dir", world["md"], "--manifest", M, "--receipts", rec, "--backup", dest]) == 0
+    os.remove(os.path.join(dest, SL.segment_names(dest)[0]))
+    assert SL.main(["check", "--dir", world["md"], "--manifest", M, "--receipts", rec, "--backup", dest]) == 1

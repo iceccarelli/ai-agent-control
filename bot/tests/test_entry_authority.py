@@ -70,7 +70,7 @@ def sent_orders(v):
     return [r for r in v.requests if "/v5/order/create" in r["url"]]
 
 
-def build(tmp_path, *, policy=None, state=None, kill=lambda: (False, ""), mark=lambda s: 100_000.0, max_usd=102.0, require_policy=True, hedge=None):
+def build(tmp_path, *, policy=None, state=None, kill=lambda: (False, ""), mark=lambda s, c=None: 100_000.0, max_usd=102.0, require_policy=True, hedge=None):
     path = None
     os.makedirs(str(tmp_path), exist_ok=True)
     if policy is not None:
@@ -197,7 +197,7 @@ def test_a_breach_latches_the_suspension_across_a_new_authority_instance(store, 
     assert len(sent_orders(v3)) == 1
 
 
-@pytest.mark.parametrize("qty,price,reason", [("0.002", None, "NOTIONAL_ABOVE_CAP"), ("0.001", "150000", "NOTIONAL_ABOVE_CAP"), ("abc", None, "UNPARSABLE"), ("-1", None, "INVALID"),
+@pytest.mark.parametrize("qty,price,reason", [("0.002", None, "NOTIONAL_ABOVE_CAP"), ("0.001", "150000", "NOTIONAL_ABOVE_CAP"), ("abc", None, "NOT_PLAIN_DECIMAL"), ("-1", None, "NOT_PLAIN_DECIMAL"),
                                               ("0", None, "INVALID")])
 def test_the_notional_cap_and_unparsable_quantities_refuse(store, tmp_path, qty, price, reason):
     c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD))
@@ -208,14 +208,14 @@ def test_the_notional_cap_and_unparsable_quantities_refuse(store, tmp_path, qty,
 
 
 def test_no_price_for_a_market_order_refuses(store, tmp_path):
-    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s: None))
+    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s, c=None: None))
     with pytest.raises(bc.PermanentAPIError, match="NO_PRICE_FOR_NOTIONAL"):
         c._request("POST", "/v5/order/create", body=order(), signed=True)
 
 
 def test_the_wrong_venue_refuses(store, tmp_path):
     auth = EA.build_for_book(venue="mainnet", store=type("S", (), {"is_kill_switch_engaged": staticmethod(lambda: (False, ""))})(), state_dir=str(tmp_path / "s"),
-                             max_notional_usd=102.0, mark_provider=lambda s: 1.0, policy_path=None, state_provider=lambda: GOOD, require_risk_policy=False,
+                             max_notional_usd=102.0, mark_provider=lambda s, c=None: 1.0, policy_path=None, state_provider=lambda: GOOD, require_risk_policy=False,
                              perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
     c, v = client(store, auth)                                                  # a testnet client holding an authority built for mainnet
     with pytest.raises(bc.PermanentAPIError, match="VENUE_NOT_ALLOWED"):
@@ -395,7 +395,7 @@ def test_a_limit_buy_is_costed_at_its_own_price_and_a_limit_sell_without_a_mark_
     c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD))
     with pytest.raises(bc.OrderNotSent, match="NOTIONAL_ABOVE_CAP"):
         c._request("POST", "/v5/order/create", body=order(category="spot", side="Buy", orderType="Limit", qty="1", price="100000", orderLinkId="LB1"), signed=True)
-    c2, v2 = client(store, build(tmp_path / "n", policy=POLICY, state=GOOD, mark=lambda s: None))
+    c2, v2 = client(store, build(tmp_path / "n", policy=POLICY, state=GOOD, mark=lambda s, c=None: None))
     with pytest.raises(bc.OrderNotSent, match="NO_PRICE_FOR_NOTIONAL"):
         c2._request("POST", "/v5/order/create", body=order(orderType="Limit", qty="0.001", price="100000", orderLinkId="LB2"), signed=True)
 
@@ -492,14 +492,14 @@ def _bare_auth(tmp_path, **kw):
 # ---- 1. Market order + price must not be sized at that price; orderType is stated, exact, and a Market order has none --------------------------------------------
 
 def test_market_order_with_a_price_is_refused_and_never_sent(store, tmp_path):
-    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s: 50_000.0))
+    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s, c=None: 50_000.0))
     with pytest.raises(bc.PermanentAPIError, match="MARKET_ORDER_WITH_PRICE"):
         c._request("POST", "/v5/order/create", body=order(qty="1", price="1", orderLinkId="M1", side="Sell"), signed=True)
     assert sent_orders(v) == []
 
 
 def test_market_order_with_a_price_is_refused_on_both_sides(tmp_path):
-    a = _bare_auth(tmp_path, mark=lambda s: 50_000.0)
+    a = _bare_auth(tmp_path, mark=lambda s, c=None: 50_000.0)
     assert _auth_refusal(a, order(side="Sell", price="1", orderLinkId="P1")) == ("MARKET_ORDER_WITH_PRICE",)
     assert _auth_refusal(a, order(category="spot", side="Buy", price="1", orderLinkId="P2")) == ("MARKET_ORDER_WITH_PRICE",)
 
@@ -511,7 +511,7 @@ def _intent(**kw):
 
 
 def test_order_notional_of_a_market_order_is_never_below_the_mark_on_either_side():
-    mark = lambda s: 50_000.0                                                   # noqa: E731
+    mark = lambda s, c=None: 50_000.0                                                   # noqa: E731
     for side in ("Buy", "Sell"):
         assert EA.order_notional(_intent(side=side, price="1"), mark)[0] == 50_000      # a stated price can only RAISE a market order's notional
         assert EA.order_notional(_intent(side=side, price="90000"), mark)[0] == 90_000
@@ -534,7 +534,7 @@ def test_unknown_or_missing_order_type_is_refused(tmp_path, bad, code):
 
 
 def test_positive_control_honest_market_and_limit_orders_pass(tmp_path):
-    a = _bare_auth(tmp_path, mark=lambda s: 50_000.0)
+    a = _bare_auth(tmp_path, mark=lambda s, c=None: 50_000.0)
     assert _auth_refusal(a, order(qty="0.001", orderLinkId="H1")) is None
     assert _auth_refusal(a, order(qty="0.001", orderType="Limit", price="50000", timeInForce="PostOnly", orderLinkId="H2")) is None
 
@@ -552,20 +552,20 @@ def test_positive_control_honest_market_and_limit_orders_pass(tmp_path):
     (order(category="spot", side="Sell", isLeverage=1), "IS_LEVERAGE_NOT_ALLOWED"),   # a leveraged spot sell: not an exit, refused as a margin order
 ])
 def test_only_the_carry_legs_in_their_direction_are_authorised(tmp_path, body, code):
-    a = _bare_auth(tmp_path, mark=lambda s: 50_000.0 if s == "BTCUSDT" else None)
+    a = _bare_auth(tmp_path, mark=lambda s, c=None: 50_000.0 if s == "BTCUSDT" else None)
     reasons = _auth_refusal(a, dict(body, orderLinkId="B1"))
     assert reasons is not None and code in reasons
 
 
 def test_the_two_carry_legs_are_authorised_positive_control(tmp_path):
-    a = _bare_auth(tmp_path, mark=lambda s: 50_000.0)
+    a = _bare_auth(tmp_path, mark=lambda s, c=None: 50_000.0)
     assert _auth_refusal(a, order(side="Sell", qty="0.001", orderLinkId="C1")) is None
     assert _auth_refusal(a, order(category="spot", side="Buy", qty="0.001", marketUnit="baseCoin", orderLinkId="C2")) is None
 
 
 def test_symbols_are_bound_per_category_not_just_listed(tmp_path):
     a = EA.build_for_book(venue="testnet", store=type("S", (), {"is_kill_switch_engaged": staticmethod(lambda: (False, ""))})(), state_dir=str(tmp_path / "s"),
-                          max_notional_usd=102.0, mark_provider=lambda s: 50_000.0, require_risk_policy=False, perp_symbol="BTCUSDT", spot_symbol="ETHUSDT")
+                          max_notional_usd=102.0, mark_provider=lambda s, c=None: 50_000.0, require_risk_policy=False, perp_symbol="BTCUSDT", spot_symbol="ETHUSDT")
     assert _auth_refusal(a, order(category="spot", symbol="BTCUSDT", side="Buy", orderLinkId="S1")) is not None     # BTCUSDT is the PERP here, not a spot leg
     assert _auth_refusal(a, order(symbol="ETHUSDT", side="Sell", orderLinkId="S2")) is not None
 
@@ -641,14 +641,14 @@ def test_whitespace_link_id_cannot_slip_a_third_distinct_order_past_the_limit(tm
 
 def test_link_id_edge_shapes_are_accepted_positive_control(tmp_path):
     a = EA.build_for_book(venue="testnet", store=type("S", (), {"is_kill_switch_engaged": staticmethod(lambda: (False, ""))})(), state_dir=str(tmp_path / "s"),
-                          max_notional_usd=102.0, mark_provider=lambda s: 50_000.0, require_risk_policy=False, perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
+                          max_notional_usd=102.0, mark_provider=lambda s, c=None: 50_000.0, require_risk_policy=False, perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
     assert _auth_refusal(a, order(orderLinkId="a-B_9" * 7 + "x")) is None                    # 36 chars
 
 
 @pytest.mark.parametrize("changed", [dict(orderType="Limit", price="50000"), dict(price=None, reduceOnly=True), dict(timeInForce="PostOnly"), dict(qty="0.002"),
                                      dict(category="spot", side="Buy"), dict(side="Buy")])
 def test_same_link_id_with_a_different_canonical_body_is_a_conflict(tmp_path, changed):
-    a = _bare_auth(tmp_path, mark=lambda s: 50_000.0)
+    a = _bare_auth(tmp_path, mark=lambda s, c=None: 50_000.0)
     first = order(orderLinkId="R1")
     assert _auth_refusal(a, first) is None
     second = dict(first, orderLinkId="R1")
@@ -779,14 +779,14 @@ class _Capture:
 
 
 def test_a_str_subclass_cannot_show_the_authority_different_data_than_the_wire(store, tmp_path):
-    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s: 50_000.0))
+    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s, c=None: 50_000.0))
     with pytest.raises(bc.PermanentAPIError, match="NOTIONAL_ABOVE_CAP"):                # the wire says qty "1" (= $50k), not the lie "0.001"
         c._request("POST", "/v5/order/create", body=order(qty=_LyingStr("1"), orderLinkId="T1"), signed=True)
     assert sent_orders(v) == []
 
 
 def test_an_eq_true_reduce_only_cannot_pass_as_an_exit(store, tmp_path):
-    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s: 50_000.0))
+    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD, mark=lambda s, c=None: 50_000.0))
     with pytest.raises(bc.PermanentAPIError, match="REDUCE_ONLY_NOT_BOOLEAN"):
         c._request("POST", "/v5/order/create", body=order(qty="1000", reduceOnly=_EqTrue("false"), orderLinkId="T2"), signed=True)
     assert sent_orders(v) == []
@@ -828,7 +828,7 @@ def test_the_canonical_regex_refuses_independently_of_the_allow_list(store, monk
 
 def _bound(tmp_path, **kw):
     """An authority bound to BTCUSDT perp+spot with no risk policy (the binding checks are what is tested)."""
-    kw.setdefault("mark", lambda s: 100_000.0)
+    kw.setdefault("mark", lambda s, c=None: 100_000.0)
     kw.setdefault("max_usd", 1_000_000.0)
     return build(tmp_path, require_policy=False, **kw)
 
