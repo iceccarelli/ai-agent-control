@@ -827,22 +827,39 @@ def test_a_concurrent_second_run_on_the_same_dataset_is_refused(root):
 
 # ---------------------------------------------------------------- universe selection
 
-def _universe_dir(tmp_path, syms=("BTCUSDT", "ETHUSDT", "NEWUSDT"), intervals=None, statuses=None, deliveries=None, bases=None):
-    def inst(s):
-        return {"symbol": s, "contractType": "LinearPerpetual", "status": (statuses or {}).get(s, "Trading"), "baseCoin": (bases or {}).get(s, s[:-4]), "quoteCoin": "USDT", "settleCoin": "USDT",
-                "launchTime": str(FIRST - 1), "deliveryTime": str((deliveries or {}).get(s, 0)), "fundingInterval": (intervals or {}).get(s, 480), "upperFundingRate": "0.00375", "lowerFundingRate": "-0.00375",
-                "priceFilter": {"minPrice": "0.1", "tickSize": "0.1"}, "lotSizeFilter": {"minOrderQty": "0.001", "maxOrderQty": "10", "qtyStep": "0.001", "minNotionalValue": "5"}}
+def _instrument(s, intervals=None, statuses=None, deliveries=None, bases=None, sid=None):
+    return {"symbol": s, "symbolId": sid or "", "contractType": "LinearPerpetual", "status": (statuses or {}).get(s, "Trading"), "baseCoin": (bases or {}).get(s, s[:-4]),
+            "quoteCoin": "USDT", "settleCoin": "USDT", "launchTime": str(FIRST - 1), "deliveryTime": str((deliveries or {}).get(s, 0)),
+            "fundingInterval": (intervals or {}).get(s, 480), "upperFundingRate": "0.00375", "lowerFundingRate": "-0.00375",
+            "priceFilter": {"minPrice": "0.1", "tickSize": "0.1"}, "lotSizeFilter": {"minOrderQty": "0.001", "maxOrderQty": "10", "qtyStep": "0.001", "minNotionalValue": "5"}}
 
-    def tick(s):
-        return {"symbol": s, "markPrice": "1", "indexPrice": "1", "lastPrice": "1", "fundingRate": "0.0001", "nextFundingTime": "1", "fundingIntervalHour": "8", "fundingCap": "0.00375",
-                "openInterest": "1", "openInterestValue": "1", "volume24h": "1", "turnover24h": "5"}
+
+def _ticker(s):
+    return {"symbol": s, "markPrice": "1", "indexPrice": "1", "lastPrice": "1", "fundingRate": "0.0001", "nextFundingTime": "1", "fundingIntervalHour": "8", "fundingCap": "0.00375",
+            "openInterest": "1", "openInterestValue": "1", "volume24h": "1", "turnover24h": "5"}
+
+
+def _universe_dir(tmp_path, syms=("BTCUSDT", "ETHUSDT", "NEWUSDT"), intervals=None, statuses=None, deliveries=None, bases=None, v2=True, name="uni", refuse_closed=False):
+    """A real schema-2 capture (``capture_universe``: every status partition asked for, a venue that serves status filters like Bybit) or, with v2=False, the legacy schema-1 one."""
+    inst = {s: _instrument(s, intervals, statuses, deliveries, bases) for s in syms}
 
     def fetch(url):
-        path = url[len(venues.rest_for("mainnet")):].partition("?")[0]
-        rows = [inst(s) for s in syms] if path == UC.PATH_INSTRUMENTS else [tick(s) for s in syms]
-        return json.dumps({"retCode": 0, "retMsg": "OK", "result": {"category": "linear", "list": rows, "nextPageCursor": ""}, "time": SERVER0}).encode()
-    d = tmp_path / "uni"
-    UC.capture(str(d), fetch=fetch, clock_ms=lambda: SERVER0, sleep=lambda _s: None)
+        base = venues.rest_for("mainnet")
+        path, _, qs = url[len(base):].partition("?")
+        q = dict(x.split("=", 1) for x in qs.split("&"))
+        if path == UC.PATH_TICKERS:
+            rows = [_ticker(s) for s in syms]
+        else:
+            want = q.get("status", "Trading")
+            if refuse_closed and want == "Closed":
+                return json.dumps({"retCode": 10001, "retMsg": "params error: status", "result": {}, "time": SERVER0}).encode()
+            rows = [r for r in inst.values() if r["status"] == want] if v2 else list(inst.values())
+        return json.dumps({"retCode": 0, "retMsg": "OK", "result": {"category": q["category"], "list": rows, "nextPageCursor": ""}, "time": SERVER0}).encode()
+    d = tmp_path / name
+    if v2:
+        UC.capture_universe(str(d), fetch=fetch, clock_ms=lambda: SERVER0, sleep=lambda _s: None, pause_s=0)
+    else:
+        UC.capture(str(d), fetch=fetch, clock_ms=lambda: SERVER0, sleep=lambda _s: None)
     return d
 
 
@@ -1071,3 +1088,43 @@ def test_cli_spot_and_hedge_commands(root, tmp_path, capsys):
     assert MH.main(["verify", "--dir", snap]) == 0
     capsys.readouterr()
     assert MH.main(["spot-instruments", "--out-root", str(root)], fetch=lambda u: b"{}", clock=Clock(SERVER0 + 10_000_000), sleep=lambda _s: None, free_bytes_fn=lambda _p: 1 << 40) == 1
+
+
+# ---------------------------------------------------------------- universe_capture v2 acceptance rules
+
+def test_a_schema_2_capture_is_accepted_only_when_it_verifies_and_its_rederived_status_is_complete_or_partial(tmp_path):
+    d = _universe_dir(tmp_path, syms=("BTCUSDT", "OLDUSDT"), statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": BASE})
+    recs, info = MH.load_universe_dir(str(d), include_statuses=["Trading", "Closed"])
+    assert info["capture_schema"] == 2 and info["dataset_status"] in ("COMPLETE", "PARTIAL") and info["status_coverage"] and sorted(recs) == ["BTCUSDT", "OLDUSDT"]
+    assert recs["OLDUSDT"]["deliveryTime"] == BASE and recs["OLDUSDT"]["fundingInterval_min"] == 480
+    f = next(p for p in os.listdir(d) if p.startswith("universe-"))
+    os.chmod(d / f, 0o600)
+    with open(d / f, "ab") as fh:
+        fh.write(b"\n")
+    with pytest.raises(MH.HistoryError, match="does not verify"):
+        MH.load_universe_dir(str(d))
+
+
+def test_a_schema_2_capture_whose_rederived_status_is_not_acceptable_is_refused(tmp_path, monkeypatch):
+    d = _universe_dir(tmp_path)
+    real = UC.verify_capture_dir
+    for bad in ("UNVERIFIED", "CONFLICTED", "STALE"):
+        monkeypatch.setattr(UC, "verify_capture_dir", lambda p, bad=bad: dict(real(p), coverage=dict(real(p)["coverage"], dataset_status=bad)))
+        with pytest.raises(MH.HistoryError, match=bad):
+            MH.load_universe_dir(str(d))
+    monkeypatch.setattr(UC, "verify_capture_dir", lambda p: dict(real(p), ok=False, problems=["x"]))
+    with pytest.raises(MH.HistoryError):
+        MH.load_universe_dir(str(d))
+
+
+def test_a_venue_that_refuses_the_closed_partition_leaves_a_recorded_answer_and_no_closed_symbols(tmp_path):
+    d = _universe_dir(tmp_path, syms=("BTCUSDT", "OLDUSDT"), statuses={"OLDUSDT": "Closed"}, refuse_closed=True)
+    recs, info = MH.load_universe_dir(str(d), include_statuses=["Trading", "Closed"])
+    assert sorted(recs) == ["BTCUSDT"] and info["dataset_status"] in ("COMPLETE", "PARTIAL")
+    assert "REFUSED" in json.dumps(info["status_coverage"])                                # the refusal is recorded, so the absence of Closed is visible, not assumed
+
+
+def test_a_legacy_schema_1_capture_is_still_readable_and_labelled(tmp_path):
+    d = _universe_dir(tmp_path, v2=False, name="uni1")
+    recs, info = MH.load_universe_dir(str(d))
+    assert info["capture_schema"] == 1 and sorted(recs) == ["BTCUSDT", "ETHUSDT", "NEWUSDT"] and info["status_coverage"] is None

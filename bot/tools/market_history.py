@@ -838,8 +838,9 @@ def _worst(statuses: Sequence[str]) -> str:
 
 
 def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses: Optional[Sequence[str]] = None) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """Symbols (and their funding interval / launch time) from a VERIFIED universe_capture directory. Refuses a directory that fails verification: no symbol list is
-    trusted from bytes that do not re-hash. Uses ``universe_capture.verify_capture_dir`` when the module provides it, plus its own hash check of the files it reads."""
+    """Symbols (and their funding interval / launch / delivery time) from a VERIFIED universe_capture directory. Schema 2: ``universe_capture.verify_capture_dir`` must be ok
+    AND its RE-DERIVED dataset_status must be COMPLETE or PARTIAL (reported in the returned info and in every manifest built from it); anything else is refused. Schema 1 (legacy):
+    its own file hash is checked and the capture is labelled ``capture_schema: 1``. Only linear rows are returned."""
     mpath = os.path.join(path, "manifest.json")
     if os.path.islink(path) or os.path.islink(mpath) or not os.path.isfile(mpath):
         raise HistoryError("universe directory: no manifest.json (or a link)")
@@ -850,15 +851,8 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
     except ValueError as exc:
         raise HistoryError("universe manifest is not JSON") from exc
     problems: List[str] = []
-    vf = getattr(UC, "verify_capture_dir", None)
-    if vf is not None:
-        res = vf(path)
-        if isinstance(res, dict):
-            if not res.get("ok", False):
-                problems += [str(p) for p in res.get("problems", ["verify_capture_dir not ok"])]
-        elif res:
-            problems += [str(p) for p in res]
-    uni = man.get("universe") if isinstance(man, dict) else None
+    v2 = isinstance(man, dict) and man.get("schema") == UC.SCHEMA_V2
+    uni = (man.get("universe_file") if v2 else man.get("universe")) if isinstance(man, dict) else None
     if not isinstance(uni, dict) or not isinstance(uni.get("file"), str) or os.path.basename(uni["file"]) != uni["file"]:
         raise HistoryError("universe manifest names no universe file")
     upath = os.path.join(path, uni["file"])
@@ -869,11 +863,22 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
             if _sha(fh.read()) != uni.get("sha256"):
                 problems.append("universe file hash differs from its manifest")
     ds = man.get("dataset_status")
-    if ds in ("CONFLICTED", "UNVERIFIED", "FAILED"):
+    derived: Dict[str, Any] = {}
+    if v2:
+        # schema 2: ``verify_capture_dir`` re-derives every claim from the raw bytes. Integrity must hold AND the RE-DERIVED dataset_status must be COMPLETE or PARTIAL
+        # (never the manifest's own claim); the answer is recorded in the manifest of every dataset built from it.
+        vres = UC.verify_capture_dir(path)
+        if not vres.get("ok"):
+            problems += [str(x) for x in vres.get("problems", ["verify_capture_dir not ok"])]
+        derived = vres.get("coverage") or {}
+        ds = derived.get("dataset_status")
+        if ds not in ("COMPLETE", "PARTIAL"):
+            problems.append(f"universe re-derived dataset_status is {ds!r}: only COMPLETE or PARTIAL captures are accepted")
+    elif ds in ("CONFLICTED", "UNVERIFIED", "FAILED"):
         problems.append(f"universe dataset_status is {ds}")
     if problems:
         raise HistoryError("universe capture does not verify: " + "; ".join(problems[:5]))
-    recs = UC.load_universe(upath)
+    recs = {k: r for k, r in UC.load_universe(upath).items() if r.get("category", "linear") == "linear"}
     if only_trading and include_statuses:
         raise HistoryError("give --only-trading or --include-statuses, not both")
     wanted = {"Trading"} if only_trading else (set(include_statuses) if include_statuses else None)
@@ -882,9 +887,10 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
         seen_statuses[str(r.get("status"))] = seen_statuses.get(str(r.get("status")), 0) + 1
     if wanted is not None:
         recs = {s: r for s, r in recs.items() if r.get("status") in wanted}
-    return recs, {"dir": os.path.abspath(path), "manifest_sha256": _sha(mbytes), "snapshot_ms": man.get("snapshot_ms"), "universe_sha256": uni.get("sha256"),
+    return recs, {"dir": os.path.abspath(path), "manifest_sha256": _sha(mbytes), "snapshot_ms": man.get("snapshot_ms", man.get("started_ms")), "universe_sha256": uni.get("sha256"),
                   "schema": man.get("schema_version", man.get("schema")), "dataset_status": ds, "symbols": len(recs),
-                  "statuses_in_capture": dict(sorted(seen_statuses.items())), "included_statuses": sorted(wanted) if wanted is not None else "ALL"}
+                  "statuses_in_capture": dict(sorted(seen_statuses.items())), "capture_schema": 2 if v2 else 1,
+                  "status_coverage": derived.get("status_coverage"), "delisting_observability": derived.get("delisting_observability"), "included_statuses": sorted(wanted) if wanted is not None else "ALL"}
 
 
 def build_specs(dataset: str, interval: Optional[str], symbols: Sequence[str], start_ms: int, end_ms: int, records: Optional[Mapping[str, Mapping[str, Any]]] = None,

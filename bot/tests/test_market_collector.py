@@ -1157,3 +1157,226 @@ def test_repair_log_refuses_a_crash_tail_on_top_of_a_mutated_row(root, capsys):
     assert MC.main(["repair-log", "--out-root", str(root)]) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is False and "not a crash tail" in out["reason"] and lp.read_bytes() == before
+
+
+# ---------------------------------------------------------------- run-continuous (long-running collection) and its health report
+
+class SimClock:
+    """Milliseconds. ``sleep(s)`` advances it, so a loop that waits for its next slot terminates without real time; each read is distinct."""
+    def __init__(self, t=T0):
+        self.t = t
+        self.sleeps = []
+
+    def __call__(self):
+        self.t += 7
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += int(s * 1000) + 1
+
+
+class LiveVenue(Venue):
+    """The scripted venue, but its own clock follows the simulated one (so the clock-skew check does not fire)."""
+    def __init__(self, clk, **kw):
+        super().__init__(**kw)
+        self.clk = clk
+
+    def __call__(self, url):
+        self.t = self.clk.t
+        sym = dict(x.split("=", 1) for x in url.partition("?")[2].split("&")).get("symbol")
+        if "recent-trade" in url and not self.script.get((MC.PATH_TRADES, sym)):          # fresh trades: stamped just before the clock, like a live market
+            self.urls.append(url)
+            return trades_body(sym, self.t, [trade(1, sym, time=str(self.t - 1000)), trade(2, sym, side="Sell", time=str(self.t - 1000))])
+        return super().__call__(url)
+
+
+def cont(root, clk=None, venue=None, **kw):
+    clk = clk or SimClock()
+    venue = venue or LiveVenue(clk)
+    kw.setdefault("free_bytes_fn", lambda _p: 1 << 40)
+    kw.setdefault("max_symbols", 2)
+    kw.setdefault("interval_ms", STEP)
+    kw.setdefault("reserve_bytes", 1)
+    return MC.run_continuous(str(root), fetch=venue, clock=clk, sleep=clk.sleep, **kw), clk, venue
+
+
+def health(root):
+    return json.load(open(os.path.join(str(root), MC.HEALTH_NAME)))
+
+
+def test_run_continuous_runs_max_cycles_writes_a_machine_readable_health_report_at_0600(root):
+    h, clk, v = cont(root, max_cycles=3)
+    assert h["status"] == "STOPPED" and h["stop_reason"] == "max_cycles" and h["cycles_run"] == 3 and h["cycles_ok"] == 3 and h["consecutive_failures"] == 0
+    doc = health(root)
+    assert doc["schema"] == MC.HEALTH_SCHEMA and doc["last_cycle"]["status"] == "OK" and doc["last_cycle"]["cycle"].startswith("cycle-")
+    assert doc["disk"]["free_bytes"] > 0 and doc["disk"]["in_git_tree"] is False and doc["disk"]["problems"] == []
+    assert doc["last_seal"] is None and doc["last_backup"] is None and doc["last_restore_check"] is None and doc["gaps"]["missed_expected_cycles_total"] == 0
+    assert stat.S_IMODE(os.stat(os.path.join(str(root), MC.HEALTH_NAME)).st_mode) == 0o600 and stat.S_IMODE(os.stat(str(root)).st_mode) == 0o700
+    assert len(rows(root)) == 3 and len(MC.cycle_dirs(str(root))) == 3
+    assert all(MC.verify_cycle_dir(os.path.join(str(root), c)) == [] for c in MC.cycle_dirs(str(root)))
+
+
+def test_run_continuous_spaces_cycles_by_the_interval_and_stops_at_a_duration(root):
+    h, clk, v = cont(root, duration_ms=5 * STEP + 1000, interval_ms=STEP)
+    assert h["stop_reason"] == "duration" and 5 <= h["cycles_run"] <= 6
+    ms = [r["cycle_ms"] for r in rows(root)]
+    assert all(b - a >= STEP for a, b in zip(ms, ms[1:]))
+
+
+def test_run_continuous_stops_cleanly_on_a_stop_file(root, tmp_path):
+    stop = tmp_path / "STOP"
+    clk = SimClock()
+    n = {"c": 0}
+    base_sleep = clk.sleep
+
+    def sleeping(s):
+        n["c"] += 1
+        if n["c"] == 3:
+            open(stop, "w").close()
+        base_sleep(s)
+    v = LiveVenue(clk)
+    h = MC.run_continuous(str(root), interval_ms=STEP, stop_file=str(stop), fetch=v, clock=clk, sleep=sleeping, max_symbols=1, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
+    assert h["stop_reason"] == "stop_file" and h["status"] == "STOPPED" and h["cycles_run"] >= 1
+    assert health(root)["stop_reason"] == "stop_file"
+    h2, *_ = cont(root, stop_file=str(stop), clk=clk)                              # an existing stop file stops before any cycle
+    assert h2["cycles_run"] == 0 and h2["stop_reason"] == "stop_file"
+
+
+def test_an_unbounded_run_needs_an_explicit_way_to_stop(root):
+    for kw in ({}, {"duration_ms": None}):
+        with pytest.raises(MC.CollectorError):
+            cont(root, **kw)
+    with pytest.raises(MC.CollectorError):
+        cont(root, max_cycles=0)
+    with pytest.raises(MC.CollectorError):
+        cont(root, max_cycles=1, backup_to="/x")                                    # backup needs receipts + seal manifest
+    with pytest.raises(MC.CollectorError):
+        cont(root, max_cycles=1, restore_check_every=1)
+
+
+def test_restart_resumes_after_a_killed_run_setting_the_interrupted_cycle_aside(root):
+    clk = SimClock()
+    v = LiveVenue(clk)
+    h, *_ = cont(root, clk=clk, venue=v, max_cycles=2)
+    os.makedirs(os.path.join(str(root), f"cycle-{clk.t + 5}"), mode=0o700)         # a cycle directory left by a kill -9: no COMPLETE
+    clk.t += 10 * STEP
+    h2, *_ = cont(root, clk=clk, venue=v, max_cycles=2)
+    assert h2["cycles_run"] == 2 and h2["cycles_ok"] == 2
+    assert any(n.endswith(".INCOMPLETE") for n in os.listdir(str(root)))
+    assert len(rows(root)) == 4
+    assert h2["gaps"]["missed_expected_cycles_total"] >= 1                          # the downtime is a recorded gap, never filled
+    assert EC.verify(os.path.join(str(root), MC.LOG_NAME))["ok"]
+
+
+def test_disk_guard_stops_the_run_before_a_cycle_when_free_space_is_under_the_floor(root):
+    h, *_ = cont(root, max_cycles=5, free_bytes_fn=lambda _p: 10, reserve_bytes=1000)
+    assert h["status"] == "REFUSED" and h["stop_reason"] == "disk_guard" and h["cycles_run"] == 0 and h["refusal"]["code"] == "DISK_GUARD"
+    assert rows(root) == [] if os.path.exists(os.path.join(str(root), MC.LOG_NAME)) else True
+    free = {"v": 1 << 40}
+    clk = SimClock()
+    v = LiveVenue(clk)
+    real = v.__call__
+
+    def fetch(url):
+        out = real(url)
+        if "orderbook" in url:
+            free["v"] = 10                                                          # the disk fills during cycle 1
+        return out
+    h2 = MC.run_continuous(str(root), interval_ms=STEP, max_cycles=5, fetch=fetch, clock=clk, sleep=clk.sleep, max_symbols=1, free_bytes_fn=lambda _p: free["v"], reserve_bytes=1000)
+    assert h2["stop_reason"] == "disk_guard" and h2["cycles_run"] == 1 and health(root)["status"] == "REFUSED"
+
+
+def test_a_data_root_inside_git_is_refused_by_the_continuous_run(tmp_path):
+    repo = tmp_path / "repo"
+    os.makedirs(repo / ".git")
+    r = repo / "data"
+    os.mkdir(r, 0o700)
+    h, *_ = cont(r, max_cycles=2)
+    assert h["stop_reason"] == "disk_guard" and any("git work tree" in p for p in h["refusal"]["problems"]) and not os.path.exists(r / MC.LOG_NAME)
+
+
+def test_a_group_readable_root_is_refused(tmp_path):
+    r = tmp_path / "wide"
+    os.mkdir(r, 0o755)
+    os.chmod(r, 0o755)
+    h, *_ = cont(r, max_cycles=1)
+    assert h["stop_reason"] == "disk_guard" and any("0700" in p for p in h["refusal"]["problems"])
+
+
+def test_a_429_storm_backs_off_longer_between_cycles_and_is_counted(root):
+    clk = SimClock()
+    v = LiveVenue(clk)
+    v.script[(MC.PATH_BOOK, "BTCUSDT")] = [MC.RateLimited("HTTP 429")] * 40
+    h = MC.run_continuous(str(root), interval_ms=STEP, max_cycles=2, fetch=v, clock=clk, sleep=clk.sleep, max_symbols=1, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1,
+                          max_retries=2, backoff_s=2.0)
+    assert h["cycles_partial"] >= 1 and h["rate_limit_events_total"] >= 3 and h["consecutive_failures"] >= 1
+    assert 2.0 in clk.sleeps and 4.0 in clk.sleeps                                  # bounded exponential backoff inside the cycle
+    assert max(clk.sleeps) >= 4.0
+    assert health(root)["rate_limit_events_total"] == h["rate_limit_events_total"]
+
+
+def test_consecutive_failures_stop_the_run(root):
+    clk = SimClock()
+
+    def dead(url):
+        raise MC.CollectorError("down")
+    h = MC.run_continuous(str(root), interval_ms=STEP, max_cycles=50, fetch=dead, clock=clk, sleep=clk.sleep, max_symbols=1, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1,
+                          max_consecutive_failures=3)
+    assert h["stop_reason"] == "consecutive_failures" and h["status"] == "REFUSED" and h["consecutive_failures"] == 3 and h["refusal"]["code"] == "CONSECUTIVE_FAILURES"
+
+
+def test_seal_backup_and_restore_check_hooks_run_on_schedule_and_are_recorded(root, tmp_path):
+    seal, rec, bk = tmp_path / "seal.jsonl", tmp_path / "receipts.jsonl", tmp_path / "backup"
+    h, *_ = cont(root, max_cycles=4, seal_manifest=str(seal), seal_every=2, backup_to=str(bk), receipts=str(rec), backup_every=4, restore_check_every=4)
+    assert h["last_seal"]["ok"] and h["last_backup"]["ok"] and h["last_restore_check"]["ok"]
+    assert len(MC.cycle_dirs(str(bk))) == 4 and MC.check_cycles(str(root), str(seal))["ok"] and MC.restore_check(str(bk), str(rec), str(seal))["ok"]
+    doc = health(root)
+    assert doc["last_backup"]["detail"]["backed_up"] and doc["last_restore_check"]["detail"]["checked"] == 4
+
+
+def test_a_failing_backup_or_restore_check_is_recorded_in_health_and_collection_continues(root, tmp_path):
+    seal, rec, bk = tmp_path / "seal.jsonl", tmp_path / "receipts.jsonl", tmp_path / "backup"
+    h, clk, v = cont(root, max_cycles=2, seal_manifest=str(seal), seal_every=2, backup_to=str(bk), receipts=str(rec), backup_every=2, restore_check_every=2)
+    victim = os.path.join(str(bk), MC.cycle_dirs(str(bk))[0], "manifest.json")
+    os.chmod(victim, 0o600)
+    open(victim, "ab").write(b" ")                                                  # the backup rots
+    h2, *_ = cont(root, clk=clk, venue=v, max_cycles=2, seal_manifest=str(seal), seal_every=2, backup_to=str(bk), receipts=str(rec), backup_every=2, restore_check_every=2)
+    assert h2["cycles_run"] == 2 and h2["last_restore_check"]["ok"] is False and h2["last_restore_check"]["detail"]["problems"]
+    assert health(root)["last_restore_check"]["ok"] is False
+    # a seal manifest placed under the collector's own directory is a recorded hook failure, not a crash
+    h3, *_ = cont(root, clk=clk, venue=v, max_cycles=1, seal_manifest=os.path.join(str(root), "seal.jsonl"), seal_every=1)
+    assert h3["last_seal"]["ok"] is False and "outside memory" in h3["last_seal"]["detail"]["error"]
+
+
+def test_a_refused_log_stops_the_run_for_the_owner(root):
+    clk = SimClock()
+    v = LiveVenue(clk)
+    cont(root, clk=clk, venue=v, max_cycles=1)
+    log = os.path.join(str(root), MC.LOG_NAME)
+    lines = open(log).read().splitlines()
+    os.chmod(log, 0o600)
+    open(log, "w").write("\n".join(lines[:-1] + [lines[-1].replace("cycle-", "cyclX-")]) + "\n")
+    h, *_ = cont(root, clk=clk, venue=v, max_cycles=2)
+    assert h["status"] == "REFUSED" and h["refusal"]["code"] == "REFUSED_LOG" and h["cycles_run"] == 1
+
+
+def test_the_continuous_cli_runs_and_reports(root, tmp_path, monkeypatch, capsys):
+    clk = SimClock()
+    v = LiveVenue(clk)
+    monkeypatch.setattr(MC, "http_fetch", v)
+    real = MC.run_continuous
+    monkeypatch.setattr(MC, "run_continuous", lambda *a, **k: real(*a, **dict(k, fetch=v, clock=clk, sleep=clk.sleep, free_bytes_fn=lambda _p: 1 << 40)))
+    rc = MC.main(["run-continuous", "--out-root", str(root), "--max-cycles", "1", "--max-symbols", "1", "--reserve-bytes", "1"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and out["ok"] is True and out["cycles_run"] == 1
+    assert MC.main(["run-continuous", "--out-root", str(root)]) == 2                    # unbounded without a stop file
+
+
+def test_the_collector_still_cannot_sign_post_or_name_an_account_path_after_the_continuous_additions():
+    tree = ast.parse(open(os.path.join(BOT, "tools", "market_collector.py")).read())
+    strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert {s for s in strings if s.startswith("/v5/")} == {"/v5/market/orderbook", "/v5/market/recent-trade"}
+    calls = " ".join(ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call))
+    assert "subprocess" not in calls and "environ" not in calls and "getenv" not in calls
+    assert {"subprocess", "socket", "requests", "hmac"}.isdisjoint({a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names})

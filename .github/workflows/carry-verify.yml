@@ -179,6 +179,8 @@ jobs:
           tests/test_risk_input_provider.py
           tests/test_order_path_inventory.py
           tests/test_market_collector.py
+          tests/test_market_history.py
+          tests/test_data_freshness_audit.py
           tests/test_economic_model.py
           tests/test_economic_faults.py
           tests/test_cost_contracts.py

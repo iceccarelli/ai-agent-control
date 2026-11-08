@@ -1239,7 +1239,7 @@ STOP_SLICE_S = 5.0
 
 
 def _write_health(path: str, doc: Mapping[str, Any]) -> None:
-    """Atomic replace, 0600. The health file is overwritten by design (a status, not evidence); it never lists a secret."""
+    """Atomic replace, 0600. The health file is overwritten by design (a status, not evidence); it holds no credential material."""
     tmp = f"{path}.tmp{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:

@@ -119,7 +119,7 @@ def _cycle_section(root: str, now: int, health: Optional[Mapping[str, Any]], iss
     return sec
 
 
-def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, Any]], universe: Optional[Sequence[str]]) -> Dict[str, Any]:
+def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, Any]], universe: Optional[Sequence[str]], history_max_age_ms: Optional[int] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for name in sorted(os.listdir(root)):
         d = os.path.join(root, name)
@@ -142,8 +142,12 @@ def _history_sections(root: str, now: int, verify: bool, issues: List[Dict[str, 
                 sec["incomplete_symbols"].append(sym)
             if isinstance(last, int) and iv and not delivery and now - last > MH.STALE_INTERVALS * iv + (now - (man.get("request") or {}).get("end_ms", now)):
                 sec["stale_symbols"].append(sym)               # data older than its cadence allows, relative to the requested window end
-        # staleness of a backfill is relative to its window end; a continuing feed is judged by the cycle section. A dataset whose newest row is far older than "now"
-        # is reported (age_ms) but only counted STALE here when the window ended recently.
+        # A backfill is judged against ITS OWN requested window end (a window the owner closed in the past is not "stale"); ``--history-max-age-ms`` additionally calls a dataset
+        # whose window ended longer ago than that STALE (for a corpus that is supposed to be refreshed). A continuing feed is judged by the cycle section.
+        wend = (man.get("request") or {}).get("end_ms")
+        if history_max_age_ms and isinstance(wend, int) and now - wend > history_max_age_ms:
+            sec["stale_symbols"] = sorted(man["symbols"])
+            sec["window_age_ms"] = now - wend
         if verify:
             v = MH.verify_dataset(d)
             sec["verify"] = "OK" if v["ok"] else "FAILED"
@@ -176,17 +180,14 @@ def _status_partitions(root: str, explicit: Optional[str], issues: List[Dict[str
         return res
     man = _load_json(os.path.join(dirs[-1], "manifest.json")) or {}
     res["schema"] = man.get("schema") or man.get("schema_version")
-    cov = man.get("status_coverage")
-    parts = man.get("partitions")
+    cov = man.get("status_coverage")                 # schema 2: {status: outcome}; a partition counts only when the venue ANSWERED (OBSERVED_ROWS / OBSERVED_EMPTY)
     present = set()
     if isinstance(cov, dict):
-        present |= {k for k, v in cov.items() if v}
-    if isinstance(parts, dict):
-        present |= set(parts)
-    elif isinstance(parts, list):
-        present |= {p.get("status") for p in parts if isinstance(p, dict) and p.get("status")}
+        present |= {k for k, v in cov.items() if isinstance(v, str) and v.startswith("OBSERVED")}
+        res["outcomes"] = dict(sorted((k, v) for k, v in cov.items() if isinstance(v, str)))
     res["present"] = sorted(present)
     res["missing"] = [s for s in REQUIRED_STATUS_PARTITIONS if s not in present]
+    res["delisting_observability"] = man.get("delisting_observability", "NOT_RECORDED")
     if res["missing"]:
         issues.append({"axis": "research_readiness", "level": "NOT_READY", "code": "MISSING_STATUS_PARTITIONS", "detail": f"universe capture lacks {res['missing']}"})
     return res
@@ -214,7 +215,7 @@ def _backup_section(root: str, health: Optional[Mapping[str, Any]], live: Mappin
     return sec
 
 
-def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[str] = None, universe_capture: Optional[str] = None, verify: bool = True,
+def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[str] = None, universe_capture: Optional[str] = None, verify: bool = True, history_max_age_ms: Optional[int] = None,
           backup_dir: Optional[str] = None, receipts: Optional[str] = None, seal_manifest: Optional[str] = None,
           clock: Callable[[], int] = lambda: int(time.time() * 1000)) -> Dict[str, Any]:
     now = int(clock()) if now_ms is None else now_ms
@@ -231,7 +232,7 @@ def audit(root: str, *, now_ms: Optional[int] = None, universe_file: Optional[st
     health = health if isinstance(health, dict) else None
     universe = load_research_universe(universe_file) if universe_file else None
     cycles = _cycle_section(root, now, health, issues)
-    history = _history_sections(root, now, verify, issues, universe)
+    history = _history_sections(root, now, verify, issues, universe, history_max_age_ms)
     parts = _status_partitions(root, universe_capture, issues)
     backups = _backup_section(root, health, {"backup_dir": backup_dir, "receipts": receipts, "seal_manifest": seal_manifest}, issues)
     if health:
@@ -286,10 +287,11 @@ def main(argv: Optional[Sequence[str]] = None, *, clock: Callable[[], int] = lam
     ap.add_argument("--backup-dir"); ap.add_argument("--receipts"); ap.add_argument("--seal-manifest")
     ap.add_argument("--skip-verify", action="store_true", help="do not re-hash history datasets (HEALTHY is then impossible)")
     ap.add_argument("--now-ms", type=int)
+    ap.add_argument("--history-max-age-ms", type=int, help="a history dataset whose requested window ended longer ago than this is STALE")
     ap.add_argument("--require-ready", action="store_true")
     a = ap.parse_args(argv)
     try:
-        rep = audit(a.root, now_ms=a.now_ms, universe_file=a.research_universe, universe_capture=a.universe_capture, verify=not a.skip_verify, backup_dir=a.backup_dir,
+        rep = audit(a.root, now_ms=a.now_ms, universe_file=a.research_universe, universe_capture=a.universe_capture, verify=not a.skip_verify, history_max_age_ms=a.history_max_age_ms, backup_dir=a.backup_dir,
                     receipts=a.receipts, seal_manifest=a.seal_manifest, clock=clock)
     except (ValueError, OSError) as exc:
         print(f"data_freshness_audit: {type(exc).__name__}: {exc}", file=sys.stderr)
