@@ -86,6 +86,7 @@ class MarketSnapshot:
     book_age_ms: Optional[int] = None
     last_funding_bps_per_print: Optional[float] = None
     trailing_funding_bps_per_print: Tuple[float, ...] = ()      # oldest -> newest, all with settlement time <= decision_ms
+    trailing_funding_intervals_min: Tuple[int, ...] = ()        # the funding interval IN FORCE AT EACH trailing print (same length as the prints, oldest -> newest); empty/mismatched => per-print interval UNKNOWN, a consumer must not normalise the prints with funding_interval_min
     funding_interval_min: Optional[int] = None                  # the interval in force AT decision time (not today's)
     next_funding_ms: Optional[int] = None
     open_interest_usd: Optional[float] = None
