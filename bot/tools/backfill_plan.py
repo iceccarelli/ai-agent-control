@@ -260,7 +260,8 @@ Classifier = Callable[[Mapping[str, Any], int, int, Sequence[str], Optional[Sequ
 
 #: lifecycle exclusion reasons that PROVE an ended contract is out of the study scope (not a perpetual of the selected quote, never traded, outside the window, ...). Any other reason an ended
 #: (Closed/Delivering) contract is not in the evaluated series (closed_without_delivery, funding_interval_unknown, an unknown classifier class) leaves it UNACCOUNTED: survivors-only.
-EXPLAINED_EXCLUSION_PREFIXES = ("not_perpetual", "quote_not_selected", "prelaunch_no_history", "delivered_before_window", "launched_after_window", "never_trading", "status_not_included")
+EXPLAINED_EXCLUSION_PREFIXES = ("not_perpetual", "quote_not_selected", "prelaunch_no_history", "delivered_before_window", "launched_after_window", "never_trading", "status_not_included",
+                                "OUT_OF_SCOPE_DATED_FUTURE", "OUT_OF_SCOPE_OTHER_CONTRACT", "CONFIRMED_CANCELLED_BEFORE_OPENING")        # universe_capture lifecycle classes that PROVE out of scope
 
 
 def exclusion_is_explained(reason: str) -> bool:
@@ -280,6 +281,43 @@ def window_of_funding_manifest(history_root: str) -> Optional[Tuple[int, int]]:
     if isinstance(req, dict) and _int(req.get("start_ms")) and _int(req.get("end_ms")) and req["start_ms"] < req["end_ms"]:
         return int(req["start_ms"]), int(req["end_ms"])
     return None
+
+
+
+def history_evidence_from_datasets(views: Mapping[str, Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """{symbol: {funding_rows, kline_rows, coverage_complete}} from VERIFIED history datasets only: it lets ``universe_capture`` tell a perpetual that was cancelled before opening (no funding and
+    no kline rows over a COMPLETE collection) from one that is merely unresolved. A symbol is included only when a verified funding dataset AND a verified kline-type dataset both hold it."""
+    f = views.get(MH.FUNDING)
+    if not f or not f["rd"].get("present") or f["rd"].get("verified") is not True:
+        return {}
+    kl = [v for d, v in views.items() if d in (MH.MARK, MH.KLINE, MH.INDEX) and v["rd"].get("present") and v["rd"].get("verified") is True]
+    out: Dict[str, Dict[str, Any]] = {}
+    for sym, fr in f["rd"]["manifest"]["symbols"].items():
+        krs = [v["rd"]["manifest"]["symbols"][sym] for v in kl if sym in v["rd"]["manifest"]["symbols"]]
+        if not krs:
+            continue
+        rows = lambda r: int((r.get("coverage") or {}).get("rows") or 0)              # noqa: E731
+        out[sym] = {"funding_rows": rows(fr), "kline_rows": max(rows(k) for k in krs), "coverage_complete": fr.get("status") == "COMPLETE" and all(k.get("status") == "COMPLETE" for k in krs)}
+    return out
+
+
+def scope_classifier(scope: Mapping[str, Any]) -> Classifier:
+    """The lifecycle classifier backed by ``universe_capture.eligible_instruments``: only an instrument the capture's scope verdict calls eligible can be eligible; an excluded perpetual
+    is named by its lifecycle CLASS (OUT_OF_SCOPE_DATED_FUTURE, CONFIRMED_CANCELLED_BEFORE_OPENING, TERMINAL_UNRESOLVED_PENDINGOPEN, UNEXPLAINED_PARTITION_CONTRADICTION, ...)."""
+    elig = scope.get("eligible") or {}
+    notable = {e["symbol"]: e["klass"] for e in ((scope.get("lifecycle") or {}).get("notable") or []) if isinstance(e, dict) and "symbol" in e}
+
+    def classify(rec: Mapping[str, Any], w0: int, w1: int, include: Sequence[str], quotes: Optional[Sequence[str]]) -> Tuple[bool, str, List[str]]:
+        ok, why, notes = classify_record(rec, w0, w1, include, quotes)
+        sym = rec.get("symbol")
+        if sym in elig:
+            return ok, why, notes
+        if why.startswith(("not_perpetual", "quote_not_selected")):
+            return False, why, notes
+        if sym in notable:
+            return False, notable[sym], notes
+        return False, why or "NOT_IN_ELIGIBLE_LIFECYCLE_SET", notes
+    return classify
 
 
 class Funnel:
@@ -304,7 +342,6 @@ def funnel(universe_dir: str, history_root: Optional[str], *, window: Optional[T
            universe: Optional[Tuple[Mapping[str, Mapping[str, Any]], Mapping[str, Any]]] = None, pre_verified: Sequence[str] = ()) -> Funnel:
     """The ONE funnel. ``window`` = (from_ms, to_ms) the history must cover; None = the window the funding manifest itself requested. Raises PlanError when the universe capture does not
     verify (``market_history.load_universe_dir``) or no window can be determined."""
-    classifier = classifier or default_classifier()
     iv = dict(DEFAULT_INTERVALS)
     iv.update(intervals or {})
     required = [d for d in DATASET_ORDER if d in required_datasets]
@@ -324,28 +361,47 @@ def funnel(universe_dir: str, history_root: Optional[str], *, window: Optional[T
         recs, uinfo = universe if universe is not None else MH.load_universe_dir(universe_dir)               # refuses anything that does not verify (integrity ok AND re-derived COMPLETE|PARTIAL)
     except (MH.HistoryError, OSError, UC.CaptureError) as exc:
         raise PlanError(f"universe capture refused: {exc}") from exc
-    cl = classify_universe(recs, w0, w1, include, list(quote_coins) if quote_coins else None, classifier)
-    eligible: Dict[str, Dict[str, Any]] = cl["eligible"]
-    esyms = sorted(eligible)
     dirs = dataset_dirs(iv)
     ds_view: Dict[str, Dict[str, Any]] = {}
     sets: Dict[str, set] = {}
     for ds in shown:
-        interval = None if ds == MH.FUNDING else iv[ds]
-        need = {s: (*symbol_range(eligible[s], w0, w1), _iv_ms(ds, interval, eligible[s])) for s in esyms}
         rd = read_dataset(root_abs, dirs[ds], verify and dirs[ds] not in pre_verified) if root_abs is not None else {"present": False}
         if rd["present"] and dirs[ds] in pre_verified:
             rd["verified"] = True
-        per: Dict[str, Dict[str, Any]] = {}
+        ds_view[ds] = {"dataset": ds, "interval": None if ds == MH.FUNDING else iv[ds], "dirname": dirs[ds], "required": ds in required, "rd": rd}
+        if rd["present"]:
+            sets[ds] = set(rd["manifest"]["symbols"])
+    evidence = history_evidence_from_datasets(ds_view)
+    scope = UC.eligible_instruments(universe_dir, history_evidence=evidence or None) if classifier is None else None
+    authority = "INJECTED_CLASSIFIER"
+    if classifier is None:
+        if scope["usable"]:
+            classifier, authority = scope_classifier(scope), "universe_capture.eligible_instruments"
+        else:
+            classifier, authority = default_classifier(), "RECORD_FIELDS_FALLBACK(scope not usable: " + str(scope.get("withheld_reason"))[:120] + ")"
+    cl = classify_universe(recs, w0, w1, include, list(quote_coins) if quote_coins else None, classifier)
+    eligible: Dict[str, Dict[str, Any]] = cl["eligible"]
+    esyms = sorted(eligible)
+    swin = (scope or {}).get("eligible") or {}
+    for ds in shown:
+        v = ds_view[ds]
+        interval = v["interval"]
+        need = {}
+        for s_ in esyms:
+            a0, a1 = symbol_range(eligible[s_], w0, w1)
+            lw = swin.get(s_, {}).get("window_ms")
+            if lw and len(lw) == 2:                                    # the capture's own stated history window beats the record fields
+                a0, a1 = max(w0, int(lw[0])), min(w1, int(lw[1]))
+            need[s_] = (a0, a1, _iv_ms(ds, interval, eligible[s_]))
+        rd, per = v["rd"], {}
         if rd["present"]:
             man = rd["manifest"]
-            sets[ds] = set(man["symbols"])
-            for s in esyms:
-                per[s] = assess_symbol(eligible[s], man["symbols"].get(s), (need[s][0], need[s][1]), need[s][2], rd["verified"] is not False)
+            for s_ in esyms:
+                per[s_] = assess_symbol(eligible[s_], man["symbols"].get(s_), (need[s_][0], need[s_][1]), need[s_][2], rd["verified"] is not False)
         else:
-            for s in esyms:
-                per[s] = {"status": "MISSING", "missing_ranges": [[need[s][0], need[s][1]]], "reasons": ["dataset_absent" if root_abs is not None else "no_history_root"]}
-        ds_view[ds] = {"dataset": ds, "interval": interval, "dirname": dirs[ds], "required": ds in required, "rd": rd, "need": need, "per": per}
+            for s_ in esyms:
+                per[s_] = {"status": "MISSING", "missing_ranges": [[need[s_][0], need[s_][1]]], "reasons": ["dataset_absent" if root_abs is not None else "no_history_root"]}
+        v["need"], v["per"] = need, per
     # ---- staged exclusions of ELIGIBLE symbols, in the loader's order (first failing check names the reason)
     stage_excluded: Dict[str, str] = {}
     stages: List[Dict[str, Any]] = [{"stage": "1_universe_rows_linear", "count": len(recs), "symbols": _cap(sorted(recs))},
@@ -429,7 +485,9 @@ def funnel(universe_dir: str, history_root: Optional[str], *, window: Optional[T
            "include_statuses": include, "quote_coins": list(quote_coins) if quote_coins else None, "required_datasets": required,
            "stages": stages, "eligible": esyms, "excluded_lifecycle": dict(sorted(cl["excluded"].items())), "excluded_stage": dict(sorted(stage_excluded.items())),
            "excluded_by_reason": {r: sorted(v) for r, v in sorted(by_reason.items())}, "loadable": loadable, "complete": complete,
-           "symbols_in_datasets_not_loaded": dict(sorted(ds_reasons.items())), "ended_unaccounted": ended_unaccounted, "symbol_set_mismatch_datasets": sorted(mismatch)}
+           "symbols_in_datasets_not_loaded": dict(sorted(ds_reasons.items())), "ended_unaccounted": ended_unaccounted,
+           "lifecycle_authority": authority, "lifecycle_class_counts": ((scope or {}).get("lifecycle") or {}).get("class_counts"), "scope_usable": (scope or {}).get("usable"),
+           "scope_dataset_status": (scope or {}).get("dataset_status"), "history_evidence_symbols": sorted(evidence), "symbol_set_mismatch_datasets": sorted(mismatch)}
     rep["funnel_digest"] = MH._sha(MH._canon(rep))              # the digest covers WHAT the funnel decided, not how the window was named: the same inputs give the same digest in every tool
     rep["window_source"] = window_source
     rep["datasets"] = {ds: {"dirname": v["dirname"], "interval": v["interval"], "present": bool(v["rd"]["present"]), "verified": v["rd"].get("verified"), "required": v["required"],

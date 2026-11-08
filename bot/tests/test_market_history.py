@@ -1322,7 +1322,7 @@ def test_a_schema_2_capture_whose_rederived_status_is_not_acceptable_is_refused(
         monkeypatch.setattr(UC, "verify_capture_dir", lambda p, bad=bad: dict(real(p), coverage=dict(real(p)["coverage"], dataset_status=bad)))
         with pytest.raises(MH.HistoryError, match=bad):
             MH.load_universe_dir(str(d))
-    monkeypatch.setattr(UC, "verify_capture_dir", lambda p: dict(real(p), ok=False, problems=["x"]))
+    monkeypatch.setattr(UC, "verify_capture_dir", lambda p, **kw: dict(real(p, **kw), ok=False, problems=["x"]))
     with pytest.raises(MH.HistoryError):
         MH.load_universe_dir(str(d))
 

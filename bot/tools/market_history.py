@@ -973,13 +973,24 @@ def load_universe_dir(path: str, *, only_trading: bool = False, include_statuses
     if v2:
         # schema 2: ``verify_capture_dir`` re-derives every claim from the raw bytes. Integrity must hold AND the RE-DERIVED dataset_status must be COMPLETE or PARTIAL
         # (never the manifest's own claim); the answer is recorded in the manifest of every dataset built from it.
+        # ``describe_scope`` judges the capture from its RAW bytes (a manifest written under older rules fails the strict claim comparison of ``verify_capture_dir`` yet is sound): raw
+        # integrity must hold; the RE-DERIVED dataset_status must be COMPLETE or PARTIAL, or the capture must be research-usable (COMPLETE_WITH_EXPLAINED_MISMATCH: every mismatched row explained).
         vres = UC.verify_capture_dir(path)
-        if not vres.get("ok"):
-            problems += [str(x) for x in vres.get("problems", ["verify_capture_dir not ok"])]
         derived = vres.get("coverage") or {}
         ds = derived.get("dataset_status")
-        if ds not in ("COMPLETE", "PARTIAL"):
-            problems.append(f"universe re-derived dataset_status is {ds!r}: only COMPLETE or PARTIAL captures are accepted")
+        usable = False
+        if not vres.get("ok") or ds not in ("COMPLETE", "PARTIAL"):      # strict claim comparison failed: judge from the raw bytes instead (older rules_version manifests)
+            scope = UC.describe_scope(path)
+            if not scope.get("raw_integrity_ok"):
+                problems += [str(x) for x in scope.get("integrity_problems", ["raw integrity failed"])]
+            ds = scope.get("dataset_status") or ds
+            usable = bool((scope.get("eligible_perpetual_lifecycle_universe") or {}).get("usable"))
+            derived = {**derived, "delisting_observability": scope.get("delisting_observability") or derived.get("delisting_observability"),
+                       "status_coverage": derived.get("status_coverage") or scope.get("status_coverage")}
+        else:
+            usable = True
+        if ds not in ("COMPLETE", "PARTIAL") and not usable:
+            problems.append(f"universe re-derived dataset_status is {ds!r}: only COMPLETE, PARTIAL or a research-usable (explained-mismatch) capture is accepted")
     elif ds in ("CONFLICTED", "UNVERIFIED", "FAILED"):
         problems.append(f"universe dataset_status is {ds}")
     if problems:

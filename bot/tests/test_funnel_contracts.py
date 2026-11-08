@@ -155,6 +155,64 @@ def test_excluded_symbol_statuses_are_the_same_constant_in_both_modules():
     assert tuple(BP.EXCLUDED_SYMBOL_STATUSES) == tuple(CR.EXCLUDED_SYMBOL_STATUSES)
 
 
-@pytest.mark.skipif(not hasattr(UC, "classify_lifecycle"), reason="Worker A's universe_capture.classify_lifecycle is not in this tree yet: the owner's PendingOpen-inside-Closed shapes cannot be written by the real writer")
-def test_the_owners_pending_open_in_closed_rows_are_classified_not_blocking():          # pragma: no cover - enabled when universe_capture.classify_lifecycle lands
-    raise AssertionError("adapt to universe_capture.classify_lifecycle")
+def _owner_universe(tmp_path):
+    """The owner's shape: perpetual / dated rows whose OWN status is PendingOpen but which the venue served inside the Closed partition (written by the real capture writer)."""
+    rows = [r for r in _instruments() if r["symbol"] != "NODELUSDT"] + [TB.inst("CANCELUSDT", "PendingOpen", delivery=T - 3 * DAY), TB.inst("UNRESUSDT", "PendingOpen", delivery=T - 3 * DAY),
+                             TB.inst("DATEDUSDT", "PendingOpen", delivery=T - 3 * DAY, ctype="LinearFutures", quote="USD")]
+
+    def fetch(url):
+        base = TB.venues.rest_for("mainnet")
+        path, _, qs = url[len(base):].partition("?")
+        q = dict(x.split("=", 1) for x in qs.split("&"))
+        if path == UC.PATH_TICKERS:
+            lst = [TB.tick(r["symbol"]) for r in rows if r["status"] != "PendingOpen"]
+        else:
+            want = q.get("status")
+            lst = [r for r in rows if want is None or r["status"] == want or (want == "Closed" and r["status"] == "PendingOpen")]
+        return json.dumps({"retCode": 0, "retMsg": "OK", "result": {"category": q["category"], "list": lst, "nextPageCursor": ""}, "time": TB.SERVER}).encode()
+    d = tmp_path / "owner_uni"
+    UC.capture_universe(str(d), fetch=fetch, clock_ms=lambda: TB.SERVER, sleep=lambda _s: None, pause_s=0)
+    return d
+
+
+def test_the_owners_pending_open_in_closed_rows_are_classified_and_agree_everywhere(tmp_path, root):
+    uni = _owner_universe(tmp_path)
+    sc = UC.eligible_instruments(str(uni))
+    assert sc["usable"] is True, sc["research_blockers"]
+    f = BP.funnel(str(uni), None, window=(W0, T)).report()
+    # without history evidence the perpetual cancelled-before-opening cannot be told from an unresolved one; the dated future is out of scope; neither is eligible
+    assert f["excluded_lifecycle"]["UNRESUSDT"] == "TERMINAL_UNRESOLVED_PENDINGOPEN" and f["excluded_lifecycle"]["CANCELUSDT"] == "TERMINAL_UNRESOLVED_PENDINGOPEN"
+    assert f["lifecycle_class_counts"] == sc["lifecycle"]["class_counts"] and f["lifecycle_authority"] == "universe_capture.eligible_instruments"
+    assert "UNRESUSDT" not in f["eligible"] and "CANCELUSDT" not in f["eligible"] and "DATEDUSDT" not in f["eligible"]
+    assert f["scope_dataset_status"] == sc["dataset_status"]
+    # the planner reports the very same classes
+    doc = BP.plan(str(uni), None, **_bp(uni, None))
+    assert doc["funnel"]["lifecycle_class_counts"] == f["lifecycle_class_counts"] and doc["funnel"]["excluded_lifecycle"] == f["excluded_lifecycle"]
+
+
+def test_verified_empty_history_distinguishes_cancelled_before_opening_from_unresolved(tmp_path, root):
+    uni = _owner_universe(tmp_path)
+    syms = ["AAAUSDT", "CANCELUSDT"]
+    g = {(MH.FUNDING, "AAAUSDT"): TB.grid(W0, T, H8), (MH.MARK, "AAAUSDT"): TB.grid(W0, T - H4, H4)}          # CANCELUSDT: the venue serves no row at all
+    _collect(root, uni, MH.FUNDING, None, g, syms)
+    _collect(root, uni, MH.MARK, "240", g, syms)
+    man = json.loads((root / "funding" / "manifest.json").read_text())
+    f = BP.funnel(str(uni), str(root), window=(W0, T), report_datasets=(MH.FUNDING, MH.MARK)).report()
+    # the real collector never reports an EMPTY symbol COMPLETE, so real empty history is NOT evidence of a cancellation: the perpetual stays unresolved
+    assert man["symbols"]["CANCELUSDT"]["status"] != "COMPLETE" and not BP.history_evidence_from_datasets(BP.funnel(str(uni), str(root), window=(W0, T), report_datasets=(MH.FUNDING, MH.MARK)).datasets).get("CANCELUSDT", {}).get("coverage_complete")
+    assert f["excluded_lifecycle"]["CANCELUSDT"] == "TERMINAL_UNRESOLVED_PENDINGOPEN"
+
+
+def test_positive_history_evidence_turns_unresolved_into_cancelled_before_opening(tmp_path, monkeypatch):
+    uni = _owner_universe(tmp_path)
+    cov = lambda rows: {"coverage": {"rows": rows}, "status": "COMPLETE"}          # noqa: E731
+    view = lambda syms: {"rd": {"present": True, "verified": True, "manifest": {"symbols": syms}}}          # noqa: E731
+    views = {MH.FUNDING: view({"CANCELUSDT": cov(0), "UNRESUSDT": cov(0)}), MH.MARK: view({"CANCELUSDT": cov(0)})}
+    ev = BP.history_evidence_from_datasets(views)
+    assert ev == {"CANCELUSDT": {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}}            # UNRESUSDT has no kline-type dataset: no evidence
+    views[MH.MARK]["rd"]["verified"] = False
+    assert BP.history_evidence_from_datasets(views) == {}                                                   # unverified datasets are never evidence
+    monkeypatch.setattr(BP, "history_evidence_from_datasets", lambda _v: {"CANCELUSDT": {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}})
+    f = BP.funnel(str(uni), None, window=(W0, T)).report()
+    assert f["excluded_lifecycle"]["CANCELUSDT"] == "CONFIRMED_CANCELLED_BEFORE_OPENING" and f["excluded_lifecycle"]["UNRESUSDT"] == "TERMINAL_UNRESOLVED_PENDINGOPEN"
+    assert f["lifecycle_class_counts"] == UC.eligible_instruments(str(uni), history_evidence={"CANCELUSDT": {"funding_rows": 0, "kline_rows": 0, "coverage_complete": True}})["lifecycle"]["class_counts"]
