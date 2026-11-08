@@ -343,6 +343,8 @@ def test_cancel_latency_race_a_trade_inside_the_window_fills_after_it_does_not(t
     inside = world(tmp_path, [row(2_100 + 52, "99.9", 10)])
     adv = run(inside, cancel_at=cancel)[1]
     assert sum(f.sim.fill.qty for f in adv.fills) == pytest.approx(2.0)                            # the cancel had not taken effect yet
+    late = FM.advance_with_trades(FM.request_cancel(place(inside).order, cancel), inside, TMS.snaps(inside)[2].tape_recv_ms + 10_000, P)
+    assert late.provenance != FM.PROV_REJECTED and sum(f.sim.fill.qty for f in late.fills) == pytest.approx(2.0)     # a cancelled order needs tape only until the cancel is effective
     after = world(tmp_path, [row(2_400 + 52, "99.9", 10)], name="c2")
     adv = run(after, cancel_at=cancel)[1]
     assert adv.fills == () and adv.order.closed

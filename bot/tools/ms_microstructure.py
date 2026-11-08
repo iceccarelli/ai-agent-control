@@ -499,7 +499,7 @@ def load_cycles(root: str, *, symbols: Optional[Sequence[str]] = None, verify: b
                         rej.append("NON_MONOTONE_TS")
                     elif ts == prev_ts:
                         rej.append("DUPLICATE_BOOK_TS")
-                if prev_u is not None and u is not None and (u < prev_u or (u == 1 and prev_u > 1) or (p.max_u_gap is not None and u - prev_u > p.max_u_gap)):
+                if prev_u is not None and u is not None and (u < prev_u or (p.max_u_gap is not None and u - prev_u > p.max_u_gap)):
                     rej.append("DISCONTINUOUS")
                 if prev_seq is not None and seq is not None and seq < prev_seq:
                     rej.append("DISCONTINUOUS")
