@@ -663,6 +663,24 @@ def single_print_ceiling(rows: Sequence[Settle], cost_levels: Sequence[float]
     return out
 
 
+def hold_cost_matrix(rows: Sequence[Settle], holds: Sequence[int],
+                     scenarios: Dict[str, float]) -> List[Dict[str, Any]]:
+    """Net bps of a forced hold of `hold` prints entered after EVERY print (unconditional: no gate, no foresight), for each cost scenario (name -> round-trip
+    bps). One print = one 8h settlement in this corpus. Overlapping windows are serially dependent: the interval is a moving-block bootstrap (block >= 2 holds),
+    and n counts overlapping entries, not independent trials. IN-SAMPLE, funding + the basis shed, price legs hedged by construction (spot owned)."""
+    out: List[Dict[str, Any]] = []
+    for h in holds:
+        for name, cost in scenarios.items():
+            t = all_forced(rows, h, cost_bps=cost)
+            net = [e["net_bps"] for e in t]
+            s = summarise(net)
+            out.append({"hold_prints": h, "hold_days": h / PRINTS_PER_DAY, "scenario": name, "round_trip_cost_bps": cost, "summary": s,
+                        "mean_block_ci90": block_bootstrap_mean(net, block=max(2 * h, 2)) if len(net) >= 4 * max(h, 1) else None,
+                        "mean_funding_bps": statistics.fmean(e["funding_bps"] for e in t) if t else None,
+                        "mean_basis_pnl_bps": statistics.fmean(e["basis_pnl_bps"] for e in t) if t else None})
+    return out
+
+
 def funding_persistence(rows: Sequence[Settle], hold: int,
                         cost_levels: Sequence[float] = (costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED,
                                                         costs.ROUND_TRIP_FEE_BPS_PERP_OVERLAY, 13.0)

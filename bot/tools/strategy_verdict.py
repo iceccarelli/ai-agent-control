@@ -514,6 +514,10 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapp
             return False, "LOOK_AHEAD_NOT_RULED_OUT"
         if m.get("universe_point_in_time") is not True:
             return False, "UNIVERSE_NOT_POINT_IN_TIME"
+        if m.get("universe_pit_basis") != "RAW_RESPONSES_VERIFIED":
+            return False, "UNIVERSE_PIT_NOT_RAW_VERIFIED"           # a boolean is a claim: point in time must rest on raw captures the harness re-verified
+        if m.get("universe_funding_normalisation_known") is False:
+            return False, "FUNDING_INTERVAL_NORMALISATION_UNKNOWN"   # per-symbol fundingInterval not recorded: per-print funding is not comparable
     if s == "cost_model":
         unk = m.get("unknown_cost_inputs")
         if type(unk) is not int or unk != 0:                           # exactly the integer 0: not False, not 0.0, not None

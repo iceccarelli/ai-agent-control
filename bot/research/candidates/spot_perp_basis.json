@@ -41,6 +41,11 @@
       "value": 6.0
     }
   },
+  "funding_interval_handling": {
+    "method": "interval-normalised: funding_bps_per_day = rate_bps * 1440 / fundingInterval_min per symbol; holding-horizon funding = bps/day x days; per-interval cohorts (480m / 240m / 60m) reported separately; settlement grid is per symbol; a Closed contract earns nothing after its deliveryTime",
+    "source_of_interval_facts": "OWNER-OBSERVED live probe (unverified in this repo): Bybit funding interval is per symbol (480m, 240m, sometimes 60m) and 14 of the top 20 positive-funding perps over $5M turnover were 240m contracts",
+    "unknown_interval": "funding normalisation UNKNOWN -> the candidate cannot pass"
+  },
   "funding_model": {
     "expected_bps_per_settlement": {
       "provenance": "assumed",

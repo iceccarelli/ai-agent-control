@@ -47,7 +47,7 @@ def ev(stage, result="PASS", spec_=None, **kw):
     base = {"provenance": "run#1 offline harness", "data_sha256": H, "candidate_id": "cand1", "spec_digest": SV.spec_digest(spec_ if spec_ is not None else spec())}
     m = {}
     if stage in ("historical_test", "oos_test"):
-        m = {"independent_observations": 500, "n_variants_tested": 3, "multiple_testing_adjusted": True, "uses_future_information": False, "universe_point_in_time": True}
+        m = {"independent_observations": 500, "n_variants_tested": 3, "multiple_testing_adjusted": True, "uses_future_information": False, "universe_point_in_time": True, "universe_pit_basis": "RAW_RESPONSES_VERIFIED"}
     elif stage == "cost_model":
         m = {"unknown_cost_inputs": 0, "net_edge_bps_after_costs": 2.5, "chain_digest": SV.cost_chain_digest(spec_ if spec_ is not None else spec())}
     elif stage == "capacity_test":

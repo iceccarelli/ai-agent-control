@@ -37,7 +37,8 @@
       "value": 2.0
     },
     "taker_bps": {
-      "provenance": "assumed",
+      "note": "carry_costs.TAKER_BPS_PERP: Bybit linear perpetual BASE-tier taker fee (published schedule); the account's actual tier is read from the venue at run time and may differ",
+      "provenance": "venue_stated",
       "value": 5.5
     }
   },
