@@ -25,6 +25,16 @@ this was introduced (``LEGACY_SEAL``), so the file in git cannot be quietly edit
 What this does NOT do: stop someone with write access from rewriting the file AND
 the test; the custody is git history and review, not this code.
 
+THE SEAL IS KEYLESS. Anyone who can write the registry can delete a FAIL (or a trial)
+and call `seal()`, and `verify()` is clean again. A registry that verifies only against
+its OWN seal is therefore UNTRUSTED for anything above PROMISING. The optional EXTERNAL
+ANCHOR closes that: `anchor_digest(reg)` is a head digest over every trial's entry
+digest and append-only state; the owner records it OUTSIDE the repository/volume
+(`--print-anchor`) and passes it to `verify(reg, anchor=...)`; a deleted, altered or
+resealed registry then no longer matches. Appending evidence changes the head, so the
+owner re-anchors after each deliberate append. The anchor is only as good as where the
+owner keeps it.
+
 NEW EXPERIMENTS use `register_experiment()` (every field below is required),
 `add_evidence()` (one entry per EVIDENCE LEVEL, never a single 'passed' flag),
 `amend()` and `abandon()` (a failed or abandoned variant is recorded, not deleted).
@@ -36,6 +46,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import sys
@@ -125,8 +136,19 @@ def seal(registry: Dict[str, Any]) -> None:
                              "appended": {t["trial_id"]: _appended_state(t) for t in registry.get("trials", [])}}
 
 
-def verify(registry: Dict[str, Any], *, require_ids: Iterable[str] = ()) -> List[str]:
-    """Problems found, empty if none. Removal and alteration are named; so is a missing seal, an append-only field that shrank or changed (evidence edited
+def anchor_digest(registry: Dict[str, Any]) -> str:
+    """The registry's HEAD digest, recomputed from the trials themselves (never read from the stored seal): SHA-256 over every trial's registration digest and its
+    append-only state (evidence, amendments, abandonment, supersession), sorted by trial id. The owner records it outside the repository/volume; see the module docstring."""
+    try:
+        rows = sorted(([t.get("trial_id"), entry_digest(t), _appended_state(t)] for t in registry.get("trials", [])), key=lambda r: str(r[0]))
+        return hashlib.sha256(json.dumps({"scheme": "registry-anchor/1", "trials": rows}, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+    except (ValueError, TypeError) as exc:
+        raise RegistryError(f"registry cannot be anchored (NaN or non-JSON value): {type(exc).__name__}") from exc
+
+
+def verify(registry: Dict[str, Any], *, require_ids: Iterable[str] = (), anchor: Optional[str] = None) -> List[str]:
+    """Problems found, empty if none. With ``anchor`` (the owner-held head digest) a registry whose head differs is a problem even if its own seal is clean
+    (deletion + reseal, or anything appended since the anchor was recorded). Removal and alteration are named; so is a missing seal, an append-only field that shrank or changed (evidence edited
     or wiped, abandonment or supersession removed) and any required id that is absent."""
     problems: List[str] = []
     trials = {t.get("trial_id"): t for t in registry.get("trials", [])}
@@ -165,6 +187,14 @@ def verify(registry: Dict[str, Any], *, require_ids: Iterable[str] = ()) -> List
     for tid in require_ids:
         if tid not in trials:
             problems.append(f"required trial {tid!r} is absent")
+    if anchor is not None:
+        try:
+            head = anchor_digest(registry)
+        except RegistryError as exc:
+            problems.append(str(exc))
+        else:
+            if not isinstance(anchor, str) or not anchor.isascii() or not hmac.compare_digest(head.encode("ascii"), anchor.encode("ascii")):
+                problems.append("registry head does not match the owner-held anchor (a trial or evidence was deleted, altered, resealed or appended since the anchor was recorded)")
     return problems
 
 
@@ -449,10 +479,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--add", default="", help="record a new trial id")
     ap.add_argument("--status", default="tested")
     ap.add_argument("--note", default="")
+    ap.add_argument("--print-anchor", action="store_true", help="print the registry head digest for the owner to record OUTSIDE the repository/volume, then exit")
     ap.add_argument("--register-prospective", action="store_true", help="link the frozen BTC prospective plan into the registry (idempotent)")
     args = ap.parse_args(argv)
 
     registry = load(args.path, missing_ok=bool(args.seed))
+    if args.print_anchor:
+        print(anchor_digest(registry))
+        return 0
     if args.register_prospective:
         register_btc_prospective(registry)
         save(registry, args.path)

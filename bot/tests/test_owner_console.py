@@ -128,4 +128,10 @@ def test_the_console_lists_every_candidate_with_a_verdict_and_none_is_promoted()
     s = OC.build({}, now_ms=LATER)["strategies"]
     assert s["status"] in OC.STATUSES and len(s["candidates"]) >= 9                       # the frozen BTC description + the 8 mechanism templates
     assert "btcusdt_funding_carry_overlay@prospective-1" in s["candidates"]
-    assert set(s["verdict_counts"]) == {"UNTESTED"} and s["candidates"]["btcusdt_funding_carry_overlay@prospective-1"]["spec_problems"] == 0 and all(c["spec_problems"] > 0 for k, c in s["candidates"].items() if not k.startswith("btcusdt_"))   # templates lack the data they name: truthfully not registrable
+    assert set(s["verdict_counts"]) == {"UNTESTED"} and s["candidates"]["btcusdt_funding_carry_overlay@prospective-1"]["spec_problems"] == 2 and all(c["spec_problems"] > 0 for k, c in s["candidates"].items() if not k.startswith("btcusdt_"))   # the BTC description truthfully declares depth and basis/margin missing (2 problems); templates lack the data they name; none is registrable
+
+
+def test_the_console_never_reports_a_verdict_above_untested_without_evidence():
+    """No registry, key or anchor is read by the console: it cannot display PROMISING or above for anything."""
+    s = OC.section_strategies()
+    assert set(s["verdict_counts"]) == {"UNTESTED"}
