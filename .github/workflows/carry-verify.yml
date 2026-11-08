@@ -190,6 +190,7 @@ jobs:
           tests/test_backfill_plan.py
           tests/test_economic_model.py
           tests/test_economic_faults.py
+          tests/test_ms_microstructure.py
           tests/test_ms_fillmodel.py
           tests/test_ms_portfolio.py
           tests/test_ms_execution.py
