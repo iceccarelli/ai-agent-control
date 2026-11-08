@@ -7,6 +7,15 @@ are stated shocks (not estimates), and the owner overrides them; a result built 
 Rules:
   * Every input is an ``Inp(value, prov)``; ``value`` None is UNKNOWN. UNKNOWN is never zero: it propagates to ``None`` and to verdict ``UNKNOWN``.
   * A result inherits the WEAKEST provenance of its inputs; ``PASS`` requires weakest in {MEASURED, VENUE_STATED, DERIVED, MODELLED}; ASSUMED/UNKNOWN give ``NOT_PROVEN``.
+  * WHAT ``assess`` ENFORCES BEFORE IT SAYS ``PASS`` (each is a separate cap to ``NOT_PROVEN``, with its own reason code; ``FAIL`` / ``UNKNOWN`` still win):
+      - the provenance of every INPUT is in STRONG_ENOUGH (a label, not proof: MODELLED and DERIVED are stated by the caller);
+      - ``scenario_prov`` (the provenance of the PESSIMISTIC factors) is in STRONG_ENOUGH. The built-in factors are ASSUMED shocks, so with them ``assess`` can never PASS: pass
+        ``pessimistic_prov`` only for factors the owner has grounded in measurement;
+      - a ZERO tail probability (operational failure, liquidation, and a maker fill probability of 1.0 = zero no-fill) is accepted only as MEASURED with a stated ``n_samples`` > 0
+        (``ZERO_TAIL_PROBABILITY_NOT_MEASURED:<input>``): "0.0, MODELLED" is the absence of a model, not evidence;
+      - the expected funding is NOT in-sample: ``EconInputs.funding_is_in_sample`` defaults to True (``FUNDING_IS_IN_SAMPLE``), and a funding input labelled DERIVED or whose ``basis``
+        mentions TRAILING_IN_SAMPLE never supports PASS (a trailing mean of the data the candidate was chosen on is a description, not a forecast).
+    So ``PASS`` is a necessary, not a sufficient, condition for edge. It does not look at whether the inputs are right.
   * Fee tier is VENUE_STATED (Bybit's published base tier) unless the caller passes a MEASURED figure from the owner account. A negative fee (rebate) is refused: never assumed.
   * A free execution (entry+exit fee == 0) that is not MEASURED can never PASS (``ZERO_FEE_NOT_MEASURED``).
   * Maker-first expected cost INCLUDES the probability of not being filled at all (``p_no_fill``); an unknown fill probability makes the expectation unknown, never 1.
@@ -33,13 +42,19 @@ _ONE_TIME = ("entry_fee", "exit_fee", "spread", "slippage", "adverse_selection",
 
 @dataclass(frozen=True)
 class Inp:
-    """One economic input: ``value`` None = UNKNOWN."""
+    """One economic input: ``value`` None = UNKNOWN. ``n_samples`` (observations behind a MEASURED figure) and ``basis`` (free text, e.g. 'TRAILING_IN_SAMPLE') are optional."""
     value: Optional[float]
     prov: str = "UNKNOWN"
+    n_samples: Optional[int] = None
+    basis: str = ""
 
     def __post_init__(self) -> None:
         if self.prov not in PROVS:
             raise ValueError(f"provenance {self.prov!r}")
+        if self.n_samples is not None and (type(self.n_samples) is not int or self.n_samples < 0):
+            raise ValueError("n_samples must be a non-negative int or None")
+        if not isinstance(self.basis, str):
+            raise ValueError("basis must be a string")
 
     @property
     def known(self) -> bool:
@@ -94,11 +109,13 @@ class EconInputs:
     op_failure_loss_bps: Inp = UNKNOWN
     liquidation_prob: Inp = UNKNOWN
     liquidation_loss_bps: Inp = UNKNOWN
+    funding_is_in_sample: bool = True            # True unless the owner states the expected funding is a forward / out-of-sample figure; True can never PASS
 
 
 #: PESSIMISTIC scenario factors: ASSUMED stated shocks (not estimates). Multipliers on costs (>= 1), haircuts on income/probability (<= 1).
 PESSIMISTIC_FACTORS = {"fee": 1.5, "spread": 2.0, "slippage": 2.0, "adverse_selection": 2.0, "cancel": 2.0, "p_fill": 0.5, "funding": 0.5, "financing": 1.5, "op_prob": 2.0,
                        "liq_prob": 2.0, "hedge": 2.0}
+PESSIMISTIC_FACTORS_PROV = "ASSUMED"            # stated shocks, not estimates: with them ``assess`` can never PASS
 IDENTITY_FACTORS = {k: 1.0 for k in PESSIMISTIC_FACTORS}
 SCENARIOS = {"base": IDENTITY_FACTORS, "pessimistic": PESSIMISTIC_FACTORS}
 
@@ -220,29 +237,55 @@ def breakeven_table(inp: EconInputs, hold_days_grid: Sequence[float]) -> List[Di
     return rows
 
 
-def assess(inp: EconInputs) -> Dict[str, Any]:
-    """Base and PESSIMISTIC scenarios side by side and a verdict: PASS | FAIL | NOT_PROVEN | UNKNOWN."""
+def _is_zero_measured(i: Inp) -> bool:
+    return i.prov == "MEASURED" and type(i.n_samples) is int and i.n_samples > 0
+
+
+def evidence_caps(inp: EconInputs, scenario_prov: str) -> List[str]:
+    """Reasons that stop a positive result from being ``PASS`` (see the module docstring). Pure; independent of the numbers."""
+    caps: List[str] = []
+    if scenario_prov not in STRONG_ENOUGH:
+        caps.append("PESSIMISTIC_FACTORS_" + scenario_prov)
+    tails = [("op_failure_prob", inp.op_failure_prob, 0.0), ("liquidation_prob", inp.liquidation_prob, 0.0)]
+    if inp.style == "maker":
+        tails.append(("p_no_fill", inp.p_fill_per_leg, 1.0))                  # a fill probability of 1.0 is a no-fill probability of 0
+    for name, i, zero in tails:
+        if i.known and i.value == zero and not _is_zero_measured(i):
+            caps.append(f"ZERO_TAIL_PROBABILITY_NOT_MEASURED:{name}")
+    f = inp.funding_bps_per_print
+    if inp.funding_is_in_sample is not False or f.prov == "DERIVED" or "TRAILING_IN_SAMPLE" in f.basis.upper():
+        caps.append("FUNDING_IS_IN_SAMPLE")
+    return caps
+
+
+def assess(inp: EconInputs, *, pessimistic_prov: str = PESSIMISTIC_FACTORS_PROV) -> Dict[str, Any]:
+    """Base and PESSIMISTIC scenarios side by side and a verdict: PASS | FAIL | NOT_PROVEN | UNKNOWN. ``PASS`` is capped to ``NOT_PROVEN`` by ``evidence_caps``."""
     if inp.style not in STYLES or inp.position_class not in CC.POSITION_CLASSES:
         raise ValueError("style/position_class")
-    out = {"base": _scenario(inp, SCENARIOS["base"]), "pessimistic": _scenario(inp, SCENARIOS["pessimistic"]), "scenario_prov": "ASSUMED",
+    if pessimistic_prov not in PROVS:
+        raise ValueError(f"pessimistic_prov {pessimistic_prov!r}")
+    out = {"base": _scenario(inp, SCENARIOS["base"]), "pessimistic": _scenario(inp, SCENARIOS["pessimistic"]), "scenario_prov": pessimistic_prov,
            "position_class": inp.position_class, "style": inp.style}
     b, p = out["base"], out["pessimistic"]
     reasons = list(dict.fromkeys(b["reasons"] + p["reasons"]))
+    caps = evidence_caps(inp, pessimistic_prov)
     if b["expected_net_bps"] is None or p["expected_net_bps"] is None:
         verdict = "UNKNOWN"
         reasons += ["UNKNOWN_INPUT:" + ",".join(b["unknown"] or p["unknown"])]
     elif b["expected_net_bps"] <= 0 or p["expected_net_bps"] <= 0:
         verdict = "FAIL"
         reasons.append("BASE_NET_NOT_POSITIVE" if b["expected_net_bps"] <= 0 else "PESSIMISTIC_NET_NOT_POSITIVE")
-    elif b["prov"] not in STRONG_ENOUGH or reasons:
+    elif b["prov"] not in STRONG_ENOUGH or reasons or caps:
         verdict = "NOT_PROVEN"
-        reasons.append("WEAKEST_PROVENANCE:" + b["prov"])
+        if b["prov"] not in STRONG_ENOUGH:
+            reasons.append("WEAKEST_PROVENANCE:" + b["prov"])
+        reasons += caps
     else:
         verdict = "PASS"
     if inp.position_class == "perp_only_unhedged":
         reasons.append("NOT_A_CARRY:unhedged_price_leg")
         verdict = "NOT_PROVEN" if verdict == "PASS" else verdict
-    out.update(verdict=verdict, reasons=reasons, prov=b["prov"])
+    out.update(verdict=verdict, reasons=reasons, prov=b["prov"], evidence_caps=caps)
     return out
 
 

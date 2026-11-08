@@ -14,7 +14,8 @@ any such import or on any send-like name). What it does:
   * authorisation is ``NOT_GRANTED`` from the generator, always. The validator accepts ``GRANTED_BY_OWNER:<reference>`` only because the owner may mark a manifest later; that enables
     nothing by itself;
   * ``enabled()`` is False unless an OWNER-SET capability file exists at ``DEFAULT_CAPABILITY_PATH`` (or the path given) holding a manifest that validates, is authorised, and whose
-    digest the file restates. This repository never creates that file. Even when ``enabled()`` is True this module still sends nothing: it is one of three conditions
+    digest the file restates. This repository never creates that file. The file is SELF-ATTESTED (a same-user process could write it; the digest is not a signature) and must be owned by the current
+    user with mode 0600 (no group/other bits), otherwise it is refused (``CAPABILITY_FILE_NOT_OWNED_BY_CURRENT_USER`` / ``CAPABILITY_FILE_MODE_NOT_OWNER_ONLY_0600``). Even when ``enabled()`` is True this module still sends nothing: it is one of three conditions
     ``ms_authority`` requires before it can be bound to a non-simulated transport (the others: a sandbox venue and a dedicated testnet credential name).
 """
 from __future__ import annotations
@@ -294,14 +295,31 @@ def engage_kill_switch(path: str, reason: str = "") -> bool:
 # ---------------------------------------------------------------------------------------------------- the capability flag
 
 def capability_status(path: Optional[str] = None) -> Dict[str, Any]:
-    """Whether the OWNER has enabled this capability. Never raises. Enabled only if ``path`` is a regular (non-symlink) file holding {schema, manifest, manifest_plan_sha256}
+    """Whether the OWNER has enabled this capability. Never raises. SELF-ATTESTED: the file is a statement the owner's account made about itself. Nothing here can prove a human
+    wrote it (any process running as the same user can create a file with a granted manifest and a matching digest), and the digest is not a signature (it is recomputable from the
+    content). What it does check is that the file is not writable or readable by anyone but its owner: a regular, non-symlink file OWNED BY THE CURRENT USER with mode 0600
+    (no group/other bits), read through the descriptor that was checked. It is one condition among several for ``ms_authority`` and enables nothing alone.
+    Enabled only if ``path`` is such a file holding {schema, manifest, manifest_plan_sha256}
     where the manifest is valid, authorised ``GRANTED_BY_OWNER:*`` and its digest equals both the recomputed digest and ``manifest_plan_sha256``."""
     p = DEFAULT_CAPABILITY_PATH if path is None else path
     try:
         if os.path.islink(p) or not os.path.isfile(p):
             return {"enabled": False, "reasons": ["CAPABILITY_FILE_ABSENT"]}
-        with open(p, encoding="utf-8") as fh:
-            doc = json.loads(fh.read(), object_pairs_hook=TAM._no_dupes, parse_constant=TAM._refuse_const)
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            st = os.fstat(fd)                                       # judged on the OPEN descriptor: the file checked is the file read
+            if (st.st_mode & 0o170000) != 0o100000:
+                return {"enabled": False, "reasons": ["CAPABILITY_FILE_NOT_REGULAR"]}
+            if st.st_uid != os.getuid():
+                return {"enabled": False, "reasons": ["CAPABILITY_FILE_NOT_OWNED_BY_CURRENT_USER"]}
+            if st.st_mode & 0o7177:                                  # any group/other bit (so never group- or world-writable), setuid/setgid/sticky, or owner-execute
+                return {"enabled": False, "reasons": ["CAPABILITY_FILE_MODE_NOT_OWNER_ONLY_0600"]}
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                fd = -1
+                doc = json.loads(fh.read(), object_pairs_hook=TAM._no_dupes, parse_constant=TAM._refuse_const)
+        finally:
+            if fd >= 0:
+                os.close(fd)
         if not isinstance(doc, dict) or set(doc) != {"schema", "manifest", "manifest_plan_sha256"} or doc["schema"] != CAPABILITY_SCHEMA:
             return {"enabled": False, "reasons": ["CAPABILITY_FILE_MALFORMED"]}
         m = doc["manifest"]

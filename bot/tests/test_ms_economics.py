@@ -15,12 +15,19 @@ import ms_economics as E  # noqa: E402
 from ms_economics import Inp  # noqa: E402
 
 
+def assess(inp, **kw):
+    """Verdict logic under test with the two EVIDENCE caps lifted (owner-grounded pessimistic factors; funding out of sample): the caps have their own tests below."""
+    kw.setdefault("pessimistic_prov", "MODELLED")
+    return E.assess(inp, **kw)
+
+
 def inputs(**kw):
     fi = E.fee_inputs("overlay_owned_spot", "taker")
     d = dict(position_class="overlay_owned_spot", style="taker", hold_days=Inp(10.0, "DERIVED"), funding_bps_per_print=Inp(2.0, "MEASURED"), funding_interval_min=480,
              taker_fee_round_trip_bps=fi["fee_round_trip_bps"], spread_round_trip_bps=Inp(0.5, "MEASURED"), slippage_round_trip_bps=Inp(1.0, "MEASURED"),
              hedge_cost_bps=Inp(0.0, "DERIVED"), financing_apr=Inp(0.0, "DERIVED"), opportunity_cost_apr=Inp(0.0, "DERIVED"), op_failure_prob=Inp(0.01, "MODELLED"),
-             op_failure_loss_bps=Inp(50.0, "MODELLED"), liquidation_prob=Inp(0.001, "MODELLED"), liquidation_loss_bps=Inp(500.0, "MODELLED"))
+             op_failure_loss_bps=Inp(50.0, "MODELLED"), liquidation_prob=Inp(0.001, "MODELLED"), liquidation_loss_bps=Inp(500.0, "MODELLED"),
+             funding_is_in_sample=False)
     d.update(kw)
     return E.EconInputs(**d)
 
@@ -53,7 +60,7 @@ def test_measured_fee_overrides_and_rebate_is_refused():
 
 # ---------------------------------------------------------------- breakeven
 def test_positive_control_pass_and_the_arithmetic():
-    r = E.assess(inputs())
+    r = assess(inputs())
     b = r["base"]
     assert r["verdict"] == "PASS" and r["prov"] == "MODELLED"
     assert b["components"]["entry_fee"] == pytest.approx(5.5) and b["components"]["exit_fee"] == pytest.approx(5.5)
@@ -72,26 +79,26 @@ def test_base_and_pessimistic_side_by_side_and_pessimistic_is_worse():
 
 
 def test_pessimistic_failure_fails_the_verdict_even_when_base_passes():
-    r = E.assess(inputs(funding_bps_per_print=Inp(0.7, "MEASURED")))              # base 21 - 13.5 > 0 ; pessimistic 10.5 - ~21 < 0
+    r = assess(inputs(funding_bps_per_print=Inp(0.7, "MEASURED")))              # base 21 - 13.5 > 0 ; pessimistic 10.5 - ~21 < 0
     assert r["base"]["expected_net_bps"] > 0 and r["pessimistic"]["expected_net_bps"] < 0 and r["verdict"] == "FAIL"
     assert "PESSIMISTIC_NET_NOT_POSITIVE" in r["reasons"]
 
 
 def test_base_failure_is_fail():
-    assert E.assess(inputs(funding_bps_per_print=Inp(0.1, "MEASURED")))["verdict"] == "FAIL"
-    assert E.assess(inputs(funding_bps_per_print=Inp(-1.0, "MEASURED")))["verdict"] == "FAIL"
+    assert assess(inputs(funding_bps_per_print=Inp(0.1, "MEASURED")))["verdict"] == "FAIL"
+    assert assess(inputs(funding_bps_per_print=Inp(-1.0, "MEASURED")))["verdict"] == "FAIL"
 
 
 def test_assumed_spread_default_can_never_pass():
     i = inputs(spread_round_trip_bps=E.fee_inputs("overlay_owned_spot", "taker")["spread_round_trip_bps"])
-    r = E.assess(i)
+    r = assess(i)
     assert r["verdict"] == "NOT_PROVEN" and r["prov"] == "ASSUMED" and any(x.startswith("WEAKEST_PROVENANCE") for x in r["reasons"])
 
 
 @pytest.mark.parametrize("name", ["hold_days", "funding_bps_per_print", "taker_fee_round_trip_bps", "spread_round_trip_bps", "slippage_round_trip_bps", "hedge_cost_bps",
                                   "financing_apr", "opportunity_cost_apr", "op_failure_prob", "op_failure_loss_bps", "liquidation_prob", "liquidation_loss_bps"])
 def test_unknown_input_gives_unknown_verdict_and_no_number(name):
-    r = E.assess(inputs(**{name: E.UNKNOWN}))
+    r = assess(inputs(**{name: E.UNKNOWN}))
     assert r["verdict"] == "UNKNOWN" and r["base"]["expected_net_bps"] is None
     assert r["base"]["unknown"]
 
@@ -99,36 +106,36 @@ def test_unknown_input_gives_unknown_verdict_and_no_number(name):
 def test_zero_cost_execution_is_never_a_pass():
     zero = inputs(taker_fee_round_trip_bps=Inp(0.0, "ASSUMED"), spread_round_trip_bps=Inp(0.0, "ASSUMED"), slippage_round_trip_bps=Inp(0.0, "ASSUMED"),
                   op_failure_prob=Inp(0.0, "ASSUMED"), liquidation_prob=Inp(0.0, "ASSUMED"))
-    r = E.assess(zero)
+    r = assess(zero)
     assert r["verdict"] != "PASS" and "ZERO_FEE_NOT_MEASURED" in r["reasons"]
     zero_stated = inputs(taker_fee_round_trip_bps=Inp(0.0, "VENUE_STATED"))
-    assert E.assess(zero_stated)["verdict"] != "PASS"
-    assert E.assess(inputs(taker_fee_round_trip_bps=Inp(0.0, "MEASURED")))["verdict"] == "PASS"       # a MEASURED zero tier is a fact, allowed
+    assert assess(zero_stated)["verdict"] != "PASS"
+    assert assess(inputs(taker_fee_round_trip_bps=Inp(0.0, "MEASURED")))["verdict"] == "PASS"       # a MEASURED zero tier is a fact, allowed
 
 
 def test_wrong_interval_conversion_is_unknown_and_equivalent_intervals_agree():
-    assert E.assess(inputs(funding_interval_min=7))["verdict"] == "UNKNOWN"
-    assert E.assess(inputs(funding_interval_min=None))["verdict"] == "UNKNOWN"
-    assert E.assess(inputs(funding_interval_min=True))["verdict"] == "UNKNOWN"
-    a = E.assess(inputs(funding_bps_per_print=Inp(2.0, "MEASURED"), funding_interval_min=480))["base"]
-    b = E.assess(inputs(funding_bps_per_print=Inp(1.0, "MEASURED"), funding_interval_min=240))["base"]
-    c = E.assess(inputs(funding_bps_per_print=Inp(0.25, "MEASURED"), funding_interval_min=60))["base"]
+    assert assess(inputs(funding_interval_min=7))["verdict"] == "UNKNOWN"
+    assert assess(inputs(funding_interval_min=None))["verdict"] == "UNKNOWN"
+    assert assess(inputs(funding_interval_min=True))["verdict"] == "UNKNOWN"
+    a = assess(inputs(funding_bps_per_print=Inp(2.0, "MEASURED"), funding_interval_min=480))["base"]
+    b = assess(inputs(funding_bps_per_print=Inp(1.0, "MEASURED"), funding_interval_min=240))["base"]
+    c = assess(inputs(funding_bps_per_print=Inp(0.25, "MEASURED"), funding_interval_min=60))["base"]
     assert a["expected_net_bps"] == pytest.approx(b["expected_net_bps"]) == pytest.approx(c["expected_net_bps"])
     assert a["funding_prints_in_hold"] == 30 and b["funding_prints_in_hold"] == 60 and c["funding_prints_in_hold"] == 240
     assert b["breakeven_gross_edge_bps_per_interval"] == pytest.approx(a["breakeven_gross_edge_bps_per_interval"] / 2)       # per-print halves with the interval
     naive_wrong = 2.0 * 3 * 10                                                                                          # an 8h assumption applied to a 60m symbol
-    assert E.assess(inputs(funding_bps_per_print=Inp(2.0, "MEASURED"), funding_interval_min=60))["base"]["expected_funding_bps_horizon"] != pytest.approx(naive_wrong)
+    assert assess(inputs(funding_bps_per_print=Inp(2.0, "MEASURED"), funding_interval_min=60))["base"]["expected_funding_bps_horizon"] != pytest.approx(naive_wrong)
 
 
 def test_breakeven_hold_days_whole_prints_and_never():
-    r = E.assess(inputs())["base"]
+    r = assess(inputs())["base"]
     assert r["breakeven_hold_days"] == pytest.approx(math.ceil(13.5 / 2.0) / 3.0)           # 7 prints at 3/day
-    r2 = E.assess(inputs(funding_bps_per_print=Inp(0.1, "MEASURED"), financing_apr=Inp(0.5, "ASSUMED")))["base"]
+    r2 = assess(inputs(funding_bps_per_print=Inp(0.1, "MEASURED"), financing_apr=Inp(0.5, "ASSUMED")))["base"]
     assert r2["breakeven_hold_days"] is None                                                # financing exceeds funding: never
 
 
 def test_financing_is_charged_per_day_from_carry_costs_convention():
-    r = E.assess(inputs(financing_apr=Inp(0.365, "MEASURED"), opportunity_cost_apr=Inp(0.0, "DERIVED")))["base"]
+    r = assess(inputs(financing_apr=Inp(0.365, "MEASURED"), opportunity_cost_apr=Inp(0.0, "DERIVED")))["base"]
     assert r["financing_bps_per_day"] == pytest.approx(10.0) and r["financing_bps_horizon"] == pytest.approx(100.0)
     assert r["expected_net_bps"] == pytest.approx(60.0 - 13.5 - 100.0)
 
@@ -141,13 +148,13 @@ def test_breakeven_table_over_holding_periods():
 
 
 def test_unhedged_class_is_never_a_pass():
-    r = E.assess(inputs(position_class="perp_only_unhedged"))
+    r = assess(inputs(position_class="perp_only_unhedged"))
     assert r["verdict"] == "NOT_PROVEN" and "NOT_A_CARRY:unhedged_price_leg" in r["reasons"]
 
 
 def test_invalid_style_or_class_raises_and_inp_provenance_is_checked():
     with pytest.raises(ValueError):
-        E.assess(inputs(style="market"))
+        assess(inputs(style="market"))
     with pytest.raises(ValueError):
         Inp(1.0, "GUESS")
     assert Inp(float("nan"), "MEASURED").known is False and Inp(True, "MEASURED").known is False
@@ -184,7 +191,7 @@ def test_unknown_or_impossible_fill_probability_gives_no_expectation(p):
 
 
 def test_maker_style_assessment_is_costlier_than_the_best_case_and_pessimistic_has_more_no_fill():
-    r = E.assess(maker_inputs())
+    r = assess(maker_inputs())
     b, p = r["base"], r["pessimistic"]
     assert b["maker_first_side"]["p_no_fill"] == pytest.approx(0.2) and p["maker_first_side"]["p_no_fill"] == pytest.approx(0.6)
     best_case = CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY_MAKER_MODELLED
@@ -193,13 +200,13 @@ def test_maker_style_assessment_is_costlier_than_the_best_case_and_pessimistic_h
 
 
 def test_maker_with_unknown_fill_probability_is_unknown_not_best_case():
-    r = E.assess(maker_inputs(p_fill_per_leg=E.UNKNOWN))
+    r = assess(maker_inputs(p_fill_per_leg=E.UNKNOWN))
     assert r["verdict"] == "UNKNOWN" and r["base"]["expected_net_bps"] is None
 
 
 def test_acquire_maker_has_no_invented_spot_maker_fee():
     m = E.fee_inputs("acquire_spot_perp", "maker")
-    r = E.assess(maker_inputs(position_class="acquire_spot_perp", maker_fee_round_trip_bps=m["fee_round_trip_bps"]))
+    r = assess(maker_inputs(position_class="acquire_spot_perp", maker_fee_round_trip_bps=m["fee_round_trip_bps"]))
     assert r["verdict"] == "UNKNOWN"
 
 
@@ -303,6 +310,76 @@ def test_liquidation_is_detected_even_when_leverage_and_equity_look_fine():
 
 
 def test_adverse_selection_is_priced_into_the_maker_expectation():
-    lo = E.assess(maker_inputs(adverse_selection_bps=Inp(0.0, "MODELLED")))["base"]["one_time_cost_bps"]
-    hi = E.assess(maker_inputs(adverse_selection_bps=Inp(4.0, "MODELLED")))["base"]["one_time_cost_bps"]
+    lo = assess(maker_inputs(adverse_selection_bps=Inp(0.0, "MODELLED")))["base"]["one_time_cost_bps"]
+    hi = assess(maker_inputs(adverse_selection_bps=Inp(4.0, "MODELLED")))["base"]["one_time_cost_bps"]
     assert hi > lo
+
+
+# ---------------------------------------------------------------- red team rt8: what PASS actually requires
+def test_the_default_pessimistic_factors_are_assumed_so_pass_is_never_reached_with_them():
+    r = E.assess(inputs())                                                              # every input is fine; only the scenario factors are ASSUMED
+    assert r["scenario_prov"] == "ASSUMED" and r["verdict"] == "NOT_PROVEN" and "PESSIMISTIC_FACTORS_ASSUMED" in r["reasons"]
+    assert E.assess(inputs(), pessimistic_prov="MODELLED")["verdict"] == "PASS"         # positive control: owner-grounded factors lift only this cap
+    with pytest.raises(ValueError):
+        E.assess(inputs(), pessimistic_prov="nonsense")
+
+
+def test_the_red_team_poc_cannot_pass():
+    fi = E.fee_inputs("acquire_spot_perp", "taker")
+    poc = E.EconInputs("acquire_spot_perp", "taker", Inp(7.0, "VENUE_STATED"), Inp(20.0, "DERIVED"), 480, fi["fee_round_trip_bps"], spread_round_trip_bps=Inp(1.0, "MODELLED"),
+                       slippage_round_trip_bps=Inp(1.0, "MODELLED"), hedge_cost_bps=Inp(1.0, "MODELLED"), financing_apr=Inp(0.0, "DERIVED"), opportunity_cost_apr=Inp(0.0, "DERIVED"),
+                       op_failure_prob=Inp(0.0, "MODELLED"), op_failure_loss_bps=Inp(0.0, "MODELLED"), liquidation_prob=Inp(0.0, "MODELLED"), liquidation_loss_bps=Inp(0.0, "MODELLED"))
+    r = E.assess(poc)
+    assert r["verdict"] == "NOT_PROVEN"
+    for code in ("PESSIMISTIC_FACTORS_ASSUMED", "FUNDING_IS_IN_SAMPLE", "ZERO_TAIL_PROBABILITY_NOT_MEASURED:op_failure_prob", "ZERO_TAIL_PROBABILITY_NOT_MEASURED:liquidation_prob"):
+        assert code in r["reasons"], code
+    # every cap lifted one by one: still NOT_PROVEN until ALL are
+    lifted = dict(op_failure_prob=Inp(0.0, "MEASURED", n_samples=500), liquidation_prob=Inp(0.0, "MEASURED", n_samples=500), funding_is_in_sample=False,
+                  funding_bps_per_print=Inp(20.0, "MEASURED"))
+    base = {k: getattr(poc, k) for k in poc.__dataclass_fields__}
+    assert E.assess(E.EconInputs(**{**base, **lifted}), pessimistic_prov="MODELLED")["verdict"] == "PASS"
+    for k in lifted:
+        part = {kk: vv for kk, vv in lifted.items() if kk != k}
+        assert E.assess(E.EconInputs(**{**base, **part}), pessimistic_prov="MODELLED")["verdict"] == "NOT_PROVEN", k
+
+
+@pytest.mark.parametrize("name", ["op_failure_prob", "liquidation_prob"])
+def test_a_zero_tail_probability_needs_a_measured_sample(name):
+    assert assess(inputs(**{name: Inp(0.0, "MODELLED")}))["verdict"] == "NOT_PROVEN"
+    assert assess(inputs(**{name: Inp(0.0, "DERIVED")}))["verdict"] == "NOT_PROVEN"
+    assert assess(inputs(**{name: Inp(0.0, "MEASURED")}))["verdict"] == "NOT_PROVEN"                    # measured but no stated sample size
+    assert assess(inputs(**{name: Inp(0.0, "MEASURED", n_samples=0)}))["verdict"] == "NOT_PROVEN"
+    assert assess(inputs(**{name: Inp(0.0, "MEASURED", n_samples=250)}))["verdict"] == "PASS"
+    assert assess(inputs(**{name: Inp(0.0001, "MODELLED")}))["verdict"] == "PASS"                        # a non-zero modelled probability is not this rule's business
+
+
+def test_a_maker_that_always_fills_is_a_zero_no_fill_tail():
+    assert assess(maker_inputs(p_fill_per_leg=Inp(1.0, "MODELLED")))["verdict"] == "NOT_PROVEN"
+    assert assess(maker_inputs(p_fill_per_leg=Inp(1.0, "MEASURED", n_samples=400)))["verdict"] in ("PASS", "NOT_PROVEN", "FAIL")
+    assert "ZERO_TAIL_PROBABILITY_NOT_MEASURED:p_no_fill" in assess(maker_inputs(p_fill_per_leg=Inp(1.0, "MODELLED")))["reasons"]
+    assert "ZERO_TAIL_PROBABILITY_NOT_MEASURED:p_no_fill" not in assess(inputs(p_fill_per_leg=Inp(1.0, "MODELLED")))["reasons"]      # a taker has no fill probability
+
+
+def test_in_sample_funding_never_supports_pass():
+    assert E.EconInputs.__dataclass_fields__["funding_is_in_sample"].default is True                       # the default is the cautious one
+    flag_default = {k: v for k, v in inputs().__dict__.items() if k != "funding_is_in_sample"}
+    assert assess(E.EconInputs(**flag_default))["verdict"] == "NOT_PROVEN"
+    assert assess(inputs(funding_bps_per_print=Inp(2.0, "DERIVED")))["verdict"] == "NOT_PROVEN"            # the label alone
+    assert assess(inputs(funding_bps_per_print=Inp(2.0, "MEASURED", basis="trailing_in_sample mean")))["verdict"] == "NOT_PROVEN"
+    r = assess(inputs(funding_is_in_sample=True))
+    assert r["verdict"] == "NOT_PROVEN" and "FUNDING_IS_IN_SAMPLE" in r["reasons"]
+    assert assess(inputs(funding_bps_per_print=Inp(2.0, "MEASURED"), funding_is_in_sample=False))["verdict"] == "PASS"        # positive control
+
+
+def test_caps_never_turn_a_fail_or_unknown_into_a_better_verdict():
+    assert assess(inputs(funding_bps_per_print=Inp(0.1, "MEASURED"), funding_is_in_sample=True))["verdict"] == "FAIL"
+    assert E.assess(inputs(hold_days=E.UNKNOWN))["verdict"] == "UNKNOWN"
+
+
+def test_inp_sample_size_and_basis_are_validated():
+    for bad in (-1, 1.5, True, "3"):
+        with pytest.raises(ValueError):
+            Inp(0.0, "MEASURED", n_samples=bad)
+    with pytest.raises(ValueError):
+        Inp(0.0, "MEASURED", basis=3)
+    assert Inp(1.0, "MEASURED") == Inp(1.0, "MEASURED", None, "")                                          # the old two-argument form is unchanged

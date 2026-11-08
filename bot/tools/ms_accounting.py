@@ -5,6 +5,11 @@ Principles (each is tested, each has a mutation):
     with no funding record (and no explicit "no funding applied" declaration) make that component ``None``, and ``net`` becomes ``None``. A flag says why.
   * Unreconciled is not profit. ``net`` is a mark-to-market figure; ``claimable_profit`` is non-None ONLY when every leg is flat, every fee and every funding component is
     known, and nothing is flagged. A ledger with open legs or unknown components never reports a clean profit.
+  * WHAT "RECONCILED" MEANS HERE. ``status == "RECONCILED"`` and ``claimable_profit`` are INTERNAL CONSISTENCY: the ledger's own fills net to flat and every component is known. They
+    are NOT a comparison with the venue (FLAT means "the venue's own position read says flat"; fill arithmetic is not that read). Every report therefore carries
+    ``reconciliation_basis`` (``INTERNAL_CONSISTENCY_ONLY`` unless a venue read was injected), ``internally_consistent``, ``venue_reconciled`` and ``venue_claimable_profit``. The
+    last two are True / non-None ONLY from ``Ledger.pnl(venue_positions=...)`` when the injected venue position read matches the ledger on every (symbol, category) and the
+    ledger is otherwise consistent. The old ``status`` / ``claimable_profit`` keys keep their values and names (consumers depend on them); read the new keys for what they prove.
   * Duplicate fills (same ``fill_id``) are ignored; a duplicate whose content differs is flagged ``DUPLICATE_FILL_CONFLICT`` and the ledger is unreconciled.
   * FUNDING SIGN CONVENTION (explicit): ``amount_usd`` > 0 is cash RECEIVED by this account, < 0 is cash PAID. For a funding rate ``r`` (fraction per print, positive = longs
     pay shorts) the cash flow of a position with signed notional ``N`` (long > 0, short < 0) is ``-N * r`` (``funding_cashflow``). A short in positive funding receives.
@@ -29,6 +34,8 @@ from ms_types import Fill, weakest  # noqa: E402
 _FILL_PROV_MAP = {"SIMULATED": "MODELLED", "MODELLED": "MODELLED", "MEASURED": "MEASURED"}
 _PROV_OK = ("MEASURED", "VENUE_STATED", "DERIVED", "MODELLED", "ASSUMED", "UNKNOWN")
 EPS = 1e-12
+STATUS_MEANING = ("RECONCILED = internally consistent (flat per the ledger's own fills, every fee/funding component known); it is NOT a venue position read. "
+                  "See venue_reconciled / reconciliation_basis.")
 
 
 class LedgerError(ValueError):
@@ -229,18 +236,52 @@ class Ledger:
         any_open = any(l["open"] for l in legs)
         flags = list(dict.fromkeys(flags))
         reconciled = with_funding and bool(legs) and not any_open and net is not None and not [f for f in flags if not f.startswith("OPEN_LEG")]
+        basis = {"reconciliation_basis": "INTERNAL_CONSISTENCY_ONLY", "internally_consistent": bool(reconciled), "venue_reconciled": False, "venue_claimable_profit": None,
+                 "internal_status": "INTERNALLY_CONSISTENT" if reconciled else "NOT_INTERNALLY_CONSISTENT", "status_meaning": STATUS_MEANING}
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": slip, "realised": realised, "unrealised": unreal, "unrealised_price": unreal, "realised_price": realised_price, "qty": float(sum(l["qty"] for l in legs)), "net": net,
                 "claimable_profit": net if reconciled else None, "status": "RECONCILED" if reconciled else "UNRECONCILED",
-                "prov": weakest(*provs, *fprovs) if (provs or fprovs) else "UNKNOWN", "flags": flags, "n_legs": len(legs)}
+                "prov": weakest(*provs, *fprovs) if (provs or fprovs) else "UNKNOWN", "flags": flags, "n_legs": len(legs), **basis}
 
-    def pnl(self) -> Dict[str, Any]:
-        """Portfolio P&L with ``per_leg`` and ``per_symbol`` rollups (same keys). See the module docstring for the definitions and for when ``claimable_profit`` is None."""
+    def _venue_check(self, venue_positions: Any, legs: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
+        """Compare an injected venue position read with the ledger. ``venue_positions``: {"SYMBOL" (linear) | "SPOT:SYMBOL": signed base units, None = the read failed}. Every
+        (symbol, category) the ledger has a leg for must be present, known and equal; a non-zero venue position the ledger has no leg for is a mismatch."""
+        if not isinstance(venue_positions, Mapping):
+            return "VENUE_READ_INVALID", ["VENUE_READ_INVALID"]
+        flags: List[str] = []
+        ledger: Dict[str, float] = {}
+        for l in legs:
+            k = l["symbol"] if l["category"] == "linear" else "SPOT:" + l["symbol"]
+            ledger[k] = ledger.get(k, 0.0) + l["qty"]
+        for k, q in sorted(ledger.items()):
+            v = _fin(venue_positions.get(k)) if k in venue_positions else None
+            if v is None:
+                flags.append(f"VENUE_POSITION_UNKNOWN:{k}")
+            elif abs(v - q) > 1e-9 + 1e-9 * max(abs(v), abs(q)):
+                flags.append(f"VENUE_POSITION_MISMATCH:{k}")
+        for k, v in sorted(venue_positions.items(), key=lambda kv: str(kv[0])):
+            if k not in ledger:
+                fv = _fin(v)
+                if fv is None or abs(fv) > EPS:
+                    flags.append(f"VENUE_POSITION_NOT_IN_LEDGER:{k}")
+        return ("VENUE_POSITION_READ_MATCHED" if not flags else "VENUE_POSITION_READ_MISMATCH"), flags
+
+    def pnl(self, venue_positions: Optional[Mapping[str, Optional[float]]] = None) -> Dict[str, Any]:
+        """Portfolio P&L with ``per_leg`` and ``per_symbol`` rollups (same keys). See the module docstring for the definitions and for when ``claimable_profit`` is None, and for what
+        ``status`` does and does not mean. ``venue_positions`` (optional, injected; this module reads no venue): a venue position read to compare with; only then can
+        ``venue_reconciled`` be True. The per-symbol and per-leg rollups are always internal-only."""
         legs = [self._leg_report(l) for l in self._legs.values()]
         syms = sorted({l["symbol"] for l in legs})
         out = self._rollup(legs, syms)
         out["flags"] = list(dict.fromkeys(out["flags"] + self._flags))
         if self._flags:
             out["claimable_profit"], out["status"] = None, "UNRECONCILED"
+            out["internally_consistent"], out["internal_status"] = False, "NOT_INTERNALLY_CONSISTENT"
+        if venue_positions is not None:
+            basis, vflags = self._venue_check(venue_positions, legs)
+            out["reconciliation_basis"] = basis
+            out["flags"] = list(dict.fromkeys(out["flags"] + vflags))
+            if basis == "VENUE_POSITION_READ_MATCHED" and out["internally_consistent"]:
+                out["venue_reconciled"], out["venue_claimable_profit"] = True, out["net"]
         out["per_symbol"] = {s: self._rollup([l for l in legs if l["symbol"] == s], [s]) for s in syms}
         out["per_leg"] = {f"{l['group_id']}/{l['leg_id']}": self._rollup([l], [l["symbol"]], with_funding=False) for l in legs}
         out["duplicates_ignored"] = self.duplicates_ignored

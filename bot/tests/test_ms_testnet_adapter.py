@@ -198,9 +198,10 @@ def test_kill_switch_file_semantics(tmp_path):
 
 
 # ---------------------------------------------------------------- the capability flag
-def write_cap(path, m, digest=None, schema=AD.CAPABILITY_SCHEMA):
+def write_cap(path, m, digest=None, schema=AD.CAPABILITY_SCHEMA, mode=0o600):
     with open(path, "w") as fh:
         json.dump({"schema": schema, "manifest": m, "manifest_plan_sha256": digest or m.get("plan_sha256")}, fh)
+    os.chmod(path, mode)
 
 
 def test_disabled_by_default_and_the_default_path_is_not_created_by_anything_here():
@@ -242,6 +243,31 @@ def test_symlinked_capability_file_is_not_an_owner_file(tmp_path):
     link = str(tmp_path / "link.json")
     os.symlink(real, link)
     assert AD.enabled(real) is True and AD.enabled(link) is False
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o660, 0o666, 0o640, 0o602, 0o620, 0o700, 0o4600, 0o1600])
+def test_capability_file_must_be_owner_only(tmp_path, mode):
+    p = str(tmp_path / "cap.json")
+    write_cap(p, granted(fresh()), mode=0o600)
+    assert AD.enabled(p) is True                                                     # positive control: 0600, ours
+    os.chmod(p, mode)
+    st = AD.capability_status(p)
+    assert st["enabled"] is False and st["reasons"] == ["CAPABILITY_FILE_MODE_NOT_OWNER_ONLY_0600"]
+
+
+def test_capability_file_read_only_for_the_owner_is_fine_and_a_foreign_owner_is_refused(tmp_path, monkeypatch):
+    p = str(tmp_path / "cap.json")
+    write_cap(p, granted(fresh()), mode=0o400)
+    assert AD.enabled(p) is True
+    me = os.getuid()
+    monkeypatch.setattr(AD.os, "getuid", lambda: me + 1)                    # a file that is not ours
+    st = AD.capability_status(p)
+    assert st["enabled"] is False and st["reasons"] == ["CAPABILITY_FILE_NOT_OWNED_BY_CURRENT_USER"]
+
+
+def test_the_capability_file_is_documented_as_self_attested():
+    doc = AD.capability_status.__doc__
+    assert "SELF-ATTESTED" in doc and "not a signature" in doc and "0600" in doc
 
 
 # ---------------------------------------------------------------- nothing can be sent

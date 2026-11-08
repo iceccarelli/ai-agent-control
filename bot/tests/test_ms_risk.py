@@ -302,3 +302,92 @@ def test_decision_is_immutable_and_does_not_mutate_inputs():
     assert (st, pol) == before
     with pytest.raises(Exception):
         d.approved = False                                              # type: ignore[misc]
+
+
+# ---------------------------------------------------------------- exits are bound by QUANTITY, cumulatively, with a price band (red team rt8 rk1)
+SHORT = {"BTCUSDT": {"category": "linear", "notional_usd": -100.0}}                         # 1 unit short at mark 100
+SPOT_LONG = {"SPOT:BTCUSDT": {"category": "spot", "notional_usd": 100.0}}
+
+
+def _exit(qty, ot="Market", price=None, lid="X", side="Buy", ro=True):
+    return leg("BTCUSDT", "linear", side, qty, lid, ot, price, ro)
+
+
+def test_exit_positive_control_one_unit_at_the_mark_is_approved():
+    d = R.risk_assess(plan(_exit("1")), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT"))
+    assert d.approved and d.limits["exit_only"] is True
+    assert R.risk_assess(plan(_exit("1", "Limit", "100")), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT")).approved
+    assert R.risk_assess(plan(_exit("0.5", lid="A"), _exit("0.5", lid="B")), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT")).approved
+
+
+def test_a_cheap_limit_price_cannot_hide_a_huge_quantity():
+    # 50 units at a limit of 1.0 is a notional of 50 USD, below the 100 USD held: the old notional check approved it
+    d = R.risk_assess(plan(_exit("50", "Limit", "1.0")), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT"))
+    assert not d.approved and "REDUCE_EXCEEDS_POSITION:BTCUSDT" in d.reasons and "EXIT_PRICE_OUT_OF_BAND:BTCUSDT" in d.reasons
+
+
+def test_two_reduce_only_legs_are_judged_together_not_each_against_the_whole_position():
+    d = R.risk_assess(plan(_exit("1", lid="A"), _exit("1", lid="B")), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT"))
+    assert not d.approved and "REDUCE_EXCEEDS_POSITION:BTCUSDT" in d.reasons                # the plan is refused AS A WHOLE
+    d = R.risk_assess(plan(_exit("1.02"), ), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT"))
+    assert d.approved                                                                       # the stated 2% slack
+    assert not R.risk_assess(plan(_exit("1.03")), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT")).approved
+
+
+def test_a_stated_position_quantity_is_what_binds_the_exit():
+    st = state(positions={"BTCUSDT": {"category": "linear", "notional_usd": -100.0, "qty": 0.5}})        # the venue says 0.5 units
+    assert "REDUCE_EXCEEDS_POSITION:BTCUSDT" in R.risk_assess(plan(_exit("1")), st, policy(), snaps("BTCUSDT")).reasons
+    assert R.risk_assess(plan(_exit("0.5")), st, policy(), snaps("BTCUSDT")).approved
+    for bad in (0.0, -1.0, float("nan"), True, "1"):
+        st = state(positions={"BTCUSDT": {"category": "linear", "notional_usd": -100.0, "qty": bad}})
+        assert "POSITION_UNKNOWN:BTCUSDT" in R.risk_assess(plan(_exit("0.5")), st, policy(), snaps("BTCUSDT")).reasons
+
+
+def test_quantity_is_unknown_without_a_mark_never_zero():
+    sn = {"BTCUSDT": MarketSnapshot(symbol="BTCUSDT", decision_ms=NOW, mark=None, spot_mark=100.0, book_age_ms=1)}
+    assert not R.risk_assess(plan(_exit("1")), state(positions=dict(SHORT)), policy(), sn).approved
+
+
+@pytest.mark.parametrize("px,ok", [("100", True), ("109", True), ("111", False), ("91", True), ("89", False), ("1.0", False), ("9999", False)])
+def test_limit_exit_price_band(px, ok):
+    d = R.risk_assess(plan(_exit("1", "Limit", px)), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT"))
+    assert d.approved is ok and (ok or "EXIT_PRICE_OUT_OF_BAND:BTCUSDT" in d.reasons)
+
+
+def test_a_market_exit_without_reduce_only_is_not_an_exit():
+    d = R.risk_assess(plan(_exit("1", ro=False)), state(positions=dict(SHORT)), policy(), snaps("BTCUSDT"))
+    assert d.limits["exit_only"] is False                                                   # it is judged as an entry (and refused by the freshness/exposure rules or not, but never as an exit)
+
+
+def test_spot_exit_is_bound_by_quantity_and_band_too():
+    st = state(positions=dict(SPOT_LONG))
+    sell = lambda q, ot="Market", px=None, lid="S": leg("BTCUSDT", "spot", "Sell", q, lid, ot, px)       # noqa: E731
+    assert R.risk_assess(plan(sell("1")), st, policy(), snaps("BTCUSDT")).approved
+    assert "REDUCE_EXCEEDS_POSITION:BTCUSDT" in R.risk_assess(plan(sell("1", lid="A"), sell("1", lid="B")), st, policy(), snaps("BTCUSDT")).reasons
+    assert "EXIT_PRICE_OUT_OF_BAND:BTCUSDT" in R.risk_assess(plan(sell("1", "Limit", "50")), st, policy(), snaps("BTCUSDT")).reasons
+
+
+# ---------------------------------------------------------------- red team: spot inventory and key/category consistency
+def test_spot_sell_with_a_zero_or_missing_inventory_figure_is_refused():
+    p = plan(leg("BTCUSDT", "spot", "Sell", "0.5", "S"))
+    for held in (0.0, -50.0):
+        st = state(positions={"SPOT:BTCUSDT": {"category": "spot", "notional_usd": held}})
+        assert "SPOT_SELL_WITHOUT_INVENTORY:BTCUSDT" in R.risk_assess(p, st, policy(), snaps("BTCUSDT")).reasons
+    assert "SPOT_SELL_WITHOUT_INVENTORY:BTCUSDT" in R.risk_assess(p, state(), policy(), snaps("BTCUSDT")).reasons
+
+
+def test_spot_sell_larger_than_the_inventory_in_a_mixed_plan_is_refused():
+    st = state(positions=dict(SPOT_LONG))
+    mixed = plan(leg("BTCUSDT", "spot", "Sell", "5", "S"), leg("ETHUSDT", "linear", "Sell", "1", "E"))
+    assert "SPOT_SELL_WITHOUT_INVENTORY:BTCUSDT" in R.risk_assess(mixed, st, policy(), snaps("BTCUSDT", "ETHUSDT")).reasons
+    ok = plan(leg("BTCUSDT", "spot", "Sell", "0.5", "S"), leg("ETHUSDT", "linear", "Sell", "1", "E"))
+    assert "SPOT_SELL_WITHOUT_INVENTORY:BTCUSDT" not in R.risk_assess(ok, st, policy(), snaps("BTCUSDT", "ETHUSDT")).reasons
+
+
+@pytest.mark.parametrize("key,cat", [("SPOT:BTCUSDT", "linear"), ("BTCUSDT", "spot"), ("SPOT:BTCUSDT#pending:G-L", "linear"), ("BTCUSDT#t", "spot")])
+def test_position_key_and_category_must_agree(key, cat):
+    st = state(positions={key: {"category": cat, "notional_usd": -100.0}})
+    d = ok_decision(st=st)
+    assert not d.approved and any(r.startswith("POSITION_KEY_CATEGORY_MISMATCH") for r in d.reasons)
+    good = state(positions={"SPOT:ETHUSDT": {"category": "spot", "notional_usd": 100.0}, "ETHUSDT": {"category": "linear", "notional_usd": -100.0}})
+    assert ok_decision(st=good).approved                                                    # positive control

@@ -22,7 +22,7 @@ What an order must satisfy (every refusal is a stable code; all are reported):
   hedge; without one it is refused.
 
 TRANSPORT BINDING. The authority is bound to ONE transport (``bound_transport``); the client approves nothing on another. Construction is refused unless the transport is an
-in-process SIMULATION (``is_simulated_transport``) or ALL of: the owner's testnet capability is enabled (``ms_testnet_adapter.enabled()``, False unless an owner-set capability file with
+in-process SIMULATION (``is_simulated_transport``: a WHITELIST of concrete classes, never a self-declared attribute) or ALL of: the owner's testnet capability is enabled (``ms_testnet_adapter.enabled()``, False unless an owner-set capability file with
 a signed-off manifest digest exists), the venue is the registry's ``testnet``, a dedicated testnet credential variable name is declared (generic Bybit names refused) and the
 transport is a ``runtime_capability.CapabilityTransport`` for the TESTNET_EXECUTOR role with the dedicated credential class. None of that exists in this repository state.
 """
@@ -63,6 +63,10 @@ class AuthorityConfigError(ValueError):
     """The authority cannot be built (no policy, bad policy, wrong transport, missing testnet capability): there is nothing to approve with."""
 
 
+def ms_risk_slack() -> Decimal:
+    return Decimal(str(ms_risk.EXIT_QTY_SLACK))
+
+
 def link_id(group_id: str, leg_id: str) -> str:
     return f"{group_id}{LINK_SEP}{leg_id}"
 
@@ -71,19 +75,82 @@ def policy_digest(policy: Mapping[str, Any]) -> str:
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
-def is_simulated_transport(t: Any) -> bool:
-    """True only for an in-process simulation: ``backtest.SimulatedExchange`` or a class that declares ``IN_PROCESS_SIMULATION = True`` at CLASS level. Never a real HTTP
-    transport (``RequestsTransport``), a capability wrapper around one, or an arbitrary object."""
+_NET_ROOTS = frozenset({"urllib", "urllib3", "http", "requests", "socket", "websocket", "websockets", "ssl", "aiohttp", "httpx", "ftplib", "smtplib", "xmlrpc", "asyncio"})
+_SIMULATED_REGISTRY: Dict[type, str] = {}        # exact class -> why it is trusted; ONLY populated by register_simulated_transport (never by an attribute a class declares)
+#: Classes accepted WITHOUT registration, by exact (module, qualname) and only when ``sys.modules[module].<qualname>`` is that very class (so a look-alike elsewhere is not it).
+_BUILTIN_SIMULATED = (("backtest", "SimulatedExchange"), ("ms_pipeline", "SimulatedTransport"))
+
+
+def _root(name: Any) -> str:
+    return str(name).split(".", 1)[0]
+
+
+def simulated_transport_class_refusals(cls: Any) -> List[str]:
+    """Why ``cls`` may NOT be a simulated transport (empty = it may be registered). Structural, not self-declared: no class in the MRO is (or derives from) ``RequestsTransport`` /
+    ``CapabilityTransport``, none lives in a network library, and none of their modules holds a network library, a socket/HTTP/TLS symbol or an HTTP session object as a module
+    global. This is a reviewable boundary, not a sandbox: a class can still hide a connection in a function body, which is why REGISTRATION is explicit and happens in code a
+    reviewer reads (this module and tests); a class that merely declares a marker is nothing."""
+    if not isinstance(cls, type):
+        return ["NOT_A_CLASS"]
+    out: List[str] = []
     try:
         import bybit_connection as _bc
-        if isinstance(t, (_bc.RequestsTransport, RC.CapabilityTransport)):
-            return False
-        import backtest as _bt
-        if isinstance(t, _bt.SimulatedExchange):
+        banned_bases: Tuple[type, ...] = (_bc.RequestsTransport, RC.CapabilityTransport)
+    except Exception:                                              # noqa: BLE001 - cannot establish what a real transport is: refuse everything
+        return ["REAL_TRANSPORT_CLASSES_UNAVAILABLE"]
+    if issubclass(cls, banned_bases):
+        out.append("DERIVES_FROM_REAL_TRANSPORT")
+    for c in cls.__mro__[:-1]:
+        if _root(getattr(c, "__module__", "")) in _NET_ROOTS:
+            out.append(f"NETWORK_MODULE_CLASS:{c.__module__}")
+        mod = sys.modules.get(getattr(c, "__module__", ""))
+        for name, val in list(vars(mod).items()) if mod is not None else []:
+            if name.startswith("__"):
+                continue
+            owners = [getattr(val, "__name__", "")] if isinstance(val, type(os)) else [getattr(val, "__module__", None) or "", getattr(type(val), "__module__", "") or ""]
+            if any(_root(o) in _NET_ROOTS for o in owners) and name != "_NET_ROOTS":
+                out.append(f"MODULE_TOUCHES_NETWORK:{c.__module__}.{name}")
+    return list(dict.fromkeys(out))
+
+
+def register_simulated_transport(cls: Any) -> Any:
+    """Whitelist ONE concrete class as an in-process simulation (exact class: a subclass is not covered). Refused (``AuthorityConfigError``) for a class that
+    ``simulated_transport_class_refusals`` rejects. Returns ``cls`` (usable as a decorator). Registration changes nothing about what the class can do: it only states, in code a
+    reviewer reads, that this class carries no request."""
+    bad = simulated_transport_class_refusals(cls)
+    if bad:
+        raise AuthorityConfigError("SIMULATED_TRANSPORT_REFUSED:" + ",".join(bad)[:200])
+    _SIMULATED_REGISTRY[cls] = f"{cls.__module__}.{cls.__qualname__}"
+    return cls
+
+
+def _is_builtin_simulated(cls: type) -> bool:
+    for mod, qn in _BUILTIN_SIMULATED:
+        m = sys.modules.get(mod)
+        if m is not None and cls.__module__ == mod and cls.__qualname__ == qn and getattr(m, qn, None) is cls:
             return True
+    return False
+
+
+def is_simulated_transport(t: Any) -> bool:
+    """True only for an instance whose EXACT class is whitelisted: ``backtest.SimulatedExchange``, ``ms_pipeline.SimulatedTransport`` or a class passed to
+    ``register_simulated_transport``; and only if that class (and the instance) still pass the structural checks. ``IN_PROCESS_SIMULATION`` is NOT consulted: it is an honour-system
+    attribute any class can claim. A real HTTP transport, a capability wrapper, a subclass of either, an instance holding a network/session object and anything unregistered are False."""
+    try:
+        cls = type(t)
+        if cls not in _SIMULATED_REGISTRY and not _is_builtin_simulated(cls):
+            return False
+        if simulated_transport_class_refusals(cls):
+            return False
+        import bybit_connection as _bc
+        if isinstance(t, (_bc.RequestsTransport, RC.CapabilityTransport)) or hasattr(t, "_session"):
+            return False
+        for v in list(getattr(t, "__dict__", {}).values()):            # an instance holding a network object / session under ANY attribute name
+            if _root(getattr(type(v), "__module__", "")) in _NET_ROOTS or isinstance(v, (_bc.RequestsTransport, RC.CapabilityTransport)) or "session" in type(v).__name__.lower():
+                return False
+        return True
     except Exception:                                              # noqa: BLE001 - cannot establish it: not simulated
         return False
-    return getattr(type(t), "IN_PROCESS_SIMULATION", False) is True and not hasattr(t, "_session")
 
 
 def credential_name_refusals(name: Any) -> List[str]:
@@ -134,6 +201,25 @@ class _GroupLedger:
             fcntl.flock(fd, fcntl.LOCK_SH)
             with open(self.path, "rb") as fh:
                 return self._parse(fh.read())
+        finally:
+            os.close(fd)
+
+    def append_if(self, decide: Callable[[List[Dict[str, Any]]], Tuple[Optional[str], Optional[Dict[str, Any]]]]) -> Optional[str]:
+        """Under ONE exclusive flock: read every row, let ``decide(rows) -> (refusal, row_to_append)`` judge, and append the row only if there is no refusal. The check and the
+        write cannot interleave with another process's (a reservation is atomic). An unreadable ledger refuses (``GROUP_LEDGER_UNREADABLE``)."""
+        fd = self._fd()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with open(self.path, "rb") as fh:
+                try:
+                    rows = self._parse(fh.read())
+                except ValueError:
+                    return "GROUP_LEDGER_UNREADABLE"
+            why, row = decide(rows)
+            if why is None and row is not None:
+                os.write(fd, (json.dumps(dict(row), sort_keys=True) + "\n").encode("utf-8"))
+                os.fsync(fd)
+            return why
         finally:
             os.close(fd)
 
@@ -295,20 +381,27 @@ class MultiSymbolAuthority:
         resolved = {r["group_id"] for r in rows if r["event"] == "resolve"}
         settled = {(r["group_id"], r["leg_id"]) for r in rows if r["event"] == "settle"}
         reserved_links = self._reserved_links()
+        # RESERVATION POLICY. A registered group's legs are reserved AS A WHOLE from the moment it is registered (sent or not), until each leg settles or the group resolves: a
+        # group registered LATER therefore sees them and is refused at registration if it does not fit, instead of squeezing an in-flight group out between its legs. Priority is
+        # registration order: a group counts every EARLIER unresolved group's legs, never a later one's (the later one was admitted on top of it). Its own legs already sent
+        # (reserved at the boundary, not part of ``legs``) count too.
+        order = list(registered)
+        earlier = order[:order.index(plan.group_id)] if plan.group_id in registered else order
         positions = state.get("positions")
         if isinstance(positions, dict):
-            for gid, p in registered.items():
-                if gid in resolved:
+            counted = [(g, l) for g in earlier if g not in resolved for l in registered[g].legs]
+            if plan.group_id in registered and plan.group_id not in resolved:
+                counted += [(plan.group_id, l) for l in registered[plan.group_id].legs
+                            if l.leg_id not in {x.leg_id for x in legs} and link_id(plan.group_id, l.leg_id) in reserved_links]
+            for gid, l in counted:
+                if (gid, l.leg_id) in settled:
                     continue
-                for l in p.legs:
-                    if (gid, l.leg_id) in settled or link_id(gid, l.leg_id) not in reserved_links or (gid == plan.group_id and l.leg_id in {x.leg_id for x in legs}):
-                        continue
-                    px = _leg_ref_notional(l, snaps.get(l.symbol))
-                    key = (("SPOT:" + l.symbol) if l.category == "spot" else l.symbol) + "#pending:" + link_id(gid, l.leg_id)        # '#...' is stripped by ms_risk
-                    amt = None if px is None else (px if l.side == "Buy" else -px)                       # unknown stays unknown
-                    positions[key] = {"category": l.category, "notional_usd": amt}
+                px = _leg_ref_notional(l, snaps.get(l.symbol))
+                key = (("SPOT:" + l.symbol) if l.category == "spot" else l.symbol) + "#pending:" + link_id(gid, l.leg_id)        # '#...' is stripped by ms_risk
+                amt = None if px is None else (px if l.side == "Buy" else -px)                       # unknown stays unknown
+                positions[key] = {"category": l.category, "notional_usd": amt}
         og = state.get("open_groups")
-        others = len([g for g in registered if g not in resolved and g != plan.group_id])
+        others = len([g for g in earlier if g not in resolved and g != plan.group_id])
         if type(og) is int and og >= 0:
             state["open_groups"] = max(og, others)
         return ms_risk.risk_assess(replace(plan, legs=tuple(legs), created_ms=self._now_ms()), state, self.policy, snaps)
@@ -367,13 +460,87 @@ class MultiSymbolAuthority:
             q = body.get("qty")
             if not (type(q) is str and EA._PLAIN_DECIMAL.fullmatch(q) and Decimal(q) > 0):
                 return "EXIT_QTY_INVALID"
-            if Decimal(q) > Decimal(leg.qty) * Decimal("1.02"):
+            if Decimal(q) > Decimal(leg.qty) * ms_risk_slack():
                 return "EXIT_QTY_EXCEEDS_ENTRY"
             if not (set(body) <= EA.ORDER_BODY_KEYS) or EA.body_value_refusals(body):
                 return "EXIT_BODY_NOT_ALLOWED"
-            return None
+            why = self._exit_price_refusal(body, leg)
+            if why:
+                return why
+            return self._reserve_exit(body, leg)
         except Exception:                                          # noqa: BLE001
             return "EXIT_NOT_BOUND:unreadable"
+
+    def _exit_price_refusal(self, body: Mapping[str, Any], leg: LegPlan) -> Optional[str]:
+        """A Limit exit must be priced within ``ms_risk.EXIT_MAX_PRICE_DEVIATION`` of the CURRENT mark of its category (read now); a mark that cannot be read refuses it (a Market
+        reduce-only exit needs no price). A Market exit is allowed only reduce-only (perp, checked above) or as a held-inventory spot sell."""
+        if body.get("orderType") != "Limit":
+            return None
+        try:
+            snap = self._snaps().get(body.get("symbol"))
+            mark = None if snap is None else ms_risk._pos(snap.spot_mark if body.get("category") == "spot" else snap.mark)
+            px = body.get("price")
+            if mark is None or not (type(px) is str and EA._PLAIN_DECIMAL.fullmatch(px)) or Decimal(px) <= 0:
+                return "EXIT_PRICE_UNVERIFIABLE"
+            return "EXIT_PRICE_OUT_OF_BAND" if abs(float(px) - mark) > ms_risk.EXIT_MAX_PRICE_DEVIATION * mark else None
+        except Exception:                                          # noqa: BLE001
+            return "EXIT_PRICE_UNVERIFIABLE"
+
+    @staticmethod
+    def _exit_outstanding(rows: Sequence[Mapping[str, Any]], group_id: str, symbol: str, category: str, *, except_link: Optional[str] = None) -> Decimal:
+        """Exit quantity already reserved or consumed for (group, symbol, category): reserved minus released. A FILL consumes its reservation (it stays counted: the position
+        is smaller and the entry quantity is spent); only ``release_exit`` gives quantity back."""
+        total = Decimal(0)
+        for r in rows:
+            if r["event"] == "exit" and r["group_id"] == group_id and r["symbol"] == symbol and r["category"] == category and r["link"] != except_link:
+                total += Decimal(r["qty"])
+            elif r["event"] == "exit_release" and r["group_id"] == group_id and r["symbol"] == symbol and r["category"] == category and r["link"] != except_link:
+                total -= Decimal(r["qty"])
+        return total
+
+    def _reserve_exit(self, body: Mapping[str, Any], leg: LegPlan) -> Optional[str]:
+        """Reserve this exit's quantity in the durable ledger, atomically (one flock): the CUMULATIVE exit quantity of the group for the symbol, over every link id, may not exceed
+        ``ms_risk.EXIT_QTY_SLACK`` x the entry leg's quantity. An identical resend of a link is idempotent (not counted twice); the same link with a different order is a conflict;
+        a released link is spent."""
+        gid, _lid = self._split_link(body.get("orderLinkId")) or ("", "")
+        link, symbol, category, qty = body["orderLinkId"], str(body["symbol"]), str(body["category"]), Decimal(body["qty"])
+        canon = {"side": body.get("side"), "orderType": body.get("orderType"), "price": body.get("price"), "qty": str(body["qty"])}
+
+        def decide(rows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+            same = [r for r in rows if r["event"] == "exit" and r["link"] == link]
+            if same:
+                if any(r["event"] == "exit_release" and r["link"] == link for r in rows):
+                    return "EXIT_LINK_RELEASED", None
+                prior = same[0]
+                return (None, None) if {k: prior.get(k) for k in canon} == canon and prior["symbol"] == symbol and prior["category"] == category else ("EXIT_LINK_CONFLICT", None)
+            if self._exit_outstanding(rows, gid, symbol, category) + qty > Decimal(leg.qty) * ms_risk_slack():
+                return "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY", None
+            return None, {"event": "exit", "group_id": gid, "link": link, "symbol": symbol, "category": category, "qty": str(body["qty"]), "at_ms": self._now_ms(), **canon}
+        try:
+            return self._groups.append_if(decide)
+        except OSError:
+            return "EXIT_RESERVATION_LEDGER_UNAVAILABLE"
+
+    def release_exit(self, order_link_id: str, unfilled_qty: Optional[str] = None) -> bool:
+        """Give back exit quantity that did NOT fill (order rejected, cancelled, expired; or the unfilled remainder of a partial fill). ``unfilled_qty`` None = the whole
+        reservation. The filled part stays consumed. Never gives back more than is outstanding for the link. False if there was nothing to release."""
+        done: List[bool] = []
+
+        def decide(rows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+            res = [r for r in rows if r["event"] == "exit" and r["link"] == order_link_id]
+            if not res:
+                return "NO_SUCH_EXIT", None
+            left = Decimal(res[0]["qty"]) - sum((Decimal(r["qty"]) for r in rows if r["event"] == "exit_release" and r["link"] == order_link_id), Decimal(0))
+            want = left if unfilled_qty is None else Decimal(str(unfilled_qty))
+            if not want.is_finite() or want <= 0 or want > left:
+                return "RELEASE_QTY_INVALID", None
+            done.append(True)
+            return None, {"event": "exit_release", "group_id": res[0]["group_id"], "link": order_link_id, "symbol": res[0]["symbol"], "category": res[0]["category"],
+                          "qty": str(want), "at_ms": self._now_ms()}
+        try:
+            return self._groups.append_if(decide) is None and bool(done)
+        except (OSError, ValueError, ArithmeticError):
+            return False
 
     def spot_sell_keeps_hedge(self, body: Mapping[str, Any]) -> bool:
         """True only if the venue's own reads (``hedge_reader(symbol) -> (perp short size, spot inventory)``) show the sell leaves the perp covered AND the sell is bound to a symbol

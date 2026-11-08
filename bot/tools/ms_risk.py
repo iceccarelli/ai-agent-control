@@ -44,6 +44,9 @@ SYMBOL_RE = re.compile(r"[A-Z0-9]{3,20}")
 _PLAIN_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
 SPOT_PREFIX = "SPOT:"
 WILDCARD_WORDS = frozenset({"ALL", "ANY", "STAR", "WILDCARD", "EVERY", "NONE", "NULL"})
+#: An exit is bound by QUANTITY (never by notional at the limit price: a Buy limit at 1.0 makes 50 units look like 50 USD) and, for a Limit exit, by a price band around the mark.
+EXIT_QTY_SLACK = 1.02                       # an exit may be at most 2% larger than the held quantity (rounding / a fill landing between the read and the order)
+EXIT_MAX_PRICE_DEVIATION = 0.10             # a Limit exit must sit within +-10% of the mark of ITS category; a Market exit is allowed only reduce-only (perp) or a held-inventory spot sell
 
 
 @dataclass(frozen=True)
@@ -174,16 +177,27 @@ def risk_assess(plan: OrderGroupPlan, state: Mapping[str, Any], policy: Mapping[
         R.append("EQUITY_UNKNOWN")
     raw_pos = state.get("positions")
     pos: Dict[Tuple[str, str], float] = {}          # (base symbol, category) -> signed USD
+    pos_qty: Dict[Tuple[str, str], float] = {}      # (base symbol, category) -> signed base units, ONLY while every entry for the key stated its own ``qty``
+    pos_qty_lacking: set = set()                    # keys with at least one entry that did not state a quantity (then the quantity is derived from notional / mark)
     if not isinstance(raw_pos, Mapping):
         R.append("POSITIONS_UNKNOWN")
     else:
         for sym, p in raw_pos.items():
             n = _num(p.get("notional_usd")) if isinstance(p, Mapping) else None
             cat = p.get("category") if isinstance(p, Mapping) else None
-            if n is None or cat not in _CATEGORIES or type(sym) is not str:
+            q_raw = p.get("qty") if isinstance(p, Mapping) else None
+            q = None if q_raw is None else _pos(q_raw)
+            if n is None or cat not in _CATEGORIES or type(sym) is not str or (q_raw is not None and q is None):
                 R.append(f"POSITION_UNKNOWN:{str(sym)[:24]}")
+            elif sym.split("#", 1)[0].startswith(SPOT_PREFIX) != (cat == "spot"):
+                R.append(f"POSITION_KEY_CATEGORY_MISMATCH:{str(sym)[:24]}")      # 'SPOT:X' labelled linear (or 'X' labelled spot) would net spot against perp
             else:
-                pos[(_base(sym), cat)] = pos.get((_base(sym), cat), 0.0) + n
+                k = (_base(sym), cat)
+                pos[k] = pos.get(k, 0.0) + n
+                if q is None:
+                    pos_qty_lacking.add(k)
+                else:
+                    pos_qty[k] = pos_qty.get(k, 0.0) + (q if n > 0 else -q if n < 0 else 0.0)
     og = state.get("open_groups")
     if not (type(og) is int and og >= 0):
         R.append("OPEN_GROUPS_UNKNOWN")
@@ -214,11 +228,20 @@ def risk_assess(plan: OrderGroupPlan, state: Mapping[str, Any], policy: Mapping[
             continue
         notional = float(leg.qty) * px
         sign = 1.0 if leg.side == "Buy" else -1.0
-        legs_info.append({"leg": leg, "notional": notional, "signed": sign * notional, "key": (leg.symbol, leg.category)})
+        snap = snapshots.get(leg.symbol)
+        legs_info.append({"leg": leg, "notional": notional, "signed": sign * notional, "key": (leg.symbol, leg.category),
+                          "mark": _pos(snap.spot_mark if leg.category == "spot" else snap.mark) if snap is not None else None})
 
     # ---- exit / entry classification (only decided when every leg is understood)
+    def held_qty(key: Tuple[str, str], mark: Optional[float]) -> Optional[float]:
+        """Signed base units held at ``key``: the stated quantity if every entry stated one, else notional / mark; None = UNKNOWN (never zero)."""
+        if key in pos_qty and key not in pos_qty_lacking:
+            return pos_qty[key]
+        return pos[key] / mark if key in pos and mark else None
+
     exit_only = bool(plan.legs) and len(legs_info) == len(plan.legs)
     if exit_only:
+        reduce_qty: Dict[Tuple[str, str], float] = {}
         for li in legs_info:
             leg = li["leg"]
             reduces = False
@@ -228,15 +251,40 @@ def risk_assess(plan: OrderGroupPlan, state: Mapping[str, Any], policy: Mapping[
             li["reduces"] = reduces
             if leg.reduce_only and leg.category == "linear" and not reduces:
                 R.append(f"REDUCE_ONLY_NO_MATCHING_POSITION:{leg.symbol}")
-            elif reduces and li["notional"] > abs(held) * 1.02:
-                R.append(f"REDUCE_EXCEEDS_POSITION:{leg.symbol}")
+            elif reduces:
+                reduce_qty[li["key"]] = reduce_qty.get(li["key"], 0.0) + float(leg.qty)
+                if leg.order_type == "Limit":                                  # price sanity: a Limit exit is priced near the market of its own category
+                    if li["mark"] is None or abs(float(leg.price) - li["mark"]) > EXIT_MAX_PRICE_DEVIATION * li["mark"]:
+                        R.append(f"EXIT_PRICE_OUT_OF_BAND:{leg.symbol}")
+                elif not (leg.reduce_only or leg.category == "spot"):          # (unreachable by construction: kept as the stated rule)
+                    R.append(f"EXIT_MARKET_NOT_REDUCE_ONLY:{leg.symbol}")
+        for key, total in reduce_qty.items():                                  # CUMULATIVE per symbol across every reducing leg of the plan, by QUANTITY
+            mark = next((li["mark"] for li in legs_info if li["key"] == key), None)
+            hq = held_qty(key, mark)
+            if hq is None:
+                R.append(f"REDUCE_QTY_UNKNOWN:{key[0]}")
+            elif total > abs(hq) * EXIT_QTY_SLACK:
+                R.append(f"REDUCE_EXCEEDS_POSITION:{key[0]}")
         exit_only = all(li["reduces"] for li in legs_info)
-    for leg in plan.legs:
-        if leg.category == "spot" and leg.side == "Sell" and not exit_only and (leg.symbol, "spot") not in pos:
+    spot_sell_qty: Dict[str, float] = {}
+    for li in legs_info:
+        leg = li["leg"]
+        if leg.category == "spot" and leg.side == "Sell":
+            held = pos.get((leg.symbol, "spot"))
+            if held is None or held <= 0:                                      # no key, a zero or a negative figure is NOT inventory
+                R.append(f"SPOT_SELL_WITHOUT_INVENTORY:{leg.symbol}")
+            elif not exit_only:                                                # (an exit was already bound by quantity above)
+                spot_sell_qty[leg.symbol] = spot_sell_qty.get(leg.symbol, 0.0) + float(leg.qty)
+    for sym, total in spot_sell_qty.items():
+        hq = held_qty((sym, "spot"), next((li["mark"] for li in legs_info if li["key"] == (sym, "spot")), None))
+        if hq is None or total > abs(hq) * EXIT_QTY_SLACK:
+            R.append(f"SPOT_SELL_WITHOUT_INVENTORY:{sym}")
+    for leg in plan.legs:                                                      # a spot sell whose price/qty could not even be read is not inventory either
+        if leg.category == "spot" and leg.side == "Sell" and not any(li["leg"] is leg for li in legs_info) and (leg.symbol, "spot") not in pos:
             R.append(f"SPOT_SELL_WITHOUT_INVENTORY:{leg.symbol}")
     limits["exit_only"] = exit_only
 
-    if exit_only and not any(r.startswith(("REDUCE_", "SYMBOL_NOT_ALLOWED", "POSITION")) for r in R):
+    if exit_only and not any(r.startswith(("REDUCE_", "EXIT_", "SYMBOL_NOT_ALLOWED", "POSITION", "SPOT_SELL")) for r in R):
         # an exit is never refused for staleness or ceilings; structural / identity reasons above still stand
         return RiskDecision(not R, tuple(dict.fromkeys(R)), limits)
 

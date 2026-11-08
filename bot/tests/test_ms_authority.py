@@ -30,8 +30,9 @@ from persistence import StateStore  # noqa: E402
 NOW = 1_800_000_000_000
 
 
+@MA.register_simulated_transport
 class SimT(bc.Transport):
-    """An in-process simulation that records and answers nothing real."""
+    """An in-process simulation that records and answers nothing real. Accepted because its EXACT class is registered (the marker alone grants nothing)."""
     IN_PROCESS_SIMULATION = True
 
     def __init__(self):
@@ -682,3 +683,208 @@ def test_the_btc_production_authority_is_unchanged_and_independent():
     assert not hasattr(EA, "MultiSymbolAuthority") and not hasattr(EA, "ms_risk")
     src = open(os.path.join(BOT, "entry_authority.py")).read()
     assert "ms_" not in src
+
+
+# ================================================================ red team rt8: the simulated-transport check is a WHITELIST, not a marker
+class _Inner:                       # stands in for a real session holder (never constructed from the repo's transports)
+    def __init__(self):
+        self.http = object()
+
+
+class Sneaky:
+    IN_PROCESS_SIMULATION = True    # self-declared; holds a "real" session under another attribute name
+    def __init__(self):
+        self.inner = _Inner()
+
+
+def test_a_class_that_only_declares_the_marker_is_not_a_simulation(env, tmp_path):
+    assert MA.is_simulated_transport(Sneaky()) is False
+    with pytest.raises(MA.AuthorityConfigError, match="TRANSPORT_NOT_SIMULATED"):
+        make(env, tmp_path, transport=Sneaky())
+
+
+def test_even_a_registered_class_is_refused_when_an_instance_holds_a_network_object(env, tmp_path):
+    class Holder:
+        def __init__(self):
+            self.conn = _Inner()
+    Holder.__module__ = "tests_holder"
+    MA.register_simulated_transport(Holder)                                       # class level is clean: registration passes
+    assert MA.is_simulated_transport(Holder()) is True
+    h = Holder()
+    NetObj = type("Session", (), {})
+    NetObj.__module__ = "requests.sessions"
+    h.conn = NetObj()                                                              # a real-looking session under an arbitrary attribute name
+    assert MA.is_simulated_transport(h) is False
+    h2 = Holder()
+    h2.whatever = type("PooledSession", (), {})()
+    assert MA.is_simulated_transport(h2) is False
+
+
+def test_registration_refuses_real_transports_and_network_touching_classes():
+    class FromRequests(bc.RequestsTransport):
+        pass
+
+    class FromCapability(RC.CapabilityTransport):
+        pass
+    for cls in (bc.RequestsTransport, FromRequests, RC.CapabilityTransport, FromCapability, "notaclass", object()):
+        with pytest.raises(MA.AuthorityConfigError, match="SIMULATED_TRANSPORT_REFUSED"):
+            MA.register_simulated_transport(cls)
+    import types
+    import urllib.request
+    mod = types.ModuleType("fake_net_mod")
+    mod.urllib_request = urllib.request                                            # the module's own namespace touches urllib
+    sys.modules["fake_net_mod"] = mod
+    try:
+        class Touches:
+            pass
+        Touches.__module__ = "fake_net_mod"
+        mod.Touches = Touches
+        assert any(r.startswith("MODULE_TOUCHES_NETWORK") for r in MA.simulated_transport_class_refusals(Touches))
+        with pytest.raises(MA.AuthorityConfigError):
+            MA.register_simulated_transport(Touches)
+        mod2 = types.ModuleType("fake_sock_mod")
+        import socket
+        mod2.s = socket.socket
+        sys.modules["fake_sock_mod"] = mod2
+
+        class Sock:
+            pass
+        Sock.__module__ = "fake_sock_mod"
+        with pytest.raises(MA.AuthorityConfigError):
+            MA.register_simulated_transport(Sock)
+    finally:
+        sys.modules.pop("fake_net_mod", None)
+        sys.modules.pop("fake_sock_mod", None)
+    assert Touches not in MA._SIMULATED_REGISTRY
+
+
+def test_registration_is_for_the_exact_class_and_a_marker_is_never_consulted(env, tmp_path):
+    class Registered:
+        pass
+    Registered.__module__ = "tests_registered"
+    MA.register_simulated_transport(Registered)
+
+    class Child(Registered):
+        IN_PROCESS_SIMULATION = True
+    assert MA.is_simulated_transport(Registered()) is True
+    assert MA.is_simulated_transport(Child()) is False                             # a subclass is another class
+    assert MA.is_simulated_transport(SimT()) is True
+    del SimT.IN_PROCESS_SIMULATION                                                  # the marker is not what grants it
+    try:
+        assert MA.is_simulated_transport(SimT()) is True
+    finally:
+        SimT.IN_PROCESS_SIMULATION = True
+
+
+def test_the_pipelines_transport_and_the_backtester_are_accepted_but_a_lookalike_is_not():
+    import ms_pipeline
+    assert MA.is_simulated_transport(ms_pipeline.SimulatedTransport()) is True
+    assert MA.is_simulated_transport(backtest.SimulatedExchange({})) is True
+    look = type("SimulatedTransport", (), {"IN_PROCESS_SIMULATION": True})
+    look.__module__ = "ms_pipeline"
+    assert MA.is_simulated_transport(look()) is False                              # same name and module, not the module's class
+    assert MA.is_simulated_transport(bc.RequestsTransport()) is False
+
+
+# ================================================================ red team rt8: exits are bound by QUANTITY, cumulatively, with a price band
+def exit_b(lid, qty="5", **kw):
+    return exit_body(orderLinkId=f"G1-{lid}", qty=qty, **kw)
+
+
+def test_exit_positive_control_and_idempotent_resend(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    opened(a, env)
+    assert a.exit_refusal(exit_b("X1", "10")) is None
+    assert a.exit_refusal(exit_b("X1", "10")) is None                               # an identical resend is how a lost ack is resolved: not counted twice
+    assert a.exit_refusal(exit_b("X1", "9")) == "EXIT_LINK_CONFLICT"                # the same link with a different order
+
+
+def test_many_exits_with_fresh_link_ids_cannot_exceed_the_entry_cumulatively(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    opened(a, env)                                                                  # entry leg qty 10 -> at most 10.2 may ever be exited
+    for i in range(2):
+        assert a.exit_refusal(exit_b(f"X{i}", "5")) is None                        # 10 total
+    assert a.exit_refusal(exit_b("X2", "0.2")) is None                              # 10.2 total: the stated 2% slack
+    assert a.exit_refusal(exit_b("X3", "0.1")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"
+    for i in range(20):
+        assert a.exit_refusal(exit_b(f"Y{i}", "1")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"
+    with pytest.raises(EA.EntryRefused) as ei:
+        a.authorize(exit_b("X9", "1"), venue="testnet")
+    assert ei.value.reasons == ("EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY",)
+
+
+def test_the_reservation_is_durable_across_authority_instances(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    opened(a, env)
+    assert a.exit_refusal(exit_b("X1", "10")) is None
+    a2, _ = make(env, tmp_path)                                                     # same state dir: a restart
+    assert a2.exit_refusal(exit_b("X2", "1")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"
+    assert a2.exit_refusal(exit_b("X1", "10")) is None
+
+
+def test_released_quantity_can_be_exited_again_and_a_filled_part_stays_consumed(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    opened(a, env)
+    assert a.exit_refusal(exit_b("X1", "10")) is None
+    assert a.exit_refusal(exit_b("X2", "4")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"
+    assert a.release_exit("G1-X1", "4") is True                                     # 6 filled, 4 never filled
+    assert a.exit_refusal(exit_b("X2", "4")) is None                                # the 4 can be exited again, under a fresh link
+    assert a.exit_refusal(exit_b("X3", "0.5")) == "EXIT_CUMULATIVE_QTY_EXCEEDS_ENTRY"      # the filled 6 stayed consumed
+    assert a.release_exit("G1-X1", "7") is False and a.release_exit("G1-NOPE") is False     # cannot release more than is outstanding, or an unknown link
+    assert a.release_exit("G1-X1") is True                                          # the rest (6 -> remaining outstanding is 6): whole remainder
+    assert a.exit_refusal(exit_b("X1", "10")) == "EXIT_LINK_RELEASED"               # a released link is spent
+
+
+def test_exit_reservations_are_per_group_and_per_symbol(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    reg(a, pair("G1", "BTCUSDT"))
+    a.authorize(body("G1", "P"), venue="testnet")
+    a.authorize(body("G1", "S", cat="spot", side="Buy"), venue="testnet")
+    reg(a, pair("G2", "ETHUSDT"))
+    a.authorize(body("G2", "P", sym="ETHUSDT"), venue="testnet")
+    assert a.exit_refusal(exit_b("X1", "10")) is None
+    assert a.exit_refusal(exit_body(orderLinkId="G2-X1", symbol="ETHUSDT", qty="10")) is None       # G1's exits do not eat G2's allowance
+
+
+def test_a_limit_exit_must_be_near_the_mark_and_an_unreadable_mark_refuses_it(env, tmp_path):
+    a, _ = make(env, tmp_path)
+    opened(a, env)
+    lim = lambda lid, px: exit_b(lid, "1", orderType="Limit", price=px, timeInForce="GTC")          # noqa: E731
+    assert a.exit_refusal(lim("L1", "100")) is None
+    assert a.exit_refusal(lim("L2", "1.0")) == "EXIT_PRICE_OUT_OF_BAND"
+    assert a.exit_refusal(lim("L3", "111")) == "EXIT_PRICE_OUT_OF_BAND"
+    assert a.exit_refusal(lim("L4", "0")) in ("EXIT_PRICE_UNVERIFIABLE", "EXIT_BODY_NOT_ALLOWED")
+    assert a.exit_refusal(exit_b("L5", "1", orderType="Limit")) in ("EXIT_PRICE_UNVERIFIABLE", "EXIT_BODY_NOT_ALLOWED")      # no price at all
+    env.snaps["BTCUSDT"] = MarketSnapshot(symbol="BTCUSDT", decision_ms=NOW, mark=None, spot_mark=100.0, book_age_ms=1)
+    assert a.exit_refusal(lim("L6", "100")) == "EXIT_PRICE_UNVERIFIABLE"
+    assert a.exit_refusal(exit_b("M1", "1")) is None                                # a Market reduce-only exit needs no mark
+    assert a.exit_refusal(exit_b("M2", "1", reduceOnly=False)) == "EXIT_NOT_REDUCE_ONLY"   # a Market exit that is not reduce-only is not an exit
+
+
+# ================================================================ red team rt8: a registered group's legs are reserved whole at registration
+def big_pair(gid, sym, qty="20"):
+    return pair(gid, sym, qty)                                                      # 2000 aggregate each; the policy cap is 3000
+
+
+def test_a_later_group_cannot_squeeze_an_in_flight_group(env, tmp_path):
+    a, _ = make(env, tmp_path, policy=pol(max_notional_per_symbol_usd=5000.0, max_unhedged_usd=3000.0, max_gross_exposure_usd=12000.0))
+    reg(a, big_pair("GA", "BTCUSDT"))                                                # registered, NOTHING sent yet
+    d = a.register_group(big_pair("GB", "ETHUSDT"))                                  # 2000 + 2000 > 3000: refused at registration, not later
+    assert not d.approved and "AGGREGATE_NOTIONAL_ABOVE_CAP" in d.reasons
+    a.authorize(body("GA", "P", qty="20"), venue="testnet")
+    a.authorize(body("GA", "S", cat="spot", side="Buy", qty="20"), venue="testnet")  # the second leg of the first group is still approved
+    assert not a.register_group(big_pair("GB", "ETHUSDT")).approved                  # and after its legs are sent
+    a.resolve_group("GA")
+    assert a.register_group(big_pair("GB", "ETHUSDT")).approved                      # positive control: it fits once the first group is resolved
+
+
+def test_unsent_legs_of_an_earlier_group_count_but_a_later_groups_never_count_against_an_earlier_one(env, tmp_path):
+    a, _ = make(env, tmp_path, policy=pol(max_notional_per_symbol_usd=5000.0, max_unhedged_usd=3000.0, max_gross_exposure_usd=12000.0))
+    reg(a, pair("GA", "BTCUSDT", "10"))
+    reg(a, pair("GB", "ETHUSDT", "10"))                                              # 1000 + 1000 + ... fits
+    assert not a.register_group(pair("GC", "SOLUSDT", "20")).approved                # 1000 + 1000 + 2000 > 3000
+    # the earlier group's legs are authorised whatever the later group has reserved
+    a.authorize(body("GB", "P", sym="ETHUSDT"), venue="testnet")
+    a.authorize(body("GB", "S", sym="ETHUSDT", cat="spot", side="Buy"), venue="testnet")
+    a.authorize(body("GA", "P"), venue="testnet")
+    a.authorize(body("GA", "S", cat="spot", side="Buy"), venue="testnet")

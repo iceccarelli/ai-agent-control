@@ -283,3 +283,50 @@ def test_slippage_is_attribution_inside_price_leg_and_unknown_without_reference(
     L2 = A.Ledger()
     L2.record_fill(fill("a", "Sell", 1, 99.5, 0.1))
     assert L2.pnl()["slippage"] is None
+
+
+# ---------------------------------------------------------------- red team rt8: RECONCILED is internal consistency, not a venue read
+FLAT_VENUE = {"BTCUSDT": 0.0, "SPOT:BTCUSDT": 0.0}
+
+
+def test_status_reconciled_is_internal_consistency_and_says_so():
+    p = closed_pair().pnl()
+    assert p["status"] == "RECONCILED" and p["claimable_profit"] == pytest.approx(2.1)         # the old keys keep their names and values (consumers depend on them)
+    assert p["reconciliation_basis"] == "INTERNAL_CONSISTENCY_ONLY" and p["internally_consistent"] is True and p["internal_status"] == "INTERNALLY_CONSISTENT"
+    assert p["venue_reconciled"] is False and p["venue_claimable_profit"] is None               # nothing here read a venue
+    assert "NOT a venue position read" in p["status_meaning"]
+    for roll in list(p["per_symbol"].values()) + list(p["per_leg"].values()):
+        assert roll["venue_reconciled"] is False and roll["reconciliation_basis"] == "INTERNAL_CONSISTENCY_ONLY"
+
+
+def test_internal_inconsistency_is_reported_in_the_new_keys_too():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Sell", 1, 100, 0.1))
+    p = L.pnl()
+    assert p["status"] == "UNRECONCILED" and p["internally_consistent"] is False and p["internal_status"] == "NOT_INTERNALLY_CONSISTENT" and p["venue_reconciled"] is False
+
+
+def test_venue_reconciled_needs_an_injected_venue_read_that_matches():
+    p = closed_pair().pnl(venue_positions=FLAT_VENUE)
+    assert p["venue_reconciled"] is True and p["reconciliation_basis"] == "VENUE_POSITION_READ_MATCHED" and p["venue_claimable_profit"] == pytest.approx(2.1)
+
+
+@pytest.mark.parametrize("venue,flag", [({"BTCUSDT": 0.5, "SPOT:BTCUSDT": 0.0}, "VENUE_POSITION_MISMATCH:BTCUSDT"),
+                                        ({"BTCUSDT": 0.0}, "VENUE_POSITION_UNKNOWN:SPOT:BTCUSDT"),
+                                        ({"BTCUSDT": 0.0, "SPOT:BTCUSDT": None}, "VENUE_POSITION_UNKNOWN:SPOT:BTCUSDT"),
+                                        ({"BTCUSDT": 0.0, "SPOT:BTCUSDT": float("nan")}, "VENUE_POSITION_UNKNOWN:SPOT:BTCUSDT"),
+                                        ({**FLAT_VENUE, "ETHUSDT": -2.0}, "VENUE_POSITION_NOT_IN_LEDGER:ETHUSDT"),
+                                        ({}, "VENUE_POSITION_UNKNOWN:BTCUSDT")])
+def test_a_venue_read_that_disagrees_or_is_incomplete_is_not_a_reconciliation(venue, flag):
+    p = closed_pair().pnl(venue_positions=venue)
+    assert p["venue_reconciled"] is False and p["venue_claimable_profit"] is None and flag in p["flags"] and p["reconciliation_basis"] == "VENUE_POSITION_READ_MISMATCH"
+    assert p["status"] == "RECONCILED" and p["claimable_profit"] == pytest.approx(2.1)         # the internal view is unchanged: the venue read adds, never rewrites
+
+
+def test_a_matching_venue_read_does_not_make_an_inconsistent_ledger_claimable():
+    L = A.Ledger()
+    L.record_fill(fill("a", "Sell", 1, 100, 0.1))                                              # open perp, no funding record
+    p = L.pnl(venue_positions={"BTCUSDT": -1.0})
+    assert p["reconciliation_basis"] == "VENUE_POSITION_READ_MATCHED" and p["venue_reconciled"] is False and p["venue_claimable_profit"] is None
+    for bad in ([], "x", 3):
+        assert closed_pair().pnl(venue_positions=bad)["reconciliation_basis"] == "VENUE_READ_INVALID"
