@@ -117,7 +117,7 @@ def mk(sym, iv, rates, marks=None, *, spot=None, delivery=None, start=0):
     step = (iv or 480) * 60_000
     f = [(start + (i + 1) * step, r) for i, r in enumerate(rates)]
     m = marks if marks is not None else [(start + i * step, 100.0) for i in range(n + 1)]
-    return CR.SymbolSeries(sym, iv, f, m, launch_ms=start, delivery_ms=delivery, spot_listed=spot)
+    return CR.SymbolSeries(sym, iv, f, m, launch_ms=start, delivery_ms=delivery, spot_listed=spot, key_basis=CR.KEY_BASIS_OBSERVATION)
 
 
 def spec(fam=None):
@@ -227,26 +227,28 @@ def offline(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", boom)
 
 
-def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT"), funding_override=None, universe_kw=None):
+def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT"), funding_override=None, universe_kw=None,
+          old_delivery=None, skip_history=()):
     """A real dataset root: universe capture (BTC/ETH 8h, FAST 240m, OLD Closed with a deliveryTime), funding + mark-kline-240 written by the real writer with a scripted
     fetch / clock / sleep, and (optionally) a spot-instruments snapshot. Returns (root, universe_dir, spot_dir)."""
     delivery = TMH.BASE - 60 * TMH.H8
     root = tmp_path / "hist"
     os.mkdir(root, 0o700)
-    uni = TMH._universe_dir(tmp_path, syms=syms, intervals={"FASTUSDT": 240}, bases={"FASTUSDT": "1000FAST"}, statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": delivery}, **(universe_kw or {}))
+    uni = TMH._universe_dir(tmp_path, syms=syms, intervals={"FASTUSDT": 240}, bases={"FASTUSDT": "1000FAST"}, statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": delivery if old_delivery is None else old_delivery}, **(universe_kw or {}))
     recs, info = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
+    hrecs = {k: v for k, v in recs.items() if k not in skip_history}          # symbols in the universe record that the history collector never fetched
     fdata = {("funding", "BTCUSDT"): TMH.grid(TMH.FIRST, TMH.N, TMH.H8), ("funding", "ETHUSDT"): TMH.grid(TMH.FIRST, TMH.N, TMH.H8),
              ("funding", "FASTUSDT"): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4), ("funding", "OLDUSDT"): TMH.grid(TMH.FIRST, TMH.N - 60, TMH.H8)}
-    fdata = {k: v for k, v in fdata.items() if k[1] in syms}
+    fdata = {k: v for k, v in fdata.items() if k[1] in syms and k[1] not in skip_history}
     for sym, ts_list in (funding_override or {}).items():
         fdata[("funding", sym)] = ts_list
-    fspecs = MH.build_specs("funding", None, sorted(recs), TMH.START, TMH.END, recs)
+    fspecs = MH.build_specs("funding", None, sorted(hrecs), TMH.START, TMH.END, recs)
     fv = TMH.HV(fdata)
     TMH.run(root, fspecs, fv, universe=info)
-    mdata = {("mark-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in syms if s != "OLDUSDT"}
-    if "OLDUSDT" in syms:
+    mdata = {("mark-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in syms if s != "OLDUSDT" and s not in skip_history}
+    if "OLDUSDT" in syms and "OLDUSDT" not in skip_history:
         mdata[("mark-kline", "OLDUSDT")] = TMH.grid(TMH.FIRST, (delivery - TMH.FIRST) // H4 + 1, H4)
-    mspecs = MH.build_specs("mark-kline", MARK_IV, sorted(recs), TMH.START, TMH.BASE + 10, recs)
+    mspecs = MH.build_specs("mark-kline", MARK_IV, sorted(hrecs), TMH.START, TMH.BASE + 10, recs)
     mv = TMH.HV(mdata)
     for k, v in (mark_scripts or {}).items():
         mv.script[k] = v
@@ -568,3 +570,141 @@ def test_a_ledger_path_changes_the_scope_statement(tmp_path):
     fam = "t_" + uuid.uuid4().hex
     out = CR.evaluate_ranked_funding(_long_capture(1, 2.0), spec=spec(fam), formation_days_grid=(3,), hold_days=7, ledger_path=str(tmp_path / "ledger.jsonl"))
     assert out["multiple_testing_scope"] == "PERSISTENT_LEDGER_FILE" and out["n_variants_counted"] == 1
+
+
+# ------------------------------------------------------------------ round-2 red-team fixes: ended contracts, survivorship, stale marks, key basis
+def test_a_closed_contract_without_a_delivery_time_is_excluded_not_immortal(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, old_delivery=0)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert "OLDUSDT" not in {x.symbol for x in series}
+    assert {"symbol": "OLDUSDT", "reason": "closed_without_delivery"} in info["excluded"]
+    assert info["survivorship"] == "SURVIVORS_ONLY" and info["closed_in_universe_not_in_series"]["names"] == ["OLDUSDT"]
+    ok_root, ok_uni, _ = _hist(tmp_path / "ok", spot=False) if os.makedirs(tmp_path / "ok") is None else (None, None, None)       # positive control: with a deliveryTime it loads
+    ok_series, ok_info = CR.load_history_root(ok_root, universe_dir=ok_uni, mark_interval=MARK_IV)
+    assert "OLDUSDT" in {x.symbol for x in ok_series} and ok_info["excluded"] == []
+
+
+def test_delistings_observed_requires_every_overlapping_closed_symbol_in_the_series(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",))          # universe capture had a Closed partition; the history holds only live symbols
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert not any(x.delivery_ms for x in series) and info["universe"]["delisting_observability"] == "OBSERVED"
+    assert info["survivorship"] == "SURVIVORS_ONLY"
+    cin = info["closed_in_universe_not_in_series"]
+    assert cin["count"] == 1 and cin["names"] == ["OLDUSDT"] and "OLDUSDT" in info["warning"]
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert out["survivorship"] == "SURVIVORS_ONLY" and out["closed_in_universe_not_in_series"]["count"] == 1
+    assert any("SURVIVORS_ONLY" in w and "absent from the evaluated series" in w for w in out["warnings"])
+
+
+def test_a_closed_contract_delivered_before_the_study_window_is_not_required_in_the_series(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",), old_delivery=TMH.FIRST - 10 * TMH.H8)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert info["closed_in_universe_not_in_series"]["count"] == 0 and info["survivorship"] == "DELISTINGS_OBSERVED"       # positive control for the rule
+    assert CR.evaluate_ranked_funding(series, universe_info=info)["survivorship"] == "DELISTINGS_OBSERVED"
+
+
+def test_an_unverifiable_delistings_observed_claim_is_downgraded_in_the_evaluation():
+    out = CR.evaluate_ranked_funding([], universe_info={"survivorship": "DELISTINGS_OBSERVED"})
+    assert out["survivorship"] == "SURVIVORS_ONLY" and any("downgraded" in w for w in out["warnings"])
+
+
+H8 = 8 * 3600 * 1000
+
+
+def _marks(upto_ms, step=4 * 3600 * 1000, price=100.0):
+    return [(i * step, price) for i in range(0, upto_ms // step + 1)]
+
+
+def test_a_stale_entry_mark_skips_the_leg_instead_of_carrying_an_old_price():
+    fund = [(i * H8, 5.0) for i in range(1, 400)]
+    s = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(2 * DAY) + _marks(40 * DAY)[int(8 * DAY // (4 * 3600 * 1000)):], 0, None, True, key_basis=CR.KEY_BASIS_OBSERVATION)   # no marks between 2d and 8d
+    r = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY)
+    assert r["rows"] == [] and r["skipped_legs_without_marks"] == 1 and r["terminal_exit_unpriced"] == 0
+    full = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(40 * DAY), 0, None, True, key_basis=CR.KEY_BASIS_OBSERVATION)
+    ok = CR.run_variant([full], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY)           # positive control
+    assert len(ok["rows"]) == 1 and ok["skipped_legs_without_marks"] == 0
+    assert CR.price_at(s.mark, 5 * DAY) == 100.0 and CR.price_at(s.mark, 5 * DAY, 8 * 3600 * 1000) is None and CR.price_at(s.mark, 5 * DAY, 4 * DAY) == 100.0
+
+
+def test_a_stale_exit_mark_skips_the_leg():
+    fund = [(i * H8, 5.0) for i in range(1, 400)]
+    s = CR.SymbolSeries("AAAUSDT", 480, fund, _marks(6 * DAY), 0, None, True, key_basis=CR.KEY_BASIS_OBSERVATION)                     # marks end at 6d, hold ends at 12d
+    r = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY)
+    assert r["rows"] == [] and r["skipped_legs_without_marks"] == 1 and r["terminal_exit_unpriced"] == 0                                  # not delisted: skipped, not a terminal loss
+    assert CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=5 * DAY, t_end=13 * DAY, max_staleness_ms=10 * DAY)["rows"]   # explicit bound honoured
+
+
+def test_a_delisted_leg_whose_last_mark_is_stale_at_delivery_is_an_unpriced_terminal_exit():
+    fund = [(i * H8, 5.0) for i in range(1, 400)]
+    s = CR.SymbolSeries("BBBUSDT", 480, fund, _marks(3 * DAY + 4 * 3600_000), 0, 6 * DAY, True, key_basis=CR.KEY_BASIS_OBSERVATION)
+    r = CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)
+    assert r["rows"] == [] and r["terminal_exit_unpriced"] == 1 and r["terminal_exit_unpriced_legs"][0]["symbol"] == "BBBUSDT" and r["skipped_legs_without_marks"] == 1
+    fresh = CR.SymbolSeries("BBBUSDT", 480, fund, _marks(6 * DAY), 0, 6 * DAY, True, key_basis=CR.KEY_BASIS_OBSERVATION)              # positive control: priced at delivery
+    ok = CR.run_variant([fresh], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)
+    assert ok["terminal_exit_unpriced"] == 0 and ok["rows"][0]["legs"][0]["closed_during_hold"] is True
+
+
+def _capture_with_delisting(full_marks):
+    cap = _long_capture(1, 2.0)
+    t_star = 8 * 3600_000 + 77 * DAY                                                          # a rebalance time on the grid (first print 8h, lead-in 7d, 7d holds)
+    a = cap[0]
+    a.delivery_ms = t_star + 3 * DAY
+    if not full_marks:
+        a.mark = [(ts, p) for ts, p in a.mark if ts <= t_star]
+    return cap
+
+
+def test_unpriced_delistings_are_surfaced_and_cap_the_verdict():
+    out = CR.evaluate_ranked_funding(_capture_with_delisting(False), spec=spec(), formation_days_grid=(3, 7), hold_days=7)
+    assert out["terminal_exit_unpriced"] >= 1 and out["terminal_exit_unpriced_symbols"] == ["A"] and out["skipped_legs_without_marks"] >= 1
+    assert out["verdict"] == "INSUFFICIENT_DATA" and any("TERMINAL_EXIT_UNPRICED" in w for w in out["warnings"])
+    ctl = CR.evaluate_ranked_funding(_capture_with_delisting(True), spec=spec(), formation_days_grid=(3, 7), hold_days=7)               # positive control
+    assert ctl["terminal_exit_unpriced"] == 0
+
+
+def test_series_without_the_observation_key_basis_are_refused_unless_explicitly_test_only():
+    legacy = CR.SymbolSeries("A", 480, [(H8, 1.0)], [(0, 100.0)])
+    with pytest.raises(RH.HarnessError, match="key_basis"):
+        CR.evaluate_ranked_funding([legacy], spec=spec())
+    out = CR.evaluate_ranked_funding([legacy], spec=spec(), allow_unverified_key_basis_for_tests=True)
+    assert out["key_basis_unverified"] is True and out["verdict"] == "INSUFFICIENT_DATA" and any("KEY_BASIS_UNVERIFIED" in w for w in out["warnings"])
+    marked = CR.SymbolSeries("A", 480, [(H8, 1.0)], [(0, 100.0)], key_basis=CR.KEY_BASIS_OBSERVATION)
+    assert CR.evaluate_ranked_funding([marked], spec=spec())["key_basis_unverified"] is False                                              # positive control
+
+
+def test_the_loader_sets_the_key_basis_and_the_mark_interval(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, _info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert series and all(x.key_basis == "OBSERVATION_TIME" and x.mark_interval_ms == H4 for x in series)
+
+
+def test_mutation_without_the_staleness_check_an_old_mark_prices_the_leg():
+    m = _mutant("if max_staleness_ms is not None and t - row[0] > max_staleness_ms:", "if False:")
+    assert m.price_at([(0, 1.0)], 10 * DAY, 1000) == 1.0 and CR.price_at([(0, 1.0)], 10 * DAY, 1000) is None
+
+
+def test_mutation_without_the_terminal_count_a_lost_delisting_vanishes():
+    m = _mutant("if m0 is not None and m0 > 0 and m1 is None and s.delivery_ms is not None", "if False and s.delivery_ms is not None")
+    fund = [(i * H8, 5.0) for i in range(1, 400)]
+    s = CR.SymbolSeries("B", 480, fund, _marks(3 * DAY + 4 * 3600_000), 0, 6 * DAY, True, key_basis=CR.KEY_BASIS_OBSERVATION)
+    assert m.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)["terminal_exit_unpriced"] == 0
+    assert CR.run_variant([s], formation_days=3, hold_days=7, top_k=1, round_trip_bps=0, t_start=3 * DAY, t_end=11 * DAY)["terminal_exit_unpriced"] == 1
+
+
+def test_mutation_without_the_key_basis_check_hand_built_series_would_be_accepted():
+    m = _mutant("if unkeyed and not allow_unverified_key_basis_for_tests:", "if False:")
+    legacy = CR.SymbolSeries("A", 480, [(H8, 1.0)], [(0, 100.0)])
+    assert m.evaluate_ranked_funding([legacy], spec=spec())["key_basis_unverified"] is True
+
+
+def test_mutation_without_the_closed_without_delivery_exclusion_the_symbol_would_load(tmp_path, offline):
+    m = _mutant("if rec.get(\"status\") in RH.ENDED_STATUSES and not (", "if False and not (")
+    root, uni, _ = _hist(tmp_path, spot=False, old_delivery=0)
+    series, _info = m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert "OLDUSDT" in {x.symbol for x in series}
+
+
+def test_mutation_without_the_closed_in_series_check_survivors_would_be_labelled_delistings(tmp_path, offline):
+    m = _mutant("closed_missing = sorted(sy for sy, r in recs.items() if", "closed_missing = [] if True else sorted(sy for sy, r in recs.items() if")
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",))
+    assert m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[1]["survivorship"] == "DELISTINGS_OBSERVED"

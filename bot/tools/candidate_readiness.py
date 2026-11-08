@@ -351,6 +351,9 @@ def render_table(rep: Mapping[str, Any]) -> str:
 
 # ---------------------------------------------------------------- ranked-funding evaluator (formation window != holding window)
 MS_DAY = 86_400_000
+KEY_BASIS_OBSERVATION = "OBSERVATION_TIME"
+STALENESS_INTERVALS = 2                   # a mark older than this many mark intervals at t is not "the price at t"
+NAMES_CAP = 20
 
 
 @dataclass
@@ -369,6 +372,8 @@ class SymbolSeries:
     spot_listed: Optional[bool] = None
     oi_usd: Optional[float] = None
     funding_intervals: Optional[List[Tuple[int, int, int]]] = None
+    key_basis: Optional[str] = None          # KEY_BASIS_OBSERVATION only when built by ``load_history_root`` (marks/funding keyed by observation time); None = hand-built, unverified
+    mark_interval_ms: Optional[int] = None   # the mark-kline interval from the mark manifest (staleness bound = 2 intervals); None = inferred from the mark spacing
 
 
 def hedgeability(s: SymbolSeries) -> str:
@@ -393,10 +398,13 @@ def assert_usable_at(observation_time: int, decision_time: int) -> None:
         raise RH.LookAheadError(f"a value observable at {observation_time} was read by a decision at {decision_time}")
 
 
-def price_at(seq: Sequence[Tuple[int, float]], t: int) -> Optional[float]:
-    """The last price KNOWABLE at ``t`` (key = observation time <= t), checked against ``usable_at``; None when nothing is known yet."""
+def price_at(seq: Sequence[Tuple[int, float]], t: int, max_staleness_ms: Optional[int] = None) -> Optional[float]:
+    """The last price KNOWABLE at ``t`` (key = observation time <= t), checked against ``usable_at``; None when nothing is known yet, or, with ``max_staleness_ms``, when the
+    last known price is older than that (a stale price is never carried forward silently)."""
     row = _last_row_at_or_before(seq, t)
     if row is None:
+        return None
+    if max_staleness_ms is not None and t - row[0] > max_staleness_ms:
         return None
     assert_usable_at(row[0], t)
     return row[1]
@@ -442,13 +450,28 @@ def _active(s: SymbolSeries, t: int) -> bool:
     return s.launch_ms <= t and (s.delivery_ms is None or t < s.delivery_ms)
 
 
-def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_days: int, top_k: int, round_trip_bps: float, t_start: int, t_end: int) -> Dict[str, Any]:
+def staleness_bound_ms(s: SymbolSeries, override: Optional[int] = None) -> Optional[int]:
+    """Largest age (ms) of the last mark that may still price a leg: ``override``, else 2 x the manifest mark interval, else 2 x the median mark spacing (hand-built series),
+    else None (fewer than two marks: nothing to infer from)."""
+    if override is not None:
+        return int(override)
+    iv = s.mark_interval_ms if isinstance(s.mark_interval_ms, int) and not isinstance(s.mark_interval_ms, bool) and s.mark_interval_ms > 0 else None
+    if iv is None and len(s.mark) >= 2:
+        iv = int(statistics.median(b[0] - a[0] for a, b in zip(s.mark, s.mark[1:]) if b[0] > a[0]) or 0) or None
+    return STALENESS_INTERVALS * iv if iv else None
+
+
+def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_days: int, top_k: int, round_trip_bps: float, t_start: int, t_end: int,
+                max_staleness_ms: Optional[int] = None) -> Dict[str, Any]:
     """Non-overlapping holds on a fixed rebalance grid. At each t: rank on the FORMATION window ending at t, hold (t, t+hold] (capped at a Closed contract's deliveryTime),
     short the top ``top_k`` perp-only. Per row: directional total = funding received + price leg of the short - perp round-trip cost (measured from mark prices);
-    for HEDGEABLE symbols also the funding-net-of-cost 'carry' (basis residual UNMEASURED here)."""
+    for HEDGEABLE symbols also the funding-net-of-cost 'carry' (basis residual UNMEASURED here).
+    A stale entry or exit mark (older than ``max_staleness_ms``, default 2 mark intervals) SKIPS the leg (``skipped_legs_without_marks``). A contract that closed during the hold
+    and whose exit mark is stale/absent is a TERMINAL EXIT UNPRICED: the loss is unknown, the leg is listed in ``terminal_exit_unpriced_legs`` and the evaluation cannot pass."""
     f_ms, h_ms = formation_days * MS_DAY, hold_days * MS_DAY
     rows: List[Dict[str, Any]] = []
     skipped = 0
+    unpriced: List[Dict[str, Any]] = []
     t = t_start
     while t + h_ms <= t_end:
         scored = sorted(((formation_score(s, t, f_ms), s) for s in series if _active(s, t)), key=lambda x: (-(x[0] if x[0] is not None else -1e18), x[1].symbol))
@@ -456,10 +479,13 @@ def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_day
         legs = []
         for sc, s in picks:
             end = min(t + h_ms, s.delivery_ms) if s.delivery_ms is not None else t + h_ms
-            m0, m1 = price_at(s.mark, t), price_at(s.mark, end)
+            bound = staleness_bound_ms(s, max_staleness_ms)
+            m0, m1 = price_at(s.mark, t, bound), price_at(s.mark, end, bound)
             fund, nprints = _sum_range(s.funding, t, end)
             if m0 is None or m1 is None or m0 <= 0:
                 skipped += 1
+                if m0 is not None and m0 > 0 and m1 is None and s.delivery_ms is not None and s.delivery_ms <= t + h_ms:
+                    unpriced.append({"symbol": s.symbol, "t": t, "delivery_ms": s.delivery_ms})
                 continue
             price_bps = -(m1 / m0 - 1.0) * 1e4
             hed = hedgeability(s)
@@ -476,19 +502,26 @@ def run_variant(series: Sequence[SymbolSeries], *, formation_days: int, hold_day
         if legs:
             rows.append({"t": t, "legs": legs, "row_total_bps": statistics.fmean(l["directional_total_bps"] for l in legs)})
         t += h_ms
-    return {"rows": rows, "skipped_legs_without_marks": skipped, "time_mode": "REPLAY_OBSERVATION_TIME"}
+    return {"rows": rows, "skipped_legs_without_marks": skipped, "terminal_exit_unpriced": len(unpriced), "terminal_exit_unpriced_legs": unpriced,
+            "staleness_bound": "explicit" if max_staleness_ms is not None else f"{STALENESS_INTERVALS}x_mark_interval_per_symbol", "time_mode": "REPLAY_OBSERVATION_TIME"}
 
 
 def _survivorship_of(universe_info: Optional[Mapping[str, Any]]) -> str:
     v = universe_info.get("survivorship") if isinstance(universe_info, Mapping) else None
-    return v if v in (SURVIVORS_ONLY, DELISTINGS_OBSERVED) else SURVIVORS_ONLY          # nothing said = survivors only (fail closed)
+    if v != DELISTINGS_OBSERVED:
+        return SURVIVORS_ONLY                                                           # nothing said = survivors only (fail closed)
+    missing = universe_info.get("closed_in_universe_not_in_series")
+    if not isinstance(missing, Mapping) or missing.get("count") != 0:                   # absent (cannot be verified) or non-empty: the series is survivors-only
+        return SURVIVORS_ONLY
+    return DELISTINGS_OBSERVED
 
 
 def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Mapping[str, Any]] = None, formation_days_grid: Sequence[int] = (3, 7, 14, 30),
                             hold_days: int = 7, top_k: int = 1, round_trip_bps: Optional[float] = None, min_rows: int = 60, alpha: float = 0.05,
                             hold_days_grid: Optional[Sequence[int]] = None, top_k_grid: Optional[Sequence[int]] = None,
                             cost_scenarios: Optional[Mapping[str, float]] = None, universe_info: Optional[Mapping[str, Any]] = None,
-                            ledger_path: Optional[str] = None) -> Dict[str, Any]:
+                            ledger_path: Optional[str] = None, max_staleness_ms: Optional[int] = None,
+                            allow_unverified_key_basis_for_tests: bool = False) -> Dict[str, Any]:
     """Walk-forward evaluation of 'short the perps with the highest trailing funding'. EVERY variant tried in the call is a member of the multiple-testing family:
     formation windows x hold lengths x top-k x cost scenarios (``variants_tried``; the count is ``n_variants_counted``). Variants that share the primary ``hold_days`` share
     one time grid and may be SELECTED (on the TRAIN rows only); a different hold length has a different row grid, so it is COUNTED but never selectable. Returns a verdict
@@ -497,6 +530,10 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
 
     ``universe_info`` is the ``info`` from ``load_history_root``: it supplies ``survivorship`` (absent = SURVIVORS_ONLY). ``multiple_testing_scope`` is PER_PROCESS for the
     default path-less ledger (the count survives only inside this process) and PERSISTENT_LEDGER_FILE with ``ledger_path``."""
+    unkeyed = sorted(s.symbol for s in series if s.key_basis != KEY_BASIS_OBSERVATION)
+    if unkeyed and not allow_unverified_key_basis_for_tests:
+        raise RH.HarnessError(f"{len(unkeyed)} series lack key_basis={KEY_BASIS_OBSERVATION!r} (only load_history_root sets it): marks/funding keyed by candle start would leak the future; "
+                              f"first: {unkeyed[:3]}")
     spec = spec if spec is not None else _default_spec()
     c = cost_constants()
     cost = float(round_trip_bps) if round_trip_bps is not None else c["perp_round_trip_total_bps"]
@@ -509,12 +546,23 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     if survivorship == SURVIVORS_ONLY:
         warnings.append("SURVIVORS_ONLY: delistings were not observed in the universe capture (Closed partition refused, empty or absent): the result is a survivorship-biased "
                         "evaluation and no point-in-time claim")
+    cin = universe_info.get("closed_in_universe_not_in_series") if isinstance(universe_info, Mapping) else None
+    if isinstance(cin, Mapping) and cin.get("count"):
+        warnings.append(f"SURVIVORS_ONLY: {cin.get('count')} Closed/delivered perpetuals of the universe record that overlap the study window are absent from the evaluated series "
+                        f"(first: {list(cin.get('names') or [])[:5]})")
+    elif isinstance(universe_info, Mapping) and universe_info.get("survivorship") == DELISTINGS_OBSERVED and survivorship == SURVIVORS_ONLY:
+        warnings.append("SURVIVORS_ONLY (downgraded from a DELISTINGS_OBSERVED claim): " + (
+            "the claim carries no closed_in_universe_not_in_series check, so it cannot be verified against the evaluated series"))
+    if unkeyed:
+        warnings.append(f"KEY_BASIS_UNVERIFIED: {len(unkeyed)} hand-built series were not keyed by observation time here (test-only path): the verdict is capped at INSUFFICIENT_DATA")
     if any(sp.spot_listed is not None for sp in series):
         warnings.append("hedgeability comes from ONE current spot snapshot (CURRENT_SNAPSHOT_ONLY): it labels legs, it is not a historical fact")
     out: Dict[str, Any] = {"schema": SCHEMA + "/ranked_funding", "round_trip_bps_used": cost, "cost_basis": c["basis"],
                            "symbols": len(series), "hedgeability_counts": {}, "intervals_min_counts": {}, "symbols_without_interval": unknown_iv, "closed_contracts": sum(1 for s in series if s.delivery_ms),
                            "ranking_rule_variants": list(formation_days_grid), "hold_days": hold_days, "top_k": top_k, "ceiling": "INSUFFICIENT_DATA",
                            "hold_days_grid": holds, "top_k_grid": ks, "cost_scenarios_bps": dict(costs), "survivorship": survivorship, "warnings": warnings,
+                           "closed_in_universe_not_in_series": dict(cin) if isinstance(cin, Mapping) else None, "key_basis_unverified": bool(unkeyed),
+                           "skipped_legs_without_marks": 0, "terminal_exit_unpriced": 0,
                            "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
                            "time_mode": "REPLAY_OBSERVATION_TIME", "hedgeability_basis": HEDGE_BASIS, "pit_label_note": PIT_LABEL_NOTE}
     for s in series:
@@ -532,6 +580,8 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     t1 = max(max((ts for ts, _ in s.funding), default=0) for s in series)
     fam = RH.normalise_family(spec.get("multiple_testing_family") or spec.get("candidate_id"))
     ledger = RH.VariantLedger(fam, path=ledger_path)
+    skipped_by_variant: Dict[str, int] = {}
+    unpriced_keys: set = set()
     per: Dict[str, List[float]] = {}                  # selectable: same hold as the primary => one row grid
     counted_only: Dict[str, Tuple[List[float], int]] = {}
     params_of: Dict[str, Dict[str, Any]] = {}
@@ -542,13 +592,22 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                 for cname, cbps in costs.items():
                     name = f"F{F}|H{h}|K{k}|C{cname}"
                     params_of[name] = {"formation_days": F, "hold_days": h, "top_k": k, "round_trip_bps": cbps}
-                    r = run_variant(series, formation_days=F, hold_days=h, top_k=k, round_trip_bps=cbps, t_start=start, t_end=t1)
+                    r = run_variant(series, formation_days=F, hold_days=h, top_k=k, round_trip_bps=cbps, t_start=start, t_end=t1, max_staleness_ms=max_staleness_ms)
+                    skipped_by_variant[name] = r["skipped_legs_without_marks"]
+                    unpriced_keys.update((x["symbol"], x["t"], h) for x in r["terminal_exit_unpriced_legs"])
                     rets = [x["row_total_bps"] for x in r["rows"]]
                     if h == hold_days:
                         per[name] = rets
                     else:
                         counted_only[name] = (rets, h)
     out["variants_tried"] = sorted(list(per) + list(counted_only))
+    out["skipped_legs_without_marks"] = max(skipped_by_variant.values(), default=0)
+    out["skipped_legs_without_marks_by_variant"] = dict(sorted(skipped_by_variant.items()))
+    out["terminal_exit_unpriced"] = len({(a, b) for a, b, _ in unpriced_keys})
+    out["terminal_exit_unpriced_symbols"] = sorted({a for a, _, _ in unpriced_keys})[:NAMES_CAP]
+    out["staleness_bound"] = "explicit" if max_staleness_ms is not None else f"{STALENESS_INTERVALS}x_mark_interval_per_symbol"
+    if out["terminal_exit_unpriced"]:
+        warnings.append(f"TERMINAL_EXIT_UNPRICED: {out['terminal_exit_unpriced']} delisted legs have no fresh mark at delivery (loss unknown): the verdict is capped at INSUFFICIENT_DATA")
     n_rows = min((len(v) for v in per.values()), default=0)
     out["rows_per_variant"] = n_rows
     out["trailing_observation"] = _trailing(series, formation_days_grid[-1] if formation_days_grid else 7)
@@ -581,6 +640,8 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    if out["terminal_exit_unpriced"] or unkeyed:
+        verdict = "INSUFFICIENT_DATA"                   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
     out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
                 "correction": "holm", "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean,
                 "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"], "p_adjusted": adj, "selected_per_fold": chosen,
@@ -778,11 +839,32 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         rec = recs[sym]
         iv = rec.get("fundingInterval_min")
         d = rec.get("deliveryTime")
+        if rec.get("status") in RH.ENDED_STATUSES and not (isinstance(d, int) and not isinstance(d, bool) and d > 0):
+            excluded.append({"symbol": sym, "reason": "closed_without_delivery"})          # an ended contract with no delivery time would be immortal (stale exit price)
+            continue
         launch = rec.get("launchTime")
         series.append(SymbolSeries(sym, iv if isinstance(iv, int) and not isinstance(iv, bool) and iv > 0 else None, fund, mark,
                                    launch if isinstance(launch, int) and not isinstance(launch, bool) and launch > 0 else 0,
                                    d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None,
-                                   funding_intervals=segs))
+                                   funding_intervals=segs, key_basis=KEY_BASIS_OBSERVATION,
+                                   mark_interval_ms=iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None))
+    in_series = {x.symbol for x in series}
+    w0 = min((x.funding[0][0] for x in series), default=None)
+    w1 = max((x.funding[-1][0] for x in series), default=None)
+
+    def _overlaps(r: Mapping[str, Any]) -> bool:
+        dl, ln = r.get("deliveryTime"), r.get("launchTime")
+        dl = dl if isinstance(dl, int) and not isinstance(dl, bool) and dl > 0 else None
+        ln = ln if isinstance(ln, int) and not isinstance(ln, bool) and ln > 0 else None
+        return (w0 is None or dl is None or dl >= w0) and (w1 is None or ln is None or ln <= w1)
+    closed_missing = sorted(sy for sy, r in recs.items() if r.get("status") in RH.ENDED_STATUSES and sy not in in_series and _overlaps(r))
+    closed_info = {"count": len(closed_missing), "names": closed_missing[:NAMES_CAP], "names_truncated": len(closed_missing) > NAMES_CAP,
+                   "window_ms": [w0, w1], "rule": "every Closed/Delivering perpetual of the universe record overlapping the study window must be in the evaluated series"}
+    if closed_missing:
+        if survivorship == DELISTINGS_OBSERVED:
+            survivorship = SURVIVORS_ONLY
+        warnings.append(f"SURVIVORS_ONLY: {len(closed_missing)} Closed/delivered perpetuals in the universe record overlap the study window but are absent from the evaluated series "
+                        f"(first: {closed_missing[:5]}): the evaluated series is survivors-only whatever the universe capture observed")
     if non_complete:
         warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
     if excluded:
@@ -792,7 +874,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
                             "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols"),
                                          "delisting_observability": uinfo.get("delisting_observability"), "status_coverage": uinfo.get("status_coverage"), "delisting_note": delisting_note},
-                            "survivorship": survivorship, "point_in_time_claim": False,
+                            "survivorship": survivorship, "closed_in_universe_not_in_series": closed_info, "point_in_time_claim": False,
                             "point_in_time_note": "this loader builds series from capture snapshots; it makes no point-in-time claim (use PointInTimeUniverse.from_capture_dirs for that). " + PIT_LABEL_NOTE,
                             "time_basis": "marks and funding are keyed by observation_time (replay mode: receipt time is not stored per row)",
                             "interval_mismatch_symbols": mismatch,
