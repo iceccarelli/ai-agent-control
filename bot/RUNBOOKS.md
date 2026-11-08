@@ -376,4 +376,3 @@ An order-create body is a CLOSED list of keys (`entry_authority.ORDER_BODY_KEYS`
 set-leverage and the stop body still go through, now shape-checked). A testnet run of one of them is therefore an OWNER-run session, and needs all of: (1) an owner-written, approved policy file (`RISK_POLICY_PATH`) with the measured inputs the
 book supplies, (2) the tool to install `entry_authority.build_for_book(...)` on its client with the carry's perp/spot symbols, a state directory and a mark provider (a code change per tool, reviewed by you; none has been made), and (3) the usual testnet-only environment. Until then
 those tools can run their read-only and exit steps and will report `ENTRY_REFUSED: NO_ENTRY_AUTHORITY` on the first opening order.
-
