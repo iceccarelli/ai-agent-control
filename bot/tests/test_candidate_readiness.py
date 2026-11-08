@@ -1303,3 +1303,21 @@ def test_mutation_the_sibling_finding_removed_leaves_the_empty_list_silent():
     finally:
         import shutil
         shutil.rmtree(d)
+
+
+# ================================================================== one funnel / short diagnostics (worker B)
+def test_a_short_history_run_is_labelled_a_diagnostic_and_names_the_exact_required_span(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), mark_interval=MARK_IV)
+    assert out["status"] == "TOO_FEW_HOLDING_ROWS" and out["verdict"] == "INSUFFICIENT_DATA"
+    assert out["evidence_class"] == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE"
+    assert out["required_span"]["window_days_required"] == 457 and out["history_shortfall"]["required_days"] == 457 and "457 days" in out["reason"]
+    assert out["history_shortfall"]["loaded_history_window_days"] < 457 and "never be quoted" in out["history_shortfall"]["note"]
+    assert out["input"]["history_window"]["days"] == out["history_shortfall"]["loaded_history_window_days"]
+
+
+def test_the_loader_embeds_the_one_funnel_and_loads_exactly_its_loadable_list(tmp_path, offline):
+    import backfill_plan as BP
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert [x.symbol for x in series] == info["funnel"]["loadable"] and info["funnel"]["funnel_digest"] == BP.funnel(uni, root, window=tuple(info["funnel"]["window"].values())).report()["funnel_digest"]

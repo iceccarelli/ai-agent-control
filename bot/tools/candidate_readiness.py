@@ -993,7 +993,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                                                        if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
                            "universe_info_verified": verdict is not None,
                            "skipped_legs_without_marks": 0, "terminal_exit_unpriced": 0,
-                           "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
+                           "evidence_class": "NOT_EVALUATED", "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
                            "time_mode": "REPLAY_OBSERVATION_TIME", "hedgeability_basis": HEDGE_BASIS, "pit_label_note": PIT_LABEL_NOTE}
     for s in series:
         out["hedgeability_counts"][hedgeability(s)] = out["hedgeability_counts"].get(hedgeability(s), 0) + 1
@@ -1044,7 +1044,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     if n_rows < min_rows:
         for name in out["variants_tried"]:
             ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping holding rows (< {min_rows})")
-        out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family": fam, "n_variants_counted": ledger.n_variants,
+        out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "evidence_class": "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE", "family": fam, "n_variants_counted": ledger.n_variants,
                     "n_variants_tried_in_call": len(out["variants_tried"]),
                     "required_span": grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows, span_days=(t1 - t0) / MS_DAY),
                     "reason": f"{n_rows} non-overlapping {hold_days}-day holding rows after the formation lead-in; need >= {min_rows}, which needs "
@@ -1075,7 +1075,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
     if out["terminal_exit_unpriced"] or unkeyed:
         verdict = "INSUFFICIENT_DATA"                   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
-    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
+    out.update({"status": "WALK_FORWARD_DONE", "evidence_class": "FULL_SPAN_WALK_FORWARD_NOT_PROFIT_EVIDENCE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
                 "correction": "holm", "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean,
                 "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"], "p_adjusted": adj, "selected_per_fold": chosen,
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
@@ -1678,6 +1678,10 @@ def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], 
         raise RH.HarnessError("LEDGER_PATH_REQUIRED: a cross-sectional evaluation records its variants in a persistent ledger so the family count survives a restart")
     series, info = load_history_root(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
     out = {"input": info, **evaluate_ranked_funding(series, universe_info=info, ledger_path=ledger_path, spec=spec, **kw)}
+    hw = info.get("history_window") or {}
+    if out.get("evidence_class") == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE" and isinstance(out.get("required_span"), dict):
+        out["history_shortfall"] = {"required_days": out["required_span"].get("window_days_required"), "loaded_history_window_days": hw.get("days"),
+                                    "note": "this run is a SHORT DIAGNOSTIC: it must never be quoted as evidence for or against the strategy"}
     stem = os.path.splitext(ledger_path)[0]
     out["families"] = {k: evaluate_family(series, k, ledger_path=f"{stem}.{k.lower()}.jsonl", universe_info=info) for k in FAMILIES}
     return out

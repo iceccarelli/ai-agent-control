@@ -135,6 +135,7 @@ def venue_for(syms, recs, start, end):
         hi = min(end, int(r["deliveryTime"])) if int(r["deliveryTime"]) else end
         g[(MH.FUNDING, s)] = grid(lo, hi, H8)
         g[(MH.MARK, s)] = grid(lo, hi - H4 if hi - H4 > lo else hi, H4)
+        g[(MH.INDEX, s)] = g[(MH.MARK, s)]
     return Venue(g)
 
 
@@ -646,3 +647,149 @@ def test_the_cli_run_plan_and_the_recorded_selection_modes(tmp_path, capsys):
             sleep=lambda _s: None, mono=lambda: 0.0, free_bytes_fn=lambda _p: 1 << 40)
     assert json.loads((ex / "funding" / "manifest.json").read_text())["selection"] == {"mode": "EXPLICIT_SYMBOLS", "plan_digest": None, "symbols_n": 1}
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------- the nine-symbol diagnosis: WHY did the loader see so few symbols, from the manifests alone
+
+def _explicit(root, uni, syms, **kw):
+    recs, info = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
+    v = venue_for(syms, {s: {k: str(x) if k in ("launchTime", "deliveryTime") else x for k, x in recs[s].items()} for s in syms}, W0, T)
+    for ds, iv in ((MH.FUNDING, None), (MH.MARK, "240")):
+        specs = MH.build_specs(ds, iv, syms, W0, T, None, {s: 480 for s in syms})                       # no record: nothing is skipped by lifecycle, as with a hand-typed --symbols list
+        MH.run_dataset(str(root), ds, iv, specs, fetch=v, clock=_clock(), sleep=lambda _s: None, mono=lambda: 0.0, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1, rate=1000.0,
+                       selection={"mode": "EXPLICIT_SYMBOLS", "plan_digest": None}, **kw)
+
+
+def _cause(res, name):
+    return next(c for c in res["why_few_symbols"]["causes"] if c["cause"] == name)
+
+
+def test_a_dataset_collected_from_an_explicit_symbols_list_is_named_as_the_cause(root, tmp_path):
+    uni = make_universe(tmp_path)
+    _explicit(root, uni, ["AAAUSDT", "OLDUSDT"])
+    res = diag(uni, root)
+    w = res["why_few_symbols"]
+    assert w["primary_cause"] == "a_explicit_symbols_list" and w["loaded_symbols"] == 2 and w["eligible_symbols"] == 3
+    assert _cause(res, "a_explicit_symbols_list")["verdict"] == "APPLIES" and _cause(res, "a_explicit_symbols_list")["evidence"]["selection"]["mode"] == "EXPLICIT_SYMBOLS"
+    assert _cause(res, "b_universe_dir_not_supplied_or_recognised")["verdict"] == "DOES_NOT_APPLY"
+    seq = [c["command"] for c in w["command_sequence"]]
+    assert "backfill_plan.py diagnose" in seq[0] and "backfill_plan.py plan" in seq[1] and "market_history.py run-plan" in seq[2] and "backfill_plan.py plan" in seq[3] and "candidate_readiness.py" in seq[4]
+    assert all(f"{root}-full-{T}" in c for c in seq[1:4]) and f"--study-to-ms {T}" in seq[0]            # a NEW root next to the old one: nothing is overwritten
+
+
+def test_a_legacy_manifest_without_a_selection_block_is_unknown_legacy_and_suspected(root, tmp_path):
+    uni = make_universe(tmp_path)
+    _explicit(root, uni, ["AAAUSDT", "OLDUSDT"])
+    for d in ("funding", "mark-kline-240"):                                          # emulate a manifest written before the block existed (and re-seal its digest)
+        mp = root / d / "manifest.json"
+        man = json.loads(mp.read_text())
+        del man["selection"]
+        man["universe"] = None
+        man["manifest_digest"] = MH._sha(MH._canon({k: v for k, v in man.items() if k != "manifest_digest"}))
+        mp.write_text(json.dumps(man, indent=1, sort_keys=True))
+    res = diag(uni, root)
+    assert res["selection"]["funding"]["mode"] == "UNKNOWN_LEGACY" and res["selection"]["funding"]["recorded"] is False and "explicit" in res["selection"]["funding"]["legacy_hint"]
+    assert _cause(res, "d_dataset_status")["verdict"] == "DOES_NOT_APPLY"
+    assert _cause(res, "a_explicit_symbols_list")["verdict"] == "SUSPECTED" and res["why_few_symbols"]["primary_cause"] == "a_explicit_symbols_list"
+    assert BP.plan(str(uni), str(root), study_from_ms=None, study_to_ms=T, **P)["datasets"]["funding"]["selection"]["mode"] == "UNKNOWN_LEGACY"
+
+
+def test_an_unsupplied_universe_dir_is_cause_b_and_the_fix_sequence_has_a_placeholder(root, tmp_path):
+    uni = make_universe(tmp_path)
+    full_history(root, uni)
+    res = diag(None, root)
+    assert _cause(res, "b_universe_dir_not_supplied_or_recognised")["verdict"] == "APPLIES" and res["why_few_symbols"]["primary_cause"] == "b_universe_dir_not_supplied_or_recognised"
+    assert "<UNIVERSE_CAPTURE_DIR>" in res["why_few_symbols"]["command_sequence"][1]["command"]
+
+
+def test_lifecycle_filtering_applies_only_when_collected_symbols_are_dropped_by_it(root, tmp_path):
+    uni = make_universe(tmp_path)
+    _explicit(root, uni, ["AAAUSDT", "GONEUSDT"])                                    # GONE was delivered before the window: collected anyway by hand
+    res = diag(uni, root)
+    c = _cause(res, "c_lifecycle_filtering")
+    assert c["verdict"] == "APPLIES" and c["evidence"]["collected_but_lifecycle_excluded"]["names"] == ["GONEUSDT"]
+
+
+def test_dataset_status_is_cause_d_when_eligible_collected_symbols_fail_the_status_checks(root, tmp_path):
+    uni = make_universe(tmp_path)
+    full_history(root, uni, datasets=(MH.FUNDING,))
+    full_history(root, uni, syms=("AAAUSDT", "BBBUSDT"), datasets=(MH.MARK,))
+    res = diag(uni, root)
+    d = _cause(res, "d_dataset_status")
+    assert d["verdict"] == "APPLIES" and d["evidence"]["stage_exclusions_by_reason"] == {"not_in_mark_dataset": 1}
+    assert _cause(res, "c_lifecycle_filtering")["verdict"] == "DOES_NOT_APPLY"
+
+
+# ---------------------------------------------------------------- required datasets per candidate spec; what remains when the span cannot be covered
+
+def _spec(*names):
+    return {"candidate_id": "synthetic@1", "required_data": [{"name": n} for n in names]}
+
+
+def test_the_real_candidate_specs_map_to_their_datasets_and_name_the_unverifiable_items():
+    import candidate_readiness as CR
+    specs = dict(CR.load_candidates())
+    a = BP.datasets_for_spec(specs["cross_sectional_funding"])
+    assert a["datasets"] == ["funding", "mark-kline", "index-kline"] and [u["kinds"] for u in a["unverifiable"]] == [["depth"]]
+    b = BP.datasets_for_spec(specs["spot_perp_basis"])
+    assert "funding" in b["datasets"] and "index-kline" in b["datasets"] and b["spot_availability"] is True and b["unverifiable"][0]["kinds"] == ["depth", "spot_price"]
+    c = BP.datasets_for_spec(_spec("open interest per symbol", "kline candles per symbol", "funding history", "mark price per symbol"))
+    assert c["datasets"] == ["funding", "mark-kline", "kline", "open-interest"] and c["unverifiable"] == []
+
+
+def test_a_spec_that_needs_depth_can_never_be_research_ready_however_complete_the_history(root, tmp_path):
+    import candidate_readiness as CR
+    uni = make_universe(tmp_path)
+    full_history(root, uni, datasets=(MH.FUNDING, MH.MARK, MH.INDEX))
+    doc = do_plan(uni, root, candidate_spec=dict(CR.load_candidates())["cross_sectional_funding"])
+    assert doc["parameters"]["required_datasets"] == ["funding", "mark-kline", "index-kline"] and doc["datasets"]["index-kline"]["counts"]["COMPLETE"] == 3
+    assert doc["readiness"]["research_ready"] is False and any("UNVERIFIABLE" in u and "depth" in u for u in doc["readiness"]["unmet"])
+    assert doc["candidate"]["required"]["unverifiable"][0]["kinds"] == ["depth"]
+
+
+def test_a_spec_whose_datasets_are_all_collectable_is_ready_only_when_each_is_complete(root, tmp_path):
+    uni = make_universe(tmp_path)
+    full_history(root, uni)
+    spec = _spec("funding history per symbol", "mark price per symbol", "kline candles per symbol")
+    doc = do_plan(uni, root, candidate_spec=spec)
+    assert doc["parameters"]["required_datasets"] == ["funding", "mark-kline", "kline"] and doc["readiness"]["research_ready"] is False
+    assert doc["datasets"]["kline"]["counts"]["MISSING"] == 3 and doc["datasets"]["funding"]["counts"]["COMPLETE"] == 3
+    assert do_plan(uni, root, candidate_spec=_spec("funding history", "mark price"))["readiness"]["research_ready"] is True
+
+
+def test_spot_availability_needs_a_verified_spot_snapshot(root, tmp_path):
+    uni = make_universe(tmp_path)
+    full_history(root, uni)
+    doc = do_plan(uni, root, candidate_spec=_spec("funding history", "mark price", "spot hedge availability"))
+    assert doc["candidate"]["spot_coverage"] == {"status": "NOT_SUPPLIED"} and any("spot availability" in u for u in doc["readiness"]["unmet"]) and doc["readiness"]["research_ready"] is False
+
+
+def test_the_replan_of_a_candidate_plan_keeps_the_candidate(root, tmp_path):
+    import candidate_readiness as CR
+    uni = make_universe(tmp_path)
+    full_history(root, uni)
+    spec = dict(CR.load_candidates())["cross_sectional_funding"]
+    doc = do_plan(uni, root, candidate_spec=spec)
+    fresh = BP.replan(doc, str(root))
+    assert fresh["candidate"]["required"]["unverifiable"] == doc["candidate"]["required"]["unverifiable"] and fresh["readiness"]["research_ready"] is False
+
+
+def test_a_collection_shorter_than_the_required_span_states_what_remains_and_is_labelled_a_diagnostic(root, tmp_path):
+    uni = make_universe(tmp_path)
+    full_history(root, uni, start=W0 + 2 * DAY)
+    doc = do_plan(uni, root)
+    s = doc["history_shortfall"]
+    assert doc["evidence_class"] == s["evidence_class"] == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE" and s["required_days"] == NEED_DAYS and s["short_by_days_max"] == 2.0
+    assert s["datasets"]["funding"]["collected_days"] == 4.0 and "window_short_start" in s["datasets"]["funding"]["causes"] and "NEW root" in s["remaining"]
+    assert any("SHORT_DIAGNOSTIC" in u for u in doc["readiness"]["unmet"])
+    full = tmp_path / "full"
+    os.mkdir(full, 0o700)
+    full_history(full, uni)
+    ok = do_plan(uni, full)
+    assert ok["evidence_class"] == "FULL_SPAN_REQUESTED" and ok["history_shortfall"]["covers_required_span"] is True and ok["readiness"]["research_ready"] is True
+
+
+def test_no_history_at_all_is_a_total_shortfall(tmp_path):
+    uni = make_universe(tmp_path)
+    s = do_plan(uni)["history_shortfall"]
+    assert s["short_by_days_max"] == NEED_DAYS and s["datasets"]["funding"]["cause"] == "DATASET_ABSENT"

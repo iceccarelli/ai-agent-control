@@ -515,12 +515,95 @@ def _estimate(dataset: str, interval: Optional[str], need_by_symbol: Mapping[str
             "note": "lower bound: requests / shared token-bucket rate; retries, backoff and server latency are not included; pages = ceil(rows/limit)+1"}
 
 
+# ---------------------------------------------------------------- required datasets of a candidate spec
+
+SPEC_UNVERIFIABLE_KINDS = ("depth", "cross_venue")        # kinds no collector serves whatever else the item also names; an item that maps to NO dataset is unverifiable too
+
+
+def datasets_for_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
+    """The market_history datasets a candidate spec's ``required_data`` needs: funding, mark-kline, index-kline, kline, open-interest, plus the spot-instruments snapshot (spot availability).
+    Items no collector here can serve (order-book depth, other venues, fees/borrow) are listed as UNVERIFIABLE and keep ``complete`` False: a spec is never called covered because a dataset
+    for a DIFFERENT need exists. Pure; read from the spec's own item names."""
+    import candidate_readiness as CR
+    wanted: set = set()
+    spot = False
+    unver: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
+    for d in spec.get("required_data", []) if isinstance(spec, Mapping) else []:
+        if not isinstance(d, dict):
+            continue
+        nm = str(d.get("name", ""))
+        low = nm.lower()
+        kinds = list(CR.classify_required(nm))
+        ds: List[str] = []
+        if "funding" in kinds:
+            ds.append(MH.FUNDING)
+        if "mark" in kinds:
+            ds.append(MH.MARK)
+        if "index price" in low or "mark/index" in low:
+            ds.append(MH.INDEX)
+        if "spot_price" in kinds and MH.INDEX not in ds:
+            ds.append(MH.INDEX)                                          # the venue's spot INDEX series: a proxy for the spot leg, never a spot price
+        if any(k in low for k in ("kline", "candle", "ohlc")):
+            ds.append(MH.KLINE)
+        if "open interest" in low or "open-interest" in low:
+            ds.append(MH.OI)
+        if "spot" in low or "hedge" in low or "hedgeab" in low:
+            spot = True
+        bad = [k for k in kinds if k in SPEC_UNVERIFIABLE_KINDS]
+        if bad or (not ds and "universe" not in kinds and not spot):
+            unver.append({"item": nm, "kinds": kinds, "why": "no collector or capture schema in this repository serves it"})
+        wanted.update(ds)
+        items.append({"item": nm, "kinds": kinds, "datasets": ds})
+    ordered = [d for d in DATASET_ORDER if d in wanted]
+    return {"datasets": ordered, "spot_availability": spot, "unverifiable": unver, "items": items,
+            "note": "derived from the spec's required_data names; index-kline stands in for a spot price only as a labelled proxy"}
+
+
+def history_shortfall(doc_window: Mapping[str, Any], datasets: Mapping[str, Any], required: Sequence[str]) -> Dict[str, Any]:
+    """What remains, exactly and why, when the collected history cannot cover the required span: per required dataset the window it was REQUESTED for, the days it falls short by, and the
+    symbols short for each cause (collected window shorter than required / the venue served no earlier rows / dataset absent)."""
+    need_days, w0, w1 = doc_window["effective_days"], doc_window["effective_from_ms"], doc_window["effective_to_ms"]
+    out: Dict[str, Any] = {"required_days": need_days, "required_from_ms": w0, "required_to_ms": w1, "datasets": {}}
+    worst = 0.0
+    for ds in required:
+        e = datasets[ds]
+        if not e["present"]:
+            out["datasets"][ds] = {"cause": "DATASET_ABSENT", "short_by_days": need_days}
+            worst = max(worst, need_days)
+            continue
+        req = e.get("request") or {}
+        have = ((req.get("end_ms") or 0) - (req.get("start_ms") or 0)) / DAY_MS if req.get("start_ms") and req.get("end_ms") else None
+        short = max(0.0, need_days - have) if have is not None else None
+        causes: Dict[str, List[str]] = {}
+        for sym, m in (e.get("missing_ranges") or {}).items():
+            for r in m["reasons"]:
+                if r in ("window_short_start", "window_short_end", "partial_without_a_locatable_range"):
+                    causes.setdefault(r, []).append(sym)
+        head = sorted(s for s, m in (e.get("missing_ranges") or {}).items() if m["status"] != "MISSING" and "window_short_start" not in m["reasons"] and m["ranges_ms"] and m["ranges_ms"][0][0] == w0)
+        if head:
+            causes["venue_served_no_rows_for_the_head_of_the_window"] = head
+        out["datasets"][ds] = {"collected_request_window": [req.get("start_ms"), req.get("end_ms")], "collected_days": round(have, 3) if have is not None else None,
+                               "short_by_days": round(short, 3) if short is not None else None, "causes": {k: _cap(sorted(v)) for k, v in sorted(causes.items())}}
+        worst = max(worst, short or 0.0)
+    out["short_by_days_max"] = round(worst, 3)
+    out["covers_required_span"] = worst == 0.0
+    out["remaining"] = ("nothing: every required dataset was requested for the whole span" if worst == 0.0 else
+                        f"{round(worst, 1)} more day(s) of history: the datasets must be collected for the whole {need_days}-day window ({w0}..{w1}); re-plan and run-plan into a NEW root")
+    out["evidence_class"] = "FULL_SPAN_REQUESTED" if worst == 0.0 else "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE"
+    return out
+
+
 # ---------------------------------------------------------------- plan
 
 def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms: Optional[int], study_to_ms: int, formation_days: int, hold_days: int, min_holding_rows: int = 60,
          warmup_days: int = 7, include_statuses: Sequence[str] = DEFAULT_STATUSES, quote_coins: Optional[Sequence[str]] = DEFAULT_QUOTES, intervals: Optional[Mapping[str, str]] = None,
          required_datasets: Sequence[str] = DEFAULT_REQUIRED, workers: int = MH.DEFAULT_WORKERS, rate: float = MH.DEFAULT_RATE, verify: bool = True,
-         plan_path: Optional[str] = None, out_root: Optional[str] = None, now_ms: Optional[int] = None, classifier: Optional[Any] = None) -> Dict[str, Any]:
+         plan_path: Optional[str] = None, out_root: Optional[str] = None, now_ms: Optional[int] = None, classifier: Optional[Any] = None, candidate_spec: Optional[Mapping[str, Any]] = None,
+         spot_dir: Optional[str] = None) -> Dict[str, Any]:
+    cand = datasets_for_spec(candidate_spec) if candidate_spec is not None else None
+    if cand is not None:
+        required_datasets = tuple(cand["datasets"]) or tuple(required_datasets)
     iv = dict(DEFAULT_INTERVALS)
     iv.update(intervals or {})
     if MH.interval_ms_of(MH.MARK, iv[MH.MARK]) is None or MH.interval_ms_of(MH.KLINE, iv[MH.KLINE]) is None or MH.interval_ms_of(MH.INDEX, iv[MH.INDEX]) is None \
@@ -588,6 +671,24 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
             unmet.append(f"{ds}: does not verify" if e.get("verified") is False else f"{ds}: not verified here")
         elif e["counts"]["COMPLETE"] != len(esyms):
             unmet.append(f"{ds}: {len(esyms) - e['counts']['COMPLETE']} of {len(esyms)} eligible symbols not COMPLETE over the required range")
+    spot_cov: Optional[Dict[str, Any]] = None
+    if cand is not None:
+        for u in cand["unverifiable"]:
+            unmet.append(f"UNVERIFIABLE required data: {u['item'][:80]} ({','.join(u['kinds'])}): {u['why']}")
+        if cand["spot_availability"]:
+            if spot_dir is None:
+                spot_cov = {"status": "NOT_SUPPLIED"}
+                unmet.append("spot availability: no --spot-dir (spot-instruments snapshot) supplied")
+            else:
+                try:
+                    h = MH.hedge_availability({s: recs[s] for s in esyms}, spot_dir)
+                    spot_cov = {"status": "SUPPLIED", "counts": h["counts"], "snapshot": h["spot_snapshot"], "basis": "CURRENT_SNAPSHOT_ONLY"}
+                except (MH.HistoryError, OSError, ValueError, KeyError) as exc:
+                    spot_cov = {"status": "REFUSED", "reason": str(exc)[:200]}
+                    unmet.append("spot availability: the spot snapshot is refused")
+    shortfall = history_shortfall(win, datasets, [d for d in DATASET_ORDER if d in required_datasets])
+    if not shortfall["covers_required_span"]:
+        unmet.append(f"history shorter than the required {win['effective_days']} days by {shortfall['short_by_days_max']} day(s): a run over it is a SHORT_DIAGNOSTIC, never strategy evidence")
     research_ready = bool(esyms) and not unmet and not blockers
     # commands
     commands = _commands(universe_dir, history_root, out_root, plan_path, win, include_statuses, iv, workers, rate, datasets, required_datasets)
@@ -597,7 +698,8 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
     doc = {"schema": SCHEMA,
            "parameters": {"study_from_ms": study_from_ms, "study_to_ms": study_to_ms, "formation_days": formation_days, "hold_days": hold_days, "min_holding_rows": min_holding_rows,
                           "warmup_days": warmup_days, "include_statuses": list(include_statuses), "include_statuses_requested": requested_statuses, "quote_coins": list(quote_coins) if quote_coins else None, "intervals": iv,
-                          "required_datasets": list(required_datasets), "workers": workers, "rate": rate},
+                          "required_datasets": list(required_datasets), "workers": workers, "rate": rate, "candidate_id": (candidate_spec or {}).get("candidate_id") if candidate_spec is not None else None,
+                          "spot_dir": spot_dir},
            "window": win,
            "universe": {"dir": uinfo.get("dir"), "manifest_sha256": uinfo.get("manifest_sha256"), "dataset_status": uinfo.get("dataset_status"), "capture_schema": uinfo.get("capture_schema"),
                         "snapshot_ms": uinfo.get("snapshot_ms"), "rows_linear": len(recs), "statuses_in_capture": uinfo.get("statuses_in_capture"), "status_coverage": uinfo.get("status_coverage"),
@@ -606,7 +708,8 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
            "eligible_by_status": {k: sum(1 for s in esyms if eligible[s].get("status") == k) for k in sorted({eligible[s].get("status") for s in esyms}, key=str)},
            "eligible_notes": {k: v for k, v in sorted(cl["notes"].items())},
            "excluded_count": len(cl["excluded"]), "excluded_by_reason": {r: _cap(v) for r, v in sorted(cl["by_reason"].items())}, "excluded_detail": dict(sorted(cl["excluded"].items())),
-           "funnel": fn.report(), "history_root": os.path.abspath(history_root) if history_root else None, "datasets": datasets, "symbol_set_mismatch": mismatch,
+           "funnel": fn.report(), "candidate": ({"required": cand, "spot_coverage": spot_cov} if cand is not None else None), "history_shortfall": shortfall,
+           "evidence_class": shortfall["evidence_class"], "history_root": os.path.abspath(history_root) if history_root else None, "datasets": datasets, "symbol_set_mismatch": mismatch,
            "estimate": {"required_datasets_requests_total": total_req, "required_datasets_requests_remaining": rem_req, "all_datasets_requests_remaining": rem_all,
                         "required_datasets_wall_clock_lower_bound_s_remaining": round(rem_req / rate, 1), "all_datasets_wall_clock_lower_bound_s_remaining": round(rem_all / rate, 1)},
            "commands": commands, "blockers": blockers, "caveats": caveats,
@@ -619,9 +722,16 @@ def replan(doc: Mapping[str, Any], history_root: str, *, verify: bool = True) ->
     """Re-run a SEALED plan's own parameters against ``history_root`` now. Used by readers (``data_freshness_audit``) that must not believe a plan file's readiness claim: only a fresh
     re-derivation counts, and it must be about the same universe capture and the same symbol set as the sealed plan."""
     p = doc["parameters"]
+    spec = None
+    if p.get("candidate_id"):
+        import candidate_readiness as CR
+        spec = next((sp for _n, sp in CR.load_candidates() if sp.get("candidate_id") == p["candidate_id"]), None)
+        if spec is None:
+            raise PlanError(f"the sealed plan names candidate {p['candidate_id']!r}, which is not among the research candidates")
     fresh = plan(doc["universe"]["dir"], history_root, study_from_ms=p["study_from_ms"], study_to_ms=p["study_to_ms"], formation_days=p["formation_days"], hold_days=p["hold_days"],
                  min_holding_rows=p["min_holding_rows"], warmup_days=p["warmup_days"], include_statuses=p.get("include_statuses_requested") or p["include_statuses"],
-                 quote_coins=p.get("quote_coins"), intervals=p["intervals"], required_datasets=p["required_datasets"], workers=p["workers"], rate=p["rate"], verify=verify)
+                 quote_coins=p.get("quote_coins"), intervals=p["intervals"], required_datasets=p["required_datasets"], workers=p["workers"], rate=p["rate"], verify=verify,
+                 candidate_spec=spec, spot_dir=p.get("spot_dir"))
     fresh["same_universe_as_sealed_plan"] = fresh["universe"]["manifest_sha256"] == doc["universe"]["manifest_sha256"]
     fresh["same_symbol_set_as_sealed_plan"] = fresh["eligible_symbols"] == doc["eligible_symbols"]
     return fresh
@@ -800,7 +910,7 @@ def why_few_symbols(res: Mapping[str, Any], fund: Mapping[str, Any], mark: Mappi
                    "evidence": {"universe_rows": n_univ, "eligible": n_elig, "excluded_lifecycle": lifecycle_n, "by_reason": {r: len(v) for r, v in sorted(lc.items())},
                                 "collected_but_lifecycle_excluded": _cap(lc_in_ds),
                                 "note": "APPLIES only when symbols that ARE in the datasets were dropped by the lifecycle rule; lifecycle exclusion of never-collected symbols shrinks the plan, not the loader"}})
-    st_ex = fr.get("excluded_stage", {})
+    st_ex = {k: v for k, v in fr.get("excluded_stage", {}).items() if k in fr.get("symbols_in_datasets_not_loaded", {})}          # collected for SOME dataset yet not loadable; never-collected symbols are cause (a)'s symptom
     causes.append({"cause": "d_dataset_status", "verdict": "UNKNOWN" if not fr else ("APPLIES" if st_ex else "DOES_NOT_APPLY"),
                    "evidence": {"stage_exclusions_by_reason": _tally(st_ex.values()), "datasets": {k: {"present": v["present"], "verified": v["verified"]} for k, v in (fr.get("datasets") or {}).items()},
                                 "examples": dict(list(st_ex.items())[:NAMES_CAP])}})
@@ -913,6 +1023,8 @@ def main(argv: Optional[Sequence[str]] = None, *, clock: Callable[[], int] = lam
     p.add_argument("--index-interval", default=DEFAULT_INTERVALS[MH.INDEX])
     p.add_argument("--oi-interval", default=DEFAULT_INTERVALS[MH.OI])
     p.add_argument("--require", default=",".join(DEFAULT_REQUIRED), help="datasets that must be COMPLETE for research_ready")
+    p.add_argument("--candidate", default=None, help="a research candidate name (research/candidates/<name>.json): its required_data decides the required datasets (overrides --require)")
+    p.add_argument("--spot-dir", default=None, help="a spot-instruments snapshot dir (spot availability coverage)")
     p.add_argument("--workers", type=int, default=MH.DEFAULT_WORKERS)
     p.add_argument("--rate", type=float, default=MH.DEFAULT_RATE)
     p.add_argument("--no-verify", action="store_true", help="do not re-hash datasets (research_ready is then impossible)")
@@ -930,11 +1042,17 @@ def main(argv: Optional[Sequence[str]] = None, *, clock: Callable[[], int] = lam
         if a.cmd == "plan":
             if not a.universe_capture:
                 raise PlanError("--universe-capture is required")
-            doc = plan(a.universe_capture, a.history_root, **common, intervals={MH.KLINE: a.kline_interval, MH.MARK: a.mark_interval, MH.INDEX: a.index_interval, MH.OI: a.oi_interval},
+            spec = None
+            if a.candidate:
+                import candidate_readiness as CR
+                spec = next((sp for n, sp in CR.load_candidates() if n == a.candidate), None)
+                if spec is None:
+                    raise PlanError(f"no research candidate named {a.candidate!r}")
+            doc = plan(a.universe_capture, a.history_root, candidate_spec=spec, spot_dir=a.spot_dir, **common, intervals={MH.KLINE: a.kline_interval, MH.MARK: a.mark_interval, MH.INDEX: a.index_interval, MH.OI: a.oi_interval},
                        required_datasets=_csv(a.require), workers=a.workers, rate=a.rate, verify=not a.no_verify, plan_path=a.out, now_ms=now)
             if a.out:
                 MH._write_atomic(a.out, (json.dumps(doc, indent=1, sort_keys=True, allow_nan=False) + "\n").encode())
-            print(json.dumps({k: doc[k] for k in ("schema", "window", "eligible_count", "excluded_count", "estimate", "blockers", "caveats", "readiness", "plan_digest")}
+            print(json.dumps({k: doc[k] for k in ("schema", "window", "eligible_count", "excluded_count", "estimate", "blockers", "caveats", "readiness", "plan_digest", "evidence_class", "history_shortfall")}
                              | {"datasets": {n: {"present": e["present"], "verified": e.get("verified"), "counts": e["counts"]} for n, e in doc["datasets"].items()},
                                 "commands": [c["command"] for c in doc["commands"]], "written": a.out}, indent=2, sort_keys=True))
             return 0 if doc["readiness"]["research_ready"] else 1
