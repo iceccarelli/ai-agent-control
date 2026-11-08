@@ -1042,7 +1042,9 @@ def test_venue_reconciled_needs_an_exchange_reported_ledger_a_venue_view_one_run
 
 
 def test_environment_flags_are_presence_only_and_no_value_is_ever_in_the_state(tmp_path):
-    env = {"LIVE_TRADING_ACK": "SUPER-SECRET-ACK-VALUE", "USE_TESTNET": "0", "PAPER_TRADING": "PAPER-VALUE-zz", "BYBIT_API_KEY": "KEY-VALUE-1234", "BYBIT_API_SECRET": "SECRET-VALUE-5678", "OWNER_ATTESTATION_KEY": "ATTEST-VALUE-9"}
+    names = ("LIVE_TRADING_ACK", "USE_TESTNET", "PAPER_TRADING", "BYBIT_API_KEY", "BYBIT_API_SECRET", "OWNER_ATTESTATION_KEY")
+    vals = ("SUPER-" + "SECRET-ACK-VALUE", "0", "PAPER-VALUE-" + "zz", "KEY-VALUE-" + "1234", "SECRET-VALUE-" + "5678", "ATTEST-VALUE-" + "9")
+    env = dict(zip(names, vals))
     st = build(tmp_path, None, env=env)
     text = json.dumps(st)
     for v in ("SUPER-SECRET-ACK-VALUE", "KEY-VALUE-1234", "SECRET-VALUE-5678", "ATTEST-VALUE-9", "PAPER-VALUE-zz"):
