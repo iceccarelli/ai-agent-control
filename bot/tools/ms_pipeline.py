@@ -82,9 +82,11 @@ class LedgerAdapter:
         ``ledger`` (the raw ms_accounting dict) is passed through untouched: ITS net is not the displayed net.
     """
 
-    def __init__(self, mark_prov: str = "MEASURED") -> None:
+    def __init__(self, mark_prov: str = "MEASURED", exit_fee_bps_perp: float = 0.0, exit_fee_bps_spot: float = 0.0) -> None:
         if mark_prov not in T.PROVS:
             raise ValueError(f"unknown provenance {mark_prov!r}")
+        self.exit_fee_bps = {"linear": float(exit_fee_bps_perp), "spot": float(exit_fee_bps_spot)}
+        self.books: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}      # (symbol, category) -> (best bid, best ask) of the latest mark that carried a book
         self.ledger = MACC.Ledger()
         self.mark_prov = mark_prov
         self.slip = {"adverse": 0.0, "taker": 0.0}
@@ -111,21 +113,45 @@ class LedgerAdapter:
         d = self.slip_by_symbol.setdefault(symbol or "", {"adverse": 0.0, "taker": 0.0})
         d[k] += float(usd)
 
-    def mark(self, symbol: str, ts_ms: int, price: float) -> None:
+    def mark(self, symbol: str, ts_ms: int, price: float, bid: Optional[float] = None, ask: Optional[float] = None) -> None:
+        """Mark a position. ``bid`` / ``ask`` (optional) are the best prices of the book at the mark: an OPEN leg is then valued at what CLOSING it would yield (a long at the bid, a
+        short at the ask, less the modelled taker exit fee), never at mid / mark. Without a book the leg stays valued at the mark."""
         if symbol.startswith("SPOT:"):
-            self.ledger.mark(symbol[5:], int(ts_ms), price, category="spot", prov=self.mark_prov)
-            self.marks[(symbol[5:], "spot")] = float(price)
+            sym, cat = symbol[5:], "spot"
         else:
-            self.ledger.mark(symbol, int(ts_ms), price, category="linear", prov=self.mark_prov)
-            self.marks[(symbol, "linear")] = float(price)
+            sym, cat = symbol, "linear"
+        self.ledger.mark(sym, int(ts_ms), price, category=cat, prov=self.mark_prov)
+        self.marks[(sym, cat)] = float(price)
+        if bid is not None and ask is not None and 0 < float(bid) <= float(ask) and math.isfinite(float(ask)):
+            self.books[(sym, cat)] = (float(bid), float(ask))
+        else:
+            self.books.pop((sym, cat), None)
+
+    def _exit_adjustment(self, ledger_pnl: Mapping[str, Any], symbol: Optional[str] = None) -> float:
+        """What valuing the OPEN legs at the exit side of the book (plus the modelled taker exit fee) changes versus the mark the ledger used. 0.0 for a leg with no book."""
+        adj = 0.0
+        for key, r in ledger_pnl["per_leg"].items():
+            q = r["qty"]
+            if abs(q) < 1e-12:
+                continue
+            cat, sym = key.split("/", 1)[1].split(":", 1)
+            if symbol is not None and sym != symbol:
+                continue
+            bk, mk = self.books.get((sym, cat)), self.marks.get((sym, cat))
+            if bk is None or mk is None:
+                continue
+            px = bk[0] if q > 0 else bk[1]
+            adj += (px - mk) * q - abs(q) * px * self.exit_fee_bps[cat] / 1e4
+        return adj
 
     def symbol_pnl(self, symbol: str) -> Optional[Dict[str, Any]]:
         """One symbol's rollup on the SAME definition (gross at mid, minus fees, taker slippage and adverse selection); None when the symbol has no ledger leg."""
-        r = self.ledger.pnl()["per_symbol"].get(symbol)
+        lp = self.ledger.pnl()
+        r = lp["per_symbol"].get(symbol)
         if r is None:
             return None
         sl = self.slip_by_symbol.get(symbol, {"adverse": 0.0, "taker": 0.0})
-        pl = None if r["price_leg"] is None else r["price_leg"] + sl["taker"]
+        pl = None if r["price_leg"] is None else r["price_leg"] + sl["taker"] + self._exit_adjustment(lp, symbol)
         gross = None if pl is None or r["funding"] is None else pl + r["funding"]
         net = None if gross is None or r["fees"] is None else gross - r["fees"] - sl["taker"] - sl["adverse"]
         return {"price_leg": pl, "gross": gross, "fees": r["fees"], "taker_slippage": sl["taker"], "adverse_selection": sl["adverse"], "net": net}
@@ -137,10 +163,13 @@ class LedgerAdapter:
         price_actual = p["price_leg"] if p["price_leg"] is not None else (p["realised_price"] or 0.0)
         price_leg = price_actual + taker                                          # AT MID
         funding, fees = known("funding"), known("fees")
+        adj = self._exit_adjustment(p)
+        price_leg += adj
         net = price_leg + funding - fees - taker - adverse
         unreal = p["unrealised_price"]
+        unreal = None if unreal is None else unreal + adj                         # the value of closing what is open NOW (exit side of the book, less the taker exit fee)
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": taker + adverse, "adverse_selection": adverse, "taker_slippage": taker,
-                "realised": net - (unreal or 0.0), "unrealised": unreal, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]), "status": p["status"],
+                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]), "status": p["status"],
                 "prov": p["prov"], "ledger": p}
 
 
@@ -531,8 +560,8 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     # ---- ledger_pnl (realised / unrealised split; a simulated ledger is never realised cash)
     rg = (p["realised"] + p["fees"] + p["slippage"]) if complete else None     # realised price leg AT MID + funding
     ledger_pnl = {"schema": "ledger_pnl/v1", "basis": "SIMULATED", **common, "period_start_ms": cfg.start_ms, "period_end_ms": cfg.end_ms, "realised_gross_usd": rg,
-                  "fees_usd": fees, "funding_usd": L["funding"], "slippage_usd": p["slippage"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": L["unrealised_price"],
-                  "net_definition": "realised_net + unrealised = net = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection); ms_accounting's own net omits adverse selection",
+                  "fees_usd": fees, "funding_usd": L["funding"], "slippage_usd": p["slippage"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": p["unrealised"], "net_usd": net,
+                  "net_definition": "net_usd = realised_net + unrealised = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection); ms_accounting's own net omits adverse selection",
                   "ledger_status": L["status"], "ledger_flags": [_short(f, 120) for f in L["flags"][:20]]}
 
     # ---- portfolio_state (end of window)
@@ -716,7 +745,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     mark_prov = "ASSUMED" if label == DATA_INJECTED else "MEASURED"
 
     def ledger_factory() -> LedgerAdapter:
-        holder.append(LedgerAdapter(mark_prov))
+        holder.append(LedgerAdapter(mark_prov, replay_cfg.fill.taker_bps_perp, replay_cfg.fill.taker_bps_spot))
         return holder[-1]
 
     def risk_assess(plan: T.OrderGroupPlan, state: Mapping[str, Any], pol: Mapping[str, Any], snaps: Mapping[str, T.MarketSnapshot]) -> Any:

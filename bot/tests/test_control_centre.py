@@ -638,3 +638,19 @@ def test_render_smoke_with_no_data_shows_empty_states(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_the_pnl_card_states_one_net_the_total_with_realised_and_unrealised_beside_it(tmp_path):
+    files = good_set(**{"ledger_pnl.json": art("ledger_pnl/v1", "SIMULATED", period_start_ms=None, period_end_ms=None, realised_gross_usd=18.5, fees_usd=7.0, funding_usd=2.0,
+                                                realised_net_usd=11.5, unrealised_usd=1.25, net_usd=12.75)})
+    st = build(tmp_path, files)
+    pnl = st["portfolio"]["pnl"]
+    assert pnl["total_net"]["v"] == 12.75 and pnl["total_net"]["basis"] == "SIMULATED"
+    assert pnl["simulated_net"]["v"] + pnl["unrealised"]["v"] == pnl["total_net"]["v"]
+    text = next(c for c in st["overview"]["cards"] if c["id"] == "pnl")["text"]
+    assert "$12.75" in text and "realised $11.50" in text and "unrealised $1.25" in text and "not realised cash" in text
+    files = good_set(**{"ledger_pnl.json": art("ledger_pnl/v1", "SIMULATED", period_start_ms=None, period_end_ms=None, realised_gross_usd=18.5, fees_usd=7.0, funding_usd=2.0,
+                                                realised_net_usd=11.5, unrealised_usd=1.25)})                      # no net_usd: the total is NOT derived here
+    st = build(tmp_path, files)
+    assert st["portfolio"]["pnl"]["total_net"]["v"] is None and st["portfolio"]["pnl"]["total_net"]["basis"] == "MISSING"
+    assert "not stated (MISSING)" in next(c for c in st["overview"]["cards"] if c["id"] == "pnl")["text"]

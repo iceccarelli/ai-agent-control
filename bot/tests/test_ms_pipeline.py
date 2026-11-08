@@ -1146,3 +1146,38 @@ def test_a_refused_exit_releases_only_a_reservation_this_call_made(reason, befor
     g = _gates_with(stub)
     assert g.on_order(_exit_req()) == reason
     assert stub.released == (["G1-x1"] if released else [])
+
+
+def test_the_pnl_card_shows_the_replay_net_with_realised_and_unrealised_beside_it_for_a_run_with_open_legs(tmp_path):
+    pr = go(tmp_path, world(), cfg(**SHORT))
+    rr, lp = art(pr, "replay_report.json"), art(pr, "ledger_pnl.json")
+    assert art(pr, "portfolio_state.json")["positions"], "the window must end with legs still open"
+    st = cc_state(pr)
+    pnl = st["portfolio"]["pnl"]
+    assert lp["unrealised_usd"] not in (None, 0.0)
+    assert pnl["total_net"]["v"] == pytest.approx(rr["net_pnl_usd"]) == pytest.approx(lp["net_usd"])        # ONE net: the replay / execution net
+    assert pnl["simulated_net"]["v"] + pnl["unrealised"]["v"] == pytest.approx(pnl["total_net"]["v"])        # realised + unrealised == net
+    assert st["execution"]["net"]["v"] == pytest.approx(pnl["total_net"]["v"])
+    card = next(c for c in st["overview"]["cards"] if c["id"] == "pnl")
+    assert f"${rr['net_pnl_usd']:,.2f}" in card["text"] and "realised" in card["text"] and "unrealised" in card["text"] and "not realised cash" in card["text"]
+    assert card["basis"] == "SIMULATED"
+
+
+def test_open_legs_are_valued_at_the_exit_side_of_the_book_less_the_taker_exit_fee():
+    led = MP.LedgerAdapter("ASSUMED", exit_fee_bps_perp=5.5, exit_fee_bps_spot=10.0)
+    now = 1_700_000_000_000
+    led.record_fill(T.Fill("f1", "G", "P", "XUSDT", "Sell", 10.0, 100.0, 0.02, "USDT", "MAKER", now, "SIMULATED"), category="linear")
+    led.record_fill(T.Fill("f2", "G", "S", "XUSDT", "Buy", 10.0, 100.0, 0.02, "USDT", "MAKER", now, "SIMULATED"), category="spot")
+    led.mark("XUSDT", now + 1, 100.0)
+    led.mark("SPOT:XUSDT", now + 1, 100.0)
+    base = led.pnl()
+    assert base["unrealised"] == pytest.approx(0.0) and base["exit_adjustment"] == 0.0               # no book: valued at the mark, as before
+    led.mark("XUSDT", now + 2, 100.0, bid=99.5, ask=100.5)                                           # short perp closes by BUYING at the ask
+    led.mark("SPOT:XUSDT", now + 2, 100.0, bid=99.8, ask=100.2)                                      # long spot closes by SELLING at the bid
+    p = led.pnl()
+    perp = (100.0 - 100.5) * 10 - 10 * 100.5 * 5.5 / 1e4                                             # short loses 0.5/unit to the ask, plus the exit fee
+    spot = (99.8 - 100.0) * 10 - 10 * 99.8 * 10.0 / 1e4
+    assert p["unrealised"] == pytest.approx(perp + spot) and p["unrealised"] < base["unrealised"]
+    assert p["net"] == pytest.approx(base["net"] + perp + spot)
+    assert p["realised"] + p["unrealised"] == pytest.approx(p["net"])
+    assert led.symbol_pnl("XUSDT")["net"] == pytest.approx(p["net"])

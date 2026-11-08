@@ -154,7 +154,7 @@
       out.push(h("p", { "class": "muted" }, sim ? "These figures are SIMULATED. They are not realised cash." : (n.kind === "OWNER_IMPORT_UNVERIFIED" ? "These figures come from an owner import that is not reconciled with the venue." : "Account figures as stated by the ledger.")));
       var g = sim ? "simulated" : "realised";
       out.push(kv([[(sim ? "Simulated" : "Realised") + " gross (before fees)", V(n[g + "_gross"])], ["Fees", V(n[g + "_fees"])], ["Funding", V(n[g + "_funding"])],
-        [(sim ? "Simulated" : "Realised") + " net (after fees)", V(n[g + "_net"])], ["Unrealised (mark-to-market)", V(n.unrealised)]]));
+        [(sim ? "Simulated" : "Realised") + " net (after fees)", V(n[g + "_net"])], ["Unrealised (mark-to-market)", V(n.unrealised)]].concat(sim ? [["Simulated net, total (realised + unrealised)", V(n.total_net)]] : [])));
     }
     return h("div", null, out);
   }

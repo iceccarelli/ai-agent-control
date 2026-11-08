@@ -49,6 +49,7 @@ A missing file => section shows an empty state. A malformed/oversize/symlink/NaN
   ledger_pnl.json       schema "ledger_pnl/v1"      basis: SIMULATED | MEASURED | EXCHANGE_REPORTED | OWNER_SUPPLIED_UNVERIFIED
       period_start_ms int|null, period_end_ms int|null
       realised_gross_usd num|null, fees_usd num|null, funding_usd num|null, realised_net_usd num|null, unrealised_usd num|null
+      net_usd num|null (OPTIONAL: the TOTAL net, = realised_net_usd + unrealised_usd, the same figure as replay_report net_pnl_usd; absent = not stated)
       (a SIMULATED ledger is shown as simulated P&L, never as realised; net is never inferred from gross)
   competition.json      schema "competition/v1"     basis: ESTIMATED | SIMULATED | CALCULATED
       candidates [ {candidate_id str, kind OPP_KIND, spot_hedge (as above), status "RESEARCHING"|"REJECTED"|"INSUFFICIENT_EVIDENCE"|"SUFFICIENT_EVIDENCE", reason str|null (REQUIRED non-empty for REJECTED and
@@ -251,7 +252,8 @@ def _v_risk(o: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _v_ledger(o: Mapping[str, Any]) -> Dict[str, Any]:
     return {"period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), **{k: _num(o, k) for k in
-            ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd")}}
+            ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd")},
+            "net_usd": _num(o, "net_usd") if "net_usd" in o else None}          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
 
 
 def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
@@ -486,6 +488,7 @@ def _pnl_view(a: Dict[str, Any]) -> Dict[str, Any]:
            f"{grp}_gross": val(d["realised_gross_usd"], b, "USD", "before fees; GROSS"), f"{grp}_fees": val(d["fees_usd"], b, "USD"), f"{grp}_funding": val(d["funding_usd"], b, "USD"),
            f"{grp}_net": val(d["realised_net_usd"], b, "USD", "after fees; NET (as stated by the ledger)"),
            f"{other}_gross": val(None, "MISSING"), f"{other}_net": val(None, "MISSING"), "unrealised": val(d["unrealised_usd"], b, "USD", "mark-to-market; not cash"),
+           "total_net": val(d["net_usd"], b, "USD", "TOTAL net = realised + unrealised, after fees; as stated by the producer"),
            "period": [d["period_start_ms"], d["period_end_ms"]]}
     return out
 
@@ -691,10 +694,15 @@ def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifa
         cards.append(card("exposure", "Portfolio exposure", "FAIL" if portfolio.get("state") == "ERROR" else "NO_DATA", portfolio.get("error") or portfolio.get("empty", ""), "MISSING", "portfolio"))
     pnl = portfolio["pnl"]
     if pnl.get("state") == "OK":
-        g = "simulated" if pnl["kind"] == "SIMULATED_NOT_REALISED" else "realised"
-        net = pnl[f"{g}_net"]
-        cards.append(card("pnl", "Realised and unrealised P&L", "INFO", (f"{'Simulated' if g == 'simulated' else 'Realised'} net: " + (f"${net['v']:,.2f}" if net["v"] is not None else "not stated (MISSING)") +
-                          ("; this is a simulation, not realised cash." if g == "simulated" else "")), pnl["basis"], "portfolio"))
+        sim = pnl["kind"] == "SIMULATED_NOT_REALISED"
+        g = "simulated" if sim else "realised"
+        usd = lambda x: f"${x['v']:,.2f}" if x["v"] is not None else "not stated (MISSING)"       # noqa: E731
+        if sim:                                                    # ONE net: the total simulated net (= the Execution tab / replay report net_pnl_usd), realised and unrealised beside it
+            text = (f"Simulated net (total): {usd(pnl['total_net'])}; of which realised {usd(pnl[g + '_net'])} and unrealised {usd(pnl['unrealised'])} (mark-to-market). "
+                    "This is a simulation, not realised cash.")
+        else:
+            text = f"Realised net: {usd(pnl[g + '_net'])}; unrealised {usd(pnl['unrealised'])}."
+        cards.append(card("pnl", "Realised and unrealised P&L", "INFO", text, pnl["basis"], "portfolio"))
     else:
         cards.append(card("pnl", "Realised and unrealised P&L", "FAIL" if pnl.get("state") == "ERROR" else "NO_DATA", pnl.get("error") or pnl.get("empty", ""), "MISSING", "portfolio"))
     core = [c for c in cards if c["id"] in ("safety", "data", "operations")]
