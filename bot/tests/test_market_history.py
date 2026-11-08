@@ -1338,3 +1338,69 @@ def test_a_legacy_schema_1_capture_is_still_readable_and_labelled(tmp_path):
     d = _universe_dir(tmp_path, v2=False, name="uni1")
     recs, info = MH.load_universe_dir(str(d))
     assert info["capture_schema"] == 1 and sorted(recs) == ["BTCUSDT", "ETHUSDT", "NEWUSDT"] and info["status_coverage"] is None
+
+
+# ---------------------------------------------------------------- a full-universe backfill (~900 symbols), stubbed venue
+
+BIG = 900
+
+
+def _big_specs(n=BIG, interval_min=480, rows=40):
+    syms = [f"S{i:04d}USDT" for i in range(n)]
+    recs = {s: {"launchTime": BASE - (rows - 1) * H8 - 1, "fundingInterval_min": interval_min, "snapshot_ms": 1} for s in syms}
+    return syms, MH.build_specs(MH.FUNDING, None, syms, START, END, recs)
+
+
+def test_a_900_symbol_funding_backfill_resumes_per_symbol_follows_the_rate_and_stays_bounded_in_memory(root):
+    import tracemalloc
+    syms, specs = _big_specs()
+    n_rows = 40
+    data = {(MH.FUNDING, s): grid(BASE - (n_rows - 1) * H8, n_rows, H8) for s in syms}
+    flaky = set(syms[::7])                                         # every 7th symbol fails (transport error) in the first run
+    healthy = HV(data)
+
+    class Flaky(HV):
+        def __call__(self, url):
+            if any(f"symbol={s}&" in url for s in flaky):
+                self.urls.append(url)
+                raise OSError("connection reset")
+            return super().__call__(url)
+    first = Flaky(data)
+    t = Time()
+    rate = 50.0
+    tracemalloc.start()
+    man = run(root, specs, first, time=t, rate=rate, workers=4, max_retries=0, clock=lambda: SERVER0 + 50)       # a fixed clock: 900 symbols must not drift into skew flags
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert man["counts"]["symbols"] == BIG
+    ok_syms = [s for s in syms if s not in flaky]
+    assert all(man["symbols"][s]["status"] == "COMPLETE" for s in ok_syms), [(man["symbols"][s]["status"], man["symbols"][s]["reasons"], man["symbols"][s]["run"]["errors"]) for s in ok_syms if man["symbols"][s]["status"] != "COMPLETE"][:3]
+    assert all(man["symbols"][s]["status"] != "COMPLETE" and man["symbols"][s]["run"]["errors"] for s in flaky)
+    # rate aware: the shared bucket (burst = int(rate)) forces at least (requests - burst) / rate seconds of waiting, whatever the worker count
+    assert t.t >= (len(first.urls) - int(rate)) / rate * 0.99
+    # bounded memory: nothing proportional to the raw bytes is retained (900 symbols x one page each); a generous ceiling, ~3x the measured peak (15 MB)
+    assert peak < 48 * 1024 * 1024
+    # resume: only the symbols that did not finish are asked again; finished ones cost zero requests
+    t2 = Time()
+    man2 = run(root, specs, healthy, time=t2, rate=rate, workers=4, clock=lambda: SERVER0 + 50)
+    asked = {u.split("symbol=")[1].split("&")[0] for u in healthy.urls}
+    assert asked == flaky and all(man2["symbols"][s]["status"] == "COMPLETE" for s in syms)
+    assert t2.t >= (len(healthy.urls) - int(rate)) / rate * 0.99
+    assert MH.verify_dataset(ddir(root))["ok"]
+    assert sum(os.path.isdir(os.path.join(ddir(root), n)) for n in os.listdir(ddir(root))) == BIG       # one directory per symbol
+
+
+def test_a_closed_contract_is_asked_only_up_to_its_delivery_time_in_every_dataset(root, tmp_path):
+    delivery = BASE - 60 * H8
+    d = _universe_dir(tmp_path, syms=("OLDUSDT",), statuses={"OLDUSDT": "Closed"}, deliveries={"OLDUSDT": delivery})
+    recs, info = MH.load_universe_dir(str(d), include_statuses=["Closed"])
+    H4 = 4 * 3600_000
+    first = (FIRST // H4 + 1) * H4
+    for ds, iv, step in ((MH.FUNDING, None, H8), (MH.MARK, "240", H4), (MH.INDEX, "240", H4), (MH.KLINE, "240", H4), (MH.OI, "4h", H4)):
+        specs = MH.build_specs(ds, iv, ["OLDUSDT"], START, END, recs)
+        assert specs[0]["end_ms"] == delivery and specs[0]["window_end_ms"] == END
+        v = HV({(ds, "OLDUSDT"): grid(first - first % step + step, 300, step)})
+        run(root, specs, v, dataset=ds, interval=iv, universe=info)
+        key = MH.DATASETS[ds]["end"]
+        ends = [int(u.split(f"{key}=")[1].split("&")[0]) for u in v.urls]
+        assert ends and max(ends) == delivery, ds                  # the first page asks exactly the delivery time, none asks beyond it

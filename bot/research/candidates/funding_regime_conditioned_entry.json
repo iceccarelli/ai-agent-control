@@ -1,0 +1,118 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "regime thresholds are fixed on the first 70% of the Bybit BTC corpus and frozen; the last 30% plus any later settlement is the test; prospective for anything beyond BTC"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": false,
+    "hedge_completeness_modelled": false,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": true,
+    "point_in_time_universe": true
+  },
+  "candidate_id": "funding_regime_conditioned_entry@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 100.0,
+    "note": "tiny owner scale; capacity is not the binding constraint, the funding regime is"
+  },
+  "counterparty": "leveraged longs on the BTC perpetual who pay funding to the short/hedge side while the positive-funding regime lasts",
+  "drawdown_model": "mark-to-market hedge basis drawdown on the hold; a regime flip mid-hold is a funding loss, measured per entry",
+  "economic_mechanism": "Counterparty: leveraged longs paying funding to the hedged short. The committed BTC corpus shows the unconditional long-hold edge is a REGIME, not a constant (COMMITTED_CORPUS_IN_SAMPLE: 51-print hold net by entry year is negative in 2022 and 2026, strongly positive in 2023-2024). Hypothesis: a funding regime state computed ONLY from past prints (run length of positive funding and a trailing level, both as-of the decision) separates entries that pay for their round trip from those that do not, so conditioning entry on the regime beats both the unconditional hold and the single threshold gate. Persists while leverage demand is persistent; disappears when regimes are too short to cover the round trip, or when the regime state is itself unstable (flapping).",
+  "eligibility_rules": [
+    "BTCUSDT only (480m contract, interval-normalised anyway)",
+    "regime state computed from prints with settlement time <= decision time only",
+    "a regime classifier parameter set is registered once; every grid cell counts as a tested variant"
+  ],
+  "entry": "enter the hedged position (short perp against owned spot) when the as-of regime state is ON per the registered classifier",
+  "execution_model": "taker perp legs on owned spot (no spot trade): perp round trip only; price-leg residual is the basis shed, measured",
+  "exit": "regime state OFF, funding inversion, or a registered maximum hold",
+  "family": "funding_regime_conditioned_entry",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "note": "carry_costs.TAKER_BPS_PERP: the PERP leg's base-tier taker fee (published schedule); the spot leg is spot_taker_bps. A spot+perp round trip is 2 x (taker_bps + spot_taker_bps) = 31.0 bps",
+      "provenance": "venue_stated",
+      "value": 5.5
+    }
+  },
+  "funding_interval_handling": {
+    "method": "interval-normalised: funding_bps_per_day = rate_bps * 1440 / fundingInterval_min per symbol; holding-horizon funding = bps/day x days; per-interval cohorts (480m / 240m / 60m) reported separately; settlement grid is per symbol; a Closed contract earns nothing after its deliveryTime",
+    "source_of_interval_facts": "OWNER-OBSERVED live probe (unverified in this repo): Bybit funding interval is per symbol (480m, 240m, sometimes 60m) and 14 of the top 20 positive-funding perps over $5M turnover were 240m contracts",
+    "unknown_interval": "funding normalisation UNKNOWN -> the candidate cannot pass"
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "note": "in-sample mean of BTC funding used as a FORECAST placeholder; a measured past mean is not a measured future rate",
+      "provenance": "derived",
+      "value": 0.259
+    }
+  },
+  "holding_period": "days to weeks (registered grid; every cell counts)",
+  "hypothesis": "On BTC, conditioning carry entries on a past-only funding regime state earns a net edge after fees and spread that neither the unconditional hold nor the single-threshold gate earns.",
+  "multiple_testing_family": "funding_regime_conditioned_entry",
+  "proposed_by": "tools/candidate_competition.py (next-hypothesis draft)",
+  "prospective_protocol": {
+    "description": "register thresholds then observe forward basis excursions and fills on testnet mechanics",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
+  "rejection_conditions": [
+    "adjusted p-value (Holm over every attempted classifier/hold variant) above 0.05 on historical_test or oos_test",
+    "net edge after assumed costs not positive in the most recent calendar year",
+    "the edge appears only inside one calendar-year regime",
+    "regime state flaps (changes more than a registered number of times per hold)",
+    "the classifier uses any print with settlement time after the decision"
+  ],
+  "required_data": [
+    {
+      "declaration_keys": [
+        "no_future_funding_knowledge"
+      ],
+      "gap": "BTC Bybit 8h in data/real_bybit_btc_4h only (a single symbol, one interval)",
+      "name": "funding history for the traded symbol (BTCUSDT Bybit, 480m)",
+      "point_in_time": true,
+      "repo_has": true
+    },
+    {
+      "declaration_keys": [
+        "hedge_completeness_modelled"
+      ],
+      "gap": "spot BTC OHLCV exists but basis at settlement is only partial (tools/basis_at_settlement): hedge-leg basis at entry/exit is not whole",
+      "name": "spot price history and hedge-leg basis at entry/exit",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
+      "gap": "BTC/ETH spot L2 only; no perp book history",
+      "name": "L2 depth for capacity",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "regime flips inside the hold; basis widening before convergence; classifier overfit to the in-sample years",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 0.2
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 0.2
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. DRAFT PROPOSED by tools/candidate_competition.py after the credible candidates all failed or stayed untestable on the data that exists; it is registered UNTESTED. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. No start date is claimed: the registration that opens a window sets and seals it."
+}

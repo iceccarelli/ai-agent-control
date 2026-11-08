@@ -467,3 +467,141 @@ def test_an_unexpected_internal_error_is_a_clean_message_and_a_non_zero_exit(tmp
     assert DA.main(["--root", str(root), "--now-ms", str(ctx["now"])]) == 2
     err = capsys.readouterr().err
     assert "KeyError" in err and "Traceback" not in err
+
+
+# ---------------------------------------------------------------- DATA_READY / RESEARCH_READY vocabulary (never strategy readiness)
+
+import copy  # noqa: E402
+import test_backfill_plan as BPT  # noqa: E402
+
+
+def plan_world(tmp_path, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), mark_syms=None, write_plan=True):
+    root = tmp_path / "hist"
+    os.mkdir(root, 0o700)
+    uni = BPT.make_universe(tmp_path)
+    BPT.full_history(root, uni, syms=syms, datasets=(MH.FUNDING,))
+    BPT.full_history(root, uni, syms=mark_syms or syms, datasets=(MH.MARK,))
+    doc = BPT.do_plan(uni)
+    pf = tmp_path / "plan.json"
+    if write_plan:
+        pf.write_text(json.dumps(doc))
+    return root, uni, doc, pf
+
+
+NOW = BPT.T + 86_400_000
+
+
+def vocab(rep):
+    return rep["readiness_vocabulary"]
+
+
+def test_without_a_plan_research_readiness_is_not_assessed_and_strategy_never_is(tmp_path):
+    root, _u, _d, _pf = plan_world(tmp_path)
+    rep = DA.audit(str(root), now_ms=NOW)
+    v = vocab(rep)
+    assert v["data_ready"]["verdict"] == "DATA_READY" and set(v["data_ready"]["per_dataset"]) == {"funding", "mark-kline-240"}
+    assert v["research_ready"]["verdict"] == "NOT_ASSESSED" and "no --plan" in v["research_ready"]["reason"]
+    assert v["strategy_ready"]["verdict"] == "NOT_ASSESSED"
+    assert "READY" not in v["strategy_ready"]["verdict"].replace("NOT_ASSESSED", "")
+    assert rep["axes"]["research_readiness"]["verdict"] in ("NOT_READY", "READY") and "NOT strategy readiness" in rep["axes"]["research_readiness"]["scope"]      # existing verdict kept
+
+
+def test_research_ready_only_when_a_re_derived_plan_says_the_window_and_symbols_are_complete(tmp_path):
+    root, _u, doc, pf = plan_world(tmp_path)
+    rep = DA.audit(str(root), now_ms=NOW, plan_file=str(pf))
+    r = vocab(rep)["research_ready"]
+    assert r["verdict"] == "RESEARCH_READY" and r["plan_digest"] == doc["plan_digest"] and r["eligible_symbols"] == 3 and r["same_symbol_set_as_sealed_plan"] is True
+    assert vocab(rep)["strategy_ready"]["verdict"] == "NOT_ASSESSED"
+
+
+def test_data_ready_and_research_ready_are_separate_claims(tmp_path):
+    root, _u, _d, pf = plan_world(tmp_path, mark_syms=("AAAUSDT", "BBBUSDT"))             # every dataset is whole in itself, but mark lacks an eligible symbol
+    rep = DA.audit(str(root), now_ms=NOW, plan_file=str(pf))
+    v = vocab(rep)
+    assert v["data_ready"]["verdict"] == "DATA_READY"
+    assert v["research_ready"]["verdict"] == "NOT_RESEARCH_READY" and any("mark-kline" in u for u in v["research_ready"]["unmet"])
+    assert any(b["code"] == "SYMBOL_SET_MISMATCH" for b in v["research_ready"]["blockers"])
+
+
+def test_a_plan_files_own_readiness_claim_is_never_read(tmp_path):
+    root, uni, _d, _pf = plan_world(tmp_path, mark_syms=("AAAUSDT", "BBBUSDT"))
+    forged = copy.deepcopy(BPT.do_plan(uni))
+    forged["readiness"] = {"research_ready": True, "unmet": []}
+    forged["datasets"]["mark-kline"]["counts"]["COMPLETE"] = 3
+    forged["plan_digest"] = MH.plan_digest(forged)                                          # re-sealed: the digest holds, the claim is still false
+    pf = tmp_path / "forged.json"
+    pf.write_text(json.dumps(forged))
+    assert vocab(DA.audit(str(root), now_ms=NOW, plan_file=str(pf)))["research_ready"]["verdict"] == "NOT_RESEARCH_READY"
+
+
+def test_an_unsealed_or_unreadable_plan_is_not_assessed_not_ready(tmp_path):
+    root, _u, doc, _pf = plan_world(tmp_path)
+    bad = copy.deepcopy(doc)
+    bad["eligible_symbols"] = bad["eligible_symbols"][:-1]
+    bad["eligible_count"] -= 1                                                              # edited without re-sealing
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
+    r = vocab(DA.audit(str(root), now_ms=NOW, plan_file=str(tmp_path / "bad.json")))["research_ready"]
+    assert r["verdict"] == "NOT_ASSESSED" and "plan_digest" in r["reason"]
+    assert vocab(DA.audit(str(root), now_ms=NOW, plan_file=str(tmp_path / "missing.json")))["research_ready"]["verdict"] == "NOT_ASSESSED"
+
+
+def test_a_plan_made_for_another_symbol_set_or_universe_cannot_vouch_for_this_one(tmp_path, monkeypatch):
+    root, _u, _d, pf = plan_world(tmp_path)
+    real = BPT.BP.replan
+    for flag in ("same_universe_as_sealed_plan", "same_symbol_set_as_sealed_plan"):
+        monkeypatch.setattr(DA.BP, "replan", lambda d, r, flag=flag: dict(real(d, r), **{flag: False}))
+        assert vocab(DA.audit(str(root), now_ms=NOW, plan_file=str(pf)))["research_ready"]["verdict"] == "NOT_RESEARCH_READY", flag
+
+
+def test_no_data_is_never_data_ready_or_research_ready_even_with_a_plan(tmp_path):
+    root, uni, doc, pf = plan_world(tmp_path)
+    empty = tmp_path / "empty"
+    os.mkdir(empty, 0o700)
+    rep = DA.audit(str(empty), now_ms=NOW, plan_file=str(pf))
+    v = vocab(rep)
+    assert v["data_ready"]["verdict"] == "NO_DATA" and rep["axes"]["data_freshness"]["verdict"] == "NO_DATA"
+    assert v["research_ready"]["verdict"] == "NOT_RESEARCH_READY"
+
+
+def test_a_dataset_with_a_partial_symbol_is_not_data_ready(tmp_path):
+    root, uni, _d, pf = plan_world(tmp_path, syms=("AAAUSDT", "BBBUSDT"))
+    BPT.full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.MARK,), start=BPT.W0 + 2 * 86_400_000)      # a shorter window: head gap
+    rep = DA.audit(str(root), now_ms=NOW)
+    h = vocab(rep)["data_ready"]
+    assert h["per_dataset"]["funding"]["data_ready"] is True
+    assert h["per_dataset"]["mark-kline-240"]["data_ready"] is False and h["verdict"] == "NOT_DATA_READY"
+
+
+def test_each_dataset_reports_the_symbols_dates_and_intervals_it_covers_and_does_not(tmp_path):
+    root, _u, _d, _pf = plan_world(tmp_path)
+    rep = DA.audit(str(root), now_ms=NOW)
+    c = rep["history"]["funding"]["coverage"]
+    assert c["symbols_total"] == 3 and c["symbols_complete"] == 3 and c["symbols_not_complete"] == []
+    assert c["first_ts_min"] == BPT.W0 and c["last_ts_max"] == BPT.T and c["intervals_ms"] == {str(BPT.H8): 3}
+    assert rep["history"]["mark-kline-240"]["coverage"]["intervals_ms"] == {str(BPT.H4): 3}
+    declared = tmp_path / "ru.json"
+    declared.write_text(json.dumps(["AAAUSDT", "ZZZUSDT"]))
+    rep2 = DA.audit(str(root), now_ms=NOW, universe_file=str(declared))
+    assert rep2["history"]["funding"]["research_universe"]["missing"] == ["ZZZUSDT"]
+
+
+def test_cli_plan_flag_prints_the_vocabulary(tmp_path, capsys):
+    root, _u, _d, pf = plan_world(tmp_path)
+    DA.main(["--root", str(root), "--now-ms", str(NOW), "--plan", str(pf)])
+    out = json.loads(capsys.readouterr().out)
+    assert out["readiness_vocabulary"]["research_ready"]["verdict"] == "RESEARCH_READY"
+
+
+def test_a_corrupt_stale_or_row_less_dataset_is_never_data_ready(tmp_path):
+    root, _u, _d, _pf = plan_world(tmp_path)
+    old = DA.audit(str(root), now_ms=NOW + 30 * 86_400_000)                                  # the window ended a month ago: stale symbols
+    assert vocab(old)["data_ready"]["verdict"] == "NOT_DATA_READY" and vocab(old)["data_ready"]["per_dataset"]["funding"]["stale_symbols"] == 3
+    page = root / "funding" / "AAAUSDT" / "page-000001.json"
+    page.write_bytes(page.read_bytes() + b" ")
+    rep = DA.audit(str(root), now_ms=NOW)
+    assert vocab(rep)["data_ready"]["per_dataset"]["funding"]["verify"] == "FAILED" and vocab(rep)["data_ready"]["verdict"] == "NOT_DATA_READY"
+    assert vocab(DA.audit(str(root), now_ms=NOW, verify=False))["data_ready"]["verdict"] == "NOT_DATA_READY"        # skipped verification proves nothing
+    r = tmp_path / "r"
+    os.mkdir(r, 0o700)
+    MH.run_dataset(str(r), "funding", None, TH.funding_specs(), fetch=TH.HV({}), clock=TH.Clock(), sleep=TT.sleep, mono=TT.mono, free_bytes_fn=lambda _p: 1 << 40, reserve_bytes=1)
+    assert vocab(DA.audit(str(r), now_ms=TH.SERVER0))["data_ready"]["verdict"] == "NO_DATA"       # a manifest with no rows is not data

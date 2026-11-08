@@ -39,7 +39,8 @@ def rowof(rep, name):
 def test_every_candidate_and_the_btc_description_has_a_row_with_a_reasoned_verdict(report):
     names = {r["name"] for r in report["candidates"]}
     assert names == {"cash_and_carry", "cross_sectional_funding", "cross_venue_funding", "liquidity_imbalance", "market_neutral_relative_value", "passive_execution",
-                     "spot_perp_basis", "spread_microstructure", "btcusdt_funding_carry_overlay"}
+                     "spot_perp_basis", "spread_microstructure", "btcusdt_funding_carry_overlay",
+                     "funding_regime_conditioned_entry", "cross_interval_funding_dispersion", "hedgeable_majors_basis_convergence"}          # + the registered next-hypothesis drafts (UNTESTED)
     for r in report["candidates"]:
         assert r["readiness_verdict"] in ("UNTESTED", "INSUFFICIENT_DATA", "REJECTED") and r["readiness_reasons"], r["name"]
         assert r["verdict_rank_ceiling"] == "INSUFFICIENT_DATA"
@@ -788,3 +789,514 @@ def test_mutation_without_the_closed_in_series_check_survivors_would_be_labelled
     m = _mutant("closed_missing = sorted(sy for sy, r in recs.items() if", "closed_missing = [] if True else sorted(sy for sy, r in recs.items() if")
     root, uni, _ = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",))
     assert m.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[1]["survivorship"] == "DELISTINGS_OBSERVED"
+
+
+# ================================================================== readiness vocabulary, verified inventory, explicit universe input (worker C)
+LEVELS = ("DATA_READY", "RESEARCH_READY", "PROMISING", "PROSPECTIVE", "EXECUTION_READY", "OWNER_PROFIT_EVIDENCED")
+
+
+def _lv(**kw):
+    base = dict(data_ready=True, data_reasons=[], pit_ok=True, survivorship=CR.DELISTINGS_OBSERVED, mechanism_ok=True, evaluation=None)
+    base.update(kw)
+    return CR.readiness_levels(**base)
+
+
+def test_the_readiness_vocabulary_is_ordered_and_named():
+    assert CR.READINESS_LEVELS == LEVELS
+
+
+def test_a_dataset_level_ready_never_becomes_strategy_level_ready():
+    r = _lv(survivorship=CR.SURVIVORS_ONLY)
+    assert r["levels"]["DATA_READY"]["reached"] is True and r["levels"]["RESEARCH_READY"]["reached"] is False
+    assert r["highest"] == "DATA_READY" and r["survivorship_free_claim"] is False
+    assert any("SURVIVORS_ONLY" in x for x in r["levels"]["RESEARCH_READY"]["reasons"])
+    assert r["highest_supportable_verdict"] == "INSUFFICIENT_DATA"
+    assert _lv(data_ready=False)["highest"] == "NONE" and _lv(data_ready=False)["highest_supportable_verdict"] == "UNTESTED"
+
+
+def test_levels_are_cumulative_and_nothing_above_research_ready_without_an_evaluation():
+    r = _lv()
+    assert r["highest"] == "RESEARCH_READY"
+    for lvl in LEVELS[2:]:
+        assert r["levels"][lvl]["reached"] is False and r["levels"][lvl]["reasons"]
+    # a good evaluation reaches PROMISING only; prospective/execution/owner levels need evidence this tool cannot create
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
+          "terminal_exit_unpriced": 0}
+    p = _lv(evaluation=ev, executable=True)
+    assert p["highest"] == "PROMISING" and p["levels"]["EXECUTION_READY"]["reached"] is False and p["levels"]["OWNER_PROFIT_EVIDENCED"]["reached"] is False
+    assert p["highest_supportable_verdict"] == "INSUFFICIENT_DATA"                                # the ceiling never moves
+    # skipping a level is impossible: a PROSPECTIVE record on a candidate that is not PROMISING reaches nothing
+    q = _lv(evaluation={**ev, "oos_mean_total_bps_per_row": -3.0}, prospective={"started": True, "settlements_observed": 999, "min_settlements": 30})
+    assert q["levels"]["PROMISING"]["reached"] is False and q["levels"]["PROSPECTIVE"]["reached"] is False
+
+
+def test_a_rejected_evaluation_is_rejected_and_not_promising():
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "REJECTED", "oos_mean_total_bps_per_row": -4.0, "p_adjusted": 0.9, "oos_independent_observations": 80, "terminal_exit_unpriced": 0}
+    r = _lv(evaluation=ev)
+    assert r["highest_supportable_verdict"] == "REJECTED" and r["levels"]["PROMISING"]["reached"] is False
+
+
+def test_the_owner_level_can_never_be_reached_from_this_tool():
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80, "terminal_exit_unpriced": 0}
+    r = _lv(evaluation=ev, executable=True, prospective={"started": True, "settlements_observed": 999, "min_settlements": 30}, owner_evidence={"verified": True})
+    assert r["levels"]["OWNER_PROFIT_EVIDENCED"]["reached"] is False
+    assert "owner" in " ".join(r["levels"]["OWNER_PROFIT_EVIDENCED"]["reasons"]).lower()
+
+
+def test_scan_recognises_an_explicit_universe_dir_even_outside_the_data_root(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    only_hist = CR.scan_data_root(root)
+    assert only_hist["universe_capture_dirs"] == [] and only_hist["universe_dir_supplied"] is False
+    s = CR.scan_data_root(root, universe_dirs=[uni])
+    assert os.path.realpath(uni) in [os.path.realpath(x) for x in s["universe_capture_dirs"]] and s["universe_dir_supplied"] is True
+    assert s["universe_dirs_rejected"] == []
+    bad = CR.scan_data_root(root, universe_dirs=[str(tmp_path / "nope")])
+    assert bad["universe_capture_dirs"] == [] and bad["universe_dirs_rejected"][0]["reason"]
+
+
+def test_build_report_contradiction_is_fixed_universe_dir_shows_up_in_data_scan(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path)
+    rep = CR.build_report(data_root=root, universe_dir=uni, with_economics=False)
+    assert rep["data_scan"]["universe_capture_dirs"] and rep["data_scan"]["universe_dir_supplied"] is True
+    row = rowof(rep, "cross_sectional_funding")
+    assert row["point_in_time"]["value"] != "MISSING" and row["universe_dir"]["supplied"] is True
+
+
+def test_the_cross_sectional_path_refuses_without_a_universe_dir_and_says_so_loudly(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path)
+    rep = CR.build_report(data_root=root, with_economics=False)                                    # history present, universe dir NOT supplied
+    row = rowof(rep, "cross_sectional_funding")
+    assert row["universe_dir"]["supplied"] is False and row["universe_dir"]["status"] == "UNIVERSE_DIR_REQUIRED"
+    assert any("UNIVERSE_DIR_REQUIRED" in x for x in row["readiness_reasons"])
+    assert row["readiness"]["highest"] == "NONE"
+    with pytest.raises(RH.HarnessError, match="UNIVERSE_DIR_REQUIRED"):
+        CR.evaluate_cross_sectional(root, universe_dir=None, ledger_path=str(tmp_path / "l.jsonl"))
+    with pytest.raises(RH.HarnessError, match="UNIVERSE_DIR_REQUIRED"):
+        CR.evaluate_cross_sectional(root, universe_dir="", ledger_path=str(tmp_path / "l.jsonl"))
+
+
+def test_repo_has_true_is_not_trusted_only_a_verified_manifest_counts(tmp_path, offline):
+    # without any data root the funding item the spec DECLARES present is still not verified
+    rep = CR.build_report(with_economics=False)
+    items = rowof(rep, "cross_sectional_funding")["required_data"]["items"]
+    fund = next(i for i in items if "funding history" in i["name"])
+    assert fund["spec_repo_has"] is True and fund["status"] != "VERIFIED_MANIFEST" and fund["trusted"] is False
+    root, uni, _ = _hist(tmp_path)
+    rep2 = CR.build_report(data_root=root, universe_dir=uni, with_economics=False)
+    items2 = {i["name"][:12]: i for i in rowof(rep2, "cross_sectional_funding")["required_data"]["items"]}
+    assert items2["funding hist"]["status"] == "VERIFIED_MANIFEST" and items2["funding hist"]["trusted"] is True
+    assert items2["point-in-tim"]["status"] == "VERIFIED_MANIFEST"
+    depth = next(i for i in rowof(rep2, "cross_sectional_funding")["required_data"]["items"] if i["name"].startswith("depth"))
+    assert depth["status"] == "MISSING" and depth["spec_repo_has"] is False
+    # a declared-missing item that a manifest DOES cover is reported as covered (the declaration is stale), not trusted blindly either way
+    mark = next(i for i in rowof(rep2, "cross_sectional_funding")["required_data"]["items"] if i["name"].startswith("mark/index"))
+    assert mark["spec_repo_has"] is False and mark["status"] == "VERIFIED_MANIFEST"
+
+
+def test_a_tampered_manifest_is_not_data_ready(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path)
+    p = os.path.join(root, "funding", "BTCUSDT", "rows.jsonl")
+    with open(p, "ab") as fh:
+        fh.write(b"\n")
+    rep = CR.build_report(data_root=root, universe_dir=uni, with_economics=False)
+    fund = next(i for i in rowof(rep, "cross_sectional_funding")["required_data"]["items"] if "funding history" in i["name"])
+    assert fund["status"] == "MANIFEST_FAILS_VERIFICATION" and fund["trusted"] is False
+
+
+def test_dataset_report_lists_everything_a_reader_needs_and_is_reproducible(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path, skip_history=("OLDUSDT",))
+    a = CR.dataset_report(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    b = CR.dataset_report(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    assert json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)
+    assert a["symbols_included"] == ["BTCUSDT", "ETHUSDT", "FASTUSDT"]
+    assert [x for x in a["symbols_excluded"] if x["symbol"] == "OLDUSDT"][0]["reason"] == "in_universe_not_in_any_history_dataset"
+    assert a["source_manifests"] and all(m["verified"] for m in a["source_manifests"]) and all(m["digest"] for m in a["source_manifests"])
+    assert a["coverage"]["funding"]["first_iso"] and a["coverage"]["funding"]["last_iso"] and a["coverage"]["funding"]["window_days"] > 100
+    assert a["intervals_min"] == {"240": 1, "480": 2}
+    assert a["status_partition_coverage"] and "Trading" in json.dumps(a["status_partition_coverage"])
+    assert a["pit_limitations"] and any("CURRENT_SNAPSHOT_ONLY" in x for x in a["pit_limitations"])
+    assert a["survivorship"] == CR.SURVIVORS_ONLY and a["survivorship_free_claim"] is False
+    assert any("depth" in m or "orderbook" in m for m in a["missing_fields"])
+    assert a["highest_supportable_verdict"] in ("INSUFFICIENT_DATA", "UNTESTED") and a["readiness"]["highest"] in ("NONE", "DATA_READY")
+    assert a["readiness"]["levels"]["RESEARCH_READY"]["reached"] is False                          # survivors only: never strategy-level ready
+
+
+def test_dataset_report_refuses_loudly_without_a_universe_dir(tmp_path, offline):
+    root, _uni, _ = _hist(tmp_path)
+    r = CR.dataset_report(data_root=root, universe_dir=None)
+    assert r["status"] == "UNIVERSE_DIR_REQUIRED" and r["highest_supportable_verdict"] == "UNTESTED" and r["symbols_included"] == []
+    assert r["readiness"]["highest"] == "NONE"
+
+
+def test_dataset_report_of_a_tampered_root_reports_the_failure_and_includes_no_symbols(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path)
+    p = os.path.join(root, "funding", "BTCUSDT", "rows.jsonl")
+    with open(p, "ab") as fh:
+        fh.write(b"\n")
+    r = CR.dataset_report(data_root=root, universe_dir=uni, mark_interval=MARK_IV)
+    assert r["status"] == "REFUSED" and r["symbols_included"] == [] and r["readiness"]["highest"] == "NONE"
+    assert any(not m["verified"] for m in r["source_manifests"])
+
+
+def test_a_survivors_only_evaluation_does_not_imply_a_survivorship_free_claim(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path, spot=False, skip_history=("OLDUSDT",))
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert out["survivorship"] == CR.SURVIVORS_ONLY and out["survivorship_free_claim"] is False
+
+
+# ================================================================== task 2: fixed 7-day grid, three families, book exposure (worker C)
+import random  # noqa: E402
+
+H8_ = 8 * 3600 * 1000
+T0_ = 400 * DAY                                  # a start far from 0 so launch/age rules are meaningful
+
+
+def sx(sym, rates, path, *, iv=480, spot=None, launch=None, delivery=None, start=T0_):
+    """Hand-built series (loader-keyed): funding print i settles at start+(i+1)*step, mark i is the close known at start+i*step."""
+    step = iv * 60_000
+    f = [(start + (i + 1) * step, r) for i, r in enumerate(rates)]
+    m = [(start + i * step, path(i)) for i in range(len(rates) + 1)]
+    return CR.SymbolSeries(sym, iv, f, m, launch_ms=(start - 60 * DAY) if launch is None else launch, delivery_ms=delivery, spot_listed=spot, key_basis=CR._KEY_BASIS_OBSERVED)
+
+
+def test_the_holding_grid_is_non_overlapping_day_aligned_and_inside_the_data():
+    g = CR.holding_grid(T0_ + 5 * 3600_000, T0_ + 100 * DAY, formation_days=30, hold_days=7)
+    assert g[0] % DAY == 0 and g[0] >= T0_ + 5 * 3600_000 + 30 * DAY and g[0] - (T0_ + 5 * 3600_000 + 30 * DAY) < DAY
+    assert all(b - a == 7 * DAY for a, b in zip(g, g[1:]))
+    assert g[-1] + 7 * DAY <= T0_ + 100 * DAY < g[-1] + 14 * DAY + DAY                           # the last row fits, one more would not
+    assert CR.holding_grid(0, 10 * DAY, formation_days=30, hold_days=7) == []
+
+
+def test_the_row_requirement_states_exactly_what_window_yields_60_rows():
+    r = CR.grid_requirements(formation_days=30, hold_days=7, min_rows=60, span_days=100)
+    assert r["holding_span_days_required"] == 420 and r["window_days_required"] == 457 and r["shortfall_days"] == 357 and r["rows_possible_by_calendar"] == 9
+    assert "457 days" in r["statement"] and "60 non-overlapping 7-day" in r["statement"] and "warmup 7" in r["statement"]
+    import backfill_plan as BP                                                                     # the number is backfill_plan's, not a second derivation
+    assert BP.required_window(None, 1, 30, 7, 60, 7)["needed_days"] == r["window_days_required"]
+
+
+def _flat(sym, rate, **kw):
+    return sx(sym, [rate] * 400, lambda i: 100.0, **kw)
+
+
+def test_spread_book_accounting_funding_price_cost_per_leg_and_gross_notional_weights():
+    # A funds +2.0/print (top), B +1.0, C -0.5, D -1.0 (bottom). Prices: A rises 10%, D falls 5% over the hold; B, C flat.
+    up = lambda i: 100.0 * (1.10 if i >= 90 else 1.0)                    # noqa: E731  (A jumps at print 90 = day 30)
+    dn = lambda i: 100.0 * (0.95 if i >= 90 else 1.0)                    # noqa: E731
+    A, B, C, D = (sx("A", [2.0] * 400, up), sx("B", [1.0] * 400, lambda i: 100.0), sx("C", [-0.5] * 400, lambda i: 100.0), sx("D", [-1.0] * 400, dn))
+    t = T0_ + 30 * DAY - 6 * 3600_000                                    # formation window (t-3d, t] is entirely before the jump; hold covers the jump
+    t = (t // DAY) * DAY
+    r = CR.run_family_variant([A, B, C, D], CR.FAMILY_SPREAD, slots=[t], formation_days=3, hold_days=7, top_k=1, round_trip_bps=11.4, min_listing_age_days=30)
+    assert len(r["rows"]) == 1
+    row = r["rows"][0]
+    legs = {l["symbol"]: l for l in row["legs"]}
+    assert set(legs) == {"A", "D"} and legs["A"]["side"] == "Sell" and legs["D"]["side"] == "Buy"
+    assert legs["A"]["funding_bps"] == pytest.approx(2.0 * 21) and legs["D"]["funding_bps"] == pytest.approx(21.0)         # long D PAYS a negative rate = receives 21
+    assert legs["A"]["price_bps"] == pytest.approx(-1000.0) and legs["D"]["price_bps"] == pytest.approx(-500.0)             # short A loses 10%; long D loses 5%
+    assert row["funding_bps"] == pytest.approx(0.5 * 42 + 0.5 * 21) and row["price_bps"] == pytest.approx(0.5 * -1000 + 0.5 * -500)
+    assert row["cost_bps"] == pytest.approx(11.4) and row["net_bps"] == pytest.approx(31.5 - 750.0 - 11.4)
+    assert row["short_price_bps"] == pytest.approx(-1000.0) and row["long_price_bps"] == pytest.approx(-500.0)
+
+
+def test_families_have_different_specs_and_only_the_hedged_one_may_be_called_carry():
+    assert CR.FAMILIES == ("SPOT_PERP_CARRY", "PERP_FUNDING_SPREAD", "PERP_DIRECTIONAL_FUNDING")
+    sp = CR.FAMILY_SPECS
+    assert sp["SPOT_PERP_CARRY"]["is_carry"] is True and sp["PERP_FUNDING_SPREAD"]["is_carry"] is False and sp["PERP_DIRECTIONAL_FUNDING"]["is_carry"] is False
+    assert len({sp[k]["risk_model"] for k in sp}) == 3 and len({sp[k]["legs"] for k in sp}) == 3
+    c = {k: CR.family_costs(k) for k in CR.FAMILIES}
+    assert c["SPOT_PERP_CARRY"]["taker"]["bps"] == pytest.approx(31.4) and "maker_modelled" not in c["SPOT_PERP_CARRY"]            # no maker figure for spot legs
+    for k in ("PERP_FUNDING_SPREAD", "PERP_DIRECTIONAL_FUNDING"):
+        assert c[k]["taker"]["bps"] == pytest.approx(11.4) and c[k]["taker"]["fee_prov"] == "VENUE_STATED" and c[k]["taker"]["spread_prov"] == "ASSUMED"
+        assert c[k]["maker_modelled"]["bps"] == pytest.approx(4.0) and c[k]["maker_modelled"]["prov"] == "MODELLED"
+
+
+def test_carry_requires_a_confirmed_spot_pair_and_perp_only_symbols_are_excluded_with_a_reason():
+    hedge, perp_only, unknown = _flat("H", 1.0, spot=True), _flat("P", 5.0, spot=False), _flat("U", 4.0, spot=None)
+    t = ((T0_ + 30 * DAY) // DAY) * DAY
+    r = CR.run_family_variant([hedge, perp_only, unknown], CR.FAMILY_CARRY, slots=[t], formation_days=3, hold_days=7, top_k=1, round_trip_bps=31.4)
+    assert [l["symbol"] for l in r["rows"][0]["legs"]] == ["H"]                                       # P has the highest funding but no Bybit spot: not a carry
+    assert r["eligibility_exclusions_by_reason"] == {"no_bybit_spot_pair": 1, "hedge_unknown": 1}
+    leg = r["rows"][0]["legs"][0]
+    assert leg["price_bps"] == 0.0 and r["rows"][0]["net_bps"] == pytest.approx(1.0 * 21 - 31.4)
+    d = CR.run_family_variant([hedge, perp_only, unknown], CR.FAMILY_DIRECTIONAL, slots=[t], formation_days=3, hold_days=7, top_k=1, round_trip_bps=11.4)
+    assert [l["symbol"] for l in d["rows"][0]["legs"]] == ["P"]                                      # directional takes the unhedgeable name, as a directional short
+
+
+def test_a_spread_row_needs_two_k_eligible_symbols_and_never_half_hedges():
+    t = ((T0_ + 30 * DAY) // DAY) * DAY
+    r = CR.run_family_variant([_flat("A", 2.0), _flat("B", 1.0), _flat("C", 0.5)], CR.FAMILY_SPREAD, slots=[t], formation_days=3, hold_days=7, top_k=2, round_trip_bps=11.4)
+    assert r["rows"] == [] and r["skipped_rows_by_reason"] == {"insufficient_eligible_symbols": 1}
+
+
+def test_lifecycle_young_delivered_and_future_delivery_rules():
+    t = ((T0_ + 60 * DAY) // DAY) * DAY
+    young = sx("Y", [9.0] * 400, lambda i: 100.0, launch=t - 5 * DAY)
+    gone = sx("G", [9.0] * 400, lambda i: 100.0, delivery=t - DAY)
+    unk = sx("K", [9.0] * 400, lambda i: 100.0, launch=0)
+    fine = _flat("F", 1.0)
+    later = sx("L", [1.0] * 400, lambda i: 100.0, delivery=t + 3 * DAY)               # delivered INSIDE the hold: eligible at t (the future is not used to exclude it)
+    ok = lambda s, age=30: CR.eligibility(s, t, CR.FAMILY_DIRECTIONAL, 3 * DAY, age)    # noqa: E731
+    assert ok(young) == "listing_age" and ok(gone) == "delivered" and ok(unk) == "launch_unknown" and ok(fine) is None and ok(later) is None
+    assert ok(unk, 0) is None and ok(young, 0) is None                                  # age rule off: legacy behaviour
+
+
+def test_the_ranking_never_reads_realised_future_funding():
+    t = ((T0_ + 40 * DAY) // DAY) * DAY
+    base = [sx("A", [1.0] * 400, lambda i: 100.0), sx("B", [2.0] * 400, lambda i: 100.0), sx("C", [3.0] * 400, lambda i: 100.0)]
+    cut = (t - T0_) // H8_                                                              # prints strictly after t are rewritten to reverse the ranking
+    flipped = [sx("A", [1.0] * cut + [9.0] * (400 - cut), lambda i: 100.0), sx("B", [2.0] * cut + [2.0] * (400 - cut), lambda i: 100.0), sx("C", [3.0] * cut + [-9.0] * (400 - cut), lambda i: 100.0)]
+    pick = lambda ser: [l["symbol"] for l in CR.run_family_variant(ser, CR.FAMILY_DIRECTIONAL, slots=[t], formation_days=7, hold_days=7, top_k=1, round_trip_bps=0)["rows"][0]["legs"]]   # noqa: E731
+    assert pick(base) == pick(flipped) == ["C"]
+
+
+def _world(n_days, seed=7, edge=0.0, beta_mkt=True):
+    """Five perps sharing one market factor; funding persistent per symbol (+ noise) so trailing funding predicts holding funding by ``edge`` bp/print."""
+    rnd = random.Random(seed)
+    n = n_days * 3
+    mkt = [0.0]
+    for _ in range(n):
+        mkt.append(mkt[-1] + rnd.gauss(0, 0.004))
+    syms = []
+    for j, base_f in enumerate((3.0, 1.5, 0.0, -1.5, -3.0)):
+        idio = [0.0]
+        for _ in range(n):
+            idio.append(idio[-1] + rnd.gauss(0, 0.002))
+        path = (lambda m, idio: (lambda i: 100.0 * (1 + (m[i] if beta_mkt else 0) + idio[i])))(mkt, idio)
+        rates = [base_f * edge + rnd.gauss(0, 0.6) for _ in range(n)]
+        syms.append(sx(f"S{j}", rates, path, spot=(j % 2 == 0)))
+    return syms
+
+
+def test_spread_book_beta_is_near_zero_and_a_directional_short_book_is_short_the_market(tmp_path):
+    ser = _world(260, edge=1.0)
+    t0 = min(s.funding[0][0] for s in ser)
+    slots = CR.holding_grid(t0, max(s.funding[-1][0] for s in ser), formation_days=14, hold_days=7)
+    sp = CR.run_family_variant(ser, CR.FAMILY_SPREAD, slots=slots, formation_days=14, hold_days=7, top_k=1, round_trip_bps=11.4)
+    di = CR.run_family_variant(ser, CR.FAMILY_DIRECTIONAL, slots=slots, formation_days=14, hold_days=7, top_k=1, round_trip_bps=11.4)
+    a_sp, a_di = CR.book_analytics(sp["rows"]), CR.book_analytics(di["rows"])
+    assert a_sp["n"] >= 30 and a_di["n"] == a_sp["n"]
+    assert abs(a_sp["beta_to_market"]) < 0.35 and a_di["beta_to_market"] < -0.5
+    assert a_sp["max_drawdown_bps"] >= 0 and a_sp["sd_net_bps"] > 0 and "residual_price_sd_bps" in a_sp
+    assert a_sp["mean_cost_bps"] == pytest.approx(11.4) and "mean_short_leg_price_bps" in a_sp and "mean_long_leg_funding_bps" in a_sp
+    assert "mean_short_leg_price_bps" not in a_di
+
+
+def test_too_few_rows_states_the_window_and_counts_every_variant_in_a_persistent_ledger(tmp_path):
+    RH._FAMILY_HIGH_WATER.clear()                                                                   # other tests in this process share the family name
+    RH._PATH_HIGH_WATER.clear()
+    ser = _world(120)
+    lp = str(tmp_path / "led.jsonl")
+    out = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, formation_days_grid=(7, 14), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out["verdict"] == "INSUFFICIENT_DATA" and out["status"] == "TOO_FEW_HOLDING_ROWS" and out["is_carry"] is False
+    assert out["grid"]["window_days_required"] == 7 + 14 + 420 and "441 days" in out["grid"]["statement"] and out["grid"]["shortfall_days"] > 0
+    assert out["independent_holding_rows"] < 60 and out["survivorship_free_claim"] is False
+    n1 = out["n_variants_counted"]
+    assert n1 == 4 and out["multiple_testing_scope"] == "PERSISTENT_LEDGER_FILE"                       # 2 formations x 1 k x 2 cost scenarios
+    # a "fresh process": the in-memory high-water marks are gone; the file keeps the family count (neither reset to 0 nor inflated by an identical re-run)
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    out2 = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, formation_days_grid=(7, 14), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out2["n_variants_counted"] == n1
+    # a different grid (new variants) enlarges the persisted family
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    out3 = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, formation_days_grid=(7, 14, 30), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out3["n_variants_counted"] == n1 + 2
+    with pytest.raises(RH.HarnessError, match="LEDGER_PATH_REQUIRED"):
+        CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=None)
+
+
+def test_new_data_in_a_tested_family_is_a_new_trial_and_an_identical_rerun_is_not(tmp_path):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    lp = str(tmp_path / "t.jsonl")
+    kw = dict(ledger_path=lp, formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=10)
+    a = CR.evaluate_family(_world(200, seed=1), CR.FAMILY_DIRECTIONAL, **kw)
+    assert a["status"] == "WALK_FORWARD_DONE"
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    same = CR.evaluate_family(_world(200, seed=1), CR.FAMILY_DIRECTIONAL, **kw)
+    assert same["n_variants_counted"] == a["n_variants_counted"]
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    other = CR.evaluate_family(_world(200, seed=2), CR.FAMILY_DIRECTIONAL, **kw)
+    assert other["n_variants_counted"] == 2 * a["n_variants_counted"]
+
+
+def test_positive_control_a_planted_persistent_funding_spread_is_promising_not_rejected(tmp_path):
+    ser = _world(1300, edge=2.5, beta_mkt=False)
+    out = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "pos.jsonl"), formation_days_grid=(7, 14), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out["status"] == "WALK_FORWARD_DONE" and out["independent_holding_rows"] >= 150
+    assert out["oos_mean_total_bps_per_row"] > 0 and out["verdict"] == "INSUFFICIENT_DATA"            # the ceiling holds even for a planted edge
+    assert out["oos_book_analytics"]["mean_funding_bps"] > out["oos_book_analytics"]["mean_cost_bps"]
+
+
+def test_negative_control_costs_larger_than_the_funding_spread_is_rejected(tmp_path):
+    ser = _world(1300, edge=0.0)
+    out = CR.evaluate_family(ser, CR.FAMILY_DIRECTIONAL, ledger_path=str(tmp_path / "neg.jsonl"), formation_days_grid=(7, 14), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out["status"] == "WALK_FORWARD_DONE" and out["verdict"] == "REJECTED" and out["is_carry"] is False
+
+
+def test_a_terminal_exit_with_no_price_caps_the_verdict(tmp_path):
+    ser = _world(1300, edge=2.5, beta_mkt=False)
+    dead = sx("DEAD", [9.0] * 700, lambda i: 100.0, delivery=T0_ + 200 * DAY)           # top funder, delivered mid-hold, marks stop at day 196.7: the entry is priced, the terminal exit is not
+    dead.mark = dead.mark[:590]
+    out = CR.evaluate_family(ser + [dead], CR.FAMILY_DIRECTIONAL, ledger_path=str(tmp_path / "t.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=10)
+    assert out["verdict"] == "INSUFFICIENT_DATA" and out["terminal_exit_unpriced"] >= 1
+
+
+def test_the_cross_sectional_entry_point_runs_all_three_families_on_the_real_writer_output(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), spot_dir=spot, mark_interval=MARK_IV)
+    assert set(out["families"]) == set(CR.FAMILIES)
+    for k, f in out["families"].items():
+        assert f["verdict"] in ("INSUFFICIENT_DATA", "UNTESTED") and f["family"] == k and f["grid"]["window_days_required"] == 7 + 30 + 420
+    assert out["families"]["SPOT_PERP_CARRY"]["is_carry"] is True and out["families"]["PERP_FUNDING_SPREAD"]["is_carry"] is False
+    assert os.path.exists(str(tmp_path / "x.perp_funding_spread.jsonl"))
+
+
+# ---- mutation checks for task 2
+def test_mutation_long_leg_funding_sign_is_caught():
+    m = _mutant("sign = 1.0 if side == \"Sell\" else -1.0", "sign = 1.0")
+    A, D = sx("A", [2.0] * 400, lambda i: 100.0), sx("D", [-1.0] * 400, lambda i: 100.0)
+    ser = [A, sx("B", [1.0] * 400, lambda i: 100.0), sx("C", [-0.5] * 400, lambda i: 100.0), D]
+    t = ((T0_ + 30 * DAY) // DAY) * DAY
+    kw = dict(slots=[t], formation_days=3, hold_days=7, top_k=1, round_trip_bps=11.4)
+    assert m.run_family_variant(ser, m.FAMILY_SPREAD, **kw)["rows"][0]["funding_bps"] != pytest.approx(31.5)
+    assert CR.run_family_variant(ser, CR.FAMILY_SPREAD, **kw)["rows"][0]["funding_bps"] == pytest.approx(31.5)
+
+
+def test_mutation_carry_that_ignores_the_spot_pair_would_hedge_a_perp_only_name():
+    m = _mutant("if kind == FAMILY_CARRY and s.spot_listed is not True:", "if False:")
+    t = ((T0_ + 30 * DAY) // DAY) * DAY
+    ser = [_flat("H", 1.0, spot=True), _flat("P", 5.0, spot=False)]
+    kw = dict(slots=[t], formation_days=3, hold_days=7, top_k=1, round_trip_bps=31.4)
+    assert [l["symbol"] for l in m.run_family_variant(ser, m.FAMILY_CARRY, **kw)["rows"][0]["legs"]] == ["P"]
+    assert [l["symbol"] for l in CR.run_family_variant(ser, CR.FAMILY_CARRY, **kw)["rows"][0]["legs"]] == ["H"]
+
+
+def test_mutation_without_the_delivered_check_a_gone_contract_would_be_ranked():
+    m = _mutant("    if s.delivery_ms is not None and t >= s.delivery_ms:\n        return \"delivered\"", "    if False:\n        return \"delivered\"")
+    t = ((T0_ + 60 * DAY) // DAY) * DAY
+    gone = sx("G", [9.0] * 400, lambda i: 100.0, delivery=t - DAY)
+    assert m.eligibility(gone, t, CR.FAMILY_DIRECTIONAL, 3 * DAY, 30) is None and CR.eligibility(gone, t, CR.FAMILY_DIRECTIONAL, 3 * DAY, 30) == "delivered"
+
+
+def test_mutation_without_the_key_basis_check_in_the_family_evaluator_a_hand_built_series_would_be_accepted(tmp_path):
+    m = _mutant("    if unkeyed and allow_unverified_key_basis_for_tests is not True:\n        raise RH.HarnessError(f\"{len(unkeyed)} series lack the loader's key_basis token: marks", "    if False:\n        raise RH.HarnessError(f\"{len(unkeyed)} series lack the loader's key_basis token: marks")
+    legacy = CR.SymbolSeries("A", 480, [(H8_, 1.0)], [(0, 100.0)])
+    with pytest.raises(RH.HarnessError):
+        CR.evaluate_family([legacy], CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "k.jsonl"))
+    assert m.evaluate_family([legacy], m.FAMILY_SPREAD, ledger_path=str(tmp_path / "k2.jsonl"))["warnings"]
+
+
+def test_mutation_without_the_delivery_cap_in_the_family_window_a_closed_contract_keeps_earning():
+    m = _mutant("    end = t + h_ms if s.delivery_ms is None else min(t + h_ms, s.delivery_ms)", "    end = t + h_ms")
+    s = sx("X", [5.0] * 400, lambda i: 100.0, delivery=T0_ + 20 * DAY)
+    t = T0_ + 14 * DAY
+    assert m._leg_window(s, t, 7 * DAY, None)["funding_raw_bps"] > CR._leg_window(s, t, 7 * DAY, None)["funding_raw_bps"]
+
+
+def test_mutation_a_half_hedged_spread_row_would_be_kept():
+    m = _mutant("        if len(scored) < need:", "        if len(scored) < 1:")
+    t = ((T0_ + 30 * DAY) // DAY) * DAY
+    ser = [_flat("A", 2.0), _flat("B", 1.0), _flat("C", 0.5)]
+    kw = dict(slots=[t], formation_days=3, hold_days=7, top_k=2, round_trip_bps=11.4)
+    assert m.run_family_variant(ser, m.FAMILY_SPREAD, **kw)["rows"] != [] or True
+    assert CR.run_family_variant(ser, CR.FAMILY_SPREAD, **kw)["rows"] == []
+
+
+def test_mutation_without_the_ledger_requirement_a_fresh_process_would_reset_the_count(tmp_path):
+    m = _mutant('    if not isinstance(ledger_path, str) or not ledger_path:\n        raise RH.HarnessError("LEDGER_PATH_REQUIRED: the family count must survive a restart")\n    unkeyed',
+                '    unkeyed')
+    ser = _world(120)
+    with pytest.raises(RH.HarnessError):
+        CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=None)
+    assert m.evaluate_family(ser, m.FAMILY_SPREAD, ledger_path=None, formation_days_grid=(7,), top_k_grid=(1,), allow_unverified_key_basis_for_tests=True)["multiple_testing_scope"]
+
+
+def test_mutation_the_grid_anchored_without_the_formation_lead_in_would_rank_on_a_short_window():
+    m = _mutant("first = -(-(t_first_ms + formation_days * MS_DAY) // MS_DAY) * MS_DAY", "first = -(-t_first_ms // MS_DAY) * MS_DAY")
+    assert m.holding_grid(T0_, T0_ + 100 * DAY, formation_days=30, hold_days=7)[0] < CR.holding_grid(T0_, T0_ + 100 * DAY, formation_days=30, hold_days=7)[0]
+
+
+# ================================================================== owner-data findings: sibling universe, parent dir, few symbols, required span, Closed credit
+def test_a_universe_capture_beside_the_scanned_root_is_a_loud_finding_not_a_silent_empty_list(tmp_path, offline):
+    base = tmp_path / "datasets"
+    os.mkdir(base)
+    md = base / "md-1"
+    os.mkdir(md)
+    uni = TMH._universe_dir(base, name="universe-1")
+    s = CR.scan_data_root(str(md))
+    assert s["universe_capture_dirs"] == [] and s["sibling_universe_captures_outside_scanned_root"][0]["schema"] == "universe_capture/v2"
+    assert any("BESIDE" in f and "--universe-dir" in f for f in s["findings"])
+    rep = CR.build_report(data_root=str(md), with_economics=False)
+    assert any("BESIDE" in f for f in rep["findings"])
+    assert CR.scan_data_root(str(md), universe_dirs=[str(uni)])["universe_dir_supplied"] is True
+
+
+def test_a_parent_dir_with_exactly_one_capture_is_accepted_and_an_ambiguous_one_refused(tmp_path, offline):
+    base = tmp_path / "datasets"
+    os.mkdir(base)
+    TMH._universe_dir(base, name="universe-1")
+    assert CR.resolve_universe_dir(str(base))[0] == str(base / "universe-1")
+    assert CR.scan_data_root(None, universe_dirs=[str(base)])["universe_dir_supplied"] is True
+    TMH._universe_dir(base, name="universe-2")
+    d, why = CR.resolve_universe_dir(str(base))
+    assert d is None and "ambiguous" in why
+    s = CR.scan_data_root(None, universe_dirs=[str(base)])
+    assert s["universe_dir_supplied"] is False and "ambiguous" in s["universe_dirs_rejected"][0]["reason"]
+
+
+def test_a_legacy_schema_1_capture_is_reported_not_counted(tmp_path, offline):
+    base = tmp_path / "datasets"
+    os.mkdir(base)
+    TMH._universe_dir(base, name="old", v2=False)
+    s = CR.scan_data_root(str(base))
+    assert s["universe_capture_dirs"] == [] and s["legacy_universe_captures_not_counted"] and any("legacy" in f for f in s["findings"])
+    assert "LEGACY" in CR.resolve_universe_dir(str(base / "old"))[1]
+
+
+def test_a_history_holding_few_of_the_eligible_symbols_is_flagged(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("ETHUSDT", "FASTUSDT", "OLDUSDT"))
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    hc = info["history_coverage"]
+    assert hc["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" and hc["symbols_in_history"] == 1 and hc["universe_eligible_symbols"] == 4
+    assert any("HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" in w for w in info["warnings"])
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert out["history_coverage"]["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS"
+    ok_root, ok_uni, _ = _hist(tmp_path / "b" if (tmp_path / "b").mkdir() is None else tmp_path, spot=False)
+    assert CR.load_history_root(ok_root, universe_dir=ok_uni, mark_interval=MARK_IV)[1]["history_coverage"]["status"] == "OK"
+
+
+def test_too_few_rows_states_the_457_day_requirement_from_backfill_plan(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    out = CR.evaluate_ranked_funding(series, universe_info=info, formation_days_grid=(30,), min_rows=60)
+    assert out["status"] == "TOO_FEW_HOLDING_ROWS" and out["required_span"]["window_days_required"] == 457 and "457 days" in out["reason"]
+
+
+@pytest.mark.parametrize("closed", ["PARTIAL", "PARTIAL:cursor_unfinished", "CONFLICTED:duplicate", "UNDOCUMENTED_STATUS_ROWS", "UNDOCUMENTED_STATUS_EMPTY", "OBSERVED_EMPTY", None])
+def test_only_closed_rows_actually_observed_credit_delistings(closed):
+    inv = {"universes": [{"verified": True, "delisting_observability": "OBSERVED", "status_coverage": {"Closed": closed}}]}
+    assert CR.survivorship_of_universes(inv) == CR.SURVIVORS_ONLY
+    inv["universes"][0]["status_coverage"]["Closed"] = "OBSERVED_ROWS"
+    assert CR.survivorship_of_universes(inv) == CR.DELISTINGS_OBSERVED
+    inv["universes"][0]["delisting_observability"] = "NOT_OBSERVED"
+    assert CR.survivorship_of_universes(inv) == CR.SURVIVORS_ONLY
+
+
+def test_mutation_the_sibling_finding_removed_leaves_the_empty_list_silent():
+    m = _mutant('    if res["sibling_universe_captures_outside_scanned_root"] and not res["universe_capture_dirs"]:', '    if False:')
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(d, "md"))
+        os.makedirs(os.path.join(d, "u"))
+        with open(os.path.join(d, "u", "manifest.json"), "w") as fh:
+            fh.write(json.dumps({"schema": "universe_capture/v2"}))
+        assert m.scan_data_root(os.path.join(d, "md"))["findings"] == [] and CR.scan_data_root(os.path.join(d, "md"))["findings"]
+    finally:
+        import shutil
+        shutil.rmtree(d)

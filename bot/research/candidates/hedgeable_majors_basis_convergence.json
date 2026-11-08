@@ -1,0 +1,132 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "final holdout window never used for threshold or universe selection"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": false,
+    "hedge_completeness_modelled": false,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": false,
+    "point_in_time_universe": false
+  },
+  "candidate_id": "hedgeable_majors_basis_convergence@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 25000.0,
+    "note": "limited by the thinner of spot and perp depth; borrow for spot shorts not available to the owner"
+  },
+  "counterparty": "leveraged perp traders paying a premium over spot, and liquidation-driven flow at extremes, on majors that have a Bybit spot pair",
+  "drawdown_model": "mark-to-market basis drawdown measured on synchronised prices",
+  "economic_mechanism": "Counterparty: the leveraged directional trader who pays a premium to be long through the perp, and liquidation-driven flow at extremes. Hypothesis: on a small set of majors that are HEDGEABLE on Bybit spot, the perp-minus-spot basis mean-reverts after a dislocation fast enough that the converging basis plus the funding collected while waiting beat the spot+perp round trip, and the dislocation is larger when funding is extreme. This is a basis-convergence trade (the basis move is the P&L, funding a secondary term), not a funding carry. Persists while perp leverage demand outstrips arbitrage balance sheet; disappears as basis desks compete, and when the basis widens further before converging (mark-to-market and margin risk on the hedge).",
+  "eligibility_rules": [
+    "majors with a confirmed Bybit spot pair (CURRENT_SNAPSHOT_ONLY hedgeability: a label, flagged as a PIT limitation)",
+    "both legs tradable at the timestamp",
+    "funding interval per symbol, interval-normalised"
+  ],
+  "entry": "enter long spot / short perp when the as-of basis z-score exceeds a registered threshold; the funding state is a registered conditioning variable",
+  "execution_model": "taker perp + taker spot; legs not atomic: leg risk modelled",
+  "exit": "basis back inside a registered band or a time stop",
+  "family": "hedgeable_majors_basis_convergence",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "spot_taker_bps": {
+      "note": "carry_costs.TAKER_BPS_SPOT: the SPOT leg's base-tier taker fee (published schedule)",
+      "provenance": "venue_stated",
+      "value": 10.0
+    },
+    "taker_bps": {
+      "note": "carry_costs.TAKER_BPS_PERP: the PERP leg's base-tier taker fee (published schedule); the spot leg is spot_taker_bps. A spot+perp round trip is 2 x (taker_bps + spot_taker_bps) = 31.0 bps",
+      "provenance": "venue_stated",
+      "value": 5.5
+    }
+  },
+  "funding_interval_handling": {
+    "method": "interval-normalised: funding_bps_per_day = rate_bps * 1440 / fundingInterval_min per symbol; holding-horizon funding = bps/day x days; per-interval cohorts (480m / 240m / 60m) reported separately; settlement grid is per symbol; a Closed contract earns nothing after its deliveryTime",
+    "source_of_interval_facts": "OWNER-OBSERVED live probe (unverified in this repo): Bybit funding interval is per symbol (480m, 240m, sometimes 60m) and 14 of the top 20 positive-funding perps over $5M turnover were 240m contracts",
+    "unknown_interval": "funding normalisation UNKNOWN -> the candidate cannot pass"
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.3
+    }
+  },
+  "holding_period": "hours to days (registered)",
+  "hypothesis": "On Bybit majors that have a spot pair, basis dislocations beyond a registered z-score converge within the hold by more than the spot+perp round trip, and extreme funding conditions the size of the dislocation.",
+  "multiple_testing_family": "hedgeable_majors_basis_convergence",
+  "proposed_by": "tools/candidate_competition.py (next-hypothesis draft)",
+  "prospective_protocol": {
+    "description": "register thresholds then observe forward basis excursions and fills on testnet mechanics",
+    "min_coverage": 0.9,
+    "min_duration_ms": 2592000000,
+    "min_settlements": 30,
+    "note": "floors only: no start date is claimed here; the registration that opens the window sets and seals it",
+    "start_ms": null
+  },
+  "rejection_conditions": [
+    "no synchronised spot/perp data of at least 1-minute resolution exists for the test window",
+    "adjusted p-value (Holm over every attempted threshold/band variant) above 0.05",
+    "net edge after assumed costs not positive",
+    "profit concentrated in fewer than 5 independent excursions",
+    "basis widens beyond the stop in more than a registered share of entries"
+  ],
+  "required_data": [
+    {
+      "declaration_keys": [
+        "hedge_completeness_modelled",
+        "no_look_ahead"
+      ],
+      "gap": "spot BTC 1h/4h OHLCV and Bybit linear 1d exist; not synchronised tick or 1m, and not for the other majors",
+      "name": "synchronised spot and perp mid/mark prices at settlement and intra-8h for the majors",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "no_future_funding_knowledge"
+      ],
+      "gap": "BTC/ETH/SOL Binance; BTC Bybit",
+      "name": "perp funding history for the majors",
+      "point_in_time": true,
+      "repo_has": true
+    },
+    {
+      "declaration_keys": [
+        "point_in_time_universe"
+      ],
+      "gap": "only a CURRENT spot-instruments snapshot can be captured; the history of which pairs were listed when is not in the repo",
+      "name": "point-in-time spot-pair availability for the majors",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "declaration_keys": [
+        "fills_modelled_against_real_depth"
+      ],
+      "gap": "BTC/ETH spot L2 only; no perp book history",
+      "name": "spot and perp L2 depth",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "basis widens before it converges; perp margin calls on the short leg; spot custody",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 3.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 3.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. DRAFT PROPOSED by tools/candidate_competition.py after the credible candidates all failed or stayed untestable on the data that exists; it is registered UNTESTED. A bias_declaration is True only where the data needed to rule that bias out is in the repo; it is False wherever a required_data item with repo_has=false names it in declaration_keys. No start date is claimed: the registration that opens a window sets and seals it."
+}

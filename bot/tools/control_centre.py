@@ -1,0 +1,892 @@
+"""Owner control centre: a READ-ONLY, localhost-only operator UI over data that already exists. It tells one operator, truthfully, what the system knows and what it does not.
+
+    python3 tools/control_centre.py [--data-root DIR] [--universe-dir DIR] [--artifacts-dir DIR] [--port 8787] [--with-economics] [--verify]
+    python3 tools/control_centre.py --print-state ...        # the JSON the UI renders, no server
+
+What it is NOT: it has no controls. It cannot place, amend or cancel an order, arm anything, write a file, or make an outbound request. It never imports a venue client, a
+transport or any signing code (``tests/test_control_centre.py`` pins that). The HTTP surface is GET-only on 127.0.0.1 (any other bind host is refused at start-up):
+
+    GET /               the page            GET /static/{index.html,app.js,style.css}   (an allow-list of exactly these; nothing else is served)
+    GET /api/state      the state dict (JSON, allow_nan=False)                           GET /api/health   {"ok": true} (liveness only)
+    anything else => 404; any method other than GET => 405; a Host header that is not localhost/127.0.0.1 (DNS rebinding) => 403; no query string is ever used.
+Headers on every response: Content-Security-Policy (default-src 'self'), X-Content-Type-Options nosniff, Cache-Control no-store. No env VALUE is logged or returned
+(secrets are ``set``/``unset`` only); the access log is silenced.
+
+Sources (all read-only, all existing modules): ``owner_console.build`` (environment flags, capital, eligibility, testnet qualification, backup, P&L stub),
+``promotion_gate.evaluate_promotion_gate`` (the gate verdict), ``candidate_readiness`` (candidate specs, readiness, universe scan), ``data_freshness_audit.audit`` (three axes),
+``universe_capture.verify_capture_dir`` (a capture's integrity) and the JSON ARTIFACTS below. Nothing is invented: a value with no source is ``{"v": null, "basis": "MISSING"}``
+and a section with no source says so (``state: "NO_DATA"``); NO_DATA is never green.
+
+BASIS vocabulary (closed; the UI shows the legend on every view; ``val()`` forces MISSING for a null value):
+    MEASURED                observed in captured data or the owner account
+    EXCHANGE_REPORTED       a venue response
+    CALCULATED              derived from measured inputs
+    ESTIMATED               a model or an assumption produced it
+    SIMULATED               replay / paper; never realised cash
+    MISSING                 no source; NOT zero, NOT fine
+    UNVERIFIED              self-consistent but not authenticated (e.g. a capture whose raw responses re-hash: it proves what was read, not that the exchange produced it)
+    OWNER_SUPPLIED_UNVERIFIED   an owner import that has not been reconciled against the venue
+
+ARTIFACT CONTRACT (files in ``--artifacts-dir``; written by the multi-symbol layer's CLIs; this module consumes ONLY these files, never the ms_* modules). Every file is one JSON
+object <= 1 MiB, UTF-8, no NaN/Infinity, a regular file (not a symlink or directory), with these common keys:
+    schema        exact string below            generated_ms  int, UTC ms (not more than 5 min in the future)
+    basis         one of the per-file allowed bases below (anything else => the file is rejected)
+Unknown extra keys are ignored (never shown). ``num`` = finite JSON number (not bool); ``num|null`` = unknown (null means UNKNOWN, never zero). Money is USD, rates are basis points.
+A missing file => section shows an empty state. A malformed/oversize/symlink/NaN/wrong-schema file => ``state: "ERROR"`` listing the file and the reason; no value from it is shown.
+
+  replay_report.json    schema "replay_report/v1"   basis: SIMULATED
+      universe_scope  "SURVIVORS_ONLY" | "DELISTINGS_OBSERVED"     (anything but a corroborated DELISTINGS_OBSERVED is shown as survivors-only)
+      period_start_ms int|null, period_end_ms int|null, n_groups int
+      groups_by_state {GroupState name: int}                        gross_pnl_usd num|null, fees_usd num|null, net_pnl_usd num|null   (gross and net are DIFFERENT fields)
+      symbols [ {symbol str, kind OPP_KIND, spot_hedge HEDGEABLE_ON_BYBIT|PERP_ONLY|HEDGE_UNKNOWN, n_groups int, gross_pnl_usd num|null, fees_usd num|null, net_pnl_usd num|null} ]
+  portfolio_state.json  schema "portfolio_state/v1" basis: SIMULATED | MEASURED | EXCHANGE_REPORTED | OWNER_SUPPLIED_UNVERIFIED
+      equity_usd num|null, gross_exposure_usd num, net_exposure_usd num, unrealised_pnl_usd num|null
+      positions [ {symbol str, kind OPP_KIND, spot_hedge (as above), side "Buy"|"Sell", notional_usd num, entry_price num|null, mark_price num|null, unrealised_pnl_usd num|null, group_id str|null} ]
+  risk_state.json       schema "risk_state/v1"      basis: CALCULATED | MEASURED | SIMULATED
+      halted bool, halt_reasons [str]
+      limits [ {name str, unit str, limit num|null, value num|null, status "OK"|"BREACH"|"UNKNOWN"} ]
+      alerts [ {severity "INFO"|"WARN"|"CRITICAL", code str, detail str} ]
+  ledger_pnl.json       schema "ledger_pnl/v1"      basis: SIMULATED | MEASURED | EXCHANGE_REPORTED | OWNER_SUPPLIED_UNVERIFIED
+      period_start_ms int|null, period_end_ms int|null
+      realised_gross_usd num|null, fees_usd num|null, funding_usd num|null, realised_net_usd num|null, unrealised_usd num|null
+      net_usd num|null (OPTIONAL: the TOTAL net, = realised_net_usd + unrealised_usd, the same figure as replay_report net_pnl_usd; absent = not stated)
+      (a SIMULATED ledger is shown as simulated P&L, never as realised; net is never inferred from gross)
+  competition.json      schema "competition/v1"     basis: ESTIMATED | SIMULATED | CALCULATED
+      candidates [ {candidate_id str, kind OPP_KIND, spot_hedge (as above), status "RESEARCHING"|"REJECTED"|"INSUFFICIENT_EVIDENCE"|"SUFFICIENT_EVIDENCE", reason str|null (REQUIRED non-empty for REJECTED and
+                    INSUFFICIENT_EVIDENCE), gross_bps_horizon num|null, net_bps_horizon num|null, n_observations int|null, prov PROV} ]
+  opportunities.json    schema "opportunities/v1"   basis: ESTIMATED | CALCULATED
+      decision_ms int, est_net_usd_per_day num|null
+      items [ {candidate_id str, kind OPP_KIND, symbols [str], spot_hedge (as above), hold_days num, gross_bps_horizon num|null, net_bps_horizon num|null, capacity_usd num|null,
+               prov PROV, exclusions [str]} ]
+  OPP_KIND = SPOT_PERP_CARRY | PERP_FUNDING_SPREAD | PERP_DIRECTIONAL_FUNDING;  PROV = MEASURED|VENUE_STATED|DERIVED|MODELLED|ASSUMED|UNKNOWN (ms_types.PROVS).
+  Rule the UI enforces: only SPOT_PERP_CARRY with spot_hedge HEDGEABLE_ON_BYBIT is called carry; a PERP_ONLY / unknown-hedge symbol is "directional funding (not carry)".
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import math
+import os
+import re
+import stat
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BOT)
+sys.path.insert(0, os.path.join(BOT, "tools"))
+
+import candidate_readiness as CR  # noqa: E402
+import data_freshness_audit as DFA  # noqa: E402
+import ms_types as MST  # noqa: E402
+import owner_console as OC  # noqa: E402
+import promotion_gate as PG  # noqa: E402
+import universe_capture as UC  # noqa: E402
+
+SCHEMA = "control_centre/v1"
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_centre_static")
+STATIC_FILES = {"index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "style.css": "text/css; charset=utf-8"}
+DEFAULT_PORT = 8787
+LOCAL_HOSTS = ("127.0.0.1", "localhost")
+MAX_ARTIFACT_BYTES = 1_048_576
+MAX_ITEMS = 2000
+MAX_STR = 400
+ARTIFACT_STALE_MS = 3 * 86_400_000
+FUTURE_SKEW_MS = 5 * 60_000
+
+BASIS_MEANING = {
+    "MEASURED": "Observed in captured data or the owner account.",
+    "EXCHANGE_REPORTED": "Stated by a venue response.",
+    "CALCULATED": "Derived from measured inputs.",
+    "ESTIMATED": "Produced by a model or an assumption; not observed.",
+    "SIMULATED": "Replay or paper run; never realised cash.",
+    "MISSING": "No source has this value. It is not zero and not fine.",
+    "UNVERIFIED": "Self-consistent but not authenticated: bytes re-hash, but nothing proves the exchange produced them.",
+    "OWNER_SUPPLIED_UNVERIFIED": "An owner import that has not been reconciled against the venue.",
+}
+BASES = tuple(BASIS_MEANING)
+STATUS_MEANING = {"OK": "A checker returned a good result from real data.", "ATTENTION": "Something needs a look.", "FAIL": "Something is wrong.",
+                  "NO_DATA": "Nothing has been captured or supplied. Not green.", "INFO": "A fact, not a verdict."}
+PROV_TO_BASIS = {"MEASURED": "MEASURED", "VENUE_STATED": "EXCHANGE_REPORTED", "DERIVED": "CALCULATED", "MODELLED": "ESTIMATED", "ASSUMED": "ESTIMATED", "UNKNOWN": "MISSING"}
+HEDGES = ("HEDGEABLE_ON_BYBIT", "PERP_ONLY", "HEDGE_UNKNOWN")
+SEVERITIES = ("INFO", "WARN", "CRITICAL")
+COMP_STATUSES = ("RESEARCHING", "REJECTED", "INSUFFICIENT_EVIDENCE", "SUFFICIENT_EVIDENCE")
+
+
+def val(v: Any, basis: str, unit: Optional[str] = None, note: Optional[str] = None) -> Dict[str, Any]:
+    """The one shape of a displayed value. A null value is MISSING whatever basis was asked for; an unknown basis is a bug."""
+    if basis not in BASES:
+        raise AssertionError(f"basis {basis!r} outside the vocabulary")
+    return {"v": v, "basis": basis if v is not None else "MISSING", "unit": unit, "note": note}
+
+
+# ======================================================================== artifacts
+class ArtifactError(ValueError):
+    pass
+
+
+def _bad(msg: str) -> "ArtifactError":
+    return ArtifactError(msg)
+
+
+def _num(o: Mapping[str, Any], k: str, *, null: bool = True) -> Optional[float]:
+    if k not in o:
+        raise _bad(f"missing key {k!r}")
+    x = o[k]
+    if x is None:
+        if null:
+            return None
+        raise _bad(f"{k!r} must be a number")
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or abs(x) > 1e15:
+        raise _bad(f"{k!r} must be a finite number")
+    return float(x)
+
+
+def _int(o: Mapping[str, Any], k: str, *, null: bool = False) -> Optional[int]:
+    if k not in o:
+        raise _bad(f"missing key {k!r}")
+    x = o[k]
+    if x is None and null:
+        return None
+    if isinstance(x, bool) or not isinstance(x, int) or x < 0 or x > 10 ** 15:
+        raise _bad(f"{k!r} must be a non-negative integer" + (" or null" if null else ""))
+    return x
+
+
+def _str(o: Mapping[str, Any], k: str, *, null: bool = False, nonempty: bool = True) -> Optional[str]:
+    if k not in o:
+        raise _bad(f"missing key {k!r}")
+    x = o[k]
+    if x is None and null:
+        return None
+    if not isinstance(x, str) or (nonempty and not x.strip()) or len(x) > MAX_STR or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", x):
+        raise _bad(f"{k!r} must be a short plain string" + (" or null" if null else ""))
+    return x
+
+
+def _enum(o: Mapping[str, Any], k: str, allowed: Sequence[str]) -> str:
+    x = _str(o, k)
+    if x not in allowed:
+        raise _bad(f"{k!r} must be one of {list(allowed)}")
+    return str(x)
+
+
+def _list(o: Mapping[str, Any], k: str, *, required: bool = True) -> List[Any]:
+    if k not in o:
+        if required:
+            raise _bad(f"missing key {k!r}")
+        return []
+    x = o[k]
+    if not isinstance(x, list) or len(x) > MAX_ITEMS:
+        raise _bad(f"{k!r} must be a list of at most {MAX_ITEMS}")
+    return x
+
+
+def _dicts(o: Mapping[str, Any], k: str) -> List[Mapping[str, Any]]:
+    rows = _list(o, k)
+    if not all(isinstance(r, dict) for r in rows):
+        raise _bad(f"every entry of {k!r} must be an object")
+    return rows
+
+
+def _strs(o: Mapping[str, Any], k: str) -> List[str]:
+    rows = _list(o, k)
+    for r in rows:
+        if not isinstance(r, str) or len(r) > MAX_STR or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", r):
+            raise _bad(f"every entry of {k!r} must be a short plain string")
+    return list(rows)
+
+
+def _bool(o: Mapping[str, Any], k: str) -> bool:
+    if k not in o or not isinstance(o[k], bool):
+        raise _bad(f"{k!r} must be true or false")
+    return bool(o[k])
+
+
+def _opp_label(kind: str, hedge: str) -> Dict[str, Any]:
+    """Only a hedged spot-perp carry is called carry. A perp-only or unknown-hedge symbol is directional funding or a spread, never carry."""
+    if kind == "SPOT_PERP_CARRY" and hedge == "HEDGEABLE_ON_BYBIT":
+        return {"is_carry": True, "label": "Spot-perp carry (hedged)"}
+    if kind == "SPOT_PERP_CARRY":
+        return {"is_carry": False, "label": f"Not shown as carry: the spot hedge is not confirmed ({hedge})"}
+    if kind == "PERP_FUNDING_SPREAD":
+        return {"is_carry": False, "label": "Perp funding spread (not carry)"}
+    return {"is_carry": False, "label": "Directional funding (not carry)"}
+
+
+def _v_replay(o: Mapping[str, Any]) -> Dict[str, Any]:
+    scope = _enum(o, "universe_scope", ("SURVIVORS_ONLY", "DELISTINGS_OBSERVED"))
+    syms = []
+    for r in _dicts(o, "symbols"):
+        kind, hedge = _enum(r, "kind", MST.OPP_KINDS), _enum(r, "spot_hedge", HEDGES)
+        syms.append({"symbol": _str(r, "symbol"), "kind": kind, "spot_hedge": hedge, **_opp_label(kind, hedge), "n_groups": _int(r, "n_groups"),
+                     "gross_pnl_usd": _num(r, "gross_pnl_usd"), "fees_usd": _num(r, "fees_usd"), "net_pnl_usd": _num(r, "net_pnl_usd")})
+    gbs = o.get("groups_by_state")
+    if not isinstance(gbs, dict) or len(gbs) > 32 or not all(k in MST.GROUP_STATES and isinstance(v, int) and not isinstance(v, bool) and v >= 0 for k, v in gbs.items()):
+        raise _bad("'groups_by_state' must map GroupState names to non-negative integers")
+    return {"universe_scope": scope, "period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), "n_groups": _int(o, "n_groups"),
+            "groups_by_state": dict(gbs), "gross_pnl_usd": _num(o, "gross_pnl_usd"), "fees_usd": _num(o, "fees_usd"), "net_pnl_usd": _num(o, "net_pnl_usd"), "symbols": syms}
+
+
+def _v_portfolio(o: Mapping[str, Any]) -> Dict[str, Any]:
+    pos = []
+    for r in _dicts(o, "positions"):
+        kind, hedge = _enum(r, "kind", MST.OPP_KINDS), _enum(r, "spot_hedge", HEDGES)
+        pos.append({"symbol": _str(r, "symbol"), "kind": kind, "spot_hedge": hedge, **_opp_label(kind, hedge), "side": _enum(r, "side", ("Buy", "Sell")),
+                    "notional_usd": _num(r, "notional_usd", null=False), "entry_price": _num(r, "entry_price"), "mark_price": _num(r, "mark_price"),
+                    "unrealised_pnl_usd": _num(r, "unrealised_pnl_usd"), "group_id": _str(r, "group_id", null=True)})
+    return {"equity_usd": _num(o, "equity_usd"), "gross_exposure_usd": _num(o, "gross_exposure_usd", null=False), "net_exposure_usd": _num(o, "net_exposure_usd", null=False),
+            "unrealised_pnl_usd": _num(o, "unrealised_pnl_usd"), "positions": pos}
+
+
+def _v_risk(o: Mapping[str, Any]) -> Dict[str, Any]:
+    limits = [{"name": _str(r, "name"), "unit": _str(r, "unit"), "limit": _num(r, "limit"), "value": _num(r, "value"), "status": _enum(r, "status", ("OK", "BREACH", "UNKNOWN"))}
+              for r in _dicts(o, "limits")]
+    alerts = [{"severity": _enum(r, "severity", SEVERITIES), "code": _str(r, "code"), "detail": _str(r, "detail", nonempty=False)} for r in _dicts(o, "alerts")]
+    return {"halted": _bool(o, "halted"), "halt_reasons": _strs(o, "halt_reasons"), "limits": limits, "alerts": alerts}
+
+
+def _v_ledger(o: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), **{k: _num(o, k) for k in
+            ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd")},
+            "net_usd": _num(o, "net_usd") if "net_usd" in o else None}          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
+
+
+def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
+    out = []
+    for r in _dicts(o, "candidates"):
+        status = _enum(r, "status", COMP_STATUSES)
+        reason = _str(r, "reason", null=True)
+        if status in ("REJECTED", "INSUFFICIENT_EVIDENCE") and not (reason and reason.strip()):
+            raise _bad(f"candidate {r.get('candidate_id')!r}: a {status} entry must carry a reason")
+        kind, hedge = _enum(r, "kind", MST.OPP_KINDS), _enum(r, "spot_hedge", HEDGES)
+        out.append({"candidate_id": _str(r, "candidate_id"), "kind": kind, "spot_hedge": hedge, **_opp_label(kind, hedge), "status": status, "reason": reason, "gross_bps_horizon": _num(r, "gross_bps_horizon"),
+                    "net_bps_horizon": _num(r, "net_bps_horizon"), "n_observations": _int(r, "n_observations", null=True), "prov": _enum(r, "prov", MST.PROVS)})
+    return {"candidates": out}
+
+
+def _v_opps(o: Mapping[str, Any]) -> Dict[str, Any]:
+    items = []
+    for r in _dicts(o, "items"):
+        kind, hedge = _enum(r, "kind", MST.OPP_KINDS), _enum(r, "spot_hedge", HEDGES)
+        items.append({"candidate_id": _str(r, "candidate_id"), "kind": kind, "symbols": _strs(r, "symbols"), "spot_hedge": hedge, **_opp_label(kind, hedge),
+                      "hold_days": _num(r, "hold_days", null=False), "gross_bps_horizon": _num(r, "gross_bps_horizon"), "net_bps_horizon": _num(r, "net_bps_horizon"),
+                      "capacity_usd": _num(r, "capacity_usd"), "prov": _enum(r, "prov", MST.PROVS), "exclusions": _strs(r, "exclusions")})
+    return {"decision_ms": _int(o, "decision_ms"), "est_net_usd_per_day": _num(o, "est_net_usd_per_day"), "items": items}
+
+
+_ALL_OWNER = ("SIMULATED", "MEASURED", "EXCHANGE_REPORTED", "OWNER_SUPPLIED_UNVERIFIED")
+ARTIFACTS: Dict[str, Tuple[str, Tuple[str, ...], Callable[[Mapping[str, Any]], Dict[str, Any]]]] = {
+    "replay_report.json": ("replay_report/v1", ("SIMULATED",), _v_replay),
+    "portfolio_state.json": ("portfolio_state/v1", _ALL_OWNER, _v_portfolio),
+    "risk_state.json": ("risk_state/v1", ("CALCULATED", "MEASURED", "SIMULATED"), _v_risk),
+    "ledger_pnl.json": ("ledger_pnl/v1", _ALL_OWNER, _v_ledger),
+    "competition.json": ("competition/v1", ("ESTIMATED", "SIMULATED", "CALCULATED"), _v_competition),
+    "opportunities.json": ("opportunities/v1", ("ESTIMATED", "CALCULATED"), _v_opps),
+}
+
+
+def _reject_const(name: str) -> Any:
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+def _read_regular(path: str) -> bytes:
+    """Open without following a link, confirm a regular file, read at most the cap (+1 to detect oversize)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _bad("not a regular file")
+        if st.st_size > MAX_ARTIFACT_BYTES:
+            raise _bad(f"oversize ({st.st_size} bytes > {MAX_ARTIFACT_BYTES})")
+        data = os.read(fd, MAX_ARTIFACT_BYTES + 1)
+        if len(data) > MAX_ARTIFACT_BYTES:
+            raise _bad("oversize")
+        return data
+    finally:
+        os.close(fd)
+
+
+def load_artifact(artifacts_dir: Optional[str], name: str, now_ms: int) -> Dict[str, Any]:
+    """One artifact -> {file, state EMPTY|OK|ERROR, error, basis, generated_ms, age_ms, stale, data}. Never raises; never guesses a value."""
+    res: Dict[str, Any] = {"file": name, "state": "EMPTY", "error": None, "basis": None, "generated_ms": None, "age_ms": None, "stale": False, "data": None}
+    if name not in ARTIFACTS:
+        raise KeyError(name)
+    schema, bases, validator = ARTIFACTS[name]
+    if not artifacts_dir or not os.path.isdir(artifacts_dir):
+        return res
+    path = os.path.join(artifacts_dir, name)
+    try:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return res
+        if stat.S_ISLNK(st.st_mode):
+            raise _bad("a symbolic link is refused")
+        if not stat.S_ISREG(st.st_mode):
+            raise _bad("not a regular file")
+        if os.path.dirname(os.path.realpath(path)) != os.path.realpath(artifacts_dir):
+            raise _bad("resolves outside the artifacts directory")
+        raw = _read_regular(path)
+        obj = json.loads(raw.decode("utf-8", "strict"), parse_constant=_reject_const)
+        if not isinstance(obj, dict):
+            raise _bad("top level must be a JSON object")
+        if obj.get("schema") != schema:
+            raise _bad(f"schema must be {schema!r}")
+        basis = obj.get("basis")
+        if basis not in bases:
+            raise _bad(f"basis must be one of {list(bases)} (got {str(basis)[:40]!r})")
+        gen = _int(obj, "generated_ms")
+        if gen is not None and gen > now_ms + FUTURE_SKEW_MS:
+            raise _bad("generated_ms is in the future")
+        data = validator(obj)
+        res.update(state="OK", basis=basis, generated_ms=gen, age_ms=now_ms - gen, stale=(now_ms - gen) > ARTIFACT_STALE_MS, data=data)
+    except OSError as exc:
+        res.update(state="ERROR", error=("a symbolic link is refused" if exc.errno == errno.ELOOP else f"unreadable ({type(exc).__name__})"))
+    except (ArtifactError, ValueError, RecursionError, UnicodeDecodeError) as exc:
+        res.update(state="ERROR", error=str(exc)[:240], data=None, basis=None)
+    return res
+
+
+# ======================================================================== sections
+def _safe(fn: Callable[[], Dict[str, Any]], what: str) -> Dict[str, Any]:
+    try:
+        return fn()
+    except Exception as exc:                                         # noqa: BLE001 - one broken source must show as an ERROR section, not take the page down
+        return {"state": "ERROR", "error": f"{what}: {type(exc).__name__}: {str(exc)[:160]}"}
+
+
+def _gate() -> Dict[str, Any]:
+    try:
+        v = PG.evaluate_promotion_gate()
+        items = [{"key": i.key, "complete": bool(i.complete), "owner": i.owner} for i in v.items]
+        return {"decision": "ALLOW" if v.allows_live else "REFUSE", "allows_live": bool(v.allows_live), "complete": sum(1 for i in items if i["complete"]), "total": len(items),
+                "open_items": [i["key"] for i in items if not i["complete"]][:12], "reasons": [str(r)[:200] for r in (getattr(v, "reasons", None) or [])][:6]}
+    except Exception as exc:                                         # noqa: BLE001 - an unreadable gate is a closed gate
+        return {"decision": "REFUSE", "allows_live": False, "complete": 0, "total": 0, "open_items": [], "reasons": [f"gate unreadable ({type(exc).__name__}): refuses"]}
+
+
+def _actions(oc: Mapping[str, Any], gate: Mapping[str, Any]) -> Dict[str, Any]:
+    env, elig = oc["environment"], oc["eligibility"]
+    armed = bool(env.get("live_authorized"))
+    acts: List[Dict[str, Any]] = []
+    acts.append({"id": "research", "label": "Read-only research on captured data", "permitted": bool(elig["research"]["met"]),
+                 "reasons": [elig["research"]["meaning"]] if elig["research"]["met"] else ["eligibility.research is not met"]})
+    paper_ok = bool(elig["research"]["met"]) and not armed
+    acts.append({"id": "replay", "label": "Paper replay (offline simulation, SIMULATED results)", "permitted": paper_ok,
+                 "reasons": ["no venue access; results are labelled SIMULATED and are never realised cash"] if paper_ok else
+                            (["the environment reports real money ARMED: stop and check it is intended"] if armed else ["research eligibility is not met"])})
+    tn = elig["testnet"]
+    tn_reasons = [] if tn["met"] else [f"{tn['meaning']} (status {tn['status']})", f"offline testnet qualification: {oc['testnet'].get('offline_qualification')}"]
+    acts.append({"id": "testnet", "label": "Testnet session", "permitted": bool(tn["met"]), "reasons": tn_reasons or ["owner-run testnet session recorded"]})
+    live_reasons: List[str] = []
+    if not armed:
+        live_reasons.append(f"not armed: {env.get('reason')}")
+    if not gate["allows_live"]:
+        live_reasons.append(f"promotion gate {gate['decision']}: {gate['complete']} of {gate['total']} checklist items complete" + (f"; first open: {gate['open_items'][0]}" if gate["open_items"] else ""))
+    live_ok = bool(elig["owner_authorised"]["met"]) and armed and bool(gate["allows_live"])
+    acts.append({"id": "mainnet", "label": "Mainnet (real money)", "permitted": live_ok,
+                 "reasons": live_reasons or ["armed by the owner AND the promotion gate allows (verify independently before relying on this display)"]})
+    return {"items": acts, "note": "This page cannot start, change or stop anything. It lists what the repository's own checks permit right now."}
+
+
+def _research(cand_rows: Sequence[Mapping[str, Any]], comp: Dict[str, Any], opps: Dict[str, Any], econ_loaded: bool, gate: Mapping[str, Any]) -> Dict[str, Any]:
+    rows, rejected = [], []
+    for r in cand_rows:
+        ladder, ready = str(r.get("ladder_verdict")), str(r.get("readiness_verdict"))
+        ex = (r.get("executable_on_qualified_venues") or {})
+        pit = (r.get("point_in_time") or {}).get("value")
+        data_present = (r.get("required_data") or {}).get("value", "MISSING")
+        if ladder == "OWNER_PROFIT_EVIDENCED":
+            stage = "OWNER_PROFIT_EVIDENCED"
+        elif ladder == "QUALIFIED" and ex.get("executable"):
+            stage = "EXECUTION_READY"
+        elif ladder in ("PROSPECTIVE", "PROMISING"):
+            stage = ladder
+        elif str(data_present).startswith("PRESENT") and pit in ("VERIFIED_RAW_RESPONSES", "NOT_APPLICABLE_SINGLE_INSTRUMENT"):
+            stage = "RESEARCH_READY"
+        elif str(data_present).startswith("PRESENT"):
+            stage = "DATA_READY"
+        else:
+            stage = "NOT_READY"
+        is_rej = ladder == "REJECTED" or ready == "REJECTED"
+        policies = ((r.get("edge_vs_costs") or {}).get("policies") or {}) if isinstance(r.get("edge_vs_costs"), dict) else {}
+        why = [str(x)[:260] for x in (list(r.get("readiness_reasons") or []) + list(r.get("ladder_reasons") or []))][:8]
+        blockers = [f"Verdict ladder: {ladder} (QUALIFIED needs prospective evidence; OWNER_PROFIT_EVIDENCED needs the owner's attestation)",
+                    f"Executable on qualified venues: {ex.get('value')}", f"Promotion gate: {gate['decision']}"]
+        row = {"candidate": str(r.get("candidate")), "name": str(r.get("name")), "stage": stage, "ladder_verdict": ladder, "readiness_verdict": ready, "rejected": bool(is_rej),
+               "evidence_sufficient": ladder in ("QUALIFIED", "OWNER_PROFIT_EVIDENCED"), "authorised": False, "required_data": str(data_present),
+               "point_in_time": str(pit), "executable": str(ex.get("value")), "edge_vs_costs": val(None, "MISSING", note=str((r.get("edge_vs_costs") or {}).get("reason") or "no measurement")[:260])
+               if not policies else val(str(r["edge_vs_costs"].get("value"))[:120], "CALCULATED", note="in-sample on the committed corpus; not an out-of-sample result"),
+               "why_not_authorised": why + blockers, "policies": {str(k): str(v) for k, v in policies.items()}}
+        rows.append(row)
+        for pk, pv in policies.items():
+            if str(pv) == "REJECTED":
+                rejected.append({"candidate": row["candidate"], "what": f"policy {pk}", "why": "rejected by the corpus economics (in-sample)", "basis": "CALCULATED"})
+        if is_rej:
+            rejected.append({"candidate": row["candidate"], "what": "candidate", "why": "; ".join(why[:2]) or ladder, "basis": "CALCULATED"})
+    for c in (comp.get("data") or {}).get("candidates", []):
+        if c["status"] == "REJECTED":
+            rejected.append({"candidate": c["candidate_id"], "what": "competition entry", "why": c["reason"], "basis": comp["basis"]})
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[r["stage"]] = counts.get(r["stage"], 0) + 1
+    out: Dict[str, Any] = {"state": "OK" if rows else "NO_DATA", "candidates": rows, "stage_counts": counts, "rejected": rejected,
+                           "sufficient_evidence": [r["candidate"] for r in rows if r["evidence_sufficient"]] +
+                                                  [c["candidate_id"] for c in (comp.get("data") or {}).get("candidates", []) if c["status"] == "SUFFICIENT_EVIDENCE"],
+                           "economics_loaded": econ_loaded,
+                           "note": "Sufficient evidence is not authorisation: authorisation is the owner's act (config.is_live_authorized AND the signed promotion gate)."
+                                   + ("" if econ_loaded else " In-sample corpus economics are not loaded (slow); start with --with-economics to include rejection reasons from them.")}
+    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"),
+                                                                       }
+                                                                      for c in d["candidates"]]},
+                                      empty="No competition result yet. Run the candidate competition CLI to write competition.json into the artifacts directory.")
+    out["opportunities"] = _artifact_view(opps, _opp_view, empty="No opportunity scan yet. Run the opportunity scanner to write opportunities.json into the artifacts directory.")
+    return out
+
+
+def _opp_view(d: Mapping[str, Any]) -> Dict[str, Any]:
+    items = []
+    for it in d["items"]:
+        b = PROV_TO_BASIS[it["prov"]]
+        items.append({**{k: it[k] for k in ("candidate_id", "kind", "symbols", "spot_hedge", "is_carry", "label", "exclusions")}, "hold_days": val(it["hold_days"], "ESTIMATED", "days"),
+                      "gross": val(it["gross_bps_horizon"], b, "bps", "before costs"), "net": val(it["net_bps_horizon"], b, "bps", "after the costs the scanner knows; not computed from gross here"),
+                      "capacity": val(it["capacity_usd"], b, "USD"), "eligible": (not it["exclusions"]) and it["net_bps_horizon"] is not None})
+    elig = [i for i in items if i["eligible"]]
+    pos = [i for i in elig if i["net"]["v"] > 0]
+    return {"items": items, "n_items": len(items), "n_eligible": len(elig), "n_positive_net": len(pos),
+            "best_net": val(max((i["net"]["v"] for i in elig), default=None), "ESTIMATED", "bps", "best eligible item; an upper bound, not a forecast"),
+            "est_net_usd_per_day": val(d["est_net_usd_per_day"], "ESTIMATED", "USD/day", "as stated by the scanner; a model output")}
+
+
+def _artifact_view(a: Dict[str, Any], view: Callable[[Dict[str, Any]], Dict[str, Any]], *, empty: str) -> Dict[str, Any]:
+    base = {"file": a["file"], "age_ms": a["age_ms"], "stale": a["stale"], "generated_ms": a["generated_ms"], "basis": a["basis"]}
+    if a["state"] == "EMPTY":
+        return {**base, "state": "NO_DATA", "empty": empty}
+    if a["state"] == "ERROR":
+        return {**base, "state": "ERROR", "error": f"{a['file']}: {a['error']}"}
+    return {**base, "state": "OK", **view(a["data"])}
+
+
+def _pnl_view(a: Dict[str, Any]) -> Dict[str, Any]:
+    base = {"file": a["file"], "age_ms": a["age_ms"], "stale": a["stale"], "generated_ms": a["generated_ms"], "basis": a["basis"]}
+    if a["state"] == "EMPTY":
+        return {**base, "state": "NO_DATA", "empty": "No P&L ledger yet. Run the accounting CLI to write ledger_pnl.json, or import an owner export with tools/owner_ledger.py."}
+    if a["state"] == "ERROR":
+        return {**base, "state": "ERROR", "error": f"{a['file']}: {a['error']}"}
+    d, b = a["data"], a["basis"]
+    simulated = b == "SIMULATED"
+    # A simulated ledger fills the 'simulated_*' group and leaves 'realised_*' EMPTY: simulated is never realised. Gross and net are separate fields; net is never derived here.
+    grp = "simulated" if simulated else "realised"
+    other = "realised" if simulated else "simulated"
+    out = {**base, "state": "OK", "kind": "SIMULATED_NOT_REALISED" if simulated else ("OWNER_IMPORT_UNVERIFIED" if b == "OWNER_SUPPLIED_UNVERIFIED" else "ACCOUNT_REALISED"),
+           f"{grp}_gross": val(d["realised_gross_usd"], b, "USD", "before fees; GROSS"), f"{grp}_fees": val(d["fees_usd"], b, "USD"), f"{grp}_funding": val(d["funding_usd"], b, "USD"),
+           f"{grp}_net": val(d["realised_net_usd"], b, "USD", "after fees; NET (as stated by the ledger)"),
+           f"{other}_gross": val(None, "MISSING"), f"{other}_net": val(None, "MISSING"), "unrealised": val(d["unrealised_usd"], b, "USD", "mark-to-market; not cash"),
+           "total_net": val(d["net_usd"], b, "USD", "TOTAL net = realised + unrealised, after fees; as stated by the producer"),
+           "period": [d["period_start_ms"], d["period_end_ms"]]}
+    return out
+
+
+def _portfolio(a: Dict[str, Any], ledger: Dict[str, Any]) -> Dict[str, Any]:
+    def view(d: Mapping[str, Any]) -> Dict[str, Any]:
+        b = a["basis"]
+        pos = [{**{k: p[k] for k in ("symbol", "kind", "spot_hedge", "is_carry", "label", "side", "group_id")}, "notional": val(p["notional_usd"], b, "USD"),
+                "entry_price": val(p["entry_price"], b, "USD"), "mark_price": val(p["mark_price"], b, "USD"), "unrealised": val(p["unrealised_pnl_usd"], b, "USD")} for p in d["positions"]]
+        return {"equity": val(d["equity_usd"], b, "USD"), "gross_exposure": val(d["gross_exposure_usd"], b, "USD"), "net_exposure": val(d["net_exposure_usd"], b, "USD"),
+                "unrealised": val(d["unrealised_pnl_usd"], b, "USD", "mark-to-market; not cash"), "positions": pos, "n_positions": len(pos),
+                "simulated": b == "SIMULATED"}
+    out = _artifact_view(a, view, empty="No portfolio state yet. Run the portfolio CLI to write portfolio_state.json into the artifacts directory. Nothing is held that this page can see.")
+    out["pnl"] = _pnl_view(ledger)
+    return out
+
+
+def _execution(replay: Dict[str, Any], oc: Mapping[str, Any]) -> Dict[str, Any]:
+    def view(d: Mapping[str, Any]) -> Dict[str, Any]:
+        sym = [{**{k: s[k] for k in ("symbol", "kind", "spot_hedge", "is_carry", "label", "n_groups")}, "gross": val(s["gross_pnl_usd"], "SIMULATED", "USD", "before fees; GROSS"),
+                "fees": val(s["fees_usd"], "SIMULATED", "USD"), "net": val(s["net_pnl_usd"], "SIMULATED", "USD", "after fees; NET")} for s in d["symbols"]]
+        unhedged = d["groups_by_state"].get("UNHEDGED", 0) + d["groups_by_state"].get("UNKNOWN_OUTCOME", 0)
+        return {"universe_scope": d["universe_scope"], "n_groups": d["n_groups"], "groups_by_state": d["groups_by_state"], "unhedged_or_unknown": unhedged,
+                "gross": val(d["gross_pnl_usd"], "SIMULATED", "USD", "before fees; GROSS; simulated"), "fees": val(d["fees_usd"], "SIMULATED", "USD"),
+                "net": val(d["net_pnl_usd"], "SIMULATED", "USD", "after fees; NET; simulated, not realised"), "period": [d["period_start_ms"], d["period_end_ms"]], "symbols": sym}
+    out = _artifact_view(replay, view, empty="No replay yet. Run the replay CLI to write replay_report.json into the artifacts directory.")
+    out["mode"] = "REPLAY / PAPER ONLY"
+    out["testnet_offline_qualification"] = val(oc["testnet"].get("offline_qualification"), "CALCULATED", note="guard probes only; it reads nothing from a venue")
+    out["note"] = "No order can be sent from this page, and the replay layer is wired to simulated transports only."
+    return out
+
+
+def _risk(rs: Dict[str, Any], oc: Mapping[str, Any]) -> Dict[str, Any]:
+    def view(d: Mapping[str, Any]) -> Dict[str, Any]:
+        b = rs["basis"]
+        return {"halted": d["halted"], "halt_reasons": d["halt_reasons"], "alerts": d["alerts"],
+                "limits": [{**{k: x[k] for k in ("name", "unit", "status")}, "limit": val(x["limit"], b, x["unit"]), "value": val(x["value"], b, x["unit"])} for x in d["limits"]]}
+    out = _artifact_view(rs, view, empty="No risk state yet. Run the risk CLI to write risk_state.json into the artifacts directory. Until then nothing says the book is within limits.")
+    r = oc["risk"]
+    out["policy"] = {"active": bool(r.get("policy_active")), "status": r.get("status"), "basis": "ESTIMATED",
+                     "text": ("A risk policy is PROPOSED from data, not owner-approved: with no approved policy every entry is refused." if not r.get("policy_active") else "A risk policy is active."),
+                     "refusals_without_policy": [str(x)[:200] for x in (r.get("evaluation_without_an_approved_policy") or [])][:4],
+                     "proposed_max_hold_days": val(r.get("proposed_max_hold_days"), "ESTIMATED", "days", "proposal only"),
+                     "proposed_drawdown_bps_of_notional": val(r.get("proposed_strategy_drawdown_bps_balanced"), "ESTIMATED", "bps", "proposal only"),
+                     "unmeasured_limits": [str(x)[:160] for x in (r.get("unmeasured_limits") or [])][:8] if isinstance(r.get("unmeasured_limits"), list) else []}
+    return out
+
+
+def _freshness(data_root: Optional[str], universe_dir: Optional[str], now_ms: int, verify: bool) -> Dict[str, Any]:
+    if not data_root:
+        return {"state": "NO_DATA", "verdict": "NO_DATA", "empty": "No data root configured. Start with --data-root DIR (the private market-data root written by tools/market_collector.py)."}
+    if not os.path.isdir(data_root):
+        return {"state": "NO_DATA", "verdict": "NO_DATA", "empty": "The data root does not exist yet. Run tools/market_collector.py run-continuous --out-root DIR to capture data."}
+    try:
+        rep = DFA.audit(data_root, now_ms=now_ms, universe_capture=universe_dir if universe_dir and os.path.isdir(universe_dir) else None, verify=verify)
+    except (ValueError, OSError) as exc:
+        return {"state": "ERROR", "verdict": "ERROR", "error": f"data_freshness_audit refused: {str(exc)[:200]}"}
+    ax = rep["axes"]
+    # Timestamps are MEASURED only if this run re-hashed the datasets; otherwise they are what the unauthenticated manifest says (UNVERIFIED).
+    tsb = "MEASURED" if verify else "UNVERIFIED"
+    cyc = rep["cycles"].get("latest_complete_cycle")
+    hist = []
+    for name, h in rep["history"].items():
+        newest = [s["latest_observed_ts"] for s in h["symbols"].values() if isinstance(s.get("latest_observed_ts"), int)]
+        hist.append({"dataset": name, "status": str(h.get("dataset_status")), "verify": h.get("verify"), "n_symbols": len(h["symbols"]), "stale_symbols": len(h["stale_symbols"]),
+                     "incomplete_symbols": len(h["incomplete_symbols"]), "newest_ms": val(max(newest, default=None), tsb, "ms"), "age_ms": val(None if not newest else now_ms - max(newest), tsb, "ms")})
+    issues = [{"code": str(i.get("code")), "level": str(i.get("level")), "detail": str(i.get("detail"))[:240]} for i in ax["data_freshness"]["issues"]][:20]
+    return {"state": "OK" if ax["data_freshness"]["verdict"] != "NO_DATA" else "NO_DATA", "verdict": ax["data_freshness"]["verdict"], "readiness": ax["research_readiness"]["verdict"],
+            "code_correctness": ax["code_correctness"]["verdict"], "issues": issues, "readiness_issues": [str(i.get("detail") or i.get("code"))[:200] for i in ax["research_readiness"]["issues"]][:10],
+            "latest_cycle": None if not cyc else {"cycle": str(cyc["cycle"]), "age_ms": val(cyc["age_ms"], tsb, "ms")}, "datasets": hist, "verified_this_run": bool(verify),
+            "backups": {k: (None if rep["backups"].get(k) is None else True) for k in ("backup", "restore_check", "seal")},
+            "status_partitions": {"present": list(rep["status_partitions"].get("present") or []), "missing": list(rep["status_partitions"].get("missing") or [])},
+            "note": "Three separate axes; they are never merged into one light. Code correctness is not assessed here."}
+
+
+def _capture(universe_dir: Optional[str]) -> Dict[str, Any]:
+    if not universe_dir:
+        return {"state": "NO_DATA", "empty": "No universe capture configured. Start with --universe-dir DIR (a schema-v2 capture from tools/universe_capture.py)."}
+    if not os.path.isdir(universe_dir):
+        return {"state": "NO_DATA", "empty": "The universe capture directory does not exist. Run tools/universe_capture.py to take one."}
+    rep = UC.verify_capture_dir(universe_dir)
+    cov = rep.get("coverage") or {}
+    try:
+        surv, surv_note = CR._survivorship_info({"status_coverage": cov.get("status_coverage"), "delisting_observability": cov.get("delisting_observability")})
+    except Exception:                                                # noqa: BLE001
+        surv, surv_note = CR.SURVIVORS_ONLY, "survivorship could not be derived: treated as survivors only"
+    ok = bool(rep.get("ok"))
+    if ok:
+        integrity = val("RAW_RESPONSES_VERIFIED", "UNVERIFIED", note=CR.PIT_LABEL_NOTE[:300])
+    else:
+        integrity = val(None, "MISSING", note="verification failed: " + "; ".join(str(p) for p in (rep.get("problems") or [])[:3])[:300])
+    return {"state": "OK" if ok else "ERROR", "ok": ok, "integrity": integrity, "dataset_status": str(cov.get("dataset_status")),
+            "survivorship": surv if ok else CR.SURVIVORS_ONLY, "survivorship_note": surv_note[:300], "problems": [str(p)[:200] for p in (rep.get("problems") or [])[:8]],
+            "error": None if ok else "capture verification failed; no value from it is trusted"}
+
+
+def _stamp(a: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"file": a["file"], "state": "NO_DATA" if a["state"] == "EMPTY" else a["state"], "error": a["error"], "basis": a["basis"], "age_ms": a["age_ms"], "stale": a["stale"]}
+
+
+def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifacts_dir: Optional[str], env: Mapping[str, str], now_ms: int,
+                with_economics: bool = False, economics: Optional[Dict[str, Any]] = None, verify: bool = False) -> Dict[str, Any]:
+    """Pure aggregation of real sources (no network, no write). Every number carries a basis; every missing source is an explicit NO_DATA/ERROR section."""
+    now_ms = int(now_ms)
+    art = {name: load_artifact(artifacts_dir, name, now_ms) for name in ARTIFACTS}
+    oc = OC.build(dict(env), now_ms=now_ms)
+    gate = _gate()
+    actions = _actions(oc, gate)
+
+    def cand() -> Dict[str, Any]:
+        scan = CR.scan_data_root(data_root)
+        econ = economics if economics is not None else (CR.btc_carry_economics() if with_economics else None)
+        return {"state": "OK", "rows": [CR.candidate_row(n, s, scan, econ) for n, s in CR.load_candidates()], "econ": econ is not None}
+    cr = _safe(cand, "candidate_readiness")
+    research = (_research(cr["rows"], art["competition.json"], art["opportunities.json"], cr["econ"], gate) if cr.get("state") == "OK" else
+                {"state": "ERROR", "error": cr.get("error"), "candidates": [], "rejected": [], "sufficient_evidence": [], "stage_counts": {}, "note": ""})
+    fresh = _safe(lambda: _freshness(data_root, universe_dir, now_ms, verify), "data_freshness_audit")
+    capture = _safe(lambda: _capture(universe_dir), "universe_capture")
+    portfolio = _portfolio(art["portfolio_state.json"], art["ledger_pnl.json"])
+    execution = _execution(art["replay_report.json"], oc)
+    risk = _risk(art["risk_state.json"], oc)
+
+    # Survivorship: a result is survivorship-free only if the file CLAIMS delistings were observed AND this run's capture check corroborates it.
+    rp = art["replay_report.json"]
+    claimed = rp["data"]["universe_scope"] if rp["state"] == "OK" else None
+    corroborated = capture.get("state") == "OK" and capture.get("survivorship") == CR.DELISTINGS_OBSERVED
+    free = bool(claimed == "DELISTINGS_OBSERVED" and corroborated)
+    if rp["state"] == "OK":
+        execution["survivorship"] = {"claimed_by_file": claimed, "corroborated_here": corroborated, "survivorship_free": free,
+                                     "text": ("Delistings observed and corroborated by a verified universe capture." if free else
+                                              "SURVIVORS ONLY: contracts that were delisted are missing, so this result must not be read as survivorship-free.")}
+
+    # ---- attention list (every red/amber, with the source)
+    att: List[Dict[str, str]] = []
+
+    def flag(sev: str, src: str, text: str) -> None:
+        att.append({"severity": sev, "source": src, "text": text})
+    for f in oc["environment"]["findings"]:
+        flag("FAIL" if oc["environment"]["live_authorized"] else "ATTENTION", "environment", f)
+    if gate["allows_live"] or oc["environment"]["live_authorized"]:
+        flag("FAIL", "safety", "Live trading looks armed or the gate allows it. This repository must stay paper/testnet.")
+    fv = fresh.get("verdict")
+    if fresh.get("state") == "ERROR":
+        flag("FAIL", "data", str(fresh.get("error")))
+    elif fv == "STALE":
+        flag("FAIL", "data", "Market data is STALE: " + "; ".join(i["detail"] for i in fresh["issues"][:2]))
+    elif fv == "PARTIAL":
+        flag("ATTENTION", "data", "Market data is PARTIAL: " + "; ".join(i["code"] for i in fresh["issues"][:4]))
+    if capture.get("state") == "ERROR":
+        flag("ATTENTION", "universe", str(capture.get("error")) + ": " + "; ".join(capture.get("problems", [])[:2]))
+    for name, a in art.items():
+        if a["state"] == "ERROR":
+            flag("FAIL", "artifacts", f"{name} refused: {a['error']}")
+        elif a["state"] == "OK" and a["stale"]:
+            flag("ATTENTION", "artifacts", f"{name} is older than {ARTIFACT_STALE_MS // 86_400_000} days")
+    if risk.get("state") == "OK":
+        if risk["halted"]:
+            flag("FAIL", "risk", "Trading is HALTED: " + "; ".join(risk["halt_reasons"][:3]))
+        for al in risk["alerts"]:
+            if al["severity"] in ("CRITICAL", "WARN"):
+                flag("FAIL" if al["severity"] == "CRITICAL" else "ATTENTION", "risk", f"{al['code']}: {al['detail']}")
+        for lim in risk["limits"]:
+            if lim["status"] == "BREACH":
+                flag("FAIL", "risk", f"limit breached: {lim['name']}")
+    if execution.get("state") == "OK" and execution["unhedged_or_unknown"]:
+        flag("ATTENTION", "execution", f"{execution['unhedged_or_unknown']} order group(s) UNHEDGED or UNKNOWN_OUTCOME in the replay")
+
+    # ---- overview cards: green only when a checker returned it from real data
+    def card(cid: str, title: str, status: str, text: str, basis: str, link: str) -> Dict[str, Any]:
+        return {"id": cid, "title": title, "status": status, "text": text, "basis": basis, "link": link}
+    cards = []
+    env_ok = oc["environment"]["status"] == "VERIFIED" and not oc["environment"]["live_authorized"] and not gate["allows_live"]
+    cards.append(card("safety", "Safety posture", "INFO" if env_ok else "FAIL" if (oc["environment"]["live_authorized"] or gate["allows_live"]) else "ATTENTION",
+                      f"Live trading: {'ARMED' if oc['environment']['live_authorized'] else 'not armed'}. Promotion gate: {gate['decision']} ({gate['complete']} of {gate['total']} items). Capital allocated: ${oc['capital']['capital_usd']:.0f}.",
+                      "CALCULATED", "execution"))
+    dm = {"HEALTHY": "OK", "PARTIAL": "ATTENTION", "STALE": "FAIL", "NO_DATA": "NO_DATA"}.get(str(fv), "FAIL" if fresh.get("state") == "ERROR" else "NO_DATA")
+    cards.append(card("data", "Market data", dm, {"NO_DATA": "No market data captured yet. Run tools/market_collector.py to start capturing.", "OK": "Complete, fresh, backed up and verified in this run.",
+                      "ATTENTION": "Data exists but is partial or unproved. See Evidence.", "FAIL": "Data is stale or the audit could not run. See Evidence."}[dm],
+                      "UNVERIFIED" if dm != "NO_DATA" else "MISSING", "evidence"))
+    if risk.get("state") == "OK":
+        bad = [a for a in att if a["source"] in ("risk", "artifacts")]
+        ops = "FAIL" if any(a["severity"] == "FAIL" for a in bad) else "ATTENTION" if bad else "OK"
+        ops_text = "Risk state reports no halt, alert or breach." if ops == "OK" else f"{len(bad)} item(s) need attention. See Risk."
+        ops_basis = risk["basis"]
+    else:
+        ops = "FAIL" if risk.get("state") == "ERROR" else "NO_DATA"
+        ops_text = risk.get("error") or "No runtime risk state is available, so nothing can say the system is operating correctly."
+        ops_basis = "MISSING"
+    cards.append(card("operations", "System operations", ops, ops_text, ops_basis, "risk"))
+    st = research.get("stage_counts", {})
+    cards.append(card("research", "Research pipeline", "INFO", f"{len(research.get('candidates', []))} candidate(s) under study; {len(research.get('rejected', []))} rejection(s) on record; "
+                      f"{len(research.get('sufficient_evidence', []))} with sufficient evidence. None is authorised.", "CALCULATED", "research"))
+    op = research.get("opportunities", {})
+    if op.get("state") == "OK":
+        cards.append(card("opportunity", "Estimated net opportunity", "INFO", f"{op['n_positive_net']} of {op['n_items']} scanned item(s) have positive NET after known costs. Estimates, not results.", "ESTIMATED", "research"))
+    else:
+        cards.append(card("opportunity", "Estimated net opportunity", "FAIL" if op.get("state") == "ERROR" else "NO_DATA", op.get("error") or op.get("empty", ""), "MISSING", "research"))
+    if portfolio.get("state") == "OK":
+        pb = portfolio["basis"]
+        cards.append(card("exposure", "Portfolio exposure", "INFO", f"Gross ${portfolio['gross_exposure']['v']:,.0f}, net ${portfolio['net_exposure']['v']:,.0f} across {portfolio['n_positions']} position(s)." +
+                          (" Simulated." if pb == "SIMULATED" else ""), pb, "portfolio"))
+    else:
+        cards.append(card("exposure", "Portfolio exposure", "FAIL" if portfolio.get("state") == "ERROR" else "NO_DATA", portfolio.get("error") or portfolio.get("empty", ""), "MISSING", "portfolio"))
+    pnl = portfolio["pnl"]
+    if pnl.get("state") == "OK":
+        sim = pnl["kind"] == "SIMULATED_NOT_REALISED"
+        g = "simulated" if sim else "realised"
+        usd = lambda x: f"${x['v']:,.2f}" if x["v"] is not None else "not stated (MISSING)"       # noqa: E731
+        if sim:                                                    # ONE net: the total simulated net (= the Execution tab / replay report net_pnl_usd), realised and unrealised beside it
+            text = (f"Simulated net (total): {usd(pnl['total_net'])}; of which realised {usd(pnl[g + '_net'])} and unrealised {usd(pnl['unrealised'])} (mark-to-market). "
+                    "This is a simulation, not realised cash.")
+        else:
+            text = f"Realised net: {usd(pnl[g + '_net'])}; unrealised {usd(pnl['unrealised'])}."
+        cards.append(card("pnl", "Realised and unrealised P&L", "INFO", text, pnl["basis"], "portfolio"))
+    else:
+        cards.append(card("pnl", "Realised and unrealised P&L", "FAIL" if pnl.get("state") == "ERROR" else "NO_DATA", pnl.get("error") or pnl.get("empty", ""), "MISSING", "portfolio"))
+    core = [c for c in cards if c["id"] in ("safety", "data", "operations")]
+    if any(c["status"] == "FAIL" for c in core):
+        head = ("FAIL", "Needs attention now")
+    elif any(c["status"] == "ATTENTION" for c in core):
+        head = ("ATTENTION", "Running, with items that need a look")
+    elif any(c["status"] == "NO_DATA" for c in core):
+        head = ("NO_DATA", "Not enough data to say the system is operating correctly")
+    else:
+        head = ("OK", "Checks that ran are passing")
+    permitted = [a["label"] for a in actions["items"] if a["permitted"]]
+    overview = {"headline": {"status": head[0], "text": head[1]}, "cards": cards, "attention": att, "permitted_now": permitted,
+                "blocked_now": [{"label": a["label"], "reasons": a["reasons"]} for a in actions["items"] if not a["permitted"]]}
+
+    evidence = {"sources": [_stamp(a) for a in art.values()], "freshness": fresh, "universe_capture": capture,
+                "owner_console": {"headline": oc["headline"], "evidence": {"status": oc["evidence"]["status"], "why": oc["evidence"].get("why") or oc["evidence"].get("reading")},
+                                  "backup": {"status": oc["backup"]["status"], "why": oc["backup"].get("why") or oc["backup"].get("note")},
+                                  "owner_pnl": {"status": oc["pnl"]["actual_realised"]["status"], "why": oc["pnl"]["actual_realised"].get("why")}},
+                "caveats": ["RAW_RESPONSES_VERIFIED means captured bytes are self-consistent; it is NOT authentication that the exchange produced them.",
+                            "health.json in a data root is unauthenticated; an ok record in it that was not re-checked is never counted as HEALTHY.",
+                            "Artifact files are unauthenticated local files; their basis is what they declare and is restricted per file."]}
+    state = {"schema": SCHEMA, "as_of_ms": now_ms, "legend": {"basis": [{"code": k, "meaning": v} for k, v in BASIS_MEANING.items()],
+                                                              "status": [{"code": k, "meaning": v} for k, v in STATUS_MEANING.items()]},
+             "overview": overview, "research": research, "portfolio": portfolio, "execution": execution, "risk": risk, "evidence": evidence, "actions": actions,
+             "environment": {"live_authorized": bool(oc["environment"]["live_authorized"]), "reason": oc["environment"]["reason"], "secrets": oc["environment"]["secrets"],
+                             "values": oc["environment"]["values"], "gate": gate, "capital_usd": val(oc["capital"]["capital_usd"], "CALCULATED", "USD", oc["capital"]["note"])}}
+    return _clean(state)
+
+
+def _clean(o: Any) -> Any:
+    """JSON-safe: NaN/inf become null (unknown), tuples lists, keys strings, unknown types strings. Nothing is guessed."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {str(k): _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set)):
+        return [_clean(v) for v in o]
+    if o is None or isinstance(o, (str, int, bool)):
+        return o
+    return str(o)
+
+
+# ======================================================================== HTTP (GET-only, loopback only)
+CSP = "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+
+
+def host_ok(host_header: Optional[str], port: int) -> bool:
+    """DNS-rebinding defence: the Host header must name this loopback listener exactly (127.0.0.1 or localhost, optional matching port)."""
+    if not host_header or len(host_header) > 64:
+        return False
+    m = re.fullmatch(r"(127\.0\.0\.1|localhost)(?::(\d{1,5}))?", host_header.strip().lower())
+    return bool(m) and (m.group(2) is None or int(m.group(2)) == port)
+
+
+class _Config:
+    def __init__(self, data_root: Optional[str], universe_dir: Optional[str], artifacts_dir: Optional[str], with_economics: bool, verify: bool,
+                 clock: Callable[[], int] = lambda: int(time.time() * 1000), ttl_ms: int = 5000, env: Optional[Mapping[str, str]] = None) -> None:
+        self.data_root, self.universe_dir, self.artifacts_dir, self.with_economics, self.verify, self.clock, self.ttl_ms = data_root, universe_dir, artifacts_dir, with_economics, verify, clock, ttl_ms
+        self.env = os.environ if env is None else env
+        self._lock = threading.Lock()
+        self._econ: Optional[Dict[str, Any]] = None
+        self._cache: Optional[Tuple[int, bytes]] = None
+
+    def state_bytes(self) -> bytes:
+        with self._lock:                                             # one build at a time; the build is read-only and a few seconds at most
+            now = self.clock()
+            if self._cache and now - self._cache[0] < self.ttl_ms:
+                return self._cache[1]
+            if self.with_economics and self._econ is None:
+                self._econ = CR.btc_carry_economics()
+            st = build_state(data_root=self.data_root, universe_dir=self.universe_dir, artifacts_dir=self.artifacts_dir, env=self.env, now_ms=now,
+                             with_economics=False, economics=self._econ, verify=self.verify)
+            body = json.dumps(st, allow_nan=False, sort_keys=True).encode("utf-8")
+            self._cache = (now, body)
+            return body
+
+
+def make_handler(cfg: _Config) -> type:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "ControlCentre"
+        sys_version = ""
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: Any) -> None:       # noqa: A002 - silenced: no request line, header or env value is ever logged
+            return
+
+        def _send(self, code: int, body: bytes, ctype: str) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if code == 405:
+                self.send_header("Allow", "GET")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def send_error(self, code: int, message: Optional[str] = None, explain: Optional[str] = None) -> None:
+            code = 405 if code == 501 else code                        # an unknown method is a method-not-allowed, not "unimplemented"
+            self._send(code, json.dumps({"error": http_status(code)}).encode(), "application/json")
+
+        def do_GET(self) -> None:
+            port = self.server.server_address[1]
+            if not host_ok(self.headers.get("Host"), port):
+                return self._send(403, b'{"error":"forbidden host"}', "application/json")
+            path = self.path.split("?", 1)[0].split("#", 1)[0]          # a query string is never used
+            if path == "/" or path == "/index.html":
+                return self._static("index.html")
+            if path.startswith("/static/"):
+                return self._static(path[len("/static/"):])
+            if path == "/api/health":
+                return self._send(200, b'{"ok":true}', "application/json")
+            if path == "/api/state":
+                try:
+                    return self._send(200, cfg.state_bytes(), "application/json")
+                except Exception as exc:                              # noqa: BLE001 - the page shows an error state; the traceback is not served
+                    return self._send(500, json.dumps({"error": "state could not be built", "kind": type(exc).__name__}).encode(), "application/json")
+            return self._send(404, b'{"error":"not found"}', "application/json")
+
+        def _static(self, name: str) -> None:
+            if name not in STATIC_FILES:                               # exact allow-list: no decoding, no separators, no traversal
+                return self._send(404, b'{"error":"not found"}', "application/json")
+            try:
+                with open(os.path.join(STATIC_DIR, name), "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                return self._send(404, b'{"error":"not found"}', "application/json")
+            self._send(200, body, STATIC_FILES[name])
+
+        def _no(self) -> None:
+            self._send(405, b'{"error":"method not allowed"}', "application/json")
+        do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _no
+
+        def do_HEAD(self) -> None:
+            self._no()
+    return Handler
+
+
+def http_status(code: int) -> str:
+    return {400: "bad request", 403: "forbidden", 404: "not found", 405: "method not allowed", 414: "uri too long", 431: "headers too large", 500: "error"}.get(code, "error")
+
+
+def make_server(cfg: _Config, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+    if host != "127.0.0.1":
+        raise ValueError("the control centre binds 127.0.0.1 only (refusing host %r)" % host)
+    srv = ThreadingHTTPServer((host, port), make_handler(cfg))
+    srv.daemon_threads = True
+    return srv
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Read-only owner control centre (127.0.0.1, GET only). No controls, no outbound request.")
+    ap.add_argument("--data-root", default=None, help="private market-data root (tools/market_collector.py output)")
+    ap.add_argument("--universe-dir", default=None, help="a schema-v2 universe capture directory")
+    ap.add_argument("--artifacts-dir", default=None, help="directory holding the multi-symbol JSON artifacts (see the module docstring)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--host", default="127.0.0.1", help="only 127.0.0.1 is accepted")
+    ap.add_argument("--with-economics", action="store_true", help="also load the in-sample corpus economics once (about 15 s)")
+    ap.add_argument("--verify", action="store_true", help="re-hash datasets in the freshness audit (slow on a large root)")
+    ap.add_argument("--print-state", action="store_true", help="print the state JSON and exit")
+    a = ap.parse_args(argv)
+    cfg = _Config(a.data_root, a.universe_dir, a.artifacts_dir, a.with_economics, a.verify, ttl_ms=0 if a.print_state else 5000)
+    if a.print_state:
+        sys.stdout.write(cfg.state_bytes().decode() + "\n")
+        return 0
+    try:
+        srv = make_server(cfg, a.host, a.port)
+    except (ValueError, OSError) as exc:
+        print(f"control_centre: {exc}", file=sys.stderr)
+        return 2
+    print(f"control centre on http://127.0.0.1:{srv.server_address[1]}/  (read-only; Ctrl-C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

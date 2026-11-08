@@ -111,11 +111,66 @@ def _read_manifest(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def scan_data_root(root: Optional[str], *, max_depth: int = 4) -> Dict[str, Any]:
-    """Find capture manifests (schema universe_capture/v2, market_history/v1) under ``root``. No root = nothing was looked for = MISSING, not assumed present."""
-    res: Dict[str, Any] = {"root": root, "universe_capture_dirs": [], "market_history": [], "checked": root is not None}
+WARMUP_DAYS = 7                       # backfill_plan's registered warm-up; the required span is ITS number (backfill_plan.required_window), never re-derived here
+
+
+def required_span(formation_days: int, hold_days: int, min_rows: int = 60, warmup_days: int = WARMUP_DAYS) -> Dict[str, Any]:
+    """The exact history span 60 independent holding rows need: warmup + formation + min_rows x hold (backfill_plan.required_window, 7 + 30 + 60 x 7 = 457 days at the registered values)."""
+    import backfill_plan as BP
+    w = BP.required_window(None, 1, formation_days, hold_days, min_rows, warmup_days)
+    return {"needed_days": w["needed_days"], "components": w["components"], "formula": w["formula"]}
+
+
+def resolve_universe_dir(path: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(dir, None) for a universe_capture directory, or for a PARENT dir holding exactly one capture below it; (None, reason) otherwise (ambiguous parents are refused, never guessed)."""
+    if not isinstance(path, str) or not path or not os.path.isdir(path) or os.path.islink(path):
+        return None, "not a directory"
+    m = _read_manifest(os.path.join(path, "manifest.json"))
+    sch = None if m is None else (m.get("schema") if m.get("schema") is not None else m.get("schema_version"))
+    if sch == RH.UNIVERSE_CAPTURE_SCHEMA:
+        return path, None
+    kids = []
+    for n in sorted(os.listdir(path))[:500]:
+        d = os.path.join(path, n)
+        if n == "state" or os.path.islink(d) or not os.path.isdir(d):
+            continue
+        mk = _read_manifest(os.path.join(d, "manifest.json"))
+        if mk is not None and (mk.get("schema") == RH.UNIVERSE_CAPTURE_SCHEMA):
+            kids.append(d)
+    if len(kids) == 1:
+        return kids[0], None
+    if len(kids) > 1:
+        return None, f"ambiguous: {len(kids)} universe captures below it ({[os.path.basename(k) for k in kids][:5]}); pass one"
+    legacy = m is not None and m.get("schema_version") is not None
+    return None, ("a LEGACY schema_version " + str(m.get("schema_version")) + " capture: no status partitions, never counted") if legacy else f"manifest schema is {sch!r}, not {RH.UNIVERSE_CAPTURE_SCHEMA}"
+
+
+def scan_data_root(root: Optional[str], *, max_depth: int = 4, universe_dirs: Sequence[str] = ()) -> Dict[str, Any]:
+    """Find capture manifests (schema universe_capture/v2, market_history/v1) under ``root``. No root = nothing was looked for = MISSING, not assumed present.
+
+    ``universe_dirs`` are universe_capture directories passed EXPLICITLY (the cross-sectional path's required input): they are recognised wherever they live (inside or outside
+    ``root``) and listed in ``universe_capture_dirs`` / ``universe_dirs_explicit``; a path that is not a universe_capture/v2 directory is listed in ``universe_dirs_rejected`` with the
+    reason, never silently dropped. ``universe_dir_supplied`` is True iff at least one explicit directory was given and recognised."""
+    res: Dict[str, Any] = {"root": root, "universe_capture_dirs": [], "universe_dirs_explicit": [], "universe_dirs_rejected": [], "universe_dir_supplied": False,
+                           "market_history": [], "spot_snapshots": [], "checked": root is not None,
+                           "legacy_universe_captures_not_counted": [], "sibling_universe_captures_outside_scanned_root": [], "findings": [],
+                           "rule": "only manifests UNDER the scanned root are found (depth <= 4, no symlinks, 'state' skipped); a universe capture counts only when schema is exactly 'universe_capture/v2'"}
+    explicit: List[str] = []
+    for ud in universe_dirs or ():
+        if not isinstance(ud, str) or not ud:
+            res["universe_dirs_rejected"].append({"dir": str(ud), "reason": "empty universe dir"})
+            continue
+        resolved, why = resolve_universe_dir(ud)
+        if resolved is None:
+            res["universe_dirs_rejected"].append({"dir": ud, "reason": why})
+            continue
+        explicit.append(os.path.realpath(resolved))
+    res["universe_dirs_explicit"] = sorted(set(explicit))
+    res["universe_dir_supplied"] = bool(explicit)
+    found: List[str] = list(explicit)
     if root is None or not os.path.isdir(root):
         res["checked"] = False
+        res["universe_capture_dirs"] = sorted(set(found))
         return res
     base = os.path.realpath(root)
     for dp, dns, fns in os.walk(base):
@@ -126,10 +181,30 @@ def scan_data_root(root: Optional[str], *, max_depth: int = 4) -> Dict[str, Any]
             m = _read_manifest(os.path.join(dp, "manifest.json"))
             schema = None if m is None else (m.get("schema") if m.get("schema") is not None else m.get("schema_version"))
             if schema == RH.UNIVERSE_CAPTURE_SCHEMA:
-                res["universe_capture_dirs"].append(dp)
+                found.append(dp)
+            elif m is not None and m.get("schema_version") is not None and m.get("schema") is None and (m.get("universe") or m.get("universe_file")):
+                res["legacy_universe_captures_not_counted"].append({"dir": dp, "schema_version": m.get("schema_version")})
+            elif schema == "market_history/v1" and m.get("dataset") == MH.SPOT:
+                res["spot_snapshots"].append({"dir": dp, "dataset_status": m.get("dataset_status")})
             elif schema == "market_history/v1":
                 res["market_history"].append({"dir": dp, "dataset_status": m.get("dataset_status"), "coverage": m.get("coverage")})
-    res["universe_capture_dirs"].sort()
+    res["universe_capture_dirs"] = sorted(set(found))
+    parent = os.path.dirname(base)
+    if os.path.isdir(parent):                                       # a capture BESIDE the scanned root (datasets/universe-... next to datasets/md-...) is invisible to a scan of the root
+        for n in sorted(os.listdir(parent))[:200]:
+            d = os.path.join(parent, n)
+            if n == "state" or os.path.islink(d) or os.path.realpath(d) == base or not os.path.isfile(os.path.join(d, "manifest.json")):
+                continue
+            mk = _read_manifest(os.path.join(d, "manifest.json"))
+            sch = None if mk is None else (mk.get("schema") if mk.get("schema") is not None else mk.get("schema_version"))
+            if sch == RH.UNIVERSE_CAPTURE_SCHEMA or (mk is not None and mk.get("schema_version") is not None and mk.get("schema") is None):
+                res["sibling_universe_captures_outside_scanned_root"].append({"dir": d, "schema": sch, "counted": False, "why": "beside, not under, the scanned root: pass it with --universe-dir"})
+    if res["sibling_universe_captures_outside_scanned_root"] and not res["universe_capture_dirs"]:
+        res["findings"].append("LOUD: universe_capture_dirs is empty because the universe capture lies BESIDE the scanned root, not under it: " + str([x["dir"] for x in res["sibling_universe_captures_outside_scanned_root"]][:3]) + "; pass --universe-dir (required by the cross-sectional path)")
+    if res["legacy_universe_captures_not_counted"]:
+        res["findings"].append("LOUD: legacy (schema_version 1) universe captures were found and NOT counted: they carry no status partitions, so they cannot show delistings")
+    res["market_history"].sort(key=lambda x: x["dir"])
+    res["spot_snapshots"].sort(key=lambda x: x["dir"])
     return res
 
 
@@ -138,26 +213,280 @@ def _needs_universe(spec: Mapping[str, Any]) -> bool:
     return "universe" in txt or "delisted" in txt or "listing" in txt
 
 
-def universe_assessment(spec: Mapping[str, Any], scan: Mapping[str, Any]) -> Dict[str, Any]:
+def _iso(ms: Any) -> Optional[str]:
+    import datetime as _dt
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+        return None
+    return _dt.datetime.fromtimestamp(ms / 1000.0, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _rel(path: str, root: Optional[str]) -> str:
+    if root and os.path.isdir(root):
+        try:
+            r = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+            if not r.startswith(".."):
+                return r
+        except ValueError:
+            pass
+    return os.path.realpath(path)
+
+
+def verified_inventory(scan: Mapping[str, Any]) -> Dict[str, Any]:
+    """Re-verify, from the bytes, every capture the scan found (market_history ``verify_dataset``; universe ``load_universe_dir`` = ``verify_capture_dir`` + COMPLETE|PARTIAL).
+    A manifest that merely exists and parses is NOT data: ``verified`` is the verifier's answer. Offline; reads only the supplied directories."""
+    datasets: List[Dict[str, Any]] = []
+    for m in scan.get("market_history", []):
+        d = m["dir"]
+        man = _read_manifest(os.path.join(d, "manifest.json")) or {}
+        try:
+            v = MH.verify_dataset(d)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            v = {"ok": False, "problems": [f"verify_dataset raised {type(exc).__name__}"]}
+        syms = man.get("symbols") if isinstance(man.get("symbols"), dict) else {}
+        firsts, lasts = [], []
+        for r in syms.values():
+            cov = r.get("coverage") if isinstance(r, dict) and isinstance(r.get("coverage"), dict) else {}
+            if isinstance(cov.get("served_first_ts"), int) and isinstance(cov.get("served_last_ts"), int):
+                firsts.append(cov["served_first_ts"])
+                lasts.append(cov["served_last_ts"])
+        top = m.get("coverage") if isinstance(m.get("coverage"), dict) else {}
+        if not firsts and isinstance(top.get("first_ts"), int) and isinstance(top.get("last_ts"), int):
+            firsts, lasts = [top["first_ts"]], [top["last_ts"]]
+        by_status: Dict[str, int] = {}
+        for r in syms.values():
+            st = str(r.get("status")) if isinstance(r, dict) else "None"
+            by_status[st] = by_status.get(st, 0) + 1
+        datasets.append({"dir": d, "rel": _rel(d, scan.get("root")), "dataset": man.get("dataset"), "interval": man.get("interval"), "verified": bool(v.get("ok")),
+                         "problems": [str(x)[:160] for x in v.get("problems", [])[:4]], "dataset_status": man.get("dataset_status"), "digest": man.get("manifest_digest"),
+                         "symbols": sorted(syms), "by_symbol_status": dict(sorted(by_status.items())), "first_ts": min(firsts) if firsts else None, "last_ts": max(lasts) if lasts else None})
+    universes: List[Dict[str, Any]] = []
+    for d in scan.get("universe_capture_dirs", []):
+        explicit = os.path.realpath(d) in set(scan.get("universe_dirs_explicit", []))
+        try:
+            recs, info = MH.load_universe_dir(d)
+            universes.append({"dir": d, "rel": _rel(d, scan.get("root")), "explicit": explicit, "verified": True, "problems": [], "dataset_status": info.get("dataset_status"),
+                              "digest": info.get("manifest_sha256"), "symbols": info.get("symbols"), "delisting_observability": info.get("delisting_observability"),
+                              "status_coverage": info.get("status_coverage"), "statuses_in_capture": info.get("statuses_in_capture"), "snapshot_ms": info.get("snapshot_ms"),
+                              "capture_schema": info.get("capture_schema")})
+        except (MH.HistoryError, UC.CaptureError, OSError, ValueError, KeyError, TypeError) as exc:
+            universes.append({"dir": d, "rel": _rel(d, scan.get("root")), "explicit": explicit, "verified": False, "problems": [str(exc)[:200]], "dataset_status": None, "digest": None,
+                              "symbols": None, "delisting_observability": "NOT_OBSERVED", "status_coverage": None, "statuses_in_capture": None, "snapshot_ms": None, "capture_schema": None})
+    spots: List[Dict[str, Any]] = []
+    for sp in scan.get("spot_snapshots", []):
+        man = _read_manifest(os.path.join(sp["dir"], "manifest.json")) or {}
+        try:
+            v = MH.verify_spot(sp["dir"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            v = {"ok": False, "problems": [f"verify_spot raised {type(exc).__name__}"]}
+        spots.append({"dir": sp["dir"], "rel": _rel(sp["dir"], scan.get("root")), "verified": bool(v.get("ok")), "problems": [str(x)[:160] for x in v.get("problems", [])[:3]],
+                      "dataset_status": man.get("dataset_status"), "digest": man.get("manifest_digest")})
+    return {"datasets": datasets, "universes": universes, "spot_snapshots": spots}
+
+
+def survivorship_of_universes(inv: Mapping[str, Any]) -> str:
+    """DELISTINGS_OBSERVED only when a VERIFIED universe capture's Closed partition served rows; everything else is SURVIVORS_ONLY (fail closed)."""
+    for u in inv.get("universes", []):
+        cov = u.get("status_coverage") if isinstance(u.get("status_coverage"), Mapping) else {}
+        if u.get("verified") and u.get("delisting_observability") == "OBSERVED" and cov.get("Closed") == "OBSERVED_ROWS":
+            return DELISTINGS_OBSERVED
+    return SURVIVORS_ONLY
+
+
+def universe_assessment(spec: Mapping[str, Any], scan: Mapping[str, Any], inv: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     if not _needs_universe(spec):
         return {"status": "NOT_APPLICABLE_SINGLE_INSTRUMENT", "reason": "the candidate trades one named instrument (BTCUSDT), so there is no universe to survive"}
-    if not scan["checked"]:
-        return {"status": MISSING, "reason": "no --data-root given: no universe_capture manifest was looked for, so none is assumed"}
+    if not scan["checked"] and not scan.get("universe_capture_dirs"):
+        return {"status": MISSING, "reason": "UNIVERSE_DIR_REQUIRED: no --universe-dir and no --data-root given: no universe_capture manifest was looked for, so none is assumed"}
     if not scan["universe_capture_dirs"]:
-        return {"status": MISSING, "reason": "no universe_capture/v2 manifest under the data root"}
-    mh = scan["market_history"]
-    cov = [c["coverage"] for c in mh if isinstance(c.get("coverage"), dict) and isinstance(c["coverage"].get("first_ts"), int) and isinstance(c["coverage"].get("last_ts"), int)]
+        return {"status": MISSING, "reason": "UNIVERSE_DIR_REQUIRED: no universe_capture/v2 manifest under the data root and none passed with --universe-dir"}
+    inv = inv if inv is not None else verified_inventory(scan)
+    good = [u for u in inv["universes"] if u["verified"]]
+    if not good:
+        return {"status": "UNVERIFIED", "reason": "universe capture directories exist but none verifies (verify_capture_dir): " + "; ".join(p for u in inv["universes"] for p in u["problems"])[:300],
+                "captures": len(scan["universe_capture_dirs"]), "survivorship": SURVIVORS_ONLY}
+    cov = [(d["first_ts"], d["last_ts"]) for d in inv["datasets"] if d["verified"] and isinstance(d["first_ts"], int) and isinstance(d["last_ts"], int)]
     if not cov:
-        return {"status": "UNVERIFIED", "reason": "universe captures exist but no market_history coverage fixes a study window, so coverage cannot be judged",
-                "captures": len(scan["universe_capture_dirs"])}
-    lo, hi = min(c["first_ts"] for c in cov), max(c["last_ts"] for c in cov)
+        return {"status": "UNVERIFIED", "reason": "universe captures verify but no verified market_history coverage fixes a study window, so coverage cannot be judged",
+                "captures": len(scan["universe_capture_dirs"]), "survivorship": survivorship_of_universes(inv)}
+    lo, hi = min(c[0] for c in cov), max(c[1] for c in cov)
     if hi <= lo:
         return {"status": "UNVERIFIED", "reason": "market_history coverage window is empty"}
-    u = RH.PointInTimeUniverse.from_capture_dirs(scan["universe_capture_dirs"], study_from_ms=lo, study_to_ms=hi)
+    try:
+        u = RH.PointInTimeUniverse.from_capture_dirs([x["dir"] for x in good], study_from_ms=lo, study_to_ms=hi)
+    except RH.HarnessError as exc:
+        return {"status": "UNVERIFIED", "reason": f"point-in-time universe refused: {str(exc)[:200]}", "survivorship": survivorship_of_universes(inv)}
     st = {RH.PIT_RAW: "VERIFIED_RAW_RESPONSES", RH.PIT_PARTIAL: "PARTIAL", RH.PIT_ASSERTED: "UNVERIFIED"}[u.pit_basis]
     return {"status": st, "pit_basis": u.pit_basis, "pit_basis_note": PIT_LABEL_NOTE, "problems": u.survivorship_problems()[:6], "unverified_segments": u.unverified_segments[:6],
             "study_window_ms": [lo, hi], "funding_normalisation_known": u.funding_normalisation_known, "captures": len(scan["universe_capture_dirs"]),
+            "explicit": bool(scan.get("universe_dir_supplied")), "survivorship": survivorship_of_universes(inv),
             "closed_contracts_seen": len(u.delisted_between(0, 2 ** 62))}
+
+
+# ---------------------------------------------------------------- required data: verified manifests, never the spec's own declaration
+MICROSTRUCTURE = ("liquidity_imbalance", "passive_execution", "spread_microstructure")
+ITEM_VERIFIED, ITEM_INCOMPLETE, ITEM_MISSING, ITEM_FAILS, ITEM_DECLARED = "VERIFIED_MANIFEST", "VERIFIED_MANIFEST_INCOMPLETE", "MISSING", "MANIFEST_FAILS_VERIFICATION", "DECLARED_ONLY_NOT_VERIFIED"
+ITEM_COMMITTED = "COMMITTED_CORPUS_READ"
+_ITEM_ORDER = (ITEM_FAILS, ITEM_MISSING, ITEM_DECLARED, ITEM_INCOMPLETE, ITEM_COMMITTED, ITEM_VERIFIED)           # worst first
+
+
+def classify_required(name: str) -> Tuple[str, ...]:
+    """The data kinds a ``required_data`` item needs. Only universe / funding / mark have a verified capture schema in this repository; every other kind is unverifiable here."""
+    n = name.lower()
+    kinds = set()
+    if "two venues" in n or "per-venue" in n:
+        kinds.add("cross_venue")
+    if any(k in n for k in ("depth", "l2", "order book", "book ", "spread per", "trade tape", "trade-by-trade", "order-by-order", "latency", "queue position")):
+        kinds.add("depth")
+    if "spot price" in n or "spot and perp" in n or "hedge-leg" in n or "synchronised" in n or "basis" in n:
+        kinds.add("spot_price")
+    if any(k in n for k in ("listing", "delisting", "universe")):
+        kinds.add("universe")
+    if "funding" in n and "cross_venue" not in kinds:
+        kinds.add("funding")
+    if ("mark" in n or "index price" in n) and "spot_price" not in kinds:
+        kinds.add("mark")
+    if "fee" in n or "borrow" in n or "financing" in n:
+        kinds.add("other")
+    return tuple(sorted(kinds)) or ("other",)
+
+
+def _kind_status(kind: str, inv: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
+    if kind in ("depth", "spot_price", "cross_venue"):
+        return ITEM_MISSING, f"no verified capture schema for {kind} data exists in this repository"
+    if kind == "other":
+        return ITEM_DECLARED, "no manifest schema covers this item; the spec's declaration is not evidence"
+    if inv is None:
+        return ITEM_MISSING, "no data root / universe dir supplied: nothing was looked for"
+    if kind == "universe":
+        us = inv["universes"]
+        if not us:
+            return ITEM_MISSING, "no universe_capture/v2 directory supplied or found"
+        ok = [u for u in us if u["verified"]]
+        if not ok:
+            return ITEM_FAILS, "; ".join(p for u in us for p in u["problems"])[:200]
+        return (ITEM_VERIFIED if any(u["dataset_status"] == "COMPLETE" for u in ok) else ITEM_INCOMPLETE), f"universe dataset_status {sorted({str(u['dataset_status']) for u in ok})}"
+    want = {"funding": ("funding",), "mark": ("mark-kline", "index-kline")}[kind]
+    ds = [d for d in inv["datasets"] if d["dataset"] in want]
+    if not ds:
+        return ITEM_MISSING, f"no {'/'.join(want)} market_history manifest under the data root"
+    ok = [d for d in ds if d["verified"]]
+    if not ok:
+        return ITEM_FAILS, "; ".join(p for d in ds for p in d["problems"])[:200]
+    return (ITEM_VERIFIED if all(d["dataset_status"] == "COMPLETE" for d in ok) else ITEM_INCOMPLETE), f"dataset_status {sorted({str(d['dataset_status']) for d in ok})}"
+
+
+def required_data_items(name: str, spec: Mapping[str, Any], inv: Optional[Mapping[str, Any]], *, committed_funding_ok: bool = False) -> List[Dict[str, Any]]:
+    """Every required_data item with the status the ACTUAL manifests give it. ``spec_repo_has`` is the spec's declaration, shown for contrast and never trusted."""
+    out = []
+    for d in spec.get("required_data", []):
+        if not isinstance(d, dict):
+            continue
+        nm = str(d.get("name", ""))
+        kinds = classify_required(nm)
+        sts = []
+        details = []
+        for k in kinds:
+            if k == "funding" and name in CORPUS_CARRY and committed_funding_ok:
+                st, det = ITEM_COMMITTED, f"{LABEL_CORPUS}: data/real_bybit_btc_4h read by the loader (in-sample, BTCUSDT 8h only)"
+            else:
+                st, det = _kind_status(k, inv)
+            sts.append(st)
+            details.append(f"{k}: {det}")
+        worst = min(sts, key=_ITEM_ORDER.index)
+        exec_only = set(kinds) == {"depth"} and name not in MICROSTRUCTURE
+        out.append({"name": nm, "kinds": list(kinds), "spec_repo_has": d.get("repo_has"), "status": worst, "trusted": worst in (ITEM_VERIFIED, ITEM_INCOMPLETE, ITEM_COMMITTED),
+                    "complete": worst in (ITEM_VERIFIED, ITEM_COMMITTED), "execution_only": exec_only, "detail": "; ".join(details)[:300]})
+    return out
+
+
+def _data_present(spec: Mapping[str, Any], scan: Mapping[str, Any], inv: Optional[Mapping[str, Any]] = None, *, name: str = "", committed_funding_ok: bool = False) -> Dict[str, Any]:
+    items = required_data_items(name, spec, inv, committed_funding_ok=committed_funding_ok)
+    rd = [d for d in spec.get("required_data", []) if isinstance(d, dict)]
+    critical = [i for i in items if not i["execution_only"]]
+    all_ok = bool(items) and all(i["trusted"] and i["complete"] for i in items)
+    crit_ok = bool(critical) and all(i["trusted"] and i["complete"] for i in critical)
+    return {"spec_declares_missing": [d["name"] for d in rd if d.get("repo_has") is False], "spec_declares_present": [d["name"] for d in rd if d.get("repo_has") is True],
+            "manifests_checked": scan["checked"] or bool(scan.get("universe_capture_dirs")), "items": items,
+            "value": "VERIFIED_ALL" if all_ok else "MISSING", "evaluation_data_verified": crit_ok,
+            "n_items": len(items), "n_trusted": sum(1 for i in items if i["trusted"]),
+            "execution_only_unverified": [i["name"] for i in items if i["execution_only"] and not (i["trusted"] and i["complete"])],
+            "note": "the spec's repo_has is a declaration and is NOT trusted: an item counts only when a manifest under --data-root / --universe-dir passes its verifier (VERIFIED_MANIFEST); "
+                    "depth-only items gate EXECUTION_READY, not DATA_READY"}
+
+
+# ---------------------------------------------------------------- the readiness vocabulary
+READINESS_LEVELS = ("DATA_READY", "RESEARCH_READY", "PROMISING", "PROSPECTIVE", "EXECUTION_READY", "OWNER_PROFIT_EVIDENCED")
+MIN_PROMISING_OOS_OBS = SV.MIN_OBSERVATIONS["oos_test"]
+
+
+def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_ok: bool, survivorship: Optional[str], mechanism_ok: bool,
+                     evaluation: Optional[Mapping[str, Any]] = None, prospective: Optional[Mapping[str, Any]] = None, executable: bool = False,
+                     owner_evidence: Any = None, alpha: float = 0.05) -> Dict[str, Any]:
+    """The six-level readiness vocabulary, CUMULATIVE (a level is reached only if every level below it is). Levels never borrow from one another:
+
+    DATA_READY      the evaluation-critical datasets verify from their manifests and are COMPLETE. A dataset-level fact: it says nothing about any strategy.
+    RESEARCH_READY  DATA_READY + point-in-time universe verified + survivorship not SURVIVORS_ONLY + stated mechanism. The evaluation is now *meaningful*; no edge is implied.
+    PROMISING       RESEARCH_READY + a walk-forward evaluation with positive out-of-sample mean, Holm-adjusted p <= alpha over the WHOLE family, enough independent observations and
+                    no unpriced terminal exits. Still in-sample-to-capture: not a pass.
+    PROSPECTIVE     PROMISING + a registered prospective window that has STARTED and observed at least its floor of settlements (this tool never reads a journal: unreachable here).
+    EXECUTION_READY PROSPECTIVE + executable on a qualified venue (never a RESEARCH_ONLY candidate).
+    OWNER_PROFIT_EVIDENCED  owner-signed evidence verified by the owner's ledger. This tool cannot read or create it: never reached here (a caller-supplied dict is ignored).
+
+    ``survivorship`` None = not applicable (single instrument). ``highest_supportable_verdict`` never exceeds INSUFFICIENT_DATA: REJECTED only when an adequately sized evaluation lost."""
+    L: Dict[str, Dict[str, Any]] = {}
+    ev = evaluation if isinstance(evaluation, Mapping) else None
+
+    def put(name: str, ok: bool, reasons: Sequence[str]) -> None:
+        prev_ok = name == READINESS_LEVELS[0] or L[READINESS_LEVELS[READINESS_LEVELS.index(name) - 1]]["reached"]
+        rs = list(reasons)
+        if ok and not prev_ok:
+            ok = False
+            rs.append(f"not reached because {READINESS_LEVELS[READINESS_LEVELS.index(name) - 1]} is not reached")
+        L[name] = {"reached": bool(ok), "reasons": rs}
+
+    put("DATA_READY", bool(data_ready), list(data_reasons) or ([] if data_ready else ["evaluation-critical data is not verified and COMPLETE from manifests"]))
+    rr = []
+    if not pit_ok:
+        rr.append("point-in-time universe not verified (or the universe dir was not supplied)")
+    if survivorship == SURVIVORS_ONLY:
+        rr.append("SURVIVORS_ONLY: delistings were not observed, so no survivorship-free claim can be made; a dataset-level DATA_READY does not become strategy-level READY")
+    if not mechanism_ok:
+        rr.append("no stated counterparty / economic mechanism")
+    put("RESEARCH_READY", pit_ok and survivorship != SURVIVORS_ONLY and mechanism_ok, rr)
+    pr: List[str] = []
+    promising = False
+    if ev is None or ev.get("status") != "WALK_FORWARD_DONE":
+        pr.append("no completed walk-forward evaluation" + ("" if ev is None else f" (status {ev.get('status')})"))
+    else:
+        mean, padj, nobs = ev.get("oos_mean_total_bps_per_row"), ev.get("p_adjusted"), ev.get("oos_independent_observations") or 0
+        if ev.get("verdict") == "REJECTED":
+            pr.append("the evaluation was REJECTED")
+        if not isinstance(mean, (int, float)) or mean <= 0:
+            pr.append(f"out-of-sample mean {mean} is not positive")
+        if not isinstance(padj, (int, float)) or padj > alpha:
+            pr.append(f"Holm-adjusted p {padj} > {alpha} over the whole family")
+        if nobs < MIN_PROMISING_OOS_OBS:
+            pr.append(f"{nobs} independent OOS observations < {MIN_PROMISING_OOS_OBS}")
+        if ev.get("terminal_exit_unpriced"):
+            pr.append("unpriced terminal exits")
+        promising = not pr
+    put("PROMISING", promising, pr)
+    pp = prospective if isinstance(prospective, Mapping) else {}
+    obs, floor = pp.get("settlements_observed") or 0, pp.get("min_settlements") or 0
+    started = bool(pp.get("started")) and floor > 0 and obs >= floor
+    put("PROSPECTIVE", started, [] if started else ["no started prospective window with its floor of settlements observed (this tool never reads a trial journal)"])
+    put("EXECUTION_READY", bool(executable), [] if executable else ["no qualified order path for this mechanism (research-only, unqualified venue, or not Bybit)"])
+    put("OWNER_PROFIT_EVIDENCED", False, ["owner-signed evidence is verified only by the owner's ledger/attestation; this tool never reads or creates it"])
+    reached = [n for n in READINESS_LEVELS if L[n]["reached"]]
+    if ev is not None and ev.get("status") == "WALK_FORWARD_DONE" and ev.get("verdict") == "REJECTED":
+        hv = "REJECTED"
+    elif L["DATA_READY"]["reached"] or ev is not None:
+        hv = "INSUFFICIENT_DATA"
+    else:
+        hv = "UNTESTED"
+    return {"levels": L, "highest": reached[-1] if reached else "NONE", "highest_supportable_verdict": hv,
+            "survivorship_free_claim": bool(pit_ok and survivorship == DELISTINGS_OBSERVED),
+            "notes": ["levels are cumulative; DATA_READY is a property of datasets, the rest are properties of a strategy", "no level here promotes a candidate: the verdict ceiling is INSUFFICIENT_DATA"]}
 
 
 # ---------------------------------------------------------------- the BTC funding carry on the committed corpus
@@ -257,28 +586,31 @@ def _family(name: str, spec: Mapping[str, Any]) -> Dict[str, Any]:
     return {"family": fam, "variants_enumerated": n, "note": note, "correction": "holm (default) / bh via VariantLedger.selection; deflated Sharpe via tools/deflated_sharpe on the best variant"}
 
 
-def _data_present(spec: Mapping[str, Any], scan: Mapping[str, Any]) -> Dict[str, Any]:
-    rd = [d for d in spec.get("required_data", []) if isinstance(d, dict)]
-    declared_missing = [d["name"] for d in rd if d.get("repo_has") is False]
-    return {"spec_declares_missing": declared_missing, "spec_declares_present": [d["name"] for d in rd if d.get("repo_has") is True],
-            "manifests_checked": scan["checked"],
-            "value": MISSING if (declared_missing and not scan["checked"]) else ("MISSING" if declared_missing else "PRESENT_PER_SPEC_UNVERIFIED_BY_MANIFEST"),
-            "note": "the spec's repo_has is a declaration; only a verified manifest under --data-root counts as present data"}
-
-
-def candidate_row(name: str, spec: Mapping[str, Any], scan: Mapping[str, Any], econ: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def candidate_row(name: str, spec: Mapping[str, Any], scan: Mapping[str, Any], econ: Optional[Mapping[str, Any]], inv: Optional[Mapping[str, Any]] = None,
+                  evaluation: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     cid = str(spec.get("candidate_id"))
     ladder = SV.evaluate(spec, [])
     bias = spec.get("bias_declarations", {}) if isinstance(spec.get("bias_declarations"), dict) else {}
-    uni = universe_assessment(spec, scan)
+    inv = inv if inv is not None else (verified_inventory(scan) if (scan["checked"] or scan.get("universe_capture_dirs")) else None)
+    uni = universe_assessment(spec, scan, inv)
+    needs_u = _needs_universe(spec)
+    u_dir = {"required": needs_u, "supplied": bool(scan.get("universe_dir_supplied")),
+             "status": "NOT_REQUIRED" if not needs_u else (("SUPPLIED_VERIFIED" if inv and any(u["verified"] and u["explicit"] for u in inv["universes"]) else "SUPPLIED_UNVERIFIED") if scan.get("universe_dir_supplied") else "UNIVERSE_DIR_REQUIRED"),
+             "discovered_under_data_root_not_supplied": [] if scan.get("universe_dir_supplied") else list(scan.get("universe_capture_dirs", []))[:4],
+             "rejected": scan.get("universe_dirs_rejected", [])}
+    if needs_u and not u_dir["supplied"]:
+        uni = {**uni, "reason": "UNIVERSE_DIR_REQUIRED: the cross-sectional path takes --universe-dir as an explicit required input; none was passed (" + str(uni.get("reason", uni["status"]))[:160] + ")"}
+        if uni["status"] != MISSING:
+            uni = {**uni, "status": uni["status"], "assessment_is_informational_only": True}
     ex = _executable(name, spec)
     costs = cost_constants()
     carry = name in CORPUS_CARRY and econ is not None and "unconditional_forced_hold" in econ
     row: Dict[str, Any] = {
         "candidate": cid, "name": name,
-        "required_data": _data_present(spec, scan),
+        "required_data": _data_present(spec, scan, inv, name=name, committed_funding_ok=carry),
+        "universe_dir": u_dir,
         "point_in_time": {"value": uni["status"], "detail": uni, "declared_by_spec": bias.get("point_in_time_universe")},
-        "universe_complete_for_claim": uni["status"] in ("VERIFIED_RAW_RESPONSES", "NOT_APPLICABLE_SINGLE_INSTRUMENT"),
+        "universe_complete_for_claim": uni["status"] in ("VERIFIED_RAW_RESPONSES", "NOT_APPLICABLE_SINGLE_INSTRUMENT") and (not needs_u or u_dir["supplied"]),
         "economic_mechanism": _mechanism(spec),
         "executable_on_qualified_venues": ex,
         "price_leg_hedge_risk_measured": {"value": bool(bias.get("hedge_completeness_modelled")),
@@ -313,7 +645,18 @@ def candidate_row(name: str, spec: Mapping[str, Any], scan: Mapping[str, Any], e
     if name == "cross_sectional_funding":
         row["readiness_reasons"].append("PERP-ONLY symbols (no Bybit spot pair) are directional price+funding, never carry; formation and holding windows must be separate (evaluate_ranked_funding)")
         row["interval_note"] = OWNER_INTERVAL_NOTE
+    if needs_u and not u_dir["supplied"]:
+        row["readiness_reasons"].append("UNIVERSE_DIR_REQUIRED: the cross-sectional path refuses to evaluate without an explicit --universe-dir (a verified universe_capture); nothing was evaluated")
     row["verdict_rank_ceiling"] = "INSUFFICIENT_DATA"
+    pit_ok = row["universe_complete_for_claim"]
+    surv = None if not needs_u else uni.get("survivorship", SURVIVORS_ONLY)
+    dr = row["required_data"]["evaluation_data_verified"] and (not needs_u or u_dir["status"] == "SUPPLIED_VERIFIED") and not (needs_u and not u_dir["supplied"])
+    pp = spec.get("prospective_protocol") if isinstance(spec.get("prospective_protocol"), dict) else {}
+    row["readiness"] = readiness_levels(
+        data_ready=bool(dr), data_reasons=[f"{i['name'][:60]}: {i['status']}" for i in row["required_data"]["items"] if not i["execution_only"] and not (i["trusted"] and i["complete"])],
+        pit_ok=bool(pit_ok), survivorship=surv, mechanism_ok=bool(row["economic_mechanism"]["present"]), evaluation=evaluation,
+        prospective={"started": pp.get("start_ms") is not None, "settlements_observed": 0, "min_settlements": pp.get("min_settlements")}, executable=bool(ex["executable"]))
+    row["readiness_level"] = row["readiness"]["highest"]
     return row
 
 
@@ -326,15 +669,21 @@ def _oos(spec: Mapping[str, Any]) -> Dict[str, Any]:
     return {"value": "NO_PROTOCOL"}
 
 
-def build_report(*, data_root: Optional[str] = None, with_economics: bool = True) -> Dict[str, Any]:
-    scan = scan_data_root(data_root)
+def build_report(*, data_root: Optional[str] = None, with_economics: bool = True, universe_dir: Optional[str] = None,
+                 evaluations: Optional[Mapping[str, Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    """The readiness table. ``universe_dir`` is the explicit universe_capture directory of the cross-sectional path: it is recognised wherever it lives (``data_scan`` lists it) and a
+    candidate that needs a universe is reported UNIVERSE_DIR_REQUIRED without it. Every ``required_data`` item is judged from re-verified manifests, never from the spec's repo_has.
+    ``evaluations`` ({candidate name: evaluation dict}) lets a caller attach a completed walk-forward so PROMISING can be judged."""
+    scan = scan_data_root(data_root, universe_dirs=[universe_dir] if universe_dir else ())
+    inv = verified_inventory(scan) if (scan["checked"] or scan["universe_capture_dirs"]) else None
     econ = btc_carry_economics() if with_economics else None
-    rows = [candidate_row(n, s, scan, econ) for n, s in load_candidates()]
-    return {"schema": SCHEMA, "tool": "tools/candidate_readiness.py", "data_scan": scan, "cost_constants": cost_constants(), "owner_observed": OWNER_INTERVAL_NOTE,
-            "economics": {"btc_carry_corpus": econ}, "candidates": rows,
+    rows = [candidate_row(n, s, scan, econ, inv, (evaluations or {}).get(n)) for n, s in load_candidates()]
+    return {"schema": SCHEMA, "tool": "tools/candidate_readiness.py", "data_scan": scan, "findings": list(scan.get("findings", [])), "inventory": inv, "cost_constants": cost_constants(), "owner_observed": OWNER_INTERVAL_NOTE,
+            "economics": {"btc_carry_corpus": econ}, "candidates": rows, "readiness_levels": list(READINESS_LEVELS),
             "caveats": ["every number sourced from the committed corpus is IN-SAMPLE; no out-of-sample settlement exists in this repository",
                         "MAKER_FIRST figures are a MODELLED execution scenario, never measured; fee tier is the published BASE tier, the account's tier is read at run time",
-                        "no verdict here exceeds INSUFFICIENT_DATA: that needs walk-forward and prospective evidence, a registry and the owner's attestation"]}
+                        "no verdict here exceeds INSUFFICIENT_DATA: that needs walk-forward and prospective evidence, a registry and the owner's attestation",
+                        "a dataset-level DATA_READY never becomes strategy-level READY; a SURVIVORS_ONLY evaluation implies no survivorship-free claim"]}
 
 
 def render_table(rep: Mapping[str, Any]) -> str:
@@ -638,6 +987,10 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                            "ranking_rule_variants": list(formation_days_grid), "hold_days": hold_days, "top_k": top_k, "ceiling": "INSUFFICIENT_DATA",
                            "hold_days_grid": holds, "top_k_grid": ks, "cost_scenarios_bps": dict(costs), "survivorship": survivorship, "warnings": warnings,
                            "closed_in_universe_not_in_series": cin, "key_basis_unverified": bool(unkeyed),
+                           "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED,
+                           "history_coverage": (universe_info or {}).get("history_coverage") if isinstance(universe_info, Mapping) else None,
+                           "survivorship_claim_note": ("DELISTINGS_OBSERVED: Closed contracts the venue still serves were observed; an absent symbol is still not proof it was never delisted"
+                                                       if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
                            "universe_info_verified": verdict is not None,
                            "skipped_legs_without_marks": 0, "terminal_exit_unpriced": 0,
                            "multiple_testing_scope": "PER_PROCESS" if ledger_path is None else "PERSISTENT_LEDGER_FILE",
@@ -693,7 +1046,10 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
             ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping holding rows (< {min_rows})")
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family": fam, "n_variants_counted": ledger.n_variants,
                     "n_variants_tried_in_call": len(out["variants_tried"]),
-                    "reason": f"{n_rows} non-overlapping {hold_days}-day holding rows after the formation lead-in; need >= {min_rows}. The same-window trailing sums below are "
+                    "required_span": grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows, span_days=(t1 - t0) / MS_DAY),
+                    "reason": f"{n_rows} non-overlapping {hold_days}-day holding rows after the formation lead-in; need >= {min_rows}, which needs "
+                              f"{grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows)['window_days_required']} days of history (warmup + formation + {min_rows} x {hold_days}); "
+                              f"this capture spans {(t1 - t0) / MS_DAY:.1f} days. The same-window trailing sums below are "
                               f"{LABEL_TRAILING}, selected after the fact, not an expectation and not a verdict"})
         return out
     cut = {k: v[:n_rows] for k, v in per.items()}
@@ -946,7 +1302,15 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
     if excluded:
         warnings.append(f"{len(excluded)} symbols excluded (listed in excluded)")
-    info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv,
+    ended_or_trading = [sy for sy, r in recs.items() if r.get("status") in ("Trading",) + tuple(RH.ENDED_STATUSES) and r.get("quoteCoin", "USDT") == "USDT"]
+    cov_frac = (len(series) / len(ended_or_trading)) if ended_or_trading else None
+    history_cov = {"universe_eligible_symbols": len(ended_or_trading), "symbols_in_history": len(series), "fraction": cov_frac,
+                   "status": "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" if cov_frac is not None and cov_frac < 0.5 else ("OK" if cov_frac is not None else "NO_ELIGIBLE_SYMBOLS"),
+                   "note": "eligible = Trading + Closed/Delivering USDT perpetuals in the universe record; the history datasets hold only the symbols they were collected for (an explicit --symbols list "
+                           "gives a small cross-section): the evaluation is over THOSE symbols, not the venue"}
+    if history_cov["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS":
+        warnings.append(f"HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS: the history datasets hold {len(series)} of {len(ended_or_trading)} eligible universe symbols; collect the rest (backfill_plan.plan) before trusting a cross-section")
+    info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
                             "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols"),
@@ -965,24 +1329,488 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     return series, info
 
 
+# ---------------------------------------------------------------- three strategy families, three specs, three risk models
+FAMILY_CARRY, FAMILY_SPREAD, FAMILY_DIRECTIONAL = "SPOT_PERP_CARRY", "PERP_FUNDING_SPREAD", "PERP_DIRECTIONAL_FUNDING"
+FAMILIES = (FAMILY_CARRY, FAMILY_SPREAD, FAMILY_DIRECTIONAL)
+FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
+    FAMILY_CARRY: {"is_carry": True, "legs": "short the perp + long the SAME-venue Bybit spot (delta-neutral)", "universe": "only symbols with a confirmed Bybit spot pair",
+                   "cost_position_class": "acquire_spot_perp", "risk_model": "basis residual + spot/perp margin; price legs cancel to first order; the basis move is UNMEASURED here (no spot series)",
+                   "price_leg": "hedged: ~0, basis_residual UNMEASURED", "name_rule": "may be called carry"},
+    FAMILY_SPREAD: {"is_carry": False, "legs": "short top-k / long bottom-k PERPS by trailing funding, dollar-neutral, perp only", "universe": "every active perp (no spot needed)",
+                    "cost_position_class": "perp_only_unhedged", "risk_model": "residual factor / beta exposure of the long-short price book + idiosyncratic squeeze risk; funding is NOT the whole P&L",
+                    "price_leg": "measured per leg from marks; beta/correlation to the equal-weight universe reported", "name_rule": "NEVER called carry"},
+    FAMILY_DIRECTIONAL: {"is_carry": False, "legs": "short top-k perps by trailing funding, no hedge", "universe": "every active perp",
+                         "cost_position_class": "perp_only_unhedged", "risk_model": "outright short-perp price exposure (beta to the market is ~ -1) plus funding; a squeeze can exceed funding by orders of magnitude",
+                         "price_leg": "measured per leg from marks", "name_rule": "NEVER called carry"},
+}
+
+
+def family_costs(kind: str) -> Dict[str, Dict[str, Any]]:
+    """Round-trip cost scenarios per family from carry_costs' authoritative names (fee venue_stated, spread ASSUMED, maker MODELLED). A scenario with no figure (spot maker) is absent."""
+    if kind not in FAMILY_SPECS:
+        raise RH.HarnessError(f"unknown strategy family {kind!r}")
+    cls = FAMILY_SPECS[kind]["cost_position_class"]
+    out: Dict[str, Dict[str, Any]] = {}
+    for style, nm in (("taker", "taker"), ("maker", "maker_modelled")):
+        c = CC.position_class_costs(cls, style)
+        if c.get("total_bps") is not None:
+            out[nm] = {"bps": float(c["total_bps"]), "fee_bps": float(c["fee_bps"]), "spread_bps": float(c["spread_bps"]),
+                       "prov": "ASSUMED" if style == "taker" else "MODELLED",
+                       "fee_prov": "VENUE_STATED" if style == "taker" else "MODELLED", "spread_prov": "ASSUMED" if style == "taker" else "MODELLED"}
+    return out
+
+
+def holding_grid(t_first_ms: int, t_last_ms: int, *, formation_days: int, hold_days: int) -> List[int]:
+    """Decision times of the NON-OVERLAPPING holding grid: the first decision is the first UTC-day boundary at or after ``t_first + formation`` (the formation window needs its full
+    history), then one every ``hold_days``; a row needs its whole holding window inside the data (``t + hold <= t_last``). Deterministic, depends on the data span only."""
+    if hold_days < 1 or formation_days < 0:
+        raise RH.HarnessError("hold_days must be >= 1 and formation_days >= 0")
+    first = -(-(t_first_ms + formation_days * MS_DAY) // MS_DAY) * MS_DAY
+    out, t = [], first
+    while t + hold_days * MS_DAY <= t_last_ms:
+        out.append(t)
+        t += hold_days * MS_DAY
+    return out
+
+
+def grid_requirements(*, formation_days: int, hold_days: int, min_rows: int = 60, span_days: Optional[float] = None, warmup_days: int = WARMUP_DAYS) -> Dict[str, Any]:
+    """Exactly what window yields ``min_rows`` independent holding rows, using backfill_plan's numbers: warmup + formation + min_rows x hold_days (7 + 30 + 60 x 7 = 457 days at the
+    registered values), one row per ``hold_days`` whatever the number of symbols."""
+    w = required_span(formation_days, hold_days, min_rows, warmup_days)
+    need = w["needed_days"]
+    out: Dict[str, Any] = {"formation_days": formation_days, "hold_days": hold_days, "warmup_days": warmup_days, "rows_required": min_rows, "holding_span_days_required": min_rows * hold_days,
+                           "window_days_required": need, "components": w["components"],
+                           "statement": f"{min_rows} non-overlapping {hold_days}-day holding rows need {need} days of funding + mark history = warmup {warmup_days} + formation {formation_days} + "
+                                        f"{min_rows} x {hold_days} (backfill_plan.required_window); one row per {hold_days} days, whatever the number of symbols"}
+    if span_days is not None:
+        out["window_days_available"] = round(span_days, 3)
+        out["rows_possible_by_calendar"] = max(0, int((span_days - formation_days - warmup_days) // hold_days))
+        out["shortfall_days"] = round(max(0.0, need - span_days), 3)
+    return out
+
+
+def eligibility(s: SymbolSeries, t: int, kind: str, formation_ms: int, min_listing_age_days: int) -> Optional[str]:
+    """None when the symbol may enter at ``t``, else the reason code. Uses only facts known at t: launch (past), delivery <= t (already gone), formation prints <= t, the entry mark
+    knowable at t. Whether the contract is delivered LATER is never used to include or exclude it (that is a forced exit during the hold, priced or counted as unpriced)."""
+    if min_listing_age_days > 0 and not s.launch_ms:
+        return "launch_unknown"
+    if s.launch_ms and t < s.launch_ms:
+        return "not_launched"
+    if s.delivery_ms is not None and t >= s.delivery_ms:
+        return "delivered"
+    if min_listing_age_days > 0 and t - s.launch_ms < min_listing_age_days * MS_DAY:
+        return "listing_age"
+    if kind == FAMILY_CARRY and s.spot_listed is not True:
+        return "hedge_unknown" if s.spot_listed is None else "no_bybit_spot_pair"
+    return None
+
+
+def _leg_window(s: SymbolSeries, t: int, h_ms: int, max_staleness_ms: Optional[int]) -> Dict[str, Any]:
+    end = t + h_ms if s.delivery_ms is None else min(t + h_ms, s.delivery_ms)
+    bound = staleness_bound_ms(s, max_staleness_ms)
+    terminal = s.delivery_ms is not None and s.delivery_ms <= t + h_ms
+    m0 = price_at(s.mark, t, bound)
+    basis = None
+    if terminal:
+        m1, basis = _terminal_price(s, max_staleness_ms)
+    else:
+        m1 = price_at(s.mark, end, bound)
+    fund, n = _sum_range(s.funding, t, end)
+    return {"m0": m0, "m1": m1, "end": end, "terminal": terminal, "terminal_basis": basis, "funding_raw_bps": fund, "prints": n}
+
+
+def run_family_variant(series: Sequence[SymbolSeries], kind: str, *, slots: Sequence[int], formation_days: int, hold_days: int, top_k: int, round_trip_bps: float,
+                       min_listing_age_days: int = 30, max_staleness_ms: Optional[int] = None, memo: Optional[Dict[Any, Any]] = None) -> Dict[str, Any]:
+    """One variant of one family on the fixed ``slots`` grid. Rank on the FORMATION window ending at t (interval-normalised bps/day), hold (t, t+hold] with a delivery cap.
+    Per leg: funding earned (short +) / paid (long -), price-leg return (short -ret, long +ret) from marks, round-trip cost on its notional. Row values are per unit of GROSS notional:
+    SPREAD = 0.5 x mean(short legs) + 0.5 x mean(long legs); CARRY / DIRECTIONAL = mean(short legs). ``market_bps`` is the equal-weight price return of EVERY eligible perp over the same
+    window (the factor the book is regressed on). A spread row needs 2 x top_k eligible ranked symbols and every leg priced, else it is skipped with a reason (never half-hedged)."""
+    f_ms, h_ms = formation_days * MS_DAY, hold_days * MS_DAY
+    is_spread = kind == FAMILY_SPREAD
+    memo = memo if memo is not None else {}
+
+    def fscore(s: SymbolSeries, t: int) -> Optional[float]:
+        k = ("f", s.symbol, t, f_ms)
+        if k not in memo:
+            memo[k] = formation_score(s, t, f_ms)
+        return memo[k]
+
+    def window(s: SymbolSeries, t: int) -> Dict[str, Any]:
+        k = ("w", s.symbol, t, h_ms, max_staleness_ms)
+        if k not in memo:
+            memo[k] = _leg_window(s, t, h_ms, max_staleness_ms)
+        return memo[k]
+    rows: List[Dict[str, Any]] = []
+    skipped: Dict[str, int] = {}
+    excl: Dict[str, int] = {}
+    unpriced: List[Dict[str, Any]] = []
+    for t in slots:
+        scored = []
+        for s in series:
+            why = eligibility(s, t, kind, f_ms, min_listing_age_days)
+            if why is None:
+                sc = fscore(s, t)
+                if sc is None:
+                    why = "no_formation_prints"
+                elif price_at(s.mark, t, staleness_bound_ms(s, max_staleness_ms)) in (None, 0.0):
+                    why = "no_entry_mark"
+                else:
+                    scored.append((sc, s))
+            if why is not None:
+                excl[why] = excl.get(why, 0) + 1
+        scored.sort(key=lambda x: (-x[0], x[1].symbol))
+        need = 2 * top_k if is_spread else top_k
+        if len(scored) < need:
+            skipped["insufficient_eligible_symbols"] = skipped.get("insufficient_eligible_symbols", 0) + 1
+            continue
+        shorts = scored[:top_k]
+        longs = scored[-top_k:] if is_spread else []
+        legs: List[Dict[str, Any]] = []
+        row_bad = None
+        for side, group in (("Sell", shorts), ("Buy", longs)):
+            for sc, s in group:
+                w = window(s, t)
+                if w["m0"] is None or w["m1"] is None or w["m0"] <= 0:
+                    if w["terminal"]:
+                        unpriced.append({"symbol": s.symbol, "t": t, "delivery_ms": s.delivery_ms})
+                    row_bad = row_bad or f"leg_unpriced:{s.symbol}"
+                    continue
+                ret = (w["m1"] / w["m0"] - 1.0) * 1e4
+                sign = 1.0 if side == "Sell" else -1.0
+                price = -ret if side == "Sell" else ret
+                fund = sign * w["funding_raw_bps"]
+                if kind == FAMILY_CARRY:
+                    price = 0.0                                   # hedged: the spot leg offsets the price leg to first order; the basis residual is UNMEASURED
+                legs.append({"symbol": s.symbol, "side": side, "interval_min": s.interval_min, "hedgeability": hedgeability(s), "formation_bps_per_day": sc, "funding_bps": fund,
+                             "prints": w["prints"], "price_bps": price, "cost_bps": round_trip_bps, "net_bps": fund + price - round_trip_bps, "closed_during_hold": w["terminal"],
+                             "terminal_price_basis": w["terminal_basis"], "raw_price_ret_bps": ret})
+        if row_bad and (is_spread or not legs):
+            skipped[row_bad.split(":")[0]] = skipped.get(row_bad.split(":")[0], 0) + 1
+            continue
+        mk = []
+        for s in series:
+            if eligibility(s, t, FAMILY_SPREAD, f_ms, min_listing_age_days) is None:
+                w = window(s, t)
+                if w["m0"] and w["m1"] and w["m0"] > 0:
+                    mk.append((w["m1"] / w["m0"] - 1.0) * 1e4)
+        side_avg = lambda sd, key: statistics.fmean(l[key] for l in legs if l["side"] == sd)           # noqa: E731
+        if is_spread:
+            if not any(l["side"] == "Sell" for l in legs) or not any(l["side"] == "Buy" for l in legs):
+                skipped["one_side_unpriced"] = skipped.get("one_side_unpriced", 0) + 1
+                continue
+            agg = {k: 0.5 * side_avg("Sell", k) + 0.5 * side_avg("Buy", k) for k in ("funding_bps", "price_bps", "cost_bps", "net_bps")}
+            agg["short_price_bps"], agg["long_price_bps"] = side_avg("Sell", "price_bps"), side_avg("Buy", "price_bps")
+            agg["short_funding_bps"], agg["long_funding_bps"] = side_avg("Sell", "funding_bps"), side_avg("Buy", "funding_bps")
+        else:
+            agg = {k: statistics.fmean(l[k] for l in legs) for k in ("funding_bps", "price_bps", "cost_bps", "net_bps")}
+        rows.append({"t": t, "legs": legs, "market_bps": statistics.fmean(mk) if mk else None, **agg})
+    return {"kind": kind, "rows": rows, "skipped_rows_by_reason": dict(sorted(skipped.items())), "eligibility_exclusions_by_reason": dict(sorted(excl.items())),
+            "terminal_exit_unpriced_legs": unpriced, "time_mode": "REPLAY_OBSERVATION_TIME"}
+
+
+def _ols(xs: Sequence[float], ys: Sequence[float]) -> Optional[Tuple[float, float, Optional[float]]]:
+    """(beta, alpha, correlation) of y on x; None under 3 points or zero x-variance."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    syy = sum((y - my) ** 2 for y in ys)
+    return sxy / sxx, my - sxy / sxx * mx, (sxy / math.sqrt(sxx * syy) if syy > 0 else None)
+
+
+def book_analytics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Return decomposition and exposure of a book's per-row series: mean/sd/per-row Sharpe, max drawdown of the cumulative net, funding / price / cost means, beta and correlation of the
+    PRICE component to the equal-weight market factor, and the residual (alpha) mean / sd after that beta. All in bps per row (one holding period)."""
+    n = len(rows)
+    out: Dict[str, Any] = {"n": n}
+    if not n:
+        return out
+    net = [r["net_bps"] for r in rows]
+    cum, peak, mdd = 0.0, 0.0, 0.0
+    for x in net:
+        cum += x
+        peak = max(peak, cum)
+        mdd = max(mdd, peak - cum)
+    sd = statistics.stdev(net) if n > 1 else None
+    out.update({"mean_net_bps": statistics.fmean(net), "sd_net_bps": sd, "per_row_sharpe": (statistics.fmean(net) / sd) if sd else None, "max_drawdown_bps": mdd,
+                "worst_row_bps": min(net), "mean_funding_bps": statistics.fmean(r["funding_bps"] for r in rows), "mean_price_bps": statistics.fmean(r["price_bps"] for r in rows),
+                "mean_cost_bps": statistics.fmean(r["cost_bps"] for r in rows), "funding_minus_cost_bps": statistics.fmean(r["funding_bps"] - r["cost_bps"] for r in rows)})
+    pairs = [(r["market_bps"], r["price_bps"]) for r in rows if r.get("market_bps") is not None]
+    ols = _ols([p[0] for p in pairs], [p[1] for p in pairs])
+    if ols is None:
+        out.update({"beta_to_market": None, "corr_to_market": None, "residual_price_mean_bps": None, "residual_price_sd_bps": None, "factor_note": "fewer than 3 rows or no market variance"})
+    else:
+        beta, alpha, corr = ols
+        resid = [y - beta * x for x, y in pairs]
+        out.update({"beta_to_market": beta, "corr_to_market": corr, "residual_price_mean_bps": statistics.fmean(resid), "residual_price_sd_bps": statistics.stdev(resid) if len(resid) > 1 else None,
+                    "market_mean_bps": statistics.fmean(p[0] for p in pairs), "market_sd_bps": statistics.stdev(p[0] for p in pairs) if len(pairs) > 1 else None})
+    if rows and "short_price_bps" in rows[0]:
+        out.update({"mean_short_leg_price_bps": statistics.fmean(r["short_price_bps"] for r in rows), "mean_long_leg_price_bps": statistics.fmean(r["long_price_bps"] for r in rows),
+                    "mean_short_leg_funding_bps": statistics.fmean(r["short_funding_bps"] for r in rows), "mean_long_leg_funding_bps": statistics.fmean(r["long_funding_bps"] for r in rows)})
+    return out
+
+
+def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: Optional[str], universe_info: Optional[Mapping[str, Any]] = None,
+                    formation_days_grid: Sequence[int] = (7, 14, 30), hold_days: int = 7, top_k_grid: Sequence[int] = (1, 3), min_rows: int = 60, alpha: float = 0.05,
+                    min_listing_age_days: int = 30, max_staleness_ms: Optional[int] = None, allow_unverified_key_basis_for_tests: bool = False) -> Dict[str, Any]:
+    """Walk-forward of one strategy family on the fixed non-overlapping grid. Every (formation x top_k x cost scenario) variant is recorded in the family's PERSISTENT ledger
+    (``ledger_path`` is required: a fresh process cannot reset the count) and is a member of the multiple-testing family. Variants are aligned on decision time: only slots where
+    every variant produced a row are used, so the row count follows from the data. The verdict is capped at INSUFFICIENT_DATA; REJECTED when an adequately sized
+    out-of-sample is non-positive or not significant after Holm over the whole family. Perp-only families are never labelled carry."""
+    if kind not in FAMILY_SPECS:
+        raise RH.HarnessError(f"unknown strategy family {kind!r}")
+    if not isinstance(ledger_path, str) or not ledger_path:
+        raise RH.HarnessError("LEDGER_PATH_REQUIRED: the family count must survive a restart")
+    unkeyed = sorted(s.symbol for s in series if s.key_basis is not _KEY_BASIS_OBSERVED)
+    if unkeyed and allow_unverified_key_basis_for_tests is not True:
+        raise RH.HarnessError(f"{len(unkeyed)} series lack the loader's key_basis token: marks/funding keyed by candle start would leak the future; first: {unkeyed[:3]}")
+    spec = FAMILY_SPECS[kind]
+    survivorship = _survivorship_of(universe_info)
+    warnings: List[str] = []
+    if survivorship == SURVIVORS_ONLY:
+        warnings.append("SURVIVORS_ONLY: no survivorship-free claim; the result is a survivorship-biased evaluation")
+    if unkeyed:
+        warnings.append("KEY_BASIS_UNVERIFIED (test-only path): capped at INSUFFICIENT_DATA")
+    costs = family_costs(kind)
+    out: Dict[str, Any] = {"schema": SCHEMA + "/family", "family": kind, "family_spec": spec, "is_carry": spec["is_carry"], "name_rule": spec["name_rule"], "survivorship": survivorship,
+                           "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED, "warnings": warnings, "ceiling": "INSUFFICIENT_DATA", "cost_scenarios": costs,
+                           "cost_basis": "carry_costs authoritative names: fee VENUE_STATED (base tier), spread ASSUMED 0.4, maker MODELLED", "symbols": len(series),
+                           "hedgeability_basis": HEDGE_BASIS, "multiple_testing_scope": "PERSISTENT_LEDGER_FILE", "ledger_path": ledger_path and os.path.abspath(ledger_path),
+                           "time_mode": "REPLAY_OBSERVATION_TIME", "selection": "formation-window information only; never realised future funding"}
+    if any(s.interval_min is None for s in series):
+        out.update({"verdict": "INSUFFICIENT_DATA", "status": "FUNDING_NORMALISATION_UNKNOWN", "reason": "a symbol carries no fundingInterval"})
+        return out
+    if not series:
+        out.update({"verdict": "UNTESTED", "status": "NO_SERIES", "reason": "no series given"})
+        return out
+    t0 = min(min((ts for ts, _ in s.funding), default=10 ** 18) for s in series)
+    t1 = max(max((ts for ts, _ in s.funding), default=0) for s in series)
+    fmax = max(formation_days_grid)
+    slots = holding_grid(t0, t1, formation_days=fmax, hold_days=hold_days)
+    out["grid"] = {**grid_requirements(formation_days=fmax, hold_days=hold_days, min_rows=min_rows, span_days=(t1 - t0) / MS_DAY), "slots": len(slots),
+                   "first_decision_ms": slots[0] if slots else None, "last_decision_ms": slots[-1] if slots else None}
+    fam = RH.normalise_family(f"cross_sectional_funding.{kind.lower()}")
+    ledger = RH.VariantLedger(fam, path=ledger_path)
+    results: Dict[str, Dict[str, Any]] = {}
+    params_of: Dict[str, Dict[str, Any]] = {}
+    memo: Dict[Any, Any] = {}
+    for F in formation_days_grid:
+        for k in top_k_grid:
+            for cname, c in costs.items():
+                name = f"{kind}|F{F}|H{hold_days}|K{k}|C{cname}"
+                params_of[name] = {"kind": kind, "formation_days": F, "hold_days": hold_days, "top_k": k, "round_trip_bps": c["bps"], "min_listing_age_days": min_listing_age_days}
+                results[name] = run_family_variant(series, kind, slots=slots, formation_days=F, hold_days=hold_days, top_k=k, round_trip_bps=c["bps"],
+                                                   min_listing_age_days=min_listing_age_days, max_staleness_ms=max_staleness_ms, memo=memo)
+    common = set(slots)
+    for r in results.values():
+        common &= {x["t"] for x in r["rows"]}
+    common_sorted = sorted(common)
+    n_rows = len(common_sorted)
+    unpriced = {(x["symbol"], x["t"]) for r in results.values() for x in r["terminal_exit_unpriced_legs"]}
+    out.update({"variants_tried": sorted(results), "rows_per_variant": {k: len(v["rows"]) for k, v in sorted(results.items())}, "independent_holding_rows": n_rows,
+                "terminal_exit_unpriced": len(unpriced), "terminal_exit_unpriced_symbols": sorted({a for a, _ in unpriced})[:NAMES_CAP],
+                "skipped_rows_by_reason": {k: v["skipped_rows_by_reason"] for k, v in sorted(results.items())},
+                "eligibility_exclusions_by_reason": next(iter(results.values()))["eligibility_exclusions_by_reason"] if results else {}})
+    if unpriced:
+        warnings.append(f"TERMINAL_EXIT_UNPRICED: {len(unpriced)} delisted legs have no price at delivery: capped at INSUFFICIENT_DATA")
+
+    def by_t(name: str) -> Dict[int, Mapping[str, Any]]:
+        return {x["t"]: x for x in results[name]["rows"]}
+    if n_rows < min_rows:
+        for name in sorted(results):
+            if not ledger.knows(name):                      # an identical re-run is the same trial, not a new one
+                ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping {hold_days}-day rows (< {min_rows})")
+        out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family_ledger": fam, "n_variants_counted": ledger.n_variants,
+                    "reason": f"{n_rows} aligned {hold_days}-day holding rows; need >= {min_rows}. " + out["grid"]["statement"]
+                              + f" This capture spans {out['grid']['window_days_available']} days (shortfall {out['grid']['shortfall_days']} days)",
+                    "descriptive_only": {"label": "IN_SAMPLE_DESCRIPTIVE_NOT_A_TEST", "book_analytics": {n: book_analytics([by_t(n)[t] for t in common_sorted]) for n in sorted(results)} if n_rows else {}}})
+        return out
+    series_by = {n: [by_t(n)[t]["net_bps"] for t in common_sorted] for n in sorted(results)}
+    for name, rets in series_by.items():
+        if RH.series_digest(rets) not in ledger.returns_digests(name):          # same variant on the very same series = the same trial; new data or a new name counts
+            ledger.record(name, params_of[name], rets, horizon=1)
+    folds = RH.walk_forward_folds(n_rows, train_min=max(20, n_rows // 2), test_len=max(5, n_rows // 10), label_horizon=1, embargo=1)
+    oos: List[float] = []
+    chosen: List[str] = []
+    test_idx: List[int] = []
+    for f in folds:
+        pick = RH.train_only_best({k: [v[i] for i in f.train] for k, v in series_by.items()})
+        chosen.append(pick)
+        oos.extend(series_by[pick][i] for i in f.test)
+        test_idx.extend((pick, i) for i in f.test)                                           # type: ignore[arg-type]
+    st = RH.significance(oos)
+    m = ledger.n_variants
+    adj = SP.adjust_pvalues([st["p_one_sided"]], "holm", alpha=alpha, n_tested=m)["adjusted"][0]
+    mean = st["mean"]
+    enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
+    verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    if unpriced or unkeyed:
+        verdict = "INSUFFICIENT_DATA"
+    oos_rows = [by_t(pick)[common_sorted[i]] for pick, i in test_idx]
+    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(results), "correction": "holm",
+                "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean, "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"],
+                "p_adjusted": adj, "selected_per_fold": chosen, "oos_book_analytics": book_analytics(oos_rows),
+                "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
+                "reason": ("carry: funding - spot+perp round trip (basis residual UNMEASURED)" if kind == FAMILY_CARRY else
+                           "perp-only book: funding earned/paid + measured price legs - perp round trips; NOT carry")})
+    return out
+
+
+# ---------------------------------------------------------------- the cross-sectional path: explicit universe, verified data, reproducible report
+def _require_universe_dir(universe_dir: Any) -> str:
+    if not isinstance(universe_dir, str) or not universe_dir.strip():
+        raise RH.HarnessError("UNIVERSE_DIR_REQUIRED: the cross-sectional path needs an explicit verified universe_capture directory (--universe-dir); "
+                              "without it survivorship, lifecycle and funding intervals cannot be established and nothing is evaluated")
+    return universe_dir
+
+
+def default_ledger_path(family: str, data_root: str, ledger_dir: Optional[str] = None) -> str:
+    """The persistent multiple-testing ledger of ``family``: ``ledger_dir`` (or $CANDIDATE_LEDGER_DIR, or ``<parent of data_root>/candidate_ledgers``) / ``<family>.jsonl``.
+    It is deliberately OUTSIDE the data root (evidence directories stay byte-for-byte what the verifier hashed) and never under bot/state."""
+    base = ledger_dir or os.environ.get("CANDIDATE_LEDGER_DIR") or os.path.join(os.path.dirname(os.path.realpath(data_root)), "candidate_ledgers")
+    path = os.path.join(os.path.abspath(base), RH.normalise_family(family) + ".jsonl")
+    if os.path.realpath(path).startswith(os.path.join(BOT, "state") + os.sep):
+        raise RH.HarnessError("the ledger may not live under bot/state")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], ledger_path: Optional[str], spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
+                             spec: Optional[Mapping[str, Any]] = None, **kw: Any) -> Dict[str, Any]:
+    """Load a market_history root against its verified universe capture and run the ranked-funding walk-forward. The universe dir is REQUIRED (HarnessError UNIVERSE_DIR_REQUIRED) and
+    so is a persistent ``ledger_path``: a fresh process must not reset the multiple-testing family count (HarnessError otherwise)."""
+    _require_universe_dir(universe_dir)
+    if not isinstance(ledger_path, str) or not ledger_path:
+        raise RH.HarnessError("LEDGER_PATH_REQUIRED: a cross-sectional evaluation records its variants in a persistent ledger so the family count survives a restart")
+    series, info = load_history_root(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+    out = {"input": info, **evaluate_ranked_funding(series, universe_info=info, ledger_path=ledger_path, spec=spec, **kw)}
+    stem = os.path.splitext(ledger_path)[0]
+    out["families"] = {k: evaluate_family(series, k, ledger_path=f"{stem}.{k.lower()}.jsonl", universe_info=info) for k in FAMILIES}
+    return out
+
+
+#: what each data kind a cross-sectional study would ALSO like and this repository cannot verify
+CROSS_SECTIONAL_WISHLIST = ("index-kline (basis/hedge price)", "open-interest (capacity)", "orderbook depth/spread (capacity and slippage; no capture schema exists)",
+                            "spot price history (hedge-leg basis)", "borrow/financing (spot-perp carry)")
+PIT_LIMITATIONS = (
+    "RAW_RESPONSES_VERIFIED means self-consistent bytes as captured by the owner (hashes, cursor chains and re-derived coverage agree); it is NOT authenticated as produced by the exchange",
+    "spot hedgeability is CURRENT_SNAPSHOT_ONLY: one spot-instruments snapshot labels legs and is never projected backwards",
+    "instrument rule fields (tick/step/min notional/launch/delivery/funding interval) are as of the capture, not a history of rule changes",
+    "marks and funding are read in REPLAY_OBSERVATION_TIME: per-row local receipt time is not stored, so a live decision would additionally need local_receive_time <= decision",
+)
+
+
+def dataset_report(*, data_root: Optional[str], universe_dir: Optional[str], spot_dir: Optional[str] = None, mark_interval: Optional[str] = None) -> Dict[str, Any]:
+    """Everything a reader needs to judge a cross-sectional dataset, REPRODUCIBLE from the manifest files under ``data_root`` + ``universe_dir`` (no repo declaration is read):
+    symbols included / excluded + why, source manifests (with digests and whether each re-verifies), coverage dates, funding intervals, incomplete datasets, missing fields,
+    status-partition coverage, PIT limitations, the readiness levels and the highest supportable verdict. The universe dir is required: without it ``status`` is UNIVERSE_DIR_REQUIRED
+    and nothing is included. A dataset that fails verification yields ``status`` REFUSED and no symbols. Offline, read-only, deterministic (no clock)."""
+    scan = scan_data_root(data_root, universe_dirs=[universe_dir] if universe_dir else ())
+    inv = verified_inventory(scan) if (scan["checked"] or scan["universe_capture_dirs"]) else {"datasets": [], "universes": [], "spot_snapshots": []}
+    manifests = ([{"kind": f"market_history:{d['dataset']}" + (f"-{d['interval']}" if d.get("interval") else ""), "path": d["rel"], "digest": d["digest"], "dataset_status": d["dataset_status"],
+                   "verified": d["verified"], "problems": d["problems"]} for d in inv["datasets"]]
+                 + [{"kind": "spot_snapshot", "path": q["rel"], "digest": q["digest"], "dataset_status": q["dataset_status"], "verified": q["verified"], "problems": q["problems"]}
+                    for q in inv.get("spot_snapshots", [])]
+                 + [{"kind": "universe_capture", "path": u["rel"], "digest": u["digest"], "dataset_status": u["dataset_status"], "verified": u["verified"], "problems": u["problems"],
+                     "explicit": u["explicit"]} for u in inv["universes"]])
+    uni_good = [u for u in inv["universes"] if u["verified"] and u["explicit"]]
+    surv = survivorship_of_universes({"universes": uni_good})
+    rep: Dict[str, Any] = {"schema": SCHEMA + "/dataset_report", "status": "OK", "reason": "", "universe_dir": {"supplied": scan["universe_dir_supplied"], "rejected": scan["universe_dirs_rejected"]},
+                           "source_manifests": manifests, "symbols_included": [], "symbols_excluded": [], "non_complete_symbols": {}, "coverage": {}, "intervals_min": {},
+                           "incomplete_datasets": [{"dataset": m["kind"], "dataset_status": m["dataset_status"], "verified": m["verified"]} for m in manifests
+                                                   if not m["verified"] or m["dataset_status"] != "COMPLETE"],
+                           "missing_fields": [], "status_partition_coverage": {u["rel"]: {"delisting_observability": u["delisting_observability"], "status_coverage": u["status_coverage"],
+                                                                                           "statuses_in_capture": u["statuses_in_capture"]} for u in inv["universes"]},
+                           "survivorship": surv, "survivorship_free_claim": False, "pit_limitations": list(PIT_LIMITATIONS), "warnings": []}
+    have = {d["dataset"] for d in inv["datasets"]}
+    for need, label in (("funding", "funding"), ("mark-kline", "mark-kline"), ("index-kline", "index-kline (basis/hedge price)"), ("open-interest", "open-interest (capacity)")):
+        if need not in have:
+            rep["missing_fields"].append(f"{label}: no manifest under the data root")
+    rep["missing_fields"] += [x for x in CROSS_SECTIONAL_WISHLIST if x.startswith(("orderbook", "spot price", "borrow"))]
+    if spot_dir is None:
+        rep["missing_fields"].append("spot-instruments snapshot (hedgeability): not supplied, so every symbol is HEDGE_UNKNOWN")
+    if not scan["universe_dir_supplied"]:
+        rep.update({"status": "UNIVERSE_DIR_REQUIRED", "reason": "UNIVERSE_DIR_REQUIRED: no (valid) --universe-dir was supplied; the cross-sectional path refuses to include any symbol without it"})
+    elif not uni_good:
+        rep.update({"status": "REFUSED", "reason": "the supplied universe capture does not verify: " + "; ".join(p for u in inv["universes"] for p in u["problems"])[:240]})
+    elif any(not d["verified"] for d in inv["datasets"]) or any(not q["verified"] for q in inv.get("spot_snapshots", [])):
+        rep.update({"status": "REFUSED", "reason": "a dataset under the data root does not re-verify: "
+                    + "; ".join(p for d in list(inv["datasets"]) + list(inv.get("spot_snapshots", [])) for p in d["problems"])[:240]})
+    elif not scan["checked"] or not scan["market_history"]:
+        rep.update({"status": "REFUSED", "reason": "no market_history datasets under the data root"})
+    else:
+        try:
+            series, info = load_history_root(data_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+        except RH.HarnessError as exc:
+            rep.update({"status": "REFUSED", "reason": str(exc)[:300]})
+        else:
+            rep["symbols_included"] = sorted(x.symbol for x in series)
+            urecs, _ui = MH.load_universe_dir(universe_dir)
+            have_sym = {x.symbol for x in series} | {x["symbol"] for x in info["excluded"]}
+            not_collected = [{"symbol": sy, "reason": "in_universe_not_in_any_history_dataset", "universe_status": str(r.get("status"))}
+                             for sy, r in sorted(urecs.items()) if sy not in have_sym]
+            rep["symbols_excluded"] = sorted(list(info["excluded"]) + not_collected, key=lambda x: x["symbol"])
+            rep["universe_symbols"] = len(urecs)
+            rep["non_complete_symbols"] = info["non_complete_symbols"]
+            rep["survivorship"] = surv = info["survivorship"]            # the EVALUATED series' survivorship (Closed contracts absent from the series downgrade it), not the capture's
+            rep["warnings"] = list(info["warnings"])
+            rep["closed_in_universe_not_in_series"] = info["closed_in_universe_not_in_series"]
+            for x in series:
+                rep["intervals_min"][str(x.interval_min)] = rep["intervals_min"].get(str(x.interval_min), 0) + 1
+            for name, d in sorted(info["datasets"].items()):
+                src = next((q for q in inv["datasets"] if os.path.basename(q["dir"]) == name), None)
+                if src and src["first_ts"] is not None:
+                    rep["coverage"][name] = {"first_ts": src["first_ts"], "last_ts": src["last_ts"], "first_iso": _iso(src["first_ts"]), "last_iso": _iso(src["last_ts"]),
+                                             "window_days": round((src["last_ts"] - src["first_ts"]) / MS_DAY, 3), "dataset_status": d["dataset_status"]}
+            if "funding" in rep["coverage"]:
+                rep["coverage"]["window"] = rep["coverage"]["funding"]
+            if info.get("hedge"):
+                rep["hedge_counts"] = info["hedge"]["counts"]
+            else:
+                rep["warnings"].append("no spot snapshot: hedgeability is HEDGE_UNKNOWN for every symbol; no SPOT_PERP_CARRY claim is possible")
+    surv_known = rep["status"] == "OK"
+    crit_complete = surv_known and all(d["dataset_status"] == "COMPLETE" and d["verified"] for d in inv["datasets"] if d["dataset"] in ("funding", "mark-kline", "index-kline")) \
+        and any(d["dataset"] == "funding" for d in inv["datasets"]) and any(d["dataset"] == "mark-kline" for d in inv["datasets"]) \
+        and all(u["dataset_status"] == "COMPLETE" for u in uni_good)
+    rep["readiness"] = readiness_levels(
+        data_ready=bool(crit_complete), data_reasons=[f"{d['dataset']}: {d['dataset_status']} verified={d['verified']}" for d in inv["datasets"] if d["dataset_status"] != "COMPLETE" or not d["verified"]]
+        or ([] if crit_complete else [rep["reason"] or "funding/mark-kline/universe not all verified and COMPLETE"]),
+        pit_ok=surv_known and surv == DELISTINGS_OBSERVED, survivorship=surv, mechanism_ok=True)
+    rep["survivorship_free_claim"] = rep["readiness"]["survivorship_free_claim"]
+    rep["highest_supportable_verdict"] = rep["readiness"]["highest_supportable_verdict"] if surv_known else "UNTESTED"
+    rep["candidate_level_note"] = "this is a DATASET report: it reaches at most RESEARCH_READY and never implies any strategy has an edge"
+    return rep
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Candidate readiness table (offline, read-only).")
     ap.add_argument("--data-root", default=None, help="directory searched for real capture manifests; absent = MISSING")
     ap.add_argument("--json", default="", help="write the machine-readable report here")
     ap.add_argument("--history-root", default="", help="a market_history root (funding/, mark-kline-<interval>/): also run the ranked-funding walk-forward on it")
-    ap.add_argument("--universe-dir", default="", help="the verified universe_capture directory the history was built from (required with --history-root)")
+    ap.add_argument("--universe-dir", default="", help="the verified universe_capture directory the history was built from: REQUIRED by the cross-sectional path (required with --history-root); recognised in data_scan when passed")
+    ap.add_argument("--ledger", default="", help="persistent multiple-testing ledger file for --history-root (default: <parent of the history root>/candidate_ledgers/<family>.jsonl: the family count survives a restart)")
+    ap.add_argument("--dataset-report", action="store_true", help="print the reproducible dataset report for --data-root/--history-root + --universe-dir and exit")
     ap.add_argument("--spot-dir", default=None, help="a spot-instruments snapshot dir (hedgeability; absent = unknown)")
     ap.add_argument("--mark-interval", default=None, help="mark-kline interval (e.g. 240); needed when the root holds more than one")
     a = ap.parse_args(argv)
     if a.history_root and not a.universe_dir:
-        ap.error("--history-root needs --universe-dir")
-    rep = build_report(data_root=a.data_root)
+        ap.error("--history-root needs --universe-dir (UNIVERSE_DIR_REQUIRED)")
+    if a.dataset_report:
+        dr = dataset_report(data_root=a.data_root or a.history_root or None, universe_dir=a.universe_dir or None, spot_dir=a.spot_dir, mark_interval=a.mark_interval)
+        print(json.dumps(dr, indent=2, sort_keys=True, default=str))
+        return 0 if dr["status"] == "OK" else 2
+    rep = build_report(data_root=a.data_root or a.history_root or None, universe_dir=a.universe_dir or None)
+    if a.data_root and not a.universe_dir and any(not r["universe_dir"]["supplied"] and r["universe_dir"]["required"] for r in rep["candidates"]):
+        print("UNIVERSE_DIR_REQUIRED: no --universe-dir passed; the cross-sectional rows are NOT evaluated and cannot reach RESEARCH_READY", file=sys.stderr)
     if a.history_root:
         try:
-            series, info = load_history_root(a.history_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval)
+            rep["ranked_funding"] = evaluate_cross_sectional(a.history_root, universe_dir=a.universe_dir, ledger_path=a.ledger or default_ledger_path("cross_sectional_funding", a.history_root), spot_dir=a.spot_dir, mark_interval=a.mark_interval)
         except RH.HarnessError as exc:
             ap.exit(2, f"refused: {exc}\n")
-        rep["ranked_funding"] = {"input": info, **evaluate_ranked_funding(series, universe_info=info)}
     print(render_table(rep))
     for r in rep["candidates"]:
         print(f"\n{r['name']}: {r['readiness_verdict']} (ladder {r['ladder_verdict']})")
