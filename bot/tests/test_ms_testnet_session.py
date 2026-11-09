@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import sys
+from decimal import Decimal as D
 
 import pytest
 
@@ -177,7 +178,7 @@ def test_plan_builds_a_complete_digested_plan_from_the_manifest_and_the_prefligh
     assert plan["plan_digest"] == d == S.digest_of(plan, ("plan_digest",)) and S.plan_refusals(plan) == []
     assert plan["manifest_plan_sha256"] == w.manifest["plan_sha256"] and plan["venue"] == "Testnet" and plan["endpoint_host"] == "api-testnet.bybit.com"
     assert [l["leg_id"] for l in plan["legs"]] == ["p", "s"] and [l["side"] for l in plan["legs"]] == ["Sell", "Buy"] and plan["style"] == "TAKER"
-    assert plan["notional_usd"] <= 100 and plan["aggregate_ceiling_usd"] <= 100 and plan["leverage"] <= plan["bounds"]["max_leverage"]
+    assert plan["notional_usd"] <= 500 and plan["aggregate_ceiling_usd"] <= 500 and plan["leverage"] <= plan["bounds"]["max_leverage"]
     assert plan["bounds"]["one_active_group"] is True and plan["bounds"]["max_lifecycle_hours"] <= 9 and plan["exit_plan"] and plan["policy"]["venue"] == "testnet"
     assert plan["preflight_digest"] and "PLAN DIGEST: " + d in w.text()
     rec = w.record()
@@ -194,7 +195,7 @@ def test_plan_sends_nothing_at_all(w):
 
 
 @pytest.mark.parametrize("args,why", [
-    (("--symbol", "BTCUSDT", "--notional-usd", "100.01"), "NOTIONAL_ABOVE_AGGREGATE_CEILING"),
+    (("--symbol", "BTCUSDT", "--notional-usd", "500.01"), "NOTIONAL_ABOVE_AGGREGATE_CEILING"),
     (("--symbol", "BTCUSDT", "--notional-usd", "0"), "NOTIONAL_ABOVE_AGGREGATE_CEILING"),
     (("--symbol", "SOLUSDT", "--notional-usd", "50"), "SYMBOL_NOT_IN_ALLOW_LIST"),
     (("--symbol", "BTCUSDT", "--notional-usd", "90", "--leverage", "4"), "LEVERAGE_ABOVE_MANIFEST"),
@@ -636,3 +637,50 @@ def test_the_runbooks_generate_command_and_digest_one_liner_run_and_agree(tmp_pa
     r2 = subprocess.run(["bash", "-c", cmd], cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=60)
     assert r2.returncode == 0, r2.stderr
     assert r2.stdout.strip() == m["strategy_allowlist"][0]["spec_digest"]
+
+
+def test_a_plan_at_the_new_ceiling_is_not_silently_clamped_to_the_old_100(w):
+    """The session tool had its own hard-coded 100 ceiling: a 400 plan must come out as ~400, not refused or clamped."""
+    assert S.HARD_CEILING_USD == AD.AGGREGATE_CEILING_USD == 500.0
+    assert w.run("preflight") == 0
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "400") == 0
+    plan = w.plan_doc()
+    assert 300.0 < plan["notional_usd"] <= 400.0 and plan["aggregate_ceiling_usd"] == 500.0        # rounded DOWN to the 0.001 BTC lot (about $60 at the fake price)
+
+
+def test_a_plan_the_wallet_cannot_fund_is_refused_offline_before_any_order(w):
+    """Spot buy (notional) + perp initial margin (notional / leverage) + a 2% buffer must fit in the USDT the preflight read."""
+    w.fake.wallet["USDT"] = D("500")
+    assert w.run("preflight") == 0
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "400") != 0
+    assert "INSUFFICIENT_USDT_FOR_PLAN" in w.text() and not any(r[0] == "POST" for r in w.fake.requests)
+    w.fake.wallet["USDT"] = D("1000")                                              # positive control: 400 + 400/1 + 2% = 816 fits
+    assert w.run("preflight") == 0
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "400") == 0
+
+
+def test_an_account_that_already_holds_the_base_coin_can_run_a_plan_at_the_new_ceiling(w):
+    """The owner's real account holds ~0.1047 BTC of spot before the session. That holding is not the session's exposure: a 400 plan must pass every notional cap and finish flat."""
+    w.fake.wallet["BTC"] = D("0.1")
+    d = w.ready("BTCUSDT", 400.0)
+    assert 300.0 < w.plan_doc()["notional_usd"] <= 400.0
+    rc = w.execute(d)
+    assert rc == 0, w.text()[-800:]
+    assert w.record()["flat_verified"] is True and w.record()["orders"]
+
+
+def test_assess_is_read_only_and_reports_the_baselines_and_the_state_the_authority_sees(w):
+    """Diagnostic for a risk refusal: GET-only, writes no journal, prints plan vs venue baseline and the account state under each."""
+    w.fake.wallet["BTC"] = D("0.1")
+    w.ready("BTCUSDT", 400.0)
+    w.fake.requests.clear()
+    assert w.run("assess") == 0, w.text()
+    assert w.fake.requests and all(r[0] == "GET" for r in w.fake.requests)
+    assert not os.path.exists(os.path.join(w.state_dir, "journal")) or os.path.getsize(os.path.join(w.state_dir, "journal")) == 0
+    out = json.loads(w.text()[w.text().index("{"):])
+    assert out["plan_baseline"]["spot:BTCUSDT"] == out["venue_baseline"]["spot:BTCUSDT"] == 0.1
+    assert "SPOT:BTCUSDT" not in out["state_with_venue_baseline"]["positions"]                 # the owner's holding is not the session's exposure
+    assert out["state_with_no_baseline"]["positions"]["SPOT:BTCUSDT"]["notional_usd"] > 1000    # positive control: without the baseline it would be
+    legs = out["risk_per_leg"]
+    assert legs and all(v["approved"] for v in legs.values()), legs                          # a 400 plan passes every cap leg by leg (the caps are printed with it)
+    assert out["policy_caps"]["max_aggregate_notional_usd"] == 500.0

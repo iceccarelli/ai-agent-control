@@ -7,7 +7,7 @@
 THERE IS NO CODE PATH IN THIS MODULE THAT SENDS AN ORDER OR OPENS A CONNECTION. It imports no transport, no client, no HTTP/socket library (a test parses the module and fails on
 any such import or on any send-like name). What it does:
   * builds the exact machine-readable ACTION MANIFEST for a bounded multi-symbol testnet qualification (closed schema, like ``tools/testnet_action_manifest.py``): the symbols and
-    strategies allowed (explicit lists, no wildcard), directions, order types, execution styles, an AGGREGATE notional ceiling of ``shadow.SHADOW_MAX_NOTIONAL_USD`` ($100) across ALL
+    strategies allowed (explicit lists, no wildcard), directions, order types, execution styles, an AGGREGATE notional ceiling of ``AGGREGATE_CEILING_USD`` ($500, Testnet only; independent of the shared ``shadow.SHADOW_MAX_NOTIONAL_USD`` = $100) across ALL
     symbols (never per symbol), gross/net/unhedged/active-group bounds, the persistent kill-switch file semantics, the reconciliation and reduce-only recovery plan, the evidence to
     capture and the DEDICATED testnet credential variable names (the generic ``BYBIT_API_KEY``/``BYBIT_API_SECRET`` are refused);
   * bounds can be LOWERED, never raised: the validator refuses a manifest above any ceiling;
@@ -47,7 +47,11 @@ DEFAULT_CAPABILITY_PATH = os.path.join(os.path.expanduser("~"), ".ai-agent-contr
 #: The variable names the owner session tool (``ms_testnet_session``) reads: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET (derived from the manifest defaults; names only, never values).
 SESSION_CREDENTIAL_ENV = dict(api_key=TAM.DEFAULT_KEY_ENV.replace("DEDICATED_", ""), api_secret=TAM.DEFAULT_SECRET_ENV.replace("DEDICATED_", ""))
 
-AGGREGATE_CEILING_USD = float(shadow.SHADOW_MAX_NOTIONAL_USD)       # across ALL symbols, hedged pair counted once; never a per-symbol allowance
+#: The multi-symbol TESTNET session's OWN aggregate ceiling (owner decision, 2026-11-09: $500 of fake money on Testnet). It is deliberately NOT ``shadow.SHADOW_MAX_NOTIONAL_USD`` ($100): that
+#: shared constant caps the frozen BTC experiment, the venue drills, the entry authority and the live-gate tests, and stays 100 (a test pins both numbers). Mainnet remains unreachable from here.
+AGGREGATE_CEILING_USD = 500.0                                       # across ALL symbols, hedged pair counted once; never a per-symbol allowance
+#: The loss ceiling keeps the ratio the old $100 drill used (1.11 on 100 = 1.11%), so the stop scales with the size: 5.55 on 500. A $500 hedged pair pays about $1.6 in taker fees + assumed spread alone.
+MAX_LOSS_CEILING_USD = round(0.0111 * AGGREGATE_CEILING_USD, 2)
 MAX_SYMBOLS = 5
 MAX_ACTIVE_GROUPS = 1                                              # ONE active group (ceiling AND default); the session tool enforces it and refusals() rejects more
 MAX_ENTRIES_PER_UTC_DAY = 4
@@ -120,7 +124,7 @@ def _ceilings() -> Dict[str, float]:
     agg = AGGREGATE_CEILING_USD
     return {"aggregate_max_notional_usd": agg, "max_notional_per_symbol_usd": 2 * agg, "max_gross_exposure_usd": 2 * agg, "max_net_exposure_usd": agg, "max_unhedged_usd": agg,
             "max_active_groups": MAX_ACTIVE_GROUPS, "max_entries_per_utc_day": MAX_ENTRIES_PER_UTC_DAY, "max_lifecycle_hours": MAX_LIFECYCLE_HOURS,
-            "max_loss_usd": TAM._max_loss(), "max_leverage": MAX_LEVERAGE, "max_market_age_ms": MAX_MARKET_AGE_MS, "max_account_age_ms": MAX_ACCOUNT_AGE_MS}
+            "max_loss_usd": MAX_LOSS_CEILING_USD, "max_leverage": MAX_LEVERAGE, "max_market_age_ms": MAX_MARKET_AGE_MS, "max_account_age_ms": MAX_ACCOUNT_AGE_MS}
 
 
 def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], strategy: str = "multi_symbol_funding_carry",
