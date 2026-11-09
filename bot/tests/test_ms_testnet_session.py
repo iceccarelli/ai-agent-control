@@ -657,3 +657,30 @@ def test_a_plan_the_wallet_cannot_fund_is_refused_offline_before_any_order(w):
     w.fake.wallet["USDT"] = D("1000")                                              # positive control: 400 + 400/1 + 2% = 816 fits
     assert w.run("preflight") == 0
     assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "400") == 0
+
+
+def test_an_account_that_already_holds_the_base_coin_can_run_a_plan_at_the_new_ceiling(w):
+    """The owner's real account holds ~0.1047 BTC of spot before the session. That holding is not the session's exposure: a 400 plan must pass every notional cap and finish flat."""
+    w.fake.wallet["BTC"] = D("0.1")
+    d = w.ready("BTCUSDT", 400.0)
+    assert 300.0 < w.plan_doc()["notional_usd"] <= 400.0
+    rc = w.execute(d)
+    assert rc == 0, w.text()[-800:]
+    assert w.record()["flat_verified"] is True and w.record()["orders"]
+
+
+def test_assess_is_read_only_and_reports_the_baselines_and_the_state_the_authority_sees(w):
+    """Diagnostic for a risk refusal: GET-only, writes no journal, prints plan vs venue baseline and the account state under each."""
+    w.fake.wallet["BTC"] = D("0.1")
+    w.ready("BTCUSDT", 400.0)
+    w.fake.requests.clear()
+    assert w.run("assess") == 0, w.text()
+    assert w.fake.requests and all(r[0] == "GET" for r in w.fake.requests)
+    assert not os.path.exists(os.path.join(w.state_dir, "journal")) or os.path.getsize(os.path.join(w.state_dir, "journal")) == 0
+    out = json.loads(w.text()[w.text().index("{"):])
+    assert out["plan_baseline"]["spot:BTCUSDT"] == out["venue_baseline"]["spot:BTCUSDT"] == 0.1
+    assert "SPOT:BTCUSDT" not in out["state_with_venue_baseline"]["positions"]                 # the owner's holding is not the session's exposure
+    assert out["state_with_no_baseline"]["positions"]["SPOT:BTCUSDT"]["notional_usd"] > 1000    # positive control: without the baseline it would be
+    legs = out["risk_per_leg"]
+    assert legs and all(v["approved"] for v in legs.values()), legs                          # a 400 plan passes every cap leg by leg (the caps are printed with it)
+    assert out["policy_caps"]["max_aggregate_notional_usd"] == 500.0

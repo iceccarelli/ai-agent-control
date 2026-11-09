@@ -40,6 +40,7 @@ import ms_authority as MA  # noqa: E402
 import ms_execution as EX  # noqa: E402
 import ms_pipeline as MP  # noqa: E402          # only its pure helpers: the git-work-tree test and the git revision reader (the repo's one)
 import ms_reconcile as MR  # noqa: E402
+import ms_risk as MRISK  # noqa: E402          # assess only: the same pure risk function the authority calls
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_executor as TE  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
@@ -468,6 +469,11 @@ def cmd_plan(ctx: Ctx) -> int:
 
 
 # ---------------------------------------------------------------------------------------------------- execute / reconcile machinery
+def _minus(a: Any, b: Any) -> float:
+    """a - b in decimal: float subtraction of a wallet balance and the pre-session baseline leaves noise (0.106 - 0.1 = 0.0060000000000000053) that makes an exact-lot sell look 1e-17 too big."""
+    return float(D(str(a)) - D(str(b)))
+
+
 class _Cached:
     """A provider that re-reads when its value is older than ``refresh_ms`` and, when a read FAILS, serves the last good value with its ORIGINAL timestamp (so the authority's
     freshness check, not this class, decides it is stale)."""
@@ -563,7 +569,7 @@ class Run:
         spot = pos.get(f"spot:{symbol}")
         if spot is None:
             raise TE.ExecutorError("hedge read incomplete")
-        return max(0.0, -pos.get(f"linear:{symbol}", 0.0)), max(0.0, spot - float(self.baseline.get(f"spot:{symbol}", 0.0)))
+        return max(0.0, -pos.get(f"linear:{symbol}", 0.0)), max(0.0, _minus(spot, self.baseline.get(f"spot:{symbol}", 0.0)))
 
     def venue_state(self) -> Dict[str, Any]:
         v = self.ex.venue_state()
@@ -641,7 +647,7 @@ class Run:
         sym = self.plan["symbol"]
         mine = [x for x in v["executions"] if x["link_id"].startswith(self.gid + "-")]
         pos = v["positions"]
-        venue_pos = None if pos is None else {sym: pos.get(f"linear:{sym}", 0.0), "SPOT:" + sym: pos.get(f"spot:{sym}", 0.0) - float(self.baseline.get(f"spot:{sym}", 0.0))}
+        venue_pos = None if pos is None else {sym: pos.get(f"linear:{sym}", 0.0), "SPOT:" + sym: _minus(pos.get(f"spot:{sym}", 0.0), self.baseline.get(f"spot:{sym}", 0.0))}
         rows = [{"execId": x["fill_id"], "execQty": x["qty"], "execPrice": x["price"], "execFee": x["fee_usd"], "side": x["side"], "symbol": x["symbol"], "orderLinkId": x["link_id"]}
                 for x in mine]
         self.venue_recon = self.ledger.reconcile_with_venue(rows, venue_pos, None, sum(float(x["fee_usd"]) for x in mine) if v["complete"] else None, executions_complete=bool(v["complete"]))
@@ -663,7 +669,7 @@ class Run:
         pos = view["positions"]
         for sym in sorted({l.symbol for l in self.group_plan.legs}):
             dust = max(float(self.ex.filters("spot", sym).qty_step), 0.002 * max(float(l.qty) for l in self.group_plan.legs if l.symbol == sym))
-            if abs(pos.get(f"linear:{sym}", 0.0)) >= 1e-12 or abs(pos.get(f"spot:{sym}", 0.0) - float(self.baseline.get(f"spot:{sym}", 0.0))) > dust:
+            if abs(pos.get(f"linear:{sym}", 0.0)) >= 1e-12 or abs(_minus(pos.get(f"spot:{sym}", 0.0), self.baseline.get(f"spot:{sym}", 0.0))) > dust:
                 return False
         return not view.get("foreign_open_orders") and not [o for o in view["orders"].values() if o["status"] in ("New", "PartiallyFilled")]
 
@@ -753,7 +759,7 @@ class Run:
             complete = bool(view["complete"]) and pos is not None
             # {symbol: qty}: perp positions by symbol; the spot leg as "SPOT:<symbol>" = balance MINUS the owner's pre-session baseline (0 when flat)
             rec["final_position"] = ({k.split(":", 1)[1]: v for k, v in pos.items() if k.startswith("linear:")}
-                                     | {"SPOT:" + k.split(":", 1)[1]: v - float(self.baseline.get(k, 0.0)) for k, v in pos.items() if k.startswith("spot:")}) if pos is not None else None
+                                     | {"SPOT:" + k.split(":", 1)[1]: _minus(v, self.baseline.get(k, 0.0)) for k, v in pos.items() if k.startswith("spot:")}) if pos is not None else None
             flat = self.venue_flat(view) if complete else False
             rec["flat_verified"] = bool(flat)                          # None only before the final read; False when the read was incomplete or anything remains
             self.last_view = view
@@ -993,6 +999,49 @@ def cmd_reconcile(ctx: Ctx) -> int:
     return EXIT_OK if rec["flat_verified"] is True and run.state() in ("CLOSED", "FAILED") else EXIT_FAIL
 
 
+def cmd_assess(ctx: Ctx) -> int:
+    """READ-ONLY diagnostic: what the entry authority would be shown right now. Only signed GETs on the Testnet host (no order, no leverage change, nothing written to the state dir).
+    Prints the plan baseline, the baseline the execute step would take from the venue, and the account state (equity, positions) under each, so a risk refusal can be explained from numbers."""
+    plan = _read_json(ctx.path("plan"))
+    why = plan_refusals(plan)
+    p = TT.TestnetCredentials.presence(ctx.env)
+    if not (p["dedicated_key_present"] and p["dedicated_secret_present"]):
+        why.append("DEDICATED_TESTNET_CREDENTIALS_MISSING")
+    if why:
+        ctx.out("assess REFUSED (no network call was made): " + "; ".join(why))
+        return EXIT_REFUSED
+    creds = TT.TestnetCredentials.from_mapping(ctx.env)
+    inner = ctx.inner if ctx.inner is not None else TT.NoRedirectInner()
+    client, _transport = TT.build_client(creds, inner)
+    sym = plan["symbol"]
+    ex = TE.TestnetExecutor(client, symbols=[sym], spot_symbols=[sym], clock_ms=ctx.clock, kill_reader=lambda: _kill(ctx))
+    try:
+        view = ex.venue_state()
+        pos = view["positions"] or {}
+        venue_baseline = {f"spot:{sym}": float(pos.get(f"spot:{sym}", 0.0))}
+        plan_baseline = dict(plan.get("spot_baseline", {}))
+        out: Dict[str, Any] = {"symbol": sym, "plan_notional_usd": plan.get("notional_usd"), "plan_baseline": plan_baseline, "venue_baseline": venue_baseline,
+                               "venue_positions": pos, "venue_complete": bool(view["complete"]), "foreign_open_orders": len(view["foreign_open_orders"])}
+        for name, base in (("state_with_plan_baseline", plan_baseline), ("state_with_venue_baseline", venue_baseline), ("state_with_no_baseline", {})):
+            st = ex.account_state(base, 0)
+            out[name] = {"equity_usd": st["equity_usd"], "positions": st["positions"]}
+        # the authority's own pure risk check, per leg, on the venue-baseline state and the plan's policy (no order, no registration): the same reasons an order would be refused with
+        gp = T.OrderGroupPlan(**{**plan["group"], "legs": tuple(T.LegPlan(**l) for l in plan["group"]["legs"])})
+        st = ex.account_state(venue_baseline, 0)
+        st["day_start_equity_usd"] = st["equity_usd"]
+        snaps = {sym: ex.snapshot(sym)}
+        out["policy_caps"] = {k: v for k, v in plan["policy"].items() if k.startswith("max_")}
+        out["risk_per_leg"] = {}
+        for lg in gp.legs:
+            d = MRISK.risk_assess(replace(gp, legs=(lg,), created_ms=int(ctx.clock())), json.loads(json.dumps(st)), plan["policy"], snaps)
+            out["risk_per_leg"][f"{lg.category}:{lg.side}:{lg.leg_id}"] = {"approved": d.approved, "reasons": list(d.reasons), "limits": d.limits}
+    except (TE.ExecutorError, bc.BybitAPIError) as exc:
+        ctx.out(f"assess failed: {type(exc).__name__}: {str(exc)[:200]}")
+        return EXIT_FAIL
+    ctx.out(json.dumps(out, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
 def cmd_status(ctx: Ctx) -> int:
     rec = load_record(ctx)
     if not os.path.exists(ctx.path("record")):
@@ -1006,7 +1055,7 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Owner-invoked Bybit TESTNET session tool (fake money; refuses anything else).")
     ap.add_argument("--state-dir", default=os.path.join(os.path.expanduser("~"), ".ai-agent-control", "ms_testnet"))
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("preflight", "plan", "execute", "reconcile", "status"):
+    for name in ("preflight", "plan", "execute", "reconcile", "status", "assess"):
         s = sub.add_parser(name)
         s.add_argument("--max-preflight-age-min", type=int, default=DEFAULT_MAX_PREFLIGHT_AGE_MIN)
         if name == "preflight":
@@ -1036,7 +1085,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str
         (out or print)(f"refused (nothing was created): {exc}")
         return EXIT_REFUSED
     ctx.plan_poll = 1                                                   # type: ignore[attr-defined]
-    return {"preflight": cmd_preflight, "plan": cmd_plan, "execute": cmd_execute, "reconcile": cmd_reconcile, "status": cmd_status}[a.cmd](ctx)
+    return {"preflight": cmd_preflight, "plan": cmd_plan, "execute": cmd_execute, "reconcile": cmd_reconcile, "status": cmd_status, "assess": cmd_assess}[a.cmd](ctx)
 
 
 if __name__ == "__main__":
