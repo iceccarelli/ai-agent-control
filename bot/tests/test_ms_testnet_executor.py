@@ -537,7 +537,9 @@ def test_a_ledger_that_disagrees_with_the_venue_halts_new_exposure(w):
 def test_spot_exit_waits_for_the_perp_exit_fill_to_show_on_the_venue_read(w):
     w.fake.fill_delay_ms = 2500                                                              # fills arrive ASYNCHRONOUSLY, after the ack
     run, ctx, rec = begin(w)
-    assert run.state() == "SUBMITTED" and run.ex.venue_state()["positions"]["linear:BTCUSDT"] == 0
+    # the session now WAITS (bounded) for the first entry leg's async fill before it assesses and sends the second (a real exchange's order list trails its position read), so the
+    # perp is already filled when begin() returns; the exit side below is what this test is about
+    assert run.state() == "SUBMITTED"
     assert drive_full(w, run, 2) == "HEDGED"
     run.engine.request_exit(run.gid, w.clock.now(), "T")
     assert drive_full(w, run, 4) == "CLOSED"

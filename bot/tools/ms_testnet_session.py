@@ -577,33 +577,41 @@ class Run:
         return v
 
     # the engine's send hook: release dead exit reservations before an exit is authorised (as ms_pipeline does), hold a spot exit until the perp is closed, then the executor
-    def settle_filled_entries(self) -> None:
-        """An entry leg the VENUE's own order read shows fully filled is reflected in the account's position read: settle it now, so the authority stops counting it twice (as a venue
-        position AND as a still-reserved leg) when it assesses the NEXT leg of the group. The engine sends both entry legs in one loop, before ``bookkeep`` runs: a market leg that fills
-        at once made the second leg look like 2x the plan and breach the per-symbol/aggregate/gross/unhedged caps. The state cache is dropped so the next assessment re-reads the
-        account AFTER the fill (a stale read plus a settled reservation would UNDER-count). Never settles on a failed or incomplete read."""
+    def settle_filled_entries(self, wait_s: float = 5.0, *, skip_leg: str = "") -> None:
+        """An entry leg the VENUE confirms fully filled is reflected in the account's position read: settle it, so the authority stops counting it twice (as a venue position AND as a
+        still-reserved leg) when it assesses the NEXT leg. The engine sends both entry legs in one loop, before ``bookkeep`` runs, and a real exchange's order list can trail its position
+        read by a moment: both real Testnet attempts were refused (per-symbol/aggregate/gross/unhedged) with the first leg counted twice. So a leg that was SENT is waited for, at most
+        ``wait_s``, until the venue's own reads show it fully filled (the order, or the sum of its executions). A leg that is never confirmed stays RESERVED (conservative: the
+        next leg is refused and the group unwound, never under-counted). The state cache is dropped after a settle so the next assessment re-reads the account AFTER the fill."""
         g = self.engine.groups.get(self.gid) if self.engine else None
         if g is None:
             return
-        pending = [l for l in g.entry_legs() if l.plan.leg_id not in self._settled]
-        if not pending:
-            return
-        try:
-            v = self.ex.venue_state()
-        except (TE.ExecutorError, bc.BybitAPIError):
-            return
-        if not v.get("complete"):
-            return
-        for l in pending:
-            o = v["orders"].get(l.link)
-            if o and o.get("status") == "Filled" and D(str(o.get("filled_qty", 0))) >= D(str(l.plan_qty)) - D("1e-12"):
-                self._settled.add(l.plan.leg_id)
-                self.authority.settle_leg(self.gid, l.plan.leg_id)
-                self._state.at = None
+        deadline = int(self.ctx.clock()) + int(wait_s * 1000)
+        while True:
+            pending = [l for l in g.entry_legs() if l.plan.leg_id != skip_leg and l.plan.leg_id not in self._settled and l.status in (EX.SENT, EX.LIVE, EX.UNKNOWN, EX.FILLED)]
+            if not pending:
+                return
+            try:
+                v = self.ex.venue_state()
+            except (TE.ExecutorError, bc.BybitAPIError):
+                v = None
+            if v and v.get("complete"):
+                for l in pending:
+                    o = v["orders"].get(l.link)
+                    done_qty = sum(D(str(x["qty"])) for x in v["executions"] if x.get("link_id") == l.link)
+                    if (o and o.get("status") == "Filled" and D(str(o.get("filled_qty", 0))) >= D(str(l.plan_qty)) - D("1e-12")) or done_qty >= D(str(l.plan_qty)) - D("1e-12"):
+                        self._settled.add(l.plan.leg_id)
+                        self.authority.settle_leg(self.gid, l.plan.leg_id)
+                        self._state.at = None
+                if all(l.plan.leg_id in self._settled for l in pending):
+                    return
+            if int(self.ctx.clock()) >= deadline:
+                return
+            self.ctx.sleep(0.25)
 
     def send(self, req: EX.OrderRequest) -> Any:
         if not req.leg.leg_id.startswith("x"):
-            self.settle_filled_entries()
+            self.settle_filled_entries(skip_leg=req.leg.leg_id)              # the leg being sent is SENT already but not on the venue yet: never wait for it
         if req.leg.leg_id.startswith("x"):
             self.release_dead_exits()
             if self.authority.is_resolved(self.gid):                    # exposure exists (the engine is exiting): a group resolved earlier may be EXITED again, never re-entered
@@ -612,7 +620,25 @@ class Run:
                 ack = self._await_perp_closed(req)
                 if ack is not None:
                     return ack
-        return self.ex.send_order(req)
+        ack = self.ex.send_order(req)
+        if getattr(ack, "status", "") == "REJECTED" and "RISK:" in str(getattr(ack, "reason", "")):
+            self.diagnose_refusal(req, ack)
+        return ack
+
+    def diagnose_refusal(self, req: EX.OrderRequest, ack: Any) -> None:
+        """Print what the authority was shown when it refused an ENTRY on risk grounds (no secrets: notionals, leg statuses, settle marks), so the next failure is explained from numbers."""
+        try:
+            st = self._state.value or {}
+            g = self.engine.groups.get(self.gid) if self.engine else None
+            v = self.last_view or {}
+            self.ctx.out("REFUSAL-DIAGNOSTIC " + json.dumps({
+                "leg": req.leg.leg_id, "reason": str(getattr(ack, "reason", ""))[:300],
+                "state_positions": {k: (p or {}).get("notional_usd") for k, p in (st.get("positions") or {}).items()}, "state_equity_usd": st.get("equity_usd"),
+                "engine_legs": {l.plan.leg_id: l.status for l in (g.entry_legs() if g else [])}, "settled": sorted(self._settled),
+                "venue_orders": {k: [o.get("status"), o.get("filled_qty")] for k, o in (v.get("orders") or {}).items()},
+                "venue_exec_qty": {x.get("link_id"): x.get("qty") for x in (v.get("executions") or [])}}, sort_keys=True, default=str))
+        except Exception as exc:                                       # noqa: BLE001 - a diagnostic must never break the run
+            self.ctx.out(f"REFUSAL-DIAGNOSTIC unavailable: {type(exc).__name__}")
 
     def _await_perp_closed(self, req: EX.OrderRequest) -> Optional[EX.Ack]:
         """A spot sell is an exit only once the perp it hedges is closed (``ms_authority.spot_sell_keeps_hedge``), and on a real exchange the perp exit's FILL arrives after its

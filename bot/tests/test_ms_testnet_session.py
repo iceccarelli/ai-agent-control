@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 import ms_authority as MA  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
+import ms_testnet_executor as TE  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
 import ms_types as T  # noqa: E402
 from ms_fake_bybit_testnet import FAKE_KEY, FAKE_SECRET, SimulatedCrash  # noqa: E402
@@ -699,3 +700,37 @@ def test_a_filled_spot_leg_is_not_counted_twice_when_the_perp_leg_is_assessed_af
     entries = [o for o in w.record()["orders"] if str(o.get("link_id", "")).rsplit("-", 1)[-1] in ("p", "s")]
     assert {o["link_id"].rsplit("-", 1)[-1] for o in entries} == {"p", "s"}, entries          # BOTH entry legs reached the venue (an unwound group also ends flat)
     assert w.record()["flat_verified"] is True
+
+
+def test_a_lagging_order_read_does_not_leave_the_filled_first_leg_double_counted(w, monkeypatch):
+    """Second real refusal of the same plan: the perp filled (the position read shows it) but the ORDER read had not caught up when the spot leg was assessed, so the perp was settled
+    by nobody and counted twice (position + reservation). The session now waits, bounded, for the venue to confirm the earlier entry leg (order Filled OR its executions) and only
+    then settles it; a leg the venue never confirms stays reserved (conservative: the group is refused and unwound, never under-counted)."""
+    monkeypatch.setattr(S._Cached.__init__, "__defaults__", (0,))
+    seen: dict = {}
+    real = TE.TestnetExecutor._take_order
+
+    def lagging(self, r, cat, out):
+        real(self, r, cat, out)
+        link = r.get("orderLinkId")
+        if link in out:
+            seen[link] = seen.get(link, 0) + 1
+            if seen[link] <= 2:                                                  # the order list shows the new order as still working for its first two reads
+                out[link] = dict(out[link], status="New", filled_qty=0.0)
+    monkeypatch.setattr(TE.TestnetExecutor, "_take_order", lagging)
+    monkeypatch.setattr(TE.TestnetExecutor, "_take_exec", lambda self, r, cat, out: None)   # and its execution list is empty until the order list has caught up
+    d = w.ready("BTCUSDT", 400.0)
+    rc = w.execute(d)
+    assert rc == 0, w.text()[-900:]
+    entries = [o for o in w.record()["orders"] if str(o.get("link_id", "")).rsplit("-", 1)[-1] in ("p", "s")]
+    assert {o["link_id"].rsplit("-", 1)[-1] for o in entries} == {"p", "s"}, entries
+
+
+def test_a_risk_refusal_of_an_entry_prints_what_the_authority_was_shown(w, monkeypatch):
+    """Positive control for the double count (settling disabled) AND the diagnostic: the refused leg, the account positions, the engine's leg statuses (the perp still LIVE: the window the double count lives in)."""
+    monkeypatch.setattr(S._Cached.__init__, "__defaults__", (0,))
+    monkeypatch.setattr(S.Run, "settle_filled_entries", lambda self, *a, **k: None)
+    d = w.ready("BTCUSDT", 400.0)
+    w.execute(d)
+    out = w.text()
+    assert "REFUSAL-DIAGNOSTIC" in out and "ABOVE_CAP" in out and '"engine_legs": {"p": "LIVE"' in out and '"state_positions": {"BTCUSDT": -360' in out
