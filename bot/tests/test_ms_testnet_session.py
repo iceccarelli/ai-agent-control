@@ -603,3 +603,36 @@ def test_every_read_the_manifest_declares_is_really_made_by_preflight_and_every_
     ev = " | ".join(w.manifest["evidence_capture"])
     for name in ("testnet_session.json", "plan.json", "preflight.json", "engine_journal.jsonl", "ms_groups.jsonl"):
         assert name in ev, f"{name} is written but not named as evidence"
+
+
+# ---------------------------------------------------------------- the runbook's numbers and commands are the code's
+def _runbook():
+    with open(os.path.join(os.path.dirname(HERE), "RUNBOOKS.md"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_runbook_states_the_real_windows_and_loss_limit(w):
+    rb = _runbook()
+    assert f"{S.DEFAULT_MAX_PREFLIGHT_AGE_MIN} minutes" in rb and f"{S.MAX_PLAN_AGE_MIN} minutes" in rb
+    assert f"${w.manifest['bounds']['max_loss_usd']}" in rb and "totalEquity" in rb
+    assert f"({w.manifest['bounds']['max_entries_per_utc_day']})" in rb and "ONE-SHOT" in rb
+    assert "SESSION_ALREADY_EXECUTED_USE_RECONCILE" in rb and "PREFLIGHT_IS_NOT_THE_ONE_THE_PLAN_WAS_BUILT_FROM" in rb
+
+
+def test_the_runbooks_generate_command_and_digest_one_liner_run_and_agree(tmp_path):
+    import re
+    import shlex
+    import subprocess
+    rb = _runbook()
+    gen = re.search(r"`(python3 tools/ms_testnet_adapter\.py generate --candidate research/candidates/\S+ --symbols \S+ --session-credentials) > manifest\.json`", rb)
+    assert gen, "the runbook's generate command moved"
+    r = subprocess.run(shlex.split(gen.group(1)), cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    m = json.loads(r.stdout)
+    assert m["strategy_allowlist"][0]["candidate_id"] == "cash_and_carry@spec-1" and m["credential_env"] == {"api_key": TT.KEY_ENV, "api_secret": TT.SECRET_ENV}
+    one = re.search(r'`(python3 -c "import json,sys.*?")`', rb)
+    assert one, "the runbook's digest one-liner moved"
+    cmd = one.group(1)
+    r2 = subprocess.run(["bash", "-c", cmd], cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=60)
+    assert r2.returncode == 0, r2.stderr
+    assert r2.stdout.strip() == m["strategy_allowlist"][0]["spec_digest"]
