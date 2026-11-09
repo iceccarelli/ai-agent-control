@@ -509,7 +509,9 @@ def test_the_manifest_loss_limit_stops_the_run_and_unwinds_reduce_only(tmp_path,
     d = w.ready(hold_seconds=30)
     assert w.execute(d) == 0, w.text()
     assert "STOP: LOSS_LIMIT" in w.text() and w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
-    assert set(w.fake.create_calls.values()) == {1} and len(w.fake.create_calls) == 4                    # entries once, exits once: nothing re-entered
+    # every order created once, nothing re-entered. The second entry leg is now assessed on a FRESH account read (the first leg's fee is already a loss), so with a one-cent limit the
+    # run may stop before it (2 orders: the first entry and its exit) or after it (4); either way it ends flat via reduce-only exits.
+    assert set(w.fake.create_calls.values()) == {1} and len(w.fake.create_calls) in (2, 4)
 
 
 def test_the_loss_limit_does_not_fire_inside_the_bound(w):
@@ -684,3 +686,16 @@ def test_assess_is_read_only_and_reports_the_baselines_and_the_state_the_authori
     legs = out["risk_per_leg"]
     assert legs and all(v["approved"] for v in legs.values()), legs                          # a 400 plan passes every cap leg by leg (the caps are printed with it)
     assert out["policy_caps"]["max_aggregate_notional_usd"] == 500.0
+
+
+def test_a_filled_spot_leg_is_not_counted_twice_when_the_perp_leg_is_assessed_after_the_state_cache_expires(w, monkeypatch):
+    """Found on the real Testnet: the engine sends both entry legs in one loop. The spot buy fills at once (the wallet shows it) but is only SETTLED by bookkeeping after the loop, so
+    the second leg saw the first leg's venue position AND the still-reserved spot leg (2x) and tripped PER_SYMBOL/AGGREGATE/GROSS/UNHEDGED caps on a plan that fits them. The fake hides it
+    because its clock does not advance between the sends (the 500 ms state cache never expires); a real round trip does."""
+    monkeypatch.setattr(S._Cached.__init__, "__defaults__", (0,))                  # the state/snapshot cache never serves a value (a real order's latency)
+    d = w.ready("BTCUSDT", 400.0)
+    rc = w.execute(d)
+    assert rc == 0, w.text()[-900:]
+    entries = [o for o in w.record()["orders"] if str(o.get("link_id", "")).rsplit("-", 1)[-1] in ("p", "s")]
+    assert {o["link_id"].rsplit("-", 1)[-1] for o in entries} == {"p", "s"}, entries          # BOTH entry legs reached the venue (an unwound group also ends flat)
+    assert w.record()["flat_verified"] is True

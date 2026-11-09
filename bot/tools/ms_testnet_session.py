@@ -577,7 +577,33 @@ class Run:
         return v
 
     # the engine's send hook: release dead exit reservations before an exit is authorised (as ms_pipeline does), hold a spot exit until the perp is closed, then the executor
+    def settle_filled_entries(self) -> None:
+        """An entry leg the VENUE's own order read shows fully filled is reflected in the account's position read: settle it now, so the authority stops counting it twice (as a venue
+        position AND as a still-reserved leg) when it assesses the NEXT leg of the group. The engine sends both entry legs in one loop, before ``bookkeep`` runs: a market leg that fills
+        at once made the second leg look like 2x the plan and breach the per-symbol/aggregate/gross/unhedged caps. The state cache is dropped so the next assessment re-reads the
+        account AFTER the fill (a stale read plus a settled reservation would UNDER-count). Never settles on a failed or incomplete read."""
+        g = self.engine.groups.get(self.gid) if self.engine else None
+        if g is None:
+            return
+        pending = [l for l in g.entry_legs() if l.plan.leg_id not in self._settled]
+        if not pending:
+            return
+        try:
+            v = self.ex.venue_state()
+        except (TE.ExecutorError, bc.BybitAPIError):
+            return
+        if not v.get("complete"):
+            return
+        for l in pending:
+            o = v["orders"].get(l.link)
+            if o and o.get("status") == "Filled" and D(str(o.get("filled_qty", 0))) >= D(str(l.plan_qty)) - D("1e-12"):
+                self._settled.add(l.plan.leg_id)
+                self.authority.settle_leg(self.gid, l.plan.leg_id)
+                self._state.at = None
+
     def send(self, req: EX.OrderRequest) -> Any:
+        if not req.leg.leg_id.startswith("x"):
+            self.settle_filled_entries()
         if req.leg.leg_id.startswith("x"):
             self.release_dead_exits()
             if self.authority.is_resolved(self.gid):                    # exposure exists (the engine is exiting): a group resolved earlier may be EXITED again, never re-entered
