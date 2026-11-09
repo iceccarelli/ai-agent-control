@@ -52,6 +52,7 @@ PLAN_SCHEMA = "testnet_plan/v1"
 PREFLIGHT_SCHEMA = "testnet_preflight/v1"
 VENUE_LABEL = "Testnet"                                  # display label in the session record; the registry key (policy venue) is the lower-case "testnet"
 NOTE = "TESTNET, not owner profit"
+SPOT_BUY_CUSHION_BPS = 30                                # the spot entry is a limit IOC this far ABOVE the plan-time ask: it still fills at the best ask, the cushion only bounds the worst price
 HARD_CEILING_USD = AD.AGGREGATE_CEILING_USD           # one number: the adapter's Testnet ceiling (it was a second hard-coded 100 that would have silently clamped a 500 plan)
 MAX_LIFECYCLE_H = 9.0
 DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
@@ -398,7 +399,9 @@ def build_plan(manifest: Mapping[str, Any], pre: Mapping[str, Any], *, symbol: s
     for cat, f, ref in (("linear", lin, mark), ("spot", sp, D(str(mk["spot_ask"])))):
         if D(f["min_notional"]) > 0 and D(qty) * ref < D(f["min_notional"]):
             raise ValueError(f"{cat.upper()}_NOTIONAL_BELOW_MIN")
-    spot_px = T.round_to_tick(mk["spot_ask"], sp["tick"], side="Buy", passive=False)
+    spot_px = T.round_to_tick(D(str(mk["spot_ask"])) * (1 + D(SPOT_BUY_CUSHION_BPS) / D(10_000)), sp["tick"], side="Buy", passive=False)     # rounds UP: never below the cushioned limit
+    if D(qty) * D(spot_px) > D(str(ceiling)) + D("1e-9"):                      # the spot leg is assessed at its LIMIT price: the cushioned leg must still fit the ceiling
+        raise ValueError(f"SPOT_LIMIT_NOTIONAL_ABOVE_CEILING:{float(D(qty) * D(spot_px)):.2f}>{ceiling}")
     legs = (T.LegPlan("p", symbol, "linear", "Sell", qty, "Market", None, False, False, "IOC"),
             T.LegPlan("s", symbol, "spot", "Buy", qty, "Limit", spot_px, False, False, "IOC"))
     s0 = manifest["strategy_allowlist"][0]
@@ -483,6 +486,10 @@ class _Cached:
         self.value: Any = None
         self.at: Optional[int] = None
 
+    def invalidate(self) -> None:
+        """Forget the value AND its timestamp: the next ``get`` must read again, and if that read fails it RAISES (a value read before a fill must never be served after it settled)."""
+        self.value, self.at = None, None
+
     def get(self) -> Any:
         now = int(self.clock())
         if self.at is None or now - self.at >= self.refresh_ms:
@@ -541,12 +548,15 @@ class Run:
         d = _read_json(os.path.join(self.ctx.dir, "run_limits.json"))
         if isinstance(d, dict) and d.get("gid") == self.gid_hint():
             self.start_ms, self.start_equity = d.get("start_ms"), d.get("start_equity_usd")
+            b = d.get("baseline")                                  # the baseline the session TRADED with (read from the venue at execute), not the plan's older preflight copy
+            if isinstance(b, dict) and b and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in b.values()):
+                self.baseline = {str(k): float(v) for k, v in b.items()}
 
     def gid_hint(self) -> str:
         return str(self.plan["group"]["group_id"])
 
     def _save_start(self) -> None:
-        _write_json(os.path.join(self.ctx.dir, "run_limits.json"), {"gid": self.gid_hint(), "start_ms": self.start_ms, "start_equity_usd": self.start_equity})
+        _write_json(os.path.join(self.ctx.dir, "run_limits.json"), {"gid": self.gid_hint(), "start_ms": self.start_ms, "start_equity_usd": self.start_equity, "baseline": self.baseline})
 
     def _read_state(self) -> Dict[str, Any]:
         # open_groups = the OTHER active groups: the authority adds the group being assessed itself (ms_risk counts og + 1), so counting it here would refuse its own legs at max_active_groups=1
@@ -602,7 +612,7 @@ class Run:
                     if (o and o.get("status") == "Filled" and D(str(o.get("filled_qty", 0))) >= D(str(l.plan_qty)) - D("1e-12")) or done_qty >= D(str(l.plan_qty)) - D("1e-12"):
                         self._settled.add(l.plan.leg_id)
                         self.authority.settle_leg(self.gid, l.plan.leg_id)
-                        self._state.at = None
+                        self._state.invalidate()
                 if all(l.plan.leg_id in self._settled for l in pending):
                     return
             if int(self.ctx.clock()) >= deadline:
@@ -733,6 +743,7 @@ class Run:
             if l.status == EX.FILLED and l.plan.leg_id not in self._settled:
                 self._settled.add(l.plan.leg_id)
                 self.authority.settle_leg(self.gid, l.plan.leg_id)
+                self._state.invalidate()                                # the account read must be taken AFTER the fill this settle reflects
         self.release_dead_exits()
         terminal = g.state in (T.GroupState.CLOSED, T.GroupState.FAILED)
         resolved = self.authority.is_resolved(self.gid)
@@ -960,6 +971,7 @@ def cmd_execute(ctx: Ctx) -> int:
         ctx.out("execute aborted before any order: the venue is not flat/clean or could not be read completely")
         return EXIT_FAIL
     run.baseline = {f"spot:{sym}": float(pos.get(f"spot:{sym}", 0.0))}
+    run._save_start()                                                   # persist the baseline the session trades with (reconcile / a restart must use it)
     if not run.ex.set_leverage(sym, int(plan["leverage"])):
         ctx.out("execute aborted before any order: leverage could not be set")
         return EXIT_FAIL
@@ -1087,6 +1099,9 @@ def cmd_assess(ctx: Ctx) -> int:
         for lg in gp.legs:
             d = MRISK.risk_assess(replace(gp, legs=(lg,), created_ms=int(ctx.clock())), json.loads(json.dumps(st)), plan["policy"], snaps)
             out["risk_per_leg"][f"{lg.category}:{lg.side}:{lg.leg_id}"] = {"approved": d.approved, "reasons": list(d.reasons), "limits": d.limits}
+        # registration assesses BOTH legs together (per-symbol = spot + perp, gross = the sum): a plan that passes each leg alone can still be refused there, after an entry was counted
+        dg = MRISK.risk_assess(replace(gp, created_ms=int(ctx.clock())), json.loads(json.dumps(st)), plan["policy"], snaps)
+        out["risk_whole_group"] = {"approved": dg.approved, "reasons": list(dg.reasons), "limits": dg.limits}
     except (TE.ExecutorError, bc.BybitAPIError) as exc:
         ctx.out(f"assess failed: {type(exc).__name__}: {str(exc)[:200]}")
         return EXIT_FAIL
