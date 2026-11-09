@@ -52,6 +52,7 @@ PLAN_SCHEMA = "testnet_plan/v1"
 PREFLIGHT_SCHEMA = "testnet_preflight/v1"
 VENUE_LABEL = "Testnet"                                  # display label in the session record; the registry key (policy venue) is the lower-case "testnet"
 NOTE = "TESTNET, not owner profit"
+SPOT_BUY_CUSHION_BPS = 30                                # the spot entry is a limit IOC this far ABOVE the plan-time ask: it still fills at the best ask, the cushion only bounds the worst price
 HARD_CEILING_USD = AD.AGGREGATE_CEILING_USD           # one number: the adapter's Testnet ceiling (it was a second hard-coded 100 that would have silently clamped a 500 plan)
 MAX_LIFECYCLE_H = 9.0
 DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
@@ -398,7 +399,9 @@ def build_plan(manifest: Mapping[str, Any], pre: Mapping[str, Any], *, symbol: s
     for cat, f, ref in (("linear", lin, mark), ("spot", sp, D(str(mk["spot_ask"])))):
         if D(f["min_notional"]) > 0 and D(qty) * ref < D(f["min_notional"]):
             raise ValueError(f"{cat.upper()}_NOTIONAL_BELOW_MIN")
-    spot_px = T.round_to_tick(mk["spot_ask"], sp["tick"], side="Buy", passive=False)
+    spot_px = T.round_to_tick(D(str(mk["spot_ask"])) * (1 + D(SPOT_BUY_CUSHION_BPS) / D(10_000)), sp["tick"], side="Buy", passive=False)     # rounds UP: never below the cushioned limit
+    if D(qty) * D(spot_px) > D(str(ceiling)) + D("1e-9"):                      # the spot leg is assessed at its LIMIT price: the cushioned leg must still fit the ceiling
+        raise ValueError(f"SPOT_LIMIT_NOTIONAL_ABOVE_CEILING:{float(D(qty) * D(spot_px)):.2f}>{ceiling}")
     legs = (T.LegPlan("p", symbol, "linear", "Sell", qty, "Market", None, False, False, "IOC"),
             T.LegPlan("s", symbol, "spot", "Buy", qty, "Limit", spot_px, False, False, "IOC"))
     s0 = manifest["strategy_allowlist"][0]

@@ -734,3 +734,20 @@ def test_a_risk_refusal_of_an_entry_prints_what_the_authority_was_shown(w, monke
     w.execute(d)
     out = w.text()
     assert "REFUSAL-DIAGNOSTIC" in out and "ABOVE_CAP" in out and '"engine_legs": {"p": "LIVE"' in out and '"state_positions": {"BTCUSDT": -360' in out
+
+
+def test_the_spot_buy_limit_has_a_cushion_over_the_ask_so_a_drifting_market_still_fills_it(w):
+    """Real Testnet run 4: the spot limit IOC was priced AT the plan-time ask; the market drifted ~15 bps up before execute, the limit never filled and the perp unwound. The limit now
+    sits SPOT_BUY_CUSHION_BPS above the ask (an IOC buy still fills at the best ask: the cushion only bounds the worst price), and the cushioned leg still fits the notional ceiling."""
+    assert w.run("preflight") == 0
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "400") == 0
+    plan = w.plan_doc()
+    spot = next(l for l in plan["legs"] if l["category"] == "spot")
+    assert S.SPOT_BUY_CUSHION_BPS == 30
+    pre = json.load(open(os.path.join(w.state_dir, "preflight.json")))
+    spot_ask = float(pre["market"]["BTCUSDT"]["spot_ask"])
+    assert float(spot["price"]) >= spot_ask * (1 + 29.0 / 1e4) and float(spot["price"]) <= spot_ask * (1 + 31.0 / 1e4)
+    assert float(spot["qty"]) * float(spot["price"]) <= plan["aggregate_ceiling_usd"]
+    d = plan["plan_digest"]
+    assert w.execute(d) == 0 and w.record()["flat_verified"] is True
+    assert {o["link_id"].rsplit("-", 1)[-1] for o in w.record()["orders"] if o["link_id"].rsplit("-", 1)[-1] in ("p", "s")} == {"p", "s"}
