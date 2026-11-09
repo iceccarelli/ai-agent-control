@@ -135,6 +135,7 @@ jobs:
           tests/test_ms_testnet_transport.py
           tests/test_ms_testnet_executor.py
           tests/test_ms_testnet_session.py
+          tests/test_ops_layer.py
           tests/test_md_storage_policy.py
           tests/test_frozen_and_lineage.py
           tests/test_fingerprint.py
