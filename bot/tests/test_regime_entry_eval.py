@@ -220,3 +220,92 @@ def test_it_runs_on_a_real_history_root_and_refuses_a_missing_universe(tmp_path,
     with pytest.raises(SystemExit) as ei:
         RE.main(["--history-root", root])
     assert ei.value.code == 2
+
+
+# ================================================================ reg-2: the same entry plus an exit on funding inversion (post-hoc, second trial)
+REG1_DIGEST = "5cc46d3febdde88b9c6e63f3e42c5cf98fd7bcbe57e676ad99a0ca9b601b9c28"      # the digest the owner's real run printed (5cc46d3febdde88b): reg-1 must never drift
+
+
+def inverting(name="INV", days=100, flip_day=48, rich=4.0, poor=-6.0):
+    """Steady `rich` bps/day until `flip_day`, then `poor` bps/day: 3 prints per day at 480m."""
+    rates = [(rich if ((i + 1) * 480 * 60_000) <= flip_day * DAY else poor) / 3.0 for i in range(int(days * 3))]
+    return sym(name, days, 0.0, rates=rates)
+
+
+def test_reg1_is_frozen_and_reg2_is_a_distinct_post_hoc_registration():
+    r1, r2 = RE.registration("reg-1"), RE.registration("reg-2")
+    assert RE.registration_digest(r1) == REG1_DIGEST == RE.registration_digest()
+    assert r1["registration_id"].endswith("@reg-1") and r2["registration_id"].endswith("@reg-2") and RE.registration_digest(r2) != REG1_DIGEST
+    assert "exit_rule" not in r1 and "post_hoc" not in r1
+    assert r2["post_hoc"] is True and "reg-1" in r2["derived_from"] and any("POST-HOC" in d for d in r2["disclosures"])
+    assert r2["exit_rule"] == {"checkpoint_days": 1, "lookback_days": 3, "exit_when_mean_funding_bps_per_day_below": 0.0}
+    for k in ("regime_state", "hold_days", "min_listing_age_days", "cost_scenario"):          # everything else is identical: reg-2 adds exactly the exit
+        assert r1[k] == r2[k], k
+    with pytest.raises(RH.HarnessError):
+        RE.registration("reg-3")
+
+
+def test_reg2_exits_on_the_first_inverted_checkpoint_and_reg1_rides_the_hold(tmp_path):
+    s = inverting()
+    o1 = RE.evaluate([s], ledger_path=str(tmp_path / "a" / "l.jsonl"), reg=RE.registration("reg-1"))
+    o2 = RE.evaluate([s], ledger_path=str(tmp_path / "b" / "l.jsonl"), reg=RE.registration("reg-2"))
+    r1 = {r["t"]: r for r in o1["rows_detail"]}[38 * DAY]
+    r2 = {r["t"]: r for r in o2["rows_detail"]}[38 * DAY]
+    # entry at day 38; funding +4/day until day 48 then -6/day. Trailing 3-day mean: day 49 -> (2 x +4 + 1 x -6)/3 = +0.67 (hold); day 50 -> (1 x +4 + 2 x -6)/3 = -2.67 (EXIT)
+    assert r2["funding_bps"] == pytest.approx(10 * 4.0 + 2 * -6.0) and r2["net_bps"] == pytest.approx(28.0 - RT)
+    assert r1["funding_bps"] == pytest.approx(10 * 4.0 + 20 * -6.0) and r1["net_bps"] == pytest.approx(-80.0 - RT)
+    leg = o2["descriptive"]
+    assert leg["early_exit_share"] == 1.0 and leg["mean_days_held"] == pytest.approx(12.0) and o1["descriptive"]["early_exit_share"] == 0.0
+
+
+def test_reg2_equals_reg1_when_funding_never_inverts(tmp_path):
+    s = sym("STEADY", 400, 4.0)
+    a = RE.evaluate([s], ledger_path=str(tmp_path / "a" / "l.jsonl"), reg=RE.registration("reg-1"))
+    b = RE.evaluate([s], ledger_path=str(tmp_path / "b" / "l.jsonl"), reg=RE.registration("reg-2"))
+    assert [r["net_bps"] for r in a["rows_detail"]] == [r["net_bps"] for r in b["rows_detail"]] and b["descriptive"]["early_exit_share"] == 0.0
+
+
+def test_the_exit_decision_uses_only_prints_up_to_the_checkpoint(tmp_path):
+    # two series identical up to day 50 and wildly different afterwards: the exit time (and so the funding earned) cannot differ
+    a = inverting("A")
+    f = [(ts, v if ts <= 50 * DAY else 500.0) for ts, v in a.funding]
+    b = CR.SymbolSeries("B", 480, f, a.mark, launch_ms=1, spot_listed=True, key_basis=CR._KEY_BASIS_OBSERVED)
+    legs = {}
+    for nm, s in (("A", a), ("B", b)):
+        res = RE.run_registered([s], reg=RE.registration("reg-2"))
+        legs[nm] = [l for l in res["legs"] if l["t"] == 38 * DAY][0]
+    assert legs["A"]["exit_ms"] == legs["B"]["exit_ms"] == 50 * DAY and legs["A"]["days_held"] == legs["B"]["days_held"] == 12.0
+
+
+def test_a_delivery_before_the_exit_checkpoint_is_not_an_early_exit(tmp_path):
+    s = sym("DEL", 100, 4.0, delivery=50 * DAY)
+    res = RE.run_registered([s], reg=RE.registration("reg-2"))
+    leg = [l for l in res["legs"] if l["t"] == 38 * DAY][0]
+    assert leg["exit_ms"] is None and leg["closed_during_hold"] is True and leg["days_held"] == pytest.approx(12.0)
+
+
+def test_the_family_ledger_counts_both_registrations_once_each_and_the_second_is_flagged_post_hoc(tmp_path):
+    p = str(tmp_path / "led" / "f.jsonl")
+    s = [sym("AAA", 400, 4.0)]
+    o1 = RE.evaluate(s, ledger_path=p, reg=RE.registration("reg-1"))
+    o2 = RE.evaluate(s, ledger_path=p, reg=RE.registration("reg-2"))
+    assert o1["n_variants_counted"] == 1 and o2["n_variants_counted"] == 2 and o1["post_hoc"] is False and o2["post_hoc"] is True
+    assert RE.evaluate(s, ledger_path=p, reg=RE.registration("reg-1"))["n_variants_counted"] == 2           # re-runs are the same trials
+    assert RE.evaluate(s, ledger_path=p, reg=RE.registration("reg-2"))["n_variants_counted"] == 2
+    assert o2["verdict"] == "INSUFFICIENT_DATA" and o2["ceiling"] == "INSUFFICIENT_DATA"
+
+
+def test_reg2_runs_through_the_cli_on_a_real_history_root(tmp_path, monkeypatch, capsys):
+    import test_candidate_readiness as TCR
+    import socket
+
+    def boom(*a, **k):
+        raise AssertionError("network touched")
+    monkeypatch.setattr(socket.socket, "connect", boom)
+    root, uni, spot = TCR._hist(tmp_path)
+    rc = RE.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", TCR.MARK_IV, "--ledger-dir", str(tmp_path / "L"), "--registration", "reg-2",
+                  "--json", str(tmp_path / "o.json")])
+    assert rc == 0
+    o = json.loads((tmp_path / "o.json").read_text())
+    assert o["registration"]["registration_id"].endswith("@reg-2") and o["post_hoc"] is True and o["verdict"] == "INSUFFICIENT_DATA"
+    assert "post-hoc registration: True" in capsys.readouterr().out

@@ -10,6 +10,7 @@ ROOT  ?= $(DATA)/md-collector
 UNI   ?= $(shell ls -d $(DATA)/universe-v3-* 2>/dev/null | sort | tail -1)
 HIST  ?= $(shell ls -d $(DATA)/md-2* 2>/dev/null | sort | tail -1)
 SPOT  ?= $(shell ls -d $(DATA)/spot-snap/spot-instruments/snapshot-* 2>/dev/null | sort | tail -1)
+REG   ?= reg-1
 ART   ?= $(DATA)/pipeline-out
 PY    ?= python3
 PORT  ?= 8787
@@ -103,7 +104,7 @@ pipeline:
 regime-eval:
 	@test -n "$(HIST)" -a -n "$(UNI)" || { echo "set HIST= (history data root) and UNI="; exit 2; }
 	@mkdir -p -m 700 $(DATA)/ledgers
-	cd $(BOT) && $(PY) tools/regime_entry_eval.py --history-root $(HIST) --universe-dir $(UNI) --spot-dir "$(SPOT)" --mark-interval 240 --ledger-dir $(DATA)/ledgers --json $(DATA)/regime-eval-latest.json
+	cd $(BOT) && $(PY) tools/regime_entry_eval.py --history-root $(HIST) --universe-dir $(UNI) --spot-dir "$(SPOT)" --mark-interval 240 --ledger-dir $(DATA)/ledgers --registration $(REG) --json $(DATA)/regime-eval-$(REG).json
 
 # --- Testnet: READ-ONLY steps only. The execute step is intentionally not a make target (RUNBOOKS: Testnet execution: owner procedure).
 testnet-preflight:
