@@ -23,7 +23,7 @@ PORT  ?= 8787
 S     := $(PY) tools/ms_testnet_session.py --state-dir $(HOME)/.ai-agent-control/ms_testnet
 
 .PHONY: help setup check test-quick scope diagnose plan backfill collect-start collect-stop collect-status collect-log seal backup restore-check audit \
-        control-centre-start control-centre-stop pipeline regime-eval testnet-preflight testnet-plan testnet-status ops-resume
+        control-centre-start control-centre-stop pipeline regime-eval testnet-preflight testnet-plan testnet-status testnet-ready ops-resume
 
 help:
 	@echo "setup | check | test-quick | scope | diagnose | plan | backfill | collect-start|stop|status|log | seal | backup | restore-check | audit"
@@ -124,3 +124,11 @@ testnet-plan:
 
 testnet-status:
 	cd $(BOT) && $(S) status
+
+# One command per Testnet session: the next UNUSED state dir (a session is one-shot per dir), then preflight -> plan -> assess, chained so the 15-minute preflight window holds.
+# Every step is GET-only or offline; it prints the plan digest and stops. Placing the order stays a separate command the owner types (RUNBOOKS: Testnet execution: owner procedure).
+# SYMBOL, NOTIONAL (default 400) and HOLD (seconds to hold the hedge before unwinding, default 0) are the only knobs.
+testnet-ready:
+	@N=5; while [ -e $(HOME)/.ai-agent-control/ms_testnet_$$N ]; do N=$$((N+1)); done; D=$(HOME)/.ai-agent-control/ms_testnet_$$N; echo "state dir: $$D"; \
+	cd $(BOT) && $(PY) tools/ms_testnet_session.py --state-dir $$D preflight && $(PY) tools/ms_testnet_session.py --state-dir $$D plan --symbol $${SYMBOL:-BTCUSDT} --notional-usd $${NOTIONAL:-400} --hold-seconds $${HOLD:-0} \
+	&& $(PY) tools/ms_testnet_session.py --state-dir $$D assess && echo "state dir for the next step: $$D"
