@@ -393,3 +393,37 @@ def test_the_policy_carries_the_manifest_loss_limit_as_a_hard_risk_limit():
     m = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"])
     pol = AD.policy_from_manifest(m)
     assert pol["max_daily_loss_usd"] == m["bounds"]["max_loss_usd"] and ms_risk.policy_refusals(pol) == []
+
+
+# ---------------------------------------------------------------- candidate ids: the repository's own ids must be allow-listable (found on first owner contact)
+def _registered_candidate_ids():
+    import glob
+    out = []
+    for p in sorted(glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "research", "candidates", "*.json"))):
+        with open(p, encoding="utf-8") as fh:
+            out.append(json.load(fh)["candidate_id"])
+    return out
+
+
+def test_every_registered_candidate_id_yields_a_valid_manifest_and_an_accepted_risk_policy():
+    ids = _registered_candidate_ids()
+    assert "cash_and_carry@spec-1" in ids                                    # the id the owner was told to use: it contains '@'
+    for cid in ids:
+        m = AD.generate(candidate_id=cid, spec_digest="a" * 64, symbols=["BTCUSDT"], credential_env=AD.SESSION_CREDENTIAL_ENV)
+        assert AD.refusals(m) == [], (cid, AD.refusals(m))
+        pol = AD.policy_from_manifest(dict(m, authorisation="GRANTED_BY_OWNER:test-ref"))
+        assert pol["candidate_id"] == cid and ms_risk.policy_refusals(pol) == [], cid
+
+
+@pytest.mark.parametrize("bad", ["a b", "a/b", "a;b", "ab", "x" * 65, "a\nb", "a'b", "a$b", "a@@@", "../x", "a\\b", "a%b"])
+def test_unsafe_candidate_ids_are_still_refused(bad):
+    m = AD.generate(candidate_id=bad, spec_digest="a" * 64, symbols=["BTCUSDT"])
+    assert any("strategy_allowlist entry malformed" in r for r in AD.refusals(m)), bad
+
+
+def test_generate_says_why_on_stderr_when_the_manifest_it_just_wrote_is_refused(capsys):
+    rc = AD.main(["generate", "--candidate-id", "has space", "--spec-digest", "a" * 64, "--symbols", "BTCUSDT"])
+    cap = capsys.readouterr()
+    assert rc == 1 and "REFUSED" in cap.err and "strategy_allowlist entry malformed" in cap.err and '"plan_sha256"' in cap.out
+    rc = AD.main(["generate", "--candidate-id", "cash_and_carry@spec-1", "--spec-digest", "a" * 64, "--symbols", "BTCUSDT"])
+    assert rc == 0 and "REFUSED" not in capsys.readouterr().err

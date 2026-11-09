@@ -58,7 +58,7 @@ MAX_LIFECYCLE_HOURS = TAM.MAX_LIFECYCLE_HOURS
 MIN_AGGREGATE_USD = TAM.MIN_NOTIONAL_USD
 _STRATEGY = re.compile(r"[a-z][a-z0-9_]{2,63}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_CANDIDATE = re.compile(r"[A-Za-z0-9_.-]{3,64}")
+_CANDIDATE = re.compile(r"(?=.{3,64}\Z)[A-Za-z0-9_.-]+(?:@[A-Za-z0-9_.-]+)?")      # ONE '@' with text on both sides is allowed because every registered candidate id is '<family>@spec-N' (cash_and_carry@spec-1); nothing else shell- or path-significant is
 
 SIDES = {"linear": ["Sell", "Buy"], "spot": ["Buy", "Sell"]}
 ORDER_TYPES = ["Limit", "Market"]
@@ -360,6 +360,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                      credential_env=SESSION_CREDENTIAL_ENV if a.session_credentials else None)
         rep = validate(m, env={})
         print(json.dumps(m, indent=2, sort_keys=True))
+        if not rep["valid"]:                                         # the manifest above is NOT usable: say so where a redirect to a file cannot hide it
+            print("REFUSED: the manifest just written does not validate: " + "; ".join(rep["refusals"]), file=sys.stderr)
         return 0 if rep["valid"] else 1
     if a.cmd == "status":
         print(json.dumps(capability_status(), indent=2, sort_keys=True))
