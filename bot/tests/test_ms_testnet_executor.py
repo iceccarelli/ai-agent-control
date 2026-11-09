@@ -851,13 +851,13 @@ def test_a_price_swing_of_the_existing_holding_does_not_trip_the_loss_limit_but_
     world = _world_with_existing_btc(tmp_path, monkeypatch)
     run, ctx, rec = begin(world, submit=False)
     run._read_state()                                    # the session's first account read: its start equity
-    assert run.max_loss_usd == pytest.approx(1.11)
+    assert run.max_loss_usd == pytest.approx(AD.MAX_LOSS_CEILING_USD)
     world.clock.sleep(60)
     world.fake.book["BTCUSDT"]["mark"] = "59500.5"       # -$500 per BTC on the 0.1 BTC held: -$50
     world.fake.book["BTCUSDT"]["spot_mark"] = "59500.5"
     assert run.enforce_limits(world.clock.now()) is None
     world.clock.sleep(60)
-    world.fake.wallet["USDT"] -= D("1.5")                # a real session loss above the limit
+    world.fake.wallet["USDT"] -= D("6.0")                # a real session loss above the limit (5.55)
     assert run.enforce_limits(world.clock.now()) == "LOSS_LIMIT"
 
 

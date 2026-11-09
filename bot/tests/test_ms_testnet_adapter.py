@@ -1,4 +1,4 @@
-"""ms_testnet_adapter: the DISABLED owner-session adapter. Manifest closed schema, bounds lower-only, $100 AGGREGATE ceiling, dedicated credentials, kill-switch file semantics,
+"""ms_testnet_adapter: the DISABLED owner-session adapter. Manifest closed schema, bounds lower-only, $500 AGGREGATE ceiling, dedicated credentials, kill-switch file semantics,
 the capability flag, and an offline proof that nothing in the module can send anything. No network, no credential, no order."""
 import ast
 import copy
@@ -55,28 +55,29 @@ def test_generation_is_deterministic_and_digest_ignores_only_authorisation():
     assert AD.validate(granted(m), env={})["authorised"] is True and AD.validate(granted(m), env={})["valid"]
 
 
-def test_aggregate_ceiling_is_100_across_all_symbols_and_never_per_symbol():
-    assert AD.AGGREGATE_CEILING_USD == shadow.SHADOW_MAX_NOTIONAL_USD == 100.0
+def test_aggregate_ceiling_is_500_across_all_symbols_and_never_per_symbol():
+    assert AD.AGGREGATE_CEILING_USD == 500.0
+    assert shadow.SHADOW_MAX_NOTIONAL_USD == 100.0                         # the SHARED cap (frozen BTC experiment, drills, entry authority, live-gate tests) is untouched and independent
     m = fresh(symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"])
-    assert m["bounds"]["aggregate_max_notional_usd"] == 100.0 and "max_notional_usd" not in m["bounds"]
+    assert m["bounds"]["aggregate_max_notional_usd"] == 500.0 and "max_notional_usd" not in m["bounds"]
     bad = copy.deepcopy(m)
-    bad["bounds"]["aggregate_max_notional_usd"] = 100.01
+    bad["bounds"]["aggregate_max_notional_usd"] = 500.01
     assert any("aggregate_max_notional_usd" in r for r in AD.refusals(resealed(bad)))
     # a larger per-symbol allowance than a hedged pair at the aggregate ceiling can never be stated
     bad = copy.deepcopy(m)
-    bad["bounds"]["max_notional_per_symbol_usd"] = 200.5
+    bad["bounds"]["max_notional_per_symbol_usd"] = 1000.5
     assert any("max_notional_per_symbol_usd" in r for r in AD.refusals(resealed(bad)))
-    # the implied risk policy enforces ONE ceiling for all symbols: 3 symbols x 50 hedged = 150 > 100 is refused by ms_risk
+    # the implied risk policy enforces ONE ceiling for all symbols: 3 symbols x 250 hedged = 750 > 500 is refused by ms_risk
     pol = AD.policy_from_manifest(m)
-    assert pol["max_aggregate_notional_usd"] == 100.0 and not ms_risk.policy_refusals(pol)
+    assert pol["max_aggregate_notional_usd"] == 500.0 and not ms_risk.policy_refusals(pol)
 
 
 def test_bounds_can_be_lowered_never_raised():
     low = fresh(lower={"aggregate_max_notional_usd": 20.0, "max_gross_exposure_usd": 40.0, "max_net_exposure_usd": 5.0, "max_unhedged_usd": 20.0})
     assert AD.validate(low, env={})["valid"] and AD.policy_from_manifest(low)["max_aggregate_notional_usd"] == 20.0
-    for k, v in (("aggregate_max_notional_usd", 101.0), ("max_gross_exposure_usd", 201.0), ("max_net_exposure_usd", 101.0), ("max_unhedged_usd", 101.0), ("max_active_groups", 3),
+    for k, v in (("aggregate_max_notional_usd", 501.0), ("max_gross_exposure_usd", 1001.0), ("max_net_exposure_usd", 501.0), ("max_unhedged_usd", 501.0), ("max_active_groups", 3),
                  ("max_entries_per_utc_day", 5), ("max_lifecycle_hours", 9.5), ("max_leverage", 3.5), ("max_market_age_ms", 5001), ("max_account_age_ms", 10001),
-                 ("max_loss_usd", 1e9), ("max_notional_per_symbol_usd", 201.0)):
+                 ("max_loss_usd", 1e9), ("max_notional_per_symbol_usd", 1001.0)):
         m = fresh()
         m["bounds"][k] = v
         assert AD.refusals(resealed(m)), k
@@ -224,7 +225,7 @@ def test_enabled_only_with_owner_file_granted_manifest_and_signed_digest(tmp_pat
     write_cap(p, edited, digest=m["plan_sha256"])
     assert AD.enabled(p) is False
     raised = copy.deepcopy(m)
-    raised["bounds"]["aggregate_max_notional_usd"] = 500.0
+    raised["bounds"]["aggregate_max_notional_usd"] = 500.01
     write_cap(p, resealed(granted(raised)))
     assert AD.enabled(p) is False                                                    # sealed but above the ceiling: refused
     write_cap(p, m, schema="x")
@@ -491,3 +492,14 @@ def test_generate_without_candidate_still_needs_id_and_digest_and_an_outside_fil
     outside.write_text(json.dumps({"candidate_id": "x_cand@spec-1", "family": "f"}))
     r = _gen("--candidate", str(outside))
     assert r.returncode == 2 and "SPEC_DIGEST_REQUIRED" in r.stderr             # same rule as ms_pipeline: a file outside research/candidates must state its digest
+
+
+def test_the_loss_ceiling_scales_with_the_aggregate_ceiling_and_the_old_drill_certificate_is_untouched():
+    assert AD.MAX_LOSS_CEILING_USD == pytest.approx(5.55) == pytest.approx(round(0.0111 * AD.AGGREGATE_CEILING_USD, 2))         # the old $100 drill's 1.11 was 1.11% of its cap: the same ratio here
+    m = fresh(symbols=["BTCUSDT"])
+    assert m["bounds"]["max_loss_usd"] == pytest.approx(5.55)
+    assert AD.TAM._max_loss() == pytest.approx(1.11)                                                                        # the shared certificate (old drill path) keeps its own figure
+    bad = copy.deepcopy(m)
+    bad["bounds"]["max_loss_usd"] = 5.56
+    assert any("max_loss_usd" in r for r in AD.refusals(resealed(bad)))                                                     # raising it above the ceiling is still refused
+    assert AD.policy_from_manifest(m)["max_daily_loss_usd"] == pytest.approx(5.55)

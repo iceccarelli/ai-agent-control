@@ -12,7 +12,7 @@ in-process fake testnet; the ``__main__`` wrapper is the ONLY place that reads `
 ``plan_digest``, ``--confirm-plan-digest`` equals it AND the digest typed at the prompt equals it, a PASS preflight younger than ``--max-preflight-age-min`` exists for the same
 manifest, the kill-switch file is absent, no session was already executed from this state dir, and (under CI / pytest) the transport was injected explicitly.
 
-Bounds (at or below the owner's manifest, which is itself <= the repository ceilings): aggregate notional <= $100 across ALL symbols, ONE active group, explicit symbol allow-list,
+Bounds (at or below the owner's manifest, which is itself <= the repository ceilings): aggregate notional <= $500 (Testnet) across ALL symbols, ONE active group, explicit symbol allow-list,
 lifecycle <= 9 h, leverage <= the manifest's, persistent kill switch file (``MS_KILL`` in the state dir), fresh account and market data, reduce-only exits, FLAT = a COMPLETE venue
 position read (never fill arithmetic). Fees, funding and price P&L are reported as the exchange reported them; they are TESTNET figures, not owner profit.
 """
@@ -51,7 +51,7 @@ PLAN_SCHEMA = "testnet_plan/v1"
 PREFLIGHT_SCHEMA = "testnet_preflight/v1"
 VENUE_LABEL = "Testnet"                                  # display label in the session record; the registry key (policy venue) is the lower-case "testnet"
 NOTE = "TESTNET, not owner profit"
-HARD_CEILING_USD = 100.0
+HARD_CEILING_USD = AD.AGGREGATE_CEILING_USD           # one number: the adapter's Testnet ceiling (it was a second hard-coded 100 that would have silently clamped a 500 plan)
 MAX_LIFECYCLE_H = 9.0
 DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
 MAX_PLAN_AGE_MIN = 120
@@ -389,6 +389,11 @@ def build_plan(manifest: Mapping[str, Any], pre: Mapping[str, Any], *, symbol: s
     notional = float(D(qty) * mark)
     if notional > ceiling + 1e-9:
         raise ValueError("QTY_NOTIONAL_ABOVE_CEILING")
+    usdt = pre.get("usdt")
+    if isinstance(usdt, (int, float)) and not isinstance(usdt, bool):          # the spot buy (notional) plus the perp initial margin (notional / leverage) plus a 2% buffer must fit in the USDT read
+        need = notional * (1.0 + 1.0 / max(1, leverage)) * 1.02
+        if need > float(usdt) + 1e-9:
+            raise ValueError(f"INSUFFICIENT_USDT_FOR_PLAN:need {need:.2f} have {float(usdt):.2f} (spot buy + perp margin at leverage {leverage} + 2%)")
     for cat, f, ref in (("linear", lin, mark), ("spot", sp, D(str(mk["spot_ask"])))):
         if D(f["min_notional"]) > 0 and D(qty) * ref < D(f["min_notional"]):
             raise ValueError(f"{cat.upper()}_NOTIONAL_BELOW_MIN")
