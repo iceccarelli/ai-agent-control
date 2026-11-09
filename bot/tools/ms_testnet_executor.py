@@ -149,6 +149,19 @@ def parse_wallet(res: Any) -> Tuple[D, Dict[str, D]]:
         raise ExecutorError("wallet answer malformed") from None
 
 
+def _wallet_usd_values(res: Any) -> Dict[str, D]:
+    """{coin: usdValue} from a wallet-balance result (the venue's own valuation, the basis of totalEquity); a coin without a usable figure is simply absent."""
+    out: Dict[str, D] = {}
+    try:
+        for c in res["list"][0]["coin"]:
+            v = c.get("usdValue")
+            if v not in (None, ""):
+                out[str(c["coin"])] = D(str(v))
+    except (KeyError, TypeError, IndexError, ArithmeticError, ValueError):
+        return {}
+    return out
+
+
 class TestnetExecutor:
     __test__ = False
 
@@ -463,6 +476,18 @@ class TestnetExecutor:
         w = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, signed=True)
         eq, coins = parse_wallet(w)
         equity = float(eq)
+        # THE LOSS MEASURE IS THE SESSION'S, NOT THE OWNER'S WHOLE ACCOUNT: spot the client held BEFORE the session (``baseline``) is valued at the wallet read's own implied price
+        # (coin usdValue / walletBalance, the same basis as totalEquity) and taken out, so its price swings cancel exactly. Without this a $10 move in BTC on a 0.1 BTC holding
+        # (about $11 would be enough on the real account) trips the 1.11 loss limit before any order exists. A real loss (fees, slippage, a fill below the unwind price) still shows in full.
+        usd_by_coin = _wallet_usd_values(w)
+        for s in self.spot_symbols:
+            f = self.filters("spot", s)
+            b_qty = D(str((baseline or {}).get(f"spot:{s}", 0)))
+            if b_qty > 0:
+                bal = coins.get(f.base_coin, D(0))
+                usd = usd_by_coin.get(f.base_coin)
+                px = (usd / bal) if (usd is not None and bal > 0 and usd > 0) else self.spot_mark(s)
+                equity -= float(b_qty * px)
         for s in self.spot_symbols:
             f = self.filters("spot", s)
             held = coins.get(f.base_coin, D(0)) - D(str((baseline or {}).get(f"spot:{s}", 0)))

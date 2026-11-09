@@ -821,3 +821,51 @@ def test_an_exit_in_flight_at_the_crash_is_not_sent_by_reconcile_without_the_dig
     assert w.run("reconcile") == 1 and len(creates(w)) == n                                 # recovery did NOT continue the exit by itself
     assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0 and len(creates(w)) > n
     assert all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+# ---------------------------------------------------------------- the loss limit measures the SESSION, not the owner's pre-existing holdings (found on the first real execute)
+def _world_with_existing_btc(tmp_path, monkeypatch, qty="0.1"):
+    world = World(tmp_path, monkeypatch)
+    world.fake.wallet["BTC"] = D(qty)                    # the owner already holds BTC before the session: about $6,000 here, about $7,800 on the real account
+    world.ready()
+    return world
+
+
+def test_the_account_equity_ignores_price_moves_of_the_pre_session_spot_holding(tmp_path, monkeypatch):
+    world = _world_with_existing_btc(tmp_path, monkeypatch)
+    run, ctx, rec = begin(world, submit=False)
+    assert run.baseline["spot:BTCUSDT"] == pytest.approx(0.1)
+    e0 = run.ex.account_state(run.baseline)["equity_usd"]
+    raw0 = run.ex.account_state({})["equity_usd"]
+    world.fake.book["BTCUSDT"]["mark"] = "59900.5"      # -$100 per BTC = -$10 on 0.1 BTC: nine times the 1.11 limit, with no trade at all
+    world.fake.book["BTCUSDT"]["spot_mark"] = "59900.5"
+    e1 = run.ex.account_state(run.baseline)["equity_usd"]
+    raw1 = run.ex.account_state({})["equity_usd"]
+    assert raw1 == pytest.approx(raw0 - 10.0)            # positive control: the whole-account figure DOES move with the unrelated holding
+    assert e1 == pytest.approx(e0)                       # the session's measure does not
+    world.fake.wallet["USDT"] -= D("2")                  # a real loss (fees / slippage) still shows in full
+    assert run.ex.account_state(run.baseline)["equity_usd"] == pytest.approx(e0 - 2.0)
+
+
+def test_a_price_swing_of_the_existing_holding_does_not_trip_the_loss_limit_but_a_real_loss_does(tmp_path, monkeypatch):
+    world = _world_with_existing_btc(tmp_path, monkeypatch)
+    run, ctx, rec = begin(world, submit=False)
+    run._read_state()                                    # the session's first account read: its start equity
+    assert run.max_loss_usd == pytest.approx(1.11)
+    world.clock.sleep(60)
+    world.fake.book["BTCUSDT"]["mark"] = "59500.5"       # -$500 per BTC on the 0.1 BTC held: -$50
+    world.fake.book["BTCUSDT"]["spot_mark"] = "59500.5"
+    assert run.enforce_limits(world.clock.now()) is None
+    world.clock.sleep(60)
+    world.fake.wallet["USDT"] -= D("1.5")                # a real session loss above the limit
+    assert run.enforce_limits(world.clock.now()) == "LOSS_LIMIT"
+
+
+def test_without_a_usd_value_in_the_wallet_read_the_baseline_falls_back_to_the_spot_price(tmp_path, monkeypatch):
+    world = _world_with_existing_btc(tmp_path, monkeypatch)
+    monkeypatch.setattr(TE, "_wallet_usd_values", lambda res: {})          # a wallet row with no usable usdValue
+    run, ctx, rec = begin(world, submit=False)
+    e0 = run.ex.account_state(run.baseline)["equity_usd"]
+    world.fake.book["BTCUSDT"]["mark"] = "59900.5"
+    world.fake.book["BTCUSDT"]["spot_mark"] = "59900.5"
+    assert run.ex.account_state(run.baseline)["equity_usd"] == pytest.approx(e0)
