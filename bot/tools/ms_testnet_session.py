@@ -178,11 +178,16 @@ def record_refusals(rec: Any) -> List[str]:
     return out
 
 
+def _num_or_none(x: Any) -> Optional[float]:
+    """The record is a JSON contract of NUMBERS (the control centre refuses a numeric string); the plan and the venue carry exact decimal strings, which stay in plan.json."""
+    return None if x is None else float(x)
+
+
 def _orders_for_record(view_orders: Mapping[str, Mapping[str, Any]], gid: str) -> List[Dict[str, Any]]:
     rows = []
     for link, o in sorted(view_orders.items()):
         if link.startswith(gid + "-"):
-            rows.append({"link_id": link, "order_id": o.get("order_id"), "symbol": o.get("symbol"), "side": o.get("side"), "qty": o.get("qty"), "status": o.get("status"),
+            rows.append({"link_id": link, "order_id": o.get("order_id"), "symbol": o.get("symbol"), "side": o.get("side"), "qty": _num_or_none(o.get("qty")), "status": o.get("status"),
                          "filled_qty": o.get("filled_qty"), "avg_price": o.get("avg_price")})
     return rows
 
@@ -448,7 +453,7 @@ def cmd_plan(ctx: Ctx) -> int:
                                                      generated_ms=int(ctx.clock())), "TESTNET", s0["candidate_id"], s0["spec_digest"], pre["preflight_digest"], MP.git_revision(),
                                     int(ctx.clock())).as_dict()
     rec["plan"] = {"digest": plan["plan_digest"], "manifest_digest": plan["manifest_plan_sha256"],
-                   "legs": [{"symbol": l["symbol"], "side": l["side"], "order_type": l["order_type"], "qty": l["qty"], "price": l["price"], "notional_usd": l["notional_usd"]} for l in plan["legs"]],
+                   "legs": [{"symbol": l["symbol"], "side": l["side"], "order_type": l["order_type"], "qty": _num_or_none(l["qty"]), "price": _num_or_none(l["price"]), "notional_usd": l["notional_usd"]} for l in plan["legs"]],
                    "notional_usd": plan["notional_usd"]}
     save_record(ctx, rec)
     ctx.out(json.dumps(plan, indent=2, sort_keys=True))

@@ -1,6 +1,6 @@
 """Owner control centre: a READ-ONLY, localhost-only operator UI over data that already exists. It tells one operator, truthfully, what the system knows and what it does not.
 
-    python3 tools/control_centre.py [--data-root DIR] [--universe-dir DIR] [--artifacts-dir DIR] [--port 8787] [--with-economics] [--verify]
+    python3 tools/control_centre.py [--data-root DIR] [--universe-dir DIR] [--artifacts-dir DIR] [--testnet-dir DIR] [--port 8787] [--with-economics] [--verify]
     python3 tools/control_centre.py --print-state ...        # the JSON the UI renders, no server
 
 What it is NOT: it has no controls. It cannot place, amend or cancel an order, arm anything, write a file, or make an outbound request. It never imports a venue client, a
@@ -69,7 +69,7 @@ plain-language answers) is combined or shown. testnet_session.json is a differen
 
 More artifacts (all optional; missing = empty state; ``basis`` is not required for these):
   pipeline_summary.json  "pipeline_summary/v1"   outcome (or outcome_code) in OUTCOME_CODES, reason?, required_span{}, data_digest_parts{}, evidence_basis{}
-  testnet_session.json   "testnet_session/v1"    venue 'Testnet', endpoint_host (must be the registered testnet host), credential_state{dedicated_key_present, dedicated_secret_present,
+  testnet_session.json   "testnet_session/v1"    (read from --testnet-dir when given, else --artifacts-dir; basis NOT_RUN may carry a preflight result and a plan, never orders/executions/a position/a confirmation) venue 'Testnet', endpoint_host (must be the registered testnet host), credential_state{dedicated_key_present, dedicated_secret_present,
                          generic_credentials_ignored}, preflight{status NOT_RUN|PASS|FAIL, checked_ms, checks[{name, ok, detail}]}, plan{digest, manifest_digest, legs[], notional_usd}|null,
                          confirmation{state NOT_REQUESTED|CONFIRMED, plan_digest_confirmed}, orders[], executions[], final_position{}|null, flat_verified bool|null,
                          basis NOT_RUN|EXCHANGE_REPORTED, net{fees_usd, funding_usd, price_pnl_usd, note}
@@ -458,8 +458,8 @@ def _v_testnet(o: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(net, dict):
         raise _bad("'net' must be an object")
     netv = {"fees_usd": _num(net, "fees_usd"), "funding_usd": _num(net, "funding_usd"), "price_pnl_usd": _num(net, "price_pnl_usd"), "note": _str(net, "note", null=True) if "note" in net else None}
-    if basis == "NOT_RUN" and (orders or execs or fp or conf["state"] == "CONFIRMED" or preflight["status"] != "NOT_RUN"):
-        raise _bad("basis NOT_RUN contradicts orders, executions, a position, a confirmation or a preflight result in the same file")
+    if basis == "NOT_RUN" and (orders or execs or fp or conf["state"] == "CONFIRMED"):         # a read-only preflight result and a plan may exist before any session: they are not orders
+        raise _bad("basis NOT_RUN contradicts orders, executions, a position or a confirmation in the same file")
     if conf["state"] == "CONFIRMED" and plan is None:
         raise _bad("a confirmation without a plan")
     return {"venue": "Testnet", "endpoint_host": host, "basis": basis, "credential_state": cred, "preflight": preflight, "plan": plan, "confirmation": conf, "orders": orders,
@@ -1047,7 +1047,7 @@ def _testnet_view(a: Dict[str, Any], oc: Mapping[str, Any]) -> Dict[str, Any]:
     fees = [e["fee_usd"] for e in d["executions"]]
     if d["net"]["fees_usd"] is not None and fees and None not in fees and abs(sum(fees) - d["net"]["fees_usd"]) > TOL:
         flags.append("FEES_DO_NOT_MATCH_EXECUTIONS: net.fees_usd differs from the sum of the execution fees")
-    if run == "NOT_RUN":
+    if run == "NOT_RUN" and eff == "NOT_RUN" and plan is None:
         state = "NOT_RUN"
     elif eff == "FAIL":
         state = "PREFLIGHT_FAILED"
@@ -1213,11 +1213,12 @@ def _answers(c: Mapping[str, Any]) -> List[Dict[str, str]]:
 
 
 def build_state(*, data_root: Optional[str], universe_dir: Optional[str], artifacts_dir: Optional[str], env: Mapping[str, str], now_ms: int,
-                with_economics: bool = False, economics: Optional[Dict[str, Any]] = None, verify: bool = False) -> Dict[str, Any]:
+                with_economics: bool = False, economics: Optional[Dict[str, Any]] = None, verify: bool = False, testnet_dir: Optional[str] = None) -> Dict[str, Any]:
     """Pure aggregation of real sources (no network, no write). Every number carries a basis; every missing source is an explicit NO_DATA/ERROR section.
     ONE state: every artifact is read once; ``coherence`` and ``figures`` are derived once; every section below reads them."""
     now_ms = int(now_ms)
-    art = {name: load_artifact(artifacts_dir, name, now_ms) for name in ARTIFACTS}
+    # testnet_session.json is written by the owner's session tool into ITS state dir (default ~/.ai-agent-control/ms_testnet), not into a pipeline run's artifacts dir: read it from there when given
+    art = {name: load_artifact(testnet_dir if (name == "testnet_session.json" and testnet_dir) else artifacts_dir, name, now_ms) for name in ARTIFACTS}
     oc = OC.build(dict(env), now_ms=now_ms)
     gate = _gate()
     actions = _actions(oc, gate)
@@ -1500,7 +1501,8 @@ def host_ok(host_header: Optional[str], port: int) -> bool:
 
 class _Config:
     def __init__(self, data_root: Optional[str], universe_dir: Optional[str], artifacts_dir: Optional[str], with_economics: bool, verify: bool,
-                 clock: Callable[[], int] = lambda: int(time.time() * 1000), ttl_ms: int = 5000, env: Optional[Mapping[str, str]] = None) -> None:
+                 clock: Callable[[], int] = lambda: int(time.time() * 1000), ttl_ms: int = 5000, env: Optional[Mapping[str, str]] = None, testnet_dir: Optional[str] = None) -> None:
+        self.testnet_dir = testnet_dir
         self.data_root, self.universe_dir, self.artifacts_dir, self.with_economics, self.verify, self.clock, self.ttl_ms = data_root, universe_dir, artifacts_dir, with_economics, verify, clock, ttl_ms
         self.env = os.environ if env is None else env
         self._lock = threading.Lock()
@@ -1515,7 +1517,7 @@ class _Config:
             if self.with_economics and self._econ is None:
                 self._econ = CR.btc_carry_economics()
             st = build_state(data_root=self.data_root, universe_dir=self.universe_dir, artifacts_dir=self.artifacts_dir, env=self.env, now_ms=now,
-                             with_economics=False, economics=self._econ, verify=self.verify)
+                             with_economics=False, economics=self._econ, verify=self.verify, testnet_dir=self.testnet_dir)
             body = json.dumps(st, allow_nan=False, sort_keys=True).encode("utf-8")
             self._cache = (now, body)
             return body
@@ -1603,13 +1605,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--data-root", default=None, help="private market-data root (tools/market_collector.py output)")
     ap.add_argument("--universe-dir", default=None, help="a schema-v2 universe capture directory")
     ap.add_argument("--artifacts-dir", default=None, help="directory holding the multi-symbol JSON artifacts (see the module docstring)")
+    ap.add_argument("--testnet-dir", default=None, help="directory holding testnet_session.json: the session tool's --state-dir (default: --artifacts-dir)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1", help="only 127.0.0.1 is accepted")
     ap.add_argument("--with-economics", action="store_true", help="also load the in-sample corpus economics once (about 15 s)")
     ap.add_argument("--verify", action="store_true", help="re-hash datasets in the freshness audit (slow on a large root)")
     ap.add_argument("--print-state", action="store_true", help="print the state JSON and exit")
     a = ap.parse_args(argv)
-    cfg = _Config(a.data_root, a.universe_dir, a.artifacts_dir, a.with_economics, a.verify, ttl_ms=0 if a.print_state else 5000)
+    cfg = _Config(a.data_root, a.universe_dir, a.artifacts_dir, a.with_economics, a.verify, ttl_ms=0 if a.print_state else 5000, testnet_dir=a.testnet_dir)
     if a.print_state:
         sys.stdout.write(cfg.state_bytes().decode() + "\n")
         return 0
