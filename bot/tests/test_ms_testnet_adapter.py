@@ -285,7 +285,7 @@ def test_module_imports_no_transport_client_or_network_library():
         elif isinstance(n, ast.ImportFrom) and n.module:
             roots.add(n.module.split(".")[0])
     assert not (roots & FORBIDDEN_IMPORT_ROOTS), roots & FORBIDDEN_IMPORT_ROOTS
-    assert roots <= {"argparse", "hashlib", "json", "math", "os", "re", "sys", "typing", "__future__", "ms_risk", "shadow", "testnet_action_manifest", "runtime_capability"}
+    assert roots <= {"argparse", "hashlib", "json", "math", "os", "re", "sys", "typing", "__future__", "ms_risk", "shadow", "testnet_action_manifest", "runtime_capability", "strategy_verdict"}   # strategy_verdict: pure (generate --candidate derives the spec digest)
 
 
 def test_module_has_no_send_like_names_or_calls():
@@ -393,3 +393,101 @@ def test_the_policy_carries_the_manifest_loss_limit_as_a_hard_risk_limit():
     m = AD.generate(candidate_id="cand_1", spec_digest="a" * 64, symbols=["BTCUSDT"])
     pol = AD.policy_from_manifest(m)
     assert pol["max_daily_loss_usd"] == m["bounds"]["max_loss_usd"] and ms_risk.policy_refusals(pol) == []
+
+
+# ---------------------------------------------------------------- candidate ids: the repository's own ids must be allow-listable (found on first owner contact)
+def _registered_candidate_ids():
+    import glob
+    out = []
+    for p in sorted(glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "research", "candidates", "*.json"))):
+        with open(p, encoding="utf-8") as fh:
+            out.append(json.load(fh)["candidate_id"])
+    return out
+
+
+def test_every_registered_candidate_id_yields_a_valid_manifest_and_an_accepted_risk_policy():
+    ids = _registered_candidate_ids()
+    assert "cash_and_carry@spec-1" in ids                                    # the id the owner was told to use: it contains '@'
+    for cid in ids:
+        m = AD.generate(candidate_id=cid, spec_digest="a" * 64, symbols=["BTCUSDT"], credential_env=AD.SESSION_CREDENTIAL_ENV)
+        assert AD.refusals(m) == [], (cid, AD.refusals(m))
+        pol = AD.policy_from_manifest(dict(m, authorisation="GRANTED_BY_OWNER:test-ref"))
+        assert pol["candidate_id"] == cid and ms_risk.policy_refusals(pol) == [], cid
+
+
+@pytest.mark.parametrize("bad", ["a b", "a/b", "a;b", "ab", "x" * 65, "a\nb", "a'b", "a$b", "a@@@", "../x", "a\\b", "a%b"])
+def test_unsafe_candidate_ids_are_still_refused(bad):
+    m = AD.generate(candidate_id=bad, spec_digest="a" * 64, symbols=["BTCUSDT"])
+    assert any("strategy_allowlist entry malformed" in r for r in AD.refusals(m)), bad
+
+
+def test_generate_says_why_on_stderr_when_the_manifest_it_just_wrote_is_refused(capsys):
+    rc = AD.main(["generate", "--candidate-id", "has space", "--spec-digest", "a" * 64, "--symbols", "BTCUSDT"])
+    cap = capsys.readouterr()
+    assert rc == 1 and "REFUSED" in cap.err and "strategy_allowlist entry malformed" in cap.err and '"plan_sha256"' in cap.out
+    rc = AD.main(["generate", "--candidate-id", "cash_and_carry@spec-1", "--spec-digest", "a" * 64, "--symbols", "BTCUSDT"])
+    assert rc == 0 and "REFUSED" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- a manifest the session tool cannot use must not look ready
+import ms_testnet_transport as _TT  # noqa: E402
+SESSION_NAMES = {"api_key": _TT.KEY_ENV, "api_secret": _TT.SECRET_ENV}            # the names the session tool reads, from the one module that defines them
+
+
+def test_default_credential_names_differ_from_the_session_tool_and_status_and_validate_say_so(tmp_path):
+    m = fresh()
+    assert m["credential_env"] != SESSION_NAMES                                  # generate's default digest is NOT changed by this fix
+    w = AD.validate(m)["warnings"]
+    assert len(w) == 1 and w[0].startswith("CREDENTIAL_ENV_NOT_SESSION_NAMES") and "--session-credentials" in w[0]
+    p = str(tmp_path / "cap.json")
+    write_cap(p, granted(m))
+    st = AD.capability_status(p)
+    assert st["enabled"] is True and st["warnings"] == w                       # still enabled (the authority is unchanged), but never a bare enabled:true
+    ok = fresh(credential_env=SESSION_NAMES)
+    assert AD.validate(ok)["warnings"] == []
+    write_cap(p, granted(ok))
+    assert "warnings" not in AD.capability_status(p) or AD.capability_status(p)["warnings"] == []
+
+
+def test_the_cli_status_and_validate_print_the_warning_loudly_on_stderr(tmp_path):
+    home = tmp_path / "home"
+    (home / ".ai-agent-control").mkdir(parents=True)
+    write_cap(str(home / ".ai-agent-control" / "ms_testnet_capability.json"), granted(fresh()))
+    mf = tmp_path / "m.json"
+    mf.write_text(json.dumps(fresh()))
+    env = {**os.environ, "HOME": str(home)}
+    for args in (["status"], ["validate", str(mf)]):
+        r = subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True, env=env, timeout=60)
+        assert "WARNING: CREDENTIAL_ENV_NOT_SESSION_NAMES" in r.stderr, (args, r.stderr)
+        assert "CREDENTIAL_ENV_NOT_SESSION_NAMES" in json.loads(r.stdout)["warnings"][0]
+
+
+# ---------------------------------------------------------------- generate --candidate derives the id and the spec digest (the one ms_pipeline binds)
+def _gen(*args, tmp=None):
+    return subprocess.run([sys.executable, TOOL, "generate", "--symbols", "BTCUSDT", "--session-credentials", *args], capture_output=True, text=True, timeout=60)
+
+
+def test_generate_candidate_file_derives_id_and_digest_like_the_pipeline():
+    import strategy_verdict as SV
+    path = os.path.join(BOT, "research", "candidates", "cash_and_carry.json")
+    with open(path, encoding="utf-8") as fh:
+        spec = json.load(fh)
+    r = _gen("--candidate", path)
+    assert r.returncode == 0, r.stderr
+    row = json.loads(r.stdout)["strategy_allowlist"][0]
+    assert row["candidate_id"] == "cash_and_carry@spec-1" and row["spec_digest"] == SV.spec_digest(spec)
+    # supplying the same values explicitly is fine; a different value is refused (never silently overridden)
+    assert _gen("--candidate", path, "--candidate-id", "cash_and_carry@spec-1", "--spec-digest", SV.spec_digest(spec)).returncode == 0
+    bad = _gen("--candidate", path, "--spec-digest", "b" * 64)
+    assert bad.returncode == 2 and "SPEC_DIGEST_MISMATCH" in bad.stderr
+    bad = _gen("--candidate", path, "--candidate-id", "other_name")
+    assert bad.returncode == 2 and "CANDIDATE_ID_MISMATCH" in bad.stderr
+
+
+def test_generate_without_candidate_still_needs_id_and_digest_and_an_outside_file_needs_its_digest(tmp_path):
+    r = _gen()
+    assert r.returncode == 2 and "--candidate" in r.stderr
+    outside = tmp_path / "c.json"
+    outside.write_text(json.dumps({"candidate_id": "x_cand@spec-1", "family": "f"}))
+    r = _gen("--candidate", str(outside))
+    assert r.returncode == 2 and "SPEC_DIGEST_REQUIRED" in r.stderr             # same rule as ms_pipeline: a file outside research/candidates must state its digest

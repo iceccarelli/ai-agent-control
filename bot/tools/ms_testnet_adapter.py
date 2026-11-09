@@ -27,7 +27,7 @@ import math
 import os
 import re
 import sys
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BOT)
@@ -58,7 +58,7 @@ MAX_LIFECYCLE_HOURS = TAM.MAX_LIFECYCLE_HOURS
 MIN_AGGREGATE_USD = TAM.MIN_NOTIONAL_USD
 _STRATEGY = re.compile(r"[a-z][a-z0-9_]{2,63}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_CANDIDATE = re.compile(r"[A-Za-z0-9_.-]{3,64}")
+_CANDIDATE = re.compile(r"(?=.{3,64}\Z)[A-Za-z0-9_.-]+(?:@[A-Za-z0-9_.-]+)?")      # ONE '@' with text on both sides is allowed because every registered candidate id is '<family>@spec-N' (cash_and_carry@spec-1); nothing else shell- or path-significant is
 
 SIDES = {"linear": ["Sell", "Buy"], "spot": ["Buy", "Sell"]}
 ORDER_TYPES = ["Limit", "Market"]
@@ -66,8 +66,11 @@ EXECUTION_STYLES = ["MAKER_FIRST", "TAKER"]
 
 KILL_SWITCH = {"file": "MS_KILL", "semantics": "PERSISTENT: the file's presence means STOP; read before every order and every reconcile; an unreadable path is an engaged switch; "
                                               "only the owner removes it; engaging never needs a running process"}
-STOP_CONDITIONS = TAM.STOP_CONDITIONS + ("aggregate notional ceiling reached", "a leg of a paired order is unfilled or unknown beyond max_wait", "venue and local position disagree",
-                                          "kill switch file present")
+# The words below are what the owner signs, so they describe THIS tool (ms_testnet_session), not the older single-symbol drill they were first copied from: the kill file is MS_KILL (not
+# DRILL_KILL), the entry bound is bounds.max_entries_per_utc_day (not "one entry"), and the evidence is the files the session tool really writes (no drill flags).
+_DRILL_ONLY_STOPS = ("DRILL_KILL file present", "more than one entry in the UTC day")
+STOP_CONDITIONS = tuple(c for c in TAM.STOP_CONDITIONS if c not in _DRILL_ONLY_STOPS) + (
+                                          "MS_KILL file present or unreadable in the session state dir", "more entries in the UTC day than bounds.max_entries_per_utc_day", "aggregate notional ceiling reached", "a leg of a paired order is unfilled or unknown beyond max_wait", "venue and local position disagree")
 RECONCILIATION = {
     "source_of_truth": "the venue's own position, order and execution reads; never the local journal or fill arithmetic",
     "before_any_resend": "query the order by orderLinkId; a lost acknowledgement is UNKNOWN_OUTCOME until the venue answers",
@@ -83,7 +86,12 @@ RECOVERY_PLAN = (
     "capture the evidence list",
     "if any position remains: HUMAN MUST ACT",
 )
-EVIDENCE = TAM.EVIDENCE + ("group plans and risk decisions", "reservation ledger", "per-leg ledger P&L with provenance", "kill switch state at every order")
+EVIDENCE = ("testnet_session.json (orders, executions, final venue position, exchange-reported fees)", "plan.json and preflight.json (their digests bind the session)",
+            "engine_journal.jsonl (every group state change)", "ms_groups.jsonl (registered groups and the reservation ledger)")
+
+#: The reads ``ms_testnet_session preflight`` really makes (a test drives it against the fake testnet and checks every endpoint here is requested). The drill's list also declares
+#: /v5/account/fee-rate and /v5/order/history, which this preflight does not call, so they are not declared here.
+PREFLIGHT_READS = tuple(r for r in TAM.PREFLIGHT_READS if r[1] not in ("/v5/account/fee-rate", "/v5/order/history"))
 
 _TOP = ("schema", "venue", "category_scope", "mode", "credential_class", "credential_env", "strategy_allowlist", "symbol_allowlist", "allowed_sides", "allowed_order_types",
         "execution_styles", "bounds", "kill_switch", "preflight_reads", "stop_conditions", "reconciliation", "recovery_plan", "evidence_capture", "authorisation", "plan_sha256")
@@ -129,7 +137,7 @@ def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], str
         "strategy_allowlist": [{"strategy": strategy, "candidate_id": candidate_id, "spec_digest": spec_digest}],
         "symbol_allowlist": list(symbols), "allowed_sides": {k: list(v) for k, v in SIDES.items()}, "allowed_order_types": list(ORDER_TYPES),
         "execution_styles": list(EXECUTION_STYLES), "bounds": bounds, "kill_switch": dict(KILL_SWITCH),
-        "preflight_reads": [{"fact": f, "endpoint": e, "signed": s} for f, e, s in TAM.PREFLIGHT_READS],
+        "preflight_reads": [{"fact": f, "endpoint": e, "signed": s} for f, e, s in PREFLIGHT_READS],
         "stop_conditions": list(STOP_CONDITIONS), "reconciliation": dict(RECONCILIATION), "recovery_plan": list(RECOVERY_PLAN), "evidence_capture": list(EVIDENCE),
         "authorisation": NOT_GRANTED,
     }
@@ -211,7 +219,7 @@ def refusals(m: Any) -> List[str]:
             out.append("bounds.max_gross_exposure_usd may not exceed twice the aggregate ceiling")
     if m["kill_switch"] != KILL_SWITCH:
         out.append("kill_switch must be exactly the persistent-file semantics")
-    want_reads = [{"fact": f, "endpoint": e, "signed": s} for f, e, s in TAM.PREFLIGHT_READS]
+    want_reads = [{"fact": f, "endpoint": e, "signed": s} for f, e, s in PREFLIGHT_READS]
     pr = m["preflight_reads"]
     if not isinstance(pr, list) or any(not isinstance(r, dict) or set(r) != {"fact", "endpoint", "signed"} for r in pr):
         out.append("preflight_reads must be a list of {fact, endpoint, signed}")
@@ -243,6 +251,18 @@ def refusals(m: Any) -> List[str]:
     return out
 
 
+def session_warnings(m: Any) -> List[str]:
+    """Things that are VALID for the adapter but make ``ms_testnet_session`` refuse the manifest. Today: credential variable names other than the ones the session tool reads
+    (the default names are the older drill's BYBIT_TESTNET_DEDICATED_*). A warning never changes ``valid`` or ``enabled`` (the authority's conditions are untouched)."""
+    try:
+        if m["credential_env"] != SESSION_CREDENTIAL_ENV:
+            return ["CREDENTIAL_ENV_NOT_SESSION_NAMES: the manifest names " + "/".join(str(m["credential_env"][k]) for k in ("api_key", "api_secret")) + " but ms_testnet_session reads "
+                    + "/".join(SESSION_CREDENTIAL_ENV[k] for k in ("api_key", "api_secret")) + ": its preflight will FAIL (manifest_credential_names); regenerate with --session-credentials"]
+    except (KeyError, TypeError):
+        pass
+    return []
+
+
 def validate(m: Any, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Refusals plus a presence-only record of the named credentials (booleans; values never enter the report). ``env`` None = presence not checked (None, never False)."""
     ref = refusals(m)
@@ -250,7 +270,7 @@ def validate(m: Any, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     if not ref and env is not None:                                  # this module never reads the process environment: presence is checked only against a mapping the caller passes
         presence = {k: bool(str(env.get(m["credential_env"][k], "") or "").strip()) for k in presence}
     return {"valid": not ref, "refusals": ref, "authorised": (not ref) and m["authorisation"] != NOT_GRANTED, "credential_presence": presence,
-            "plan_sha256": m.get("plan_sha256") if isinstance(m, dict) else None,
+            "plan_sha256": m.get("plan_sha256") if isinstance(m, dict) else None, "warnings": [] if ref else session_warnings(m),
             "note": "validation enables nothing; an authorised manifest is a record of the owner's instruction, not a switch"}
 
 
@@ -333,7 +353,11 @@ def capability_status(path: Optional[str] = None) -> Dict[str, Any]:
             return {"enabled": False, "reasons": ["MANIFEST_NOT_GRANTED"]}
         if doc["manifest_plan_sha256"] != m["plan_sha256"] or m["plan_sha256"] != plan_digest(m):
             return {"enabled": False, "reasons": ["DIGEST_NOT_SIGNED_OFF"]}
-        return {"enabled": True, "reasons": [], "plan_sha256": m["plan_sha256"]}
+        out: Dict[str, Any] = {"enabled": True, "reasons": [], "plan_sha256": m["plan_sha256"]}
+        w = session_warnings(m)
+        if w:                                                       # enabled for the authority, yet unusable by the session tool: never a bare enabled:true
+            out["warnings"] = w
+        return out
     except Exception as exc:                                       # noqa: BLE001 - any doubt is disabled
         return {"enabled": False, "reasons": [f"CAPABILITY_UNREADABLE:{type(exc).__name__}"]}
 
@@ -342,12 +366,40 @@ def enabled(path: Optional[str] = None) -> bool:
     return capability_status(path)["enabled"] is True
 
 
+def _resolve_candidate(path: Optional[str], cid: Optional[str], dig: Optional[str]) -> Tuple[str, str]:
+    """(candidate_id, spec_digest) for ``generate``: from a candidate file (the digest is ``strategy_verdict.spec_digest``, the SAME one ms_pipeline binds a run to) or both typed."""
+    if path is None:
+        if not cid or not dig:
+            raise ManifestError("give --candidate FILE (id and digest are derived) or both --candidate-id and --spec-digest")
+        return cid, dig
+    import strategy_verdict as SV                                   # pure; imported only here
+    try:
+        with open(path, encoding="utf-8") as fh:
+            spec = json.loads(fh.read(), parse_constant=TAM._refuse_const)
+    except (OSError, ValueError) as exc:
+        raise ManifestError(f"CANDIDATE_UNREADABLE: {exc}") from None
+    if not isinstance(spec, dict) or not isinstance(spec.get("candidate_id"), str):
+        raise ManifestError("CANDIDATE_UNREADABLE: no candidate_id in the spec")
+    derived = SV.spec_digest(spec)
+    registry = os.path.realpath(os.path.join(BOT, "research", "candidates"))
+    if os.path.dirname(os.path.realpath(path)) != registry and dig is None:
+        raise ManifestError("SPEC_DIGEST_REQUIRED: a candidate file outside research/candidates must come with --spec-digest (as for ms_pipeline)")
+    if cid is not None and cid != spec["candidate_id"]:
+        raise ManifestError(f"CANDIDATE_ID_MISMATCH: --candidate-id {cid!r} but the file says {spec['candidate_id']!r}")
+    if dig is not None and dig != derived:
+        raise ManifestError(f"SPEC_DIGEST_MISMATCH: --spec-digest does not equal the file's spec digest {derived}")
+    return spec["candidate_id"], derived
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Multi-symbol testnet action manifest (offline; sends nothing).")
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate")
-    g.add_argument("--candidate-id", required=True)
-    g.add_argument("--spec-digest", required=True)
+    g.add_argument("--candidate-id", default=None)
+    g.add_argument("--spec-digest", default=None)
+    g.add_argument("--candidate", default=None, metavar="FILE",
+                   help="a candidate spec JSON (e.g. research/candidates/cash_and_carry.json): the id and the spec digest ms_pipeline binds are DERIVED from it; --candidate-id/--spec-digest, if "
+                        "also given, must equal them; a file outside research/candidates needs --spec-digest")
     g.add_argument("--symbols", required=True)
     g.add_argument("--session-credentials", action="store_true",
                    help="name the dedicated variables the owner session tool reads: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET (the names are part of the digest)")
@@ -356,13 +408,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub.add_parser("status")
     a = ap.parse_args(argv)
     if a.cmd == "generate":
-        m = generate(candidate_id=a.candidate_id, spec_digest=a.spec_digest, symbols=[s for s in a.symbols.split(",") if s],
+        try:
+            cid, dig = _resolve_candidate(a.candidate, a.candidate_id, a.spec_digest)
+        except ManifestError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        m = generate(candidate_id=cid, spec_digest=dig, symbols=[s for s in a.symbols.split(",") if s],
                      credential_env=SESSION_CREDENTIAL_ENV if a.session_credentials else None)
         rep = validate(m, env={})
         print(json.dumps(m, indent=2, sort_keys=True))
+        for w in rep["warnings"]:
+            print("WARNING: " + w, file=sys.stderr)
+        if not rep["valid"]:                                         # the manifest above is NOT usable: say so where a redirect to a file cannot hide it
+            print("REFUSED: the manifest just written does not validate: " + "; ".join(rep["refusals"]), file=sys.stderr)
         return 0 if rep["valid"] else 1
     if a.cmd == "status":
-        print(json.dumps(capability_status(), indent=2, sort_keys=True))
+        st = capability_status()
+        print(json.dumps(st, indent=2, sort_keys=True))
+        for w in st.get("warnings", []):
+            print("WARNING: " + w, file=sys.stderr)
         return 0
     try:
         with open(a.file, encoding="utf-8") as fh:
@@ -372,6 +436,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     rep = validate(m)
     print(json.dumps(rep, indent=2, sort_keys=True))
+    for w in rep["warnings"]:
+        print("WARNING: " + w, file=sys.stderr)
     return 0 if rep["valid"] else 1
 
 

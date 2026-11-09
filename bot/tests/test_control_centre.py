@@ -900,9 +900,9 @@ def test_testnet_credentials_are_booleans_only_and_the_endpoint_must_be_the_regi
                                 "testnet_session.json", NOW)["state"] == "ERROR"
 
 
-def test_testnet_not_run_cannot_carry_orders_a_confirmation_or_a_preflight_result(tmp_path):
-    for over in ({"orders": tn_executed()["orders"]}, {"final_position": {"BTCUSDT": 0.0}}, {"confirmation": {"state": "CONFIRMED", "plan_digest_confirmed": "x"}, "plan": tn_executed()["plan"]},
-                 {"preflight": {"status": "PASS", "checked_ms": NOW, "checks": []}}):
+def test_testnet_not_run_cannot_carry_orders_a_position_or_a_confirmation(tmp_path):
+    """A preflight result is NOT in this list any more: the session tool records one (read-only, no session) under basis NOT_RUN, and that is a valid file."""
+    for over in ({"orders": tn_executed()["orders"]}, {"final_position": {"BTCUSDT": 0.0}}, {"confirmation": {"state": "CONFIRMED", "plan_digest_confirmed": "x"}, "plan": tn_executed()["plan"]}):
         assert CC.load_artifact(write_set(tmp_path / str(abs(hash(str(over)))), good_set(**{"testnet_session.json": tn(**over)})), "testnet_session.json", NOW)["state"] == "ERROR", over
 
 
@@ -1296,3 +1296,51 @@ def test_the_testnet_credential_names_are_scrubbed_like_the_others(tmp_path):
     files["risk_state.json"]["alerts"] = [{"severity": "WARN", "code": "X", "detail": "leaked TESTNETKEYCANARY123 and TESTNETSECRETCANARY456"}]
     text = json.dumps(build(tmp_path, files, env=env))
     assert "TESTNETKEYCANARY123" not in text and "TESTNETSECRETCANARY456" not in text and "[value hidden]" in text
+
+
+def test_a_preflight_result_under_basis_not_run_is_shown_as_the_preflight_state_never_as_green(tmp_path):
+    pf = lambda status: {"status": status, "checked_ms": NOW, "checks": [{"name": "env_presence", "ok": status == "PASS", "detail": "x"}]}
+    for status, want, pill in (("PASS", "PREFLIGHT_PASSED_NO_PLAN", "ATTENTION"), ("FAIL", "PREFLIGHT_FAILED", "FAIL")):
+        t = build(tmp_path / status, good_set(**{"testnet_session.json": tn(preflight=pf(status))}))["testnet"]
+        assert t["state"] == "OK" and t["session_state"] == want and t["pill"] == pill, (status, t.get("error"), t.get("session_state"))
+
+
+def test_every_stage_of_a_real_testnet_session_loads_without_error_and_shows_the_right_state(tmp_path, monkeypatch):
+    """END TO END: the real session tool (preflight -> plan -> execute, against the in-process fake testnet) writes testnet_session.json; the control centre must accept the file as
+    written at every stage (no coercion by the test), read from the session's own state dir through ``testnet_dir``, and name the stage."""
+    sys.path.insert(0, HERE)
+    from ms_testnet_world import World
+    w = World(tmp_path / "w", monkeypatch)
+    os.makedirs(tmp_path / "empty_art")
+
+    def shown(label):
+        st = CC.build_state(data_root=None, universe_dir=None, artifacts_dir=str(tmp_path / "empty_art"), testnet_dir=w.state_dir, env={}, now_ms=w.clock.now() + 1000)
+        t = st["testnet"]
+        assert t["state"] == "OK", (label, t.get("error"))
+        assert not any(src["state"] == "ERROR" for src in st["evidence"]["sources"]), label
+        return t
+
+    w.run("status")
+    assert shown("status")["session_state"] == "NOT_RUN"
+    assert w.run("preflight", env={}) == 1                                    # no credentials: a FAIL that never touched the network
+    assert shown("preflight fail")["session_state"] == "PREFLIGHT_FAILED"
+    assert w.run("preflight") == 0
+    assert shown("preflight pass")["session_state"] == "PREFLIGHT_PASSED_NO_PLAN"
+    d = w.ready()
+    t = shown("planned")
+    assert t["session_state"] == "PLANNED_UNCONFIRMED" and t["plan"]["digest"]["v"] == d and len(t["plan"]["legs"]) == 2
+    assert w.execute(d) == 0
+    t = shown("executed")
+    assert t["session_state"] == "EXECUTED_FLAT_VERIFIED" and t["flat"]["verified_flat"] is True and t["flags"] == [] and t["counts"]["orders"] == 4
+
+
+def test_testnet_dir_is_read_for_the_session_file_only_and_defaults_to_the_artifacts_dir(tmp_path):
+    a, n = tmp_path / "art", tmp_path / "ns"
+    write_set(a, good_set())
+    write_set(n, {"testnet_session.json": tn_executed()})
+    base = dict(data_root=None, universe_dir=None, env={}, now_ms=NOW)
+    assert CC.build_state(artifacts_dir=str(a), **base)["testnet"]["session_state"] == "NOT_RUN"
+    assert CC.build_state(artifacts_dir=str(a), testnet_dir=str(n), **base)["testnet"]["session_state"] == "EXECUTED_FLAT_VERIFIED"
+    out = subprocess.run([sys.executable, os.path.join(BOT, "tools", "control_centre.py"), "--artifacts-dir", str(a), "--testnet-dir", str(n), "--print-state"],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0 and json.loads(out.stdout)["testnet"]["session_state"] == "EXECUTED_FLAT_VERIFIED"

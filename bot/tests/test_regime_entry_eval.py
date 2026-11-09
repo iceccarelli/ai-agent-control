@@ -222,6 +222,16 @@ def test_it_runs_on_a_real_history_root_and_refuses_a_missing_universe(tmp_path,
     assert ei.value.code == 2
 
 
+def test_print_registration_works_with_no_other_argument_and_a_run_still_needs_its_inputs(capsys):
+    """The runbook says `--print-registration` prints the frozen registration: it must not demand a history root nor a universe."""
+    assert RE.main(["--print-registration"]) == 0
+    assert json.loads(capsys.readouterr().out)["digest"] == RE.registration_digest()
+    with pytest.raises(SystemExit) as e:                                         # a real run without its inputs is still refused (argparse error, exit 2)
+        RE.main(["--history-root", "x"])
+    assert e.value.code == 2
+    assert "--universe-dir" in capsys.readouterr().err
+
+
 # ================================================================ reg-2: the same entry plus an exit on funding inversion (post-hoc, second trial)
 REG1_DIGEST = "5cc46d3febdde88b9c6e63f3e42c5cf98fd7bcbe57e676ad99a0ca9b601b9c28"      # the digest the owner's real run printed (5cc46d3febdde88b): reg-1 must never drift
 

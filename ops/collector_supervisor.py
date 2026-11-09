@@ -99,7 +99,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="restart-on-failure supervisor for the PUBLIC market collector (no order path)")
     p.add_argument("--root", default=os.path.join(h, "datasets", "md-collector"))
     p.add_argument("--state-dir", default=os.path.join(h, ".ai-agent-control", "ops"))
-    p.add_argument("--stop-file", default=os.path.join(h, "datasets", "STOP"))
+    p.add_argument("--stop-file", default=os.path.join(h, "datasets", "STOP-md-collector"))
     p.add_argument("--seal-manifest", default=os.path.join(h, "seals", "md-seal.jsonl"))
     p.add_argument("--receipts", default=os.path.join(h, "seals", "md-receipts.jsonl"))
     p.add_argument("--backup-to", default=os.path.join(h, "backups", "md"))

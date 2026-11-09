@@ -1,10 +1,10 @@
 """OWNER-INVOKED Bybit TESTNET session tool for the multi-symbol hedged carry (testnet only; fake money; never mainnet).
 
-    python3 tools/ms_testnet_session.py preflight  --state-dir DIR                          # READ-ONLY: env, endpoint, key permissions, clock, modes, balances, filters, book, flat/empty
-    python3 tools/ms_testnet_session.py plan       --state-dir DIR --symbol BTCUSDT --notional-usd 40     # offline: builds plan.json from the manifest + the preflight capture
-    python3 tools/ms_testnet_session.py execute    --state-dir DIR --confirm-plan-digest <digest>        # then TYPE the digest at the prompt
-    python3 tools/ms_testnet_session.py reconcile  --state-dir DIR [--unwind --confirm-plan-digest D]   # re-read the venue, re-verify an interrupted session
-    python3 tools/ms_testnet_session.py status     --state-dir DIR                                       # prints testnet_session.json (no network)
+    python3 tools/ms_testnet_session.py --state-dir DIR preflight                          # READ-ONLY: env, endpoint, key permissions, clock, modes, balances, filters, book, flat/empty
+    python3 tools/ms_testnet_session.py --state-dir DIR plan        --symbol BTCUSDT --notional-usd 40     # offline: builds plan.json from the manifest + the preflight capture
+    python3 tools/ms_testnet_session.py --state-dir DIR execute     --confirm-plan-digest <digest>        # then TYPE the digest at the prompt
+    python3 tools/ms_testnet_session.py --state-dir DIR reconcile   [--unwind --confirm-plan-digest D]   # re-read the venue, re-verify an interrupted session
+    python3 tools/ms_testnet_session.py --state-dir DIR status                                            # prints testnet_session.json (no network)
 
 Nothing here runs on import. ``main`` takes everything it needs as arguments (environment mapping, inner transport, clock, sleep, prompt) so the offline proof drives it against the
 in-process fake testnet; the ``__main__`` wrapper is the ONLY place that reads ``os.environ`` and builds the real (no-redirect, no-proxy) inner transport. ``execute`` refuses
@@ -38,6 +38,7 @@ import bybit_connection as bc  # noqa: E402
 import ms_accounting as AC  # noqa: E402
 import ms_authority as MA  # noqa: E402
 import ms_execution as EX  # noqa: E402
+import ms_pipeline as MP  # noqa: E402          # only its pure helpers: the git-work-tree test and the git revision reader (the repo's one)
 import ms_reconcile as MR  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_executor as TE  # noqa: E402
@@ -91,11 +92,24 @@ def _read_json(path: str) -> Optional[Any]:
         return None
 
 
+class StateDirRefused(ValueError):
+    """The ``--state-dir`` argument cannot be used (raised before anything is created)."""
+
+
+def resolve_state_dir(raw: str) -> str:
+    """``~`` is expanded here because the runbook's ``S="... --state-dir ~/..."`` reaches us unexpanded (a tilde inside double quotes is literal), and a state dir inside a git
+    work tree is refused: the session record, plan, journal and kill switch must never be committable, and a literal ``./~`` directory is exactly that."""
+    d = os.path.abspath(os.path.expanduser(str(raw)))
+    if MP._inside_git(d):
+        raise StateDirRefused(f"STATE_DIR_INSIDE_GIT_WORK_TREE: {d} (use a directory outside the repository, e.g. $HOME/.ai-agent-control/ms_testnet)")
+    return d
+
+
 class Ctx:
     def __init__(self, args: argparse.Namespace, env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], input_fn: Callable[[str], str],
                  out: Callable[[str], None]) -> None:
         self.args, self.env, self.inner, self.clock, self.sleep, self.input_fn, self.out = args, env, inner, clock, sleep, input_fn, out
-        self.dir = os.path.abspath(args.state_dir)
+        self.dir = resolve_state_dir(args.state_dir)
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
 
     def path(self, k: str) -> str:
@@ -111,7 +125,7 @@ def credential_state(env: Mapping[str, str]) -> Dict[str, Any]:
 def new_record(ctx: Ctx, *, candidate_id: str = "UNKNOWN", spec_digest: str = "UNKNOWN", data_digest: str = "UNKNOWN") -> Dict[str, Any]:
     now = int(ctx.clock())
     ident = T.RunIdentity(T.derive_run_id(mode="TESTNET", candidate_id=candidate_id, spec_digest=spec_digest, data_digest=data_digest, generated_ms=now), "TESTNET", candidate_id,
-                          spec_digest, data_digest, "UNKNOWN", now)
+                          spec_digest, data_digest, MP.git_revision(), now)
     return {"schema": SESSION_SCHEMA, "identity": ident.as_dict(), "venue": VENUE_LABEL, "endpoint_host": _venues.get("testnet").host, "credential_state": credential_state(ctx.env),
             "preflight": {"status": "NOT_RUN", "checked_ms": None, "checks": []}, "plan": None, "confirmation": {"state": "NOT_REQUESTED", "plan_digest_confirmed": None},
             "orders": [], "executions": [], "final_position": None, "flat_verified": None, "basis": "NOT_RUN",
@@ -164,11 +178,16 @@ def record_refusals(rec: Any) -> List[str]:
     return out
 
 
+def _num_or_none(x: Any) -> Optional[float]:
+    """The record is a JSON contract of NUMBERS (the control centre refuses a numeric string); the plan and the venue carry exact decimal strings, which stay in plan.json."""
+    return None if x is None else float(x)
+
+
 def _orders_for_record(view_orders: Mapping[str, Mapping[str, Any]], gid: str) -> List[Dict[str, Any]]:
     rows = []
     for link, o in sorted(view_orders.items()):
         if link.startswith(gid + "-"):
-            rows.append({"link_id": link, "order_id": o.get("order_id"), "symbol": o.get("symbol"), "side": o.get("side"), "qty": o.get("qty"), "status": o.get("status"),
+            rows.append({"link_id": link, "order_id": o.get("order_id"), "symbol": o.get("symbol"), "side": o.get("side"), "qty": _num_or_none(o.get("qty")), "status": o.get("status"),
                          "filled_qty": o.get("filled_qty"), "avg_price": o.get("avg_price")})
     return rows
 
@@ -431,10 +450,10 @@ def cmd_plan(ctx: Ctx) -> int:
     rec = load_record(ctx)
     s0 = manifest["strategy_allowlist"][0]
     rec["identity"] = T.RunIdentity(T.derive_run_id(mode="TESTNET", candidate_id=s0["candidate_id"], spec_digest=s0["spec_digest"], data_digest=pre["preflight_digest"],
-                                                     generated_ms=int(ctx.clock())), "TESTNET", s0["candidate_id"], s0["spec_digest"], pre["preflight_digest"], "UNKNOWN",
+                                                     generated_ms=int(ctx.clock())), "TESTNET", s0["candidate_id"], s0["spec_digest"], pre["preflight_digest"], MP.git_revision(),
                                     int(ctx.clock())).as_dict()
     rec["plan"] = {"digest": plan["plan_digest"], "manifest_digest": plan["manifest_plan_sha256"],
-                   "legs": [{"symbol": l["symbol"], "side": l["side"], "order_type": l["order_type"], "qty": l["qty"], "price": l["price"], "notional_usd": l["notional_usd"]} for l in plan["legs"]],
+                   "legs": [{"symbol": l["symbol"], "side": l["side"], "order_type": l["order_type"], "qty": _num_or_none(l["qty"]), "price": _num_or_none(l["price"]), "notional_usd": l["notional_usd"]} for l in plan["legs"]],
                    "notional_usd": plan["notional_usd"]}
     save_record(ctx, rec)
     ctx.out(json.dumps(plan, indent=2, sort_keys=True))
@@ -1006,7 +1025,11 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str
          sleep: Optional[Callable[[float], None]] = None, input_fn: Optional[Callable[[str], str]] = None, out: Optional[Callable[[str], None]] = None) -> int:
     import time as _time
     a = _parser().parse_args(list(argv) if argv is not None else None)
-    ctx = Ctx(a, dict(env or {}), inner_transport, clock_ms or (lambda: int(_time.time() * 1000)), sleep or _time.sleep, input_fn or input, out or print)
+    try:
+        ctx = Ctx(a, dict(env or {}), inner_transport, clock_ms or (lambda: int(_time.time() * 1000)), sleep or _time.sleep, input_fn or input, out or print)
+    except StateDirRefused as exc:
+        (out or print)(f"refused (nothing was created): {exc}")
+        return EXIT_REFUSED
     ctx.plan_poll = 1                                                   # type: ignore[attr-defined]
     return {"preflight": cmd_preflight, "plan": cmd_plan, "execute": cmd_execute, "reconcile": cmd_reconcile, "status": cmd_status}[a.cmd](ctx)
 

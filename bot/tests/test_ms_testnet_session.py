@@ -549,3 +549,90 @@ def test_reconcile_past_the_lifecycle_says_unwind_required(w):
     w.clock.t += 2 * 3_600_000
     w.run("reconcile")
     assert "LIFECYCLE_EXCEEDED" in w.text()
+
+
+# ---------------------------------------------------------------- the state directory argument (the runbook's S= line passes a literal '~')
+def test_a_literal_tilde_state_dir_is_the_home_directory_not_a_directory_named_tilde(tmp_path, monkeypatch):
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    out = []
+    assert S.main(["--state-dir", "~/.ai-agent-control/ms_testnet", "status"], env={}, out=out.append) == 0
+    assert (home / ".ai-agent-control" / "ms_testnet" / "testnet_session.json").is_file()
+    assert os.listdir(cwd) == [], "a literal '~' directory was created in the working directory"
+
+
+def test_a_state_dir_inside_a_git_work_tree_is_refused_before_anything_is_written(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    out = []
+    target = repo / "bot" / "~" / "state"
+    assert S.main(["--state-dir", str(target), "status"], env={}, out=out.append) == 2
+    assert "STATE_DIR_INSIDE_GIT_WORK_TREE" in "\n".join(out)
+    assert not (repo / "bot").exists(), "the refusal must come before the directory is created"
+
+
+def test_the_session_record_carries_the_git_revision_not_UNKNOWN(w, monkeypatch):
+    monkeypatch.setattr(S.MP, "git_revision", lambda *a, **k: "b" * 40)
+    assert w.run("status") == 0
+    assert w.record()["identity"]["code_revision"] == "b" * 40
+    w.ready()
+    assert w.record()["identity"]["code_revision"] == "b" * 40
+
+# ---------------------------------------------------------------- the manifest's words describe what the session tool really does
+def test_the_manifest_text_names_the_real_kill_file_the_real_entry_bound_and_only_evidence_the_tool_writes(w):
+    m = w.manifest
+    sc = " | ".join(m["stop_conditions"])
+    assert "DRILL_KILL" not in sc and "MS_KILL" in sc, sc
+    assert "more than one entry" not in sc and "max_entries_per_utc_day" in sc, sc          # the bound is 4 (and lowerable), not 'one'
+    ev = " | ".join(m["evidence_capture"])
+    assert "--execution-records" not in ev and "--evidence-path" not in ev and "drill" not in ev.lower(), ev
+
+
+def test_every_read_the_manifest_declares_is_really_made_by_preflight_and_every_evidence_file_it_names_exists_after_a_session(w):
+    assert w.run("preflight") == 0
+    made = {r[1] for r in w.fake.requests}
+    for r in w.manifest["preflight_reads"]:
+        assert r["endpoint"] in made, f"declared but never read: {r['fact']} {r['endpoint']}"
+    d = w.ready()
+    assert w.execute(d) == 0
+    for name in ("testnet_session.json", "plan.json", "preflight.json", "engine_journal.jsonl", "ms_groups.jsonl"):
+        assert os.path.isfile(os.path.join(w.state_dir, name)), name
+    ev = " | ".join(w.manifest["evidence_capture"])
+    for name in ("testnet_session.json", "plan.json", "preflight.json", "engine_journal.jsonl", "ms_groups.jsonl"):
+        assert name in ev, f"{name} is written but not named as evidence"
+
+
+# ---------------------------------------------------------------- the runbook's numbers and commands are the code's
+def _runbook():
+    with open(os.path.join(os.path.dirname(HERE), "RUNBOOKS.md"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_runbook_states_the_real_windows_and_loss_limit(w):
+    rb = _runbook()
+    assert f"{S.DEFAULT_MAX_PREFLIGHT_AGE_MIN} minutes" in rb and f"{S.MAX_PLAN_AGE_MIN} minutes" in rb
+    assert f"${w.manifest['bounds']['max_loss_usd']}" in rb and "totalEquity" in rb
+    assert f"({w.manifest['bounds']['max_entries_per_utc_day']})" in rb and "ONE-SHOT" in rb
+    assert "SESSION_ALREADY_EXECUTED_USE_RECONCILE" in rb and "PREFLIGHT_IS_NOT_THE_ONE_THE_PLAN_WAS_BUILT_FROM" in rb
+
+
+def test_the_runbooks_generate_command_and_digest_one_liner_run_and_agree(tmp_path):
+    import re
+    import shlex
+    import subprocess
+    rb = _runbook()
+    gen = re.search(r"`(python3 tools/ms_testnet_adapter\.py generate --candidate research/candidates/\S+ --symbols \S+ --session-credentials) > manifest\.json`", rb)
+    assert gen, "the runbook's generate command moved"
+    r = subprocess.run(shlex.split(gen.group(1)), cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    m = json.loads(r.stdout)
+    assert m["strategy_allowlist"][0]["candidate_id"] == "cash_and_carry@spec-1" and m["credential_env"] == {"api_key": TT.KEY_ENV, "api_secret": TT.SECRET_ENV}
+    one = re.search(r'`(python3 -c "import json,sys.*?")`', rb)
+    assert one, "the runbook's digest one-liner moved"
+    cmd = one.group(1)
+    r2 = subprocess.run(["bash", "-c", cmd], cwd=os.path.dirname(HERE), capture_output=True, text=True, timeout=60)
+    assert r2.returncode == 0, r2.stderr
+    assert r2.stdout.strip() == m["strategy_allowlist"][0]["spec_digest"]
