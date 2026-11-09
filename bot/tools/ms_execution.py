@@ -705,7 +705,13 @@ class ExecutionEngine:
         if not nets:
             return {}
         if g.exit_mode == "EXIT":
-            return {l.plan.leg_id: n for l, n, _ in nets}
+            out_exit: Dict[str, Decimal] = {}
+            for l, n, _ in nets:
+                st = self._step_of(l)
+                q = (n / st).to_integral_value(rounding="ROUND_DOWN") * st if st else n       # an off-step net (a fee taken in the base coin) would be rejected by the venue: the dust stays
+                if q > 0 or not st:
+                    out_exit[l.plan.leg_id] = q
+            return out_exit
         matched = min(nv for _, _, nv in nets)
         out: Dict[str, Decimal] = {}
         for l, n, nv in nets:

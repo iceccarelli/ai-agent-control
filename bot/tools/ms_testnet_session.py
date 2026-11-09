@@ -486,6 +486,10 @@ class _Cached:
         self.value: Any = None
         self.at: Optional[int] = None
 
+    def invalidate(self) -> None:
+        """Forget the value AND its timestamp: the next ``get`` must read again, and if that read fails it RAISES (a value read before a fill must never be served after it settled)."""
+        self.value, self.at = None, None
+
     def get(self) -> Any:
         now = int(self.clock())
         if self.at is None or now - self.at >= self.refresh_ms:
@@ -544,12 +548,15 @@ class Run:
         d = _read_json(os.path.join(self.ctx.dir, "run_limits.json"))
         if isinstance(d, dict) and d.get("gid") == self.gid_hint():
             self.start_ms, self.start_equity = d.get("start_ms"), d.get("start_equity_usd")
+            b = d.get("baseline")                                  # the baseline the session TRADED with (read from the venue at execute), not the plan's older preflight copy
+            if isinstance(b, dict) and b and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in b.values()):
+                self.baseline = {str(k): float(v) for k, v in b.items()}
 
     def gid_hint(self) -> str:
         return str(self.plan["group"]["group_id"])
 
     def _save_start(self) -> None:
-        _write_json(os.path.join(self.ctx.dir, "run_limits.json"), {"gid": self.gid_hint(), "start_ms": self.start_ms, "start_equity_usd": self.start_equity})
+        _write_json(os.path.join(self.ctx.dir, "run_limits.json"), {"gid": self.gid_hint(), "start_ms": self.start_ms, "start_equity_usd": self.start_equity, "baseline": self.baseline})
 
     def _read_state(self) -> Dict[str, Any]:
         # open_groups = the OTHER active groups: the authority adds the group being assessed itself (ms_risk counts og + 1), so counting it here would refuse its own legs at max_active_groups=1
@@ -605,7 +612,7 @@ class Run:
                     if (o and o.get("status") == "Filled" and D(str(o.get("filled_qty", 0))) >= D(str(l.plan_qty)) - D("1e-12")) or done_qty >= D(str(l.plan_qty)) - D("1e-12"):
                         self._settled.add(l.plan.leg_id)
                         self.authority.settle_leg(self.gid, l.plan.leg_id)
-                        self._state.at = None
+                        self._state.invalidate()
                 if all(l.plan.leg_id in self._settled for l in pending):
                     return
             if int(self.ctx.clock()) >= deadline:
@@ -736,6 +743,7 @@ class Run:
             if l.status == EX.FILLED and l.plan.leg_id not in self._settled:
                 self._settled.add(l.plan.leg_id)
                 self.authority.settle_leg(self.gid, l.plan.leg_id)
+                self._state.invalidate()                                # the account read must be taken AFTER the fill this settle reflects
         self.release_dead_exits()
         terminal = g.state in (T.GroupState.CLOSED, T.GroupState.FAILED)
         resolved = self.authority.is_resolved(self.gid)
@@ -963,6 +971,7 @@ def cmd_execute(ctx: Ctx) -> int:
         ctx.out("execute aborted before any order: the venue is not flat/clean or could not be read completely")
         return EXIT_FAIL
     run.baseline = {f"spot:{sym}": float(pos.get(f"spot:{sym}", 0.0))}
+    run._save_start()                                                   # persist the baseline the session trades with (reconcile / a restart must use it)
     if not run.ex.set_leverage(sym, int(plan["leverage"])):
         ctx.out("execute aborted before any order: leverage could not be set")
         return EXIT_FAIL
@@ -1090,6 +1099,9 @@ def cmd_assess(ctx: Ctx) -> int:
         for lg in gp.legs:
             d = MRISK.risk_assess(replace(gp, legs=(lg,), created_ms=int(ctx.clock())), json.loads(json.dumps(st)), plan["policy"], snaps)
             out["risk_per_leg"][f"{lg.category}:{lg.side}:{lg.leg_id}"] = {"approved": d.approved, "reasons": list(d.reasons), "limits": d.limits}
+        # registration assesses BOTH legs together (per-symbol = spot + perp, gross = the sum): a plan that passes each leg alone can still be refused there, after an entry was counted
+        dg = MRISK.risk_assess(replace(gp, created_ms=int(ctx.clock())), json.loads(json.dumps(st)), plan["policy"], snaps)
+        out["risk_whole_group"] = {"approved": dg.approved, "reasons": list(dg.reasons), "limits": dg.limits}
     except (TE.ExecutorError, bc.BybitAPIError) as exc:
         ctx.out(f"assess failed: {type(exc).__name__}: {str(exc)[:200]}")
         return EXIT_FAIL

@@ -696,3 +696,18 @@ def test_without_a_baseline_the_group_cannot_be_closed_by_delta_and_says_why():
     h.e.step(6_000)
     assert h.state() == G.EXITING
     assert any(a.get("code") == "SPOT_BASELINE_MISSING" for a in h.e.anomalies)
+
+
+def test_an_exit_quantity_is_on_the_lot_step_even_when_a_spot_fee_taken_in_the_base_coin_left_an_off_step_net():
+    """A spot buy whose fee is taken in the base coin leaves a NET quantity that is not a multiple of the lot step (10 bought, 9.95 held, step 0.1). The EXIT used the raw net, the
+    executor rejects an off-step quantity (FILTER:QTY_NOT_ON_STEP), five rejections halt the group and the spot stays unsold. The exit rounds DOWN to the step (the dust stays, as the
+    flat check's one-step allowance already assumes); the entry-side excess already did."""
+    h = H()
+    h.start()
+    h.fill(PL, 10)
+    h.fill(SL, 9.95)
+    h.e.request_exit(GID, 5_000)
+    spot_exits = [o for k, o in h.v.orders.items() if "-x" in k and o["category"] == "spot"]
+    assert len(spot_exits) == 1
+    q = Decimal(str(spot_exits[0]["qty"]))
+    assert q % Decimal("0.1") == 0 and q == Decimal("9.9"), q

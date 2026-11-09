@@ -687,6 +687,7 @@ def test_assess_is_read_only_and_reports_the_baselines_and_the_state_the_authori
     legs = out["risk_per_leg"]
     assert legs and all(v["approved"] for v in legs.values()), legs                          # a 400 plan passes every cap leg by leg (the caps are printed with it)
     assert out["policy_caps"]["max_aggregate_notional_usd"] == 500.0
+    assert out["risk_whole_group"]["approved"] is True and out["risk_whole_group"]["limits"]["per_symbol"]["BTCUSDT"] > 0       # the registration-time check, both legs together
 
 
 def test_a_filled_spot_leg_is_not_counted_twice_when_the_perp_leg_is_assessed_after_the_state_cache_expires(w, monkeypatch):
@@ -751,3 +752,37 @@ def test_the_spot_buy_limit_has_a_cushion_over_the_ask_so_a_drifting_market_stil
     d = plan["plan_digest"]
     assert w.execute(d) == 0 and w.record()["flat_verified"] is True
     assert {o["link_id"].rsplit("-", 1)[-1] for o in w.record()["orders"] if o["link_id"].rsplit("-", 1)[-1] in ("p", "s")} == {"p", "s"}
+
+
+def test_an_invalidated_cache_never_serves_the_value_it_held_before_the_fill():
+    """After a leg settles, the next assessment must re-read the account. If that re-read FAILS, the pre-fill value (no position, reservation already gone) must NOT be served:
+    the read raises and the authority refuses with STATE_UNAVAILABLE (never under-counts)."""
+    import ms_testnet_executor as _TE
+    t = {"now": 0, "fail": False}
+
+    def read():
+        if t["fail"]:
+            raise _TE.ExecutorError("account read failed")
+        return {"positions": {}}
+    c = S._Cached(read, lambda: t["now"])
+    assert c.get() == {"positions": {}}
+    t["fail"] = True
+    t["now"] += 1000
+    assert c.get() == {"positions": {}}                                   # an ordinary failed refresh still serves the last good value (the authority's age check decides)
+    c.invalidate()
+    with pytest.raises(_TE.ExecutorError):
+        c.get()
+
+
+def test_the_baseline_the_session_traded_with_is_persisted_and_reloaded_not_the_older_preflight_copy(w):
+    """execute re-reads the spot baseline from the venue just before its first order; a later reconcile/restart must use THAT, not plan['spot_baseline'] (read up to 15 minutes earlier)."""
+    w.fake.wallet["BTC"] = D("0.1")
+    d = w.ready("BTCUSDT", 400.0)
+    w.fake.wallet["BTC"] = D("0.2")                                      # the holding changed between the preflight/plan and the order
+    assert w.execute(d) == 0, w.text()[-600:]
+    saved = json.load(open(os.path.join(w.state_dir, "run_limits.json")))
+    assert saved["baseline"] == {"spot:BTCUSDT": 0.2}
+    a = S._parser().parse_args(["--state-dir", w.state_dir, "status"])
+    ctx = S.Ctx(a, w.env, w.fake, w.clock.now, w.clock.sleep, lambda _p: "", w.out.append)
+    run = S.Run(ctx, w.plan_doc(), S._load_capability_manifest()[0])
+    assert run.baseline == {"spot:BTCUSDT": 0.2} and w.plan_doc()["spot_baseline"]["spot:BTCUSDT"] == 0.1
