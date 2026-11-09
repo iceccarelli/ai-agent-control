@@ -430,7 +430,8 @@ def test_generate_says_why_on_stderr_when_the_manifest_it_just_wrote_is_refused(
 
 
 # ---------------------------------------------------------------- a manifest the session tool cannot use must not look ready
-SESSION_NAMES = {"api_key": "BYBIT_TESTNET_API_KEY", "api_secret": "BYBIT_TESTNET_API_SECRET"}
+import ms_testnet_transport as _TT  # noqa: E402
+SESSION_NAMES = {"api_key": _TT.KEY_ENV, "api_secret": _TT.SECRET_ENV}            # the names the session tool reads, from the one module that defines them
 
 
 def test_default_credential_names_differ_from_the_session_tool_and_status_and_validate_say_so(tmp_path):
