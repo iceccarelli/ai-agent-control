@@ -336,8 +336,8 @@ def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, spot_
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="pre-registered funding-regime-conditioned carry evaluator (offline, read-only, one trial)")
-    ap.add_argument("--history-root", required=True)
-    ap.add_argument("--universe-dir", required=True)
+    ap.add_argument("--history-root", default=None, help="required unless --print-registration")
+    ap.add_argument("--universe-dir", default=None, help="required unless --print-registration")
     ap.add_argument("--spot-dir", default=None)
     ap.add_argument("--mark-interval", default=None)
     ap.add_argument("--ledger-dir", default=None)
@@ -347,6 +347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if a.print_registration:
         print(json.dumps({"registration": registration(), "digest": registration_digest()}, indent=1, sort_keys=True))
         return 0
+    if not a.history_root or not a.universe_dir:
+        ap.error("--history-root and --universe-dir are required (only --print-registration runs without them)")
     lpath = CR.default_ledger_path(FAMILY, a.history_root, a.ledger_dir)
     try:
         out = run_on_root(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval)

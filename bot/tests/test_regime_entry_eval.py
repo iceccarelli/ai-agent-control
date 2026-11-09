@@ -220,3 +220,13 @@ def test_it_runs_on_a_real_history_root_and_refuses_a_missing_universe(tmp_path,
     with pytest.raises(SystemExit) as ei:
         RE.main(["--history-root", root])
     assert ei.value.code == 2
+
+
+def test_print_registration_works_with_no_other_argument_and_a_run_still_needs_its_inputs(capsys):
+    """The runbook says `--print-registration` prints the frozen registration: it must not demand a history root nor a universe."""
+    assert RE.main(["--print-registration"]) == 0
+    assert json.loads(capsys.readouterr().out)["digest"] == RE.registration_digest()
+    with pytest.raises(SystemExit) as e:                                         # a real run without its inputs is still refused (argparse error, exit 2)
+        RE.main(["--history-root", "x"])
+    assert e.value.code == 2
+    assert "--universe-dir" in capsys.readouterr().err
