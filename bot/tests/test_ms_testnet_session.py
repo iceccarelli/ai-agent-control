@@ -580,3 +580,26 @@ def test_the_session_record_carries_the_git_revision_not_UNKNOWN(w, monkeypatch)
     assert w.record()["identity"]["code_revision"] == "b" * 40
     w.ready()
     assert w.record()["identity"]["code_revision"] == "b" * 40
+
+# ---------------------------------------------------------------- the manifest's words describe what the session tool really does
+def test_the_manifest_text_names_the_real_kill_file_the_real_entry_bound_and_only_evidence_the_tool_writes(w):
+    m = w.manifest
+    sc = " | ".join(m["stop_conditions"])
+    assert "DRILL_KILL" not in sc and "MS_KILL" in sc, sc
+    assert "more than one entry" not in sc and "max_entries_per_utc_day" in sc, sc          # the bound is 4 (and lowerable), not 'one'
+    ev = " | ".join(m["evidence_capture"])
+    assert "--execution-records" not in ev and "--evidence-path" not in ev and "drill" not in ev.lower(), ev
+
+
+def test_every_read_the_manifest_declares_is_really_made_by_preflight_and_every_evidence_file_it_names_exists_after_a_session(w):
+    assert w.run("preflight") == 0
+    made = {r[1] for r in w.fake.requests}
+    for r in w.manifest["preflight_reads"]:
+        assert r["endpoint"] in made, f"declared but never read: {r['fact']} {r['endpoint']}"
+    d = w.ready()
+    assert w.execute(d) == 0
+    for name in ("testnet_session.json", "plan.json", "preflight.json", "engine_journal.jsonl", "ms_groups.jsonl"):
+        assert os.path.isfile(os.path.join(w.state_dir, name)), name
+    ev = " | ".join(w.manifest["evidence_capture"])
+    for name in ("testnet_session.json", "plan.json", "preflight.json", "engine_journal.jsonl", "ms_groups.jsonl"):
+        assert name in ev, f"{name} is written but not named as evidence"

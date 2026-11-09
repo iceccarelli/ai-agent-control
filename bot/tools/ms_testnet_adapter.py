@@ -66,8 +66,11 @@ EXECUTION_STYLES = ["MAKER_FIRST", "TAKER"]
 
 KILL_SWITCH = {"file": "MS_KILL", "semantics": "PERSISTENT: the file's presence means STOP; read before every order and every reconcile; an unreadable path is an engaged switch; "
                                               "only the owner removes it; engaging never needs a running process"}
-STOP_CONDITIONS = TAM.STOP_CONDITIONS + ("aggregate notional ceiling reached", "a leg of a paired order is unfilled or unknown beyond max_wait", "venue and local position disagree",
-                                          "kill switch file present")
+# The words below are what the owner signs, so they describe THIS tool (ms_testnet_session), not the older single-symbol drill they were first copied from: the kill file is MS_KILL (not
+# DRILL_KILL), the entry bound is bounds.max_entries_per_utc_day (not "one entry"), and the evidence is the files the session tool really writes (no drill flags).
+_DRILL_ONLY_STOPS = ("DRILL_KILL file present", "more than one entry in the UTC day")
+STOP_CONDITIONS = tuple(c for c in TAM.STOP_CONDITIONS if c not in _DRILL_ONLY_STOPS) + (
+                                          "MS_KILL file present or unreadable in the session state dir", "more entries in the UTC day than bounds.max_entries_per_utc_day", "aggregate notional ceiling reached", "a leg of a paired order is unfilled or unknown beyond max_wait", "venue and local position disagree")
 RECONCILIATION = {
     "source_of_truth": "the venue's own position, order and execution reads; never the local journal or fill arithmetic",
     "before_any_resend": "query the order by orderLinkId; a lost acknowledgement is UNKNOWN_OUTCOME until the venue answers",
@@ -83,7 +86,12 @@ RECOVERY_PLAN = (
     "capture the evidence list",
     "if any position remains: HUMAN MUST ACT",
 )
-EVIDENCE = TAM.EVIDENCE + ("group plans and risk decisions", "reservation ledger", "per-leg ledger P&L with provenance", "kill switch state at every order")
+EVIDENCE = ("testnet_session.json (orders, executions, final venue position, exchange-reported fees)", "plan.json and preflight.json (their digests bind the session)",
+            "engine_journal.jsonl (every group state change)", "ms_groups.jsonl (registered groups and the reservation ledger)")
+
+#: The reads ``ms_testnet_session preflight`` really makes (a test drives it against the fake testnet and checks every endpoint here is requested). The drill's list also declares
+#: /v5/account/fee-rate and /v5/order/history, which this preflight does not call, so they are not declared here.
+PREFLIGHT_READS = tuple(r for r in TAM.PREFLIGHT_READS if r[1] not in ("/v5/account/fee-rate", "/v5/order/history"))
 
 _TOP = ("schema", "venue", "category_scope", "mode", "credential_class", "credential_env", "strategy_allowlist", "symbol_allowlist", "allowed_sides", "allowed_order_types",
         "execution_styles", "bounds", "kill_switch", "preflight_reads", "stop_conditions", "reconciliation", "recovery_plan", "evidence_capture", "authorisation", "plan_sha256")
@@ -129,7 +137,7 @@ def generate(*, candidate_id: str, spec_digest: str, symbols: Sequence[str], str
         "strategy_allowlist": [{"strategy": strategy, "candidate_id": candidate_id, "spec_digest": spec_digest}],
         "symbol_allowlist": list(symbols), "allowed_sides": {k: list(v) for k, v in SIDES.items()}, "allowed_order_types": list(ORDER_TYPES),
         "execution_styles": list(EXECUTION_STYLES), "bounds": bounds, "kill_switch": dict(KILL_SWITCH),
-        "preflight_reads": [{"fact": f, "endpoint": e, "signed": s} for f, e, s in TAM.PREFLIGHT_READS],
+        "preflight_reads": [{"fact": f, "endpoint": e, "signed": s} for f, e, s in PREFLIGHT_READS],
         "stop_conditions": list(STOP_CONDITIONS), "reconciliation": dict(RECONCILIATION), "recovery_plan": list(RECOVERY_PLAN), "evidence_capture": list(EVIDENCE),
         "authorisation": NOT_GRANTED,
     }
@@ -211,7 +219,7 @@ def refusals(m: Any) -> List[str]:
             out.append("bounds.max_gross_exposure_usd may not exceed twice the aggregate ceiling")
     if m["kill_switch"] != KILL_SWITCH:
         out.append("kill_switch must be exactly the persistent-file semantics")
-    want_reads = [{"fact": f, "endpoint": e, "signed": s} for f, e, s in TAM.PREFLIGHT_READS]
+    want_reads = [{"fact": f, "endpoint": e, "signed": s} for f, e, s in PREFLIGHT_READS]
     pr = m["preflight_reads"]
     if not isinstance(pr, list) or any(not isinstance(r, dict) or set(r) != {"fact", "endpoint", "signed"} for r in pr):
         out.append("preflight_reads must be a list of {fact, endpoint, signed}")
