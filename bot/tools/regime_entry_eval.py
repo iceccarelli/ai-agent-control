@@ -29,6 +29,7 @@ index-vs-spot tracking error. With no index dataset the residual is UNMEASURED.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import math
@@ -81,12 +82,39 @@ REGISTRATION: Dict[str, Any] = {
 }
 
 
+def _make_reg2() -> Dict[str, Any]:
+    r = json.loads(json.dumps(REGISTRATION))
+    r.update({
+        "registration_id": "funding_regime_conditioned_entry@reg-2",
+        "post_hoc": True,
+        "derived_from": ("reg-1 descriptive result on the owner's 457-day capture: 14 rows, mean -78.6 bps, median leg +32.6 bps, 69.7% of legs positive, a heavy negative-funding tail "
+                         "and 55% of legs with the entry condition already false at a later weekly checkpoint. reg-1 registered a fixed hold with no exit rule although the draft spec's exit "
+                         "list named funding inversion; reg-2 adds exactly that exit and nothing else"),
+        "hypothesis": ("the same past-only regime entry as reg-1, with an exit on funding inversion, avoids most of the negative-funding tail that a fixed 30-day hold absorbs and earns a "
+                       "positive net edge after the spot+perp taker round trip"),
+        "exit": ("the first daily checkpoint at which the trailing exit_rule.lookback_days mean funding (interval-normalised, prints with key <= the checkpoint only) is below "
+                 "exit_rule.exit_when_mean_funding_bps_per_day_below; otherwise the end of the hold or the contract's deliveryTime; one round trip per position, no re-entry in the hold"),
+        "exit_rule": {"checkpoint_days": 1, "lookback_days": 3, "exit_when_mean_funding_bps_per_day_below": 0.0},
+    })
+    r["disclosures"] = list(r["disclosures"]) + [
+        "POST-HOC: this registration was written after seeing reg-1's result; it is the SECOND trial in the family and its adjusted p-value counts both",
+        "the exit rule is a past-only inversion test; it does not model any extra execution cost or slippage on the early unwind (the same taker round trip is assumed)",
+    ]
+    return r
+
+
+REGISTRATION_2: Dict[str, Any] = _make_reg2()
+REGISTRATIONS: Dict[str, Dict[str, Any]] = {"reg-1": REGISTRATION, "reg-2": REGISTRATION_2}
+
+
 def _round_trip() -> float:
     return float(CC.position_class_costs("acquire_spot_perp", "taker")["total_bps"])
 
 
-def registration() -> Dict[str, Any]:
-    reg = json.loads(json.dumps(REGISTRATION))
+def registration(name: str = "reg-1") -> Dict[str, Any]:
+    if name not in REGISTRATIONS:
+        raise RH.HarnessError(f"unknown registration {name!r}; known: {sorted(REGISTRATIONS)}")
+    reg = json.loads(json.dumps(REGISTRATIONS[name]))
     reg["cost_scenario"]["round_trip_bps"] = _round_trip()
     return reg
 
@@ -97,20 +125,39 @@ def registration_digest(reg: Optional[Mapping[str, Any]] = None) -> str:
 
 
 # ---------------------------------------------------------------- the regime state (past-only)
+def _prints_in(s: CR.SymbolSeries, a: int, b: int) -> List[Tuple[int, float]]:
+    """The prints with key in (a, b], by binary search (the series is ascending). The upper bound IS the look-ahead guard: nothing after ``b`` is ever read."""
+    lo = bisect.bisect_right(s.funding, a, key=lambda x: x[0])
+    hi = bisect.bisect_right(s.funding, b, key=lambda x: x[0])
+    return s.funding[lo:hi]
+
+
+def trailing_mean_bps_per_day(s: CR.SymbolSeries, t: int, days: int) -> Tuple[Optional[float], int, Optional[float]]:
+    """(mean funding bps/day, n prints, positive share) over (t - days, t], each print normalised by the interval of ITS OWN segment; mean None when any print has no interval."""
+    per_day: List[float] = []
+    positive = 0
+    for ts, v in _prints_in(s, t - int(days) * MS_DAY, t):
+        iv = CR._interval_at(s, ts)
+        if iv is None or iv <= 0:
+            return None, len(per_day), None
+        per_day.append(v * 1440.0 / iv)
+        positive += 1 if v > 0 else 0
+    if not per_day:
+        return None, 0, None
+    return statistics.fmean(per_day), len(per_day), positive / len(per_day)
+
+
 def regime_state(s: CR.SymbolSeries, t: int, p: Mapping[str, Any]) -> Tuple[Optional[bool], Dict[str, Any]]:
     """(ON/OFF/None, diagnostics) at decision time ``t`` from prints with key <= t ONLY. None = unknown (no interval for a print, too few prints): never ON."""
     f_ms = int(p["formation_days"]) * MS_DAY
     per_day: List[float] = []
     positive = 0
-    for ts, v in s.funding:
-        if ts > t:
-            break
-        if ts > t - f_ms:
-            iv = CR._interval_at(s, ts)
-            if iv is None or iv <= 0:
-                return None, {"why": "interval_unknown_for_a_print"}
-            per_day.append(v * 1440.0 / iv)
-            positive += 1 if v > 0 else 0
+    for ts, v in _prints_in(s, t - f_ms, t):
+        iv = CR._interval_at(s, ts)
+        if iv is None or iv <= 0:
+            return None, {"why": "interval_unknown_for_a_print"}
+        per_day.append(v * 1440.0 / iv)
+        positive += 1 if v > 0 else 0
     n = len(per_day)
     if n < int(p["min_prints"]):
         return None, {"why": "too_few_prints", "n_prints": n}
@@ -185,14 +232,28 @@ def run_registered(series: Sequence[CR.SymbolSeries], *, reg: Optional[Mapping[s
             if why is not None:
                 excl[why] = excl.get(why, 0) + 1
                 continue
-            w = CR._leg_window(s, t, h_ms, None)
+            leg_h, exit_ms = h_ms, None
+            xr = reg.get("exit_rule")
+            if xr:                                                           # reg-2: exit on funding inversion, decided at daily checkpoints from prints with key <= the checkpoint ONLY
+                end_cap = t + h_ms if s.delivery_ms is None else min(t + h_ms, s.delivery_ms)
+                step = int(xr["checkpoint_days"])
+                for k in range(step, int(reg["hold_days"]), step):
+                    tc = t + k * MS_DAY
+                    if tc >= end_cap:
+                        break
+                    mean, n_pr, _share = trailing_mean_bps_per_day(s, tc, int(xr["lookback_days"]))
+                    if mean is not None and n_pr >= int(p["min_prints"]) and mean < float(xr["exit_when_mean_funding_bps_per_day_below"]):
+                        leg_h, exit_ms = tc - t, tc
+                        break
+            w = CR._leg_window(s, t, leg_h, None)
             if w["m0"] is None or w["m1"] is None or w["m0"] <= 0:
                 skipped["leg_unpriced"] = skipped.get("leg_unpriced", 0) + 1
                 if w["terminal"]:
                     unpriced.append({"symbol": s.symbol, "t": t, "delivery_ms": s.delivery_ms})
                 continue
             leg: Dict[str, Any] = {"symbol": s.symbol, "t": t, "interval_min": s.interval_min, "funding_bps": w["funding_raw_bps"], "prints": w["prints"], "cost_bps": rt,
-                                   "net_bps": w["funding_raw_bps"] - rt, "closed_during_hold": w["terminal"], "state_at_entry": diag}
+                                   "net_bps": w["funding_raw_bps"] - rt, "closed_during_hold": w["terminal"], "state_at_entry": diag,
+                                   "exit_ms": exit_ms, "days_held": (w["end"] - t) / MS_DAY}
             persists = []
             for k in (1, 2, 3):                                              # ex-post persistence diagnostic only: states at later checkpoints use prints known THEN
                 tc = t + k * 7 * MS_DAY
@@ -240,7 +301,9 @@ def descriptive(res: Mapping[str, Any]) -> Dict[str, Any]:
                     "row_worst_net_bps": min(net), "row_best_net_bps": max(net), "rows_positive_share": sum(1 for x in net if x > 0) / len(net), "max_drawdown_bps": _drawdown(net),
                     "mean_legs_per_row": statistics.fmean(r["n_legs"] for r in rows)})
         ln = [x["net_bps"] for x in legs]
-        out.update({"leg_mean_net_bps": statistics.fmean(ln), "leg_median_net_bps": statistics.median(ln), "leg_positive_share": sum(1 for x in ln if x > 0) / len(ln)})
+        out.update({"leg_mean_net_bps": statistics.fmean(ln), "leg_median_net_bps": statistics.median(ln), "leg_positive_share": sum(1 for x in ln if x > 0) / len(ln),
+                    "leg_worst_net_bps": min(ln), "leg_p05_net_bps": sorted(ln)[int(0.05 * (len(ln) - 1))], "mean_days_held": statistics.fmean(x["days_held"] for x in legs),
+                    "early_exit_share": sum(1 for x in legs if x["exit_ms"] is not None) / len(legs)})
         by_sym: Dict[str, float] = {}
         for x in legs:
             by_sym[x["symbol"]] = by_sym.get(x["symbol"], 0.0) + x["net_bps"]
@@ -280,7 +343,7 @@ def evaluate(series: Sequence[CR.SymbolSeries], *, ledger_path: str, universe_in
         warnings.append("SURVIVORS_ONLY: no survivorship-free claim")
     out: Dict[str, Any] = {"schema": SCHEMA, "family": FAMILY, "registration": reg, "registration_digest": digest, "survivorship": survivorship, "survivorship_free_claim": False,
                            "warnings": warnings, "ceiling": "INSUFFICIENT_DATA", "symbols_in_series": len(series), "time_mode": "REPLAY_OBSERVATION_TIME",
-                           "multiple_testing_scope": "PERSISTENT_LEDGER_FILE", "ledger_path": os.path.abspath(ledger_path),
+                           "multiple_testing_scope": "PERSISTENT_LEDGER_FILE", "ledger_path": os.path.abspath(ledger_path), "post_hoc": bool(reg.get("post_hoc", False)),
                            "not_a_clean_holdout": "the capture window was already used by other families: thresholds were fixed from cost arithmetic before this module read a return, but the data is not untouched"}
     if any(s.interval_min is None for s in series):
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "FUNDING_NORMALISATION_UNKNOWN", "reason": "a symbol carries no fundingInterval"})
@@ -324,10 +387,10 @@ def evaluate(series: Sequence[CR.SymbolSeries], *, ledger_path: str, universe_in
     return out
 
 
-def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None) -> Dict[str, Any]:
+def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, registration_name: str = "reg-1") -> Dict[str, Any]:
     series, info = CR.load_history_root(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
     index, idx_info = load_index_series(history_root, str(info["mark_interval"]), [s.symbol for s in series])
-    out = evaluate(series, ledger_path=ledger_path, universe_info=info, index=index)
+    out = evaluate(series, ledger_path=ledger_path, universe_info=info, index=index, reg=registration(registration_name))
     out["basis_measurement"] = idx_info
     out["input"] = {k: info.get(k) for k in ("root", "mark_interval", "history_window", "history_coverage", "datasets", "universe", "survivorship", "hedge", "non_complete_symbols",
                                              "symbols_loaded", "warnings")}
@@ -342,16 +405,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--mark-interval", default=None)
     ap.add_argument("--ledger-dir", default=None)
     ap.add_argument("--json", default=None, help="write the full report here")
+    ap.add_argument("--registration", default="reg-1", choices=sorted(REGISTRATIONS), help="which frozen registration to run (each is one trial in the family ledger; an identical re-run is the same trial)")
     ap.add_argument("--print-registration", action="store_true", help="print the frozen registration and its digest, then exit")
     a = ap.parse_args(argv)
     if a.print_registration:
-        print(json.dumps({"registration": registration(), "digest": registration_digest()}, indent=1, sort_keys=True))
+        print(json.dumps({"registration": registration(a.registration), "digest": registration_digest(registration(a.registration))}, indent=1, sort_keys=True))
         return 0
     if not a.history_root or not a.universe_dir:
         ap.error("--history-root and --universe-dir are required (only --print-registration runs without them)")
     lpath = CR.default_ledger_path(FAMILY, a.history_root, a.ledger_dir)
     try:
-        out = run_on_root(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval)
+        out = run_on_root(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval, registration_name=a.registration)
     except RH.HarnessError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
@@ -364,7 +428,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if d.get("rows"):
         print(f"row net bps: mean {d['row_mean_net_bps']:.1f}  median {d['row_median_net_bps']:.1f}  worst {d['row_worst_net_bps']:.1f}  positive {d['rows_positive_share']:.0%}  "
               f"max drawdown {d['max_drawdown_bps']:.1f}; top-5 symbols hold {d['concentration_top5_symbols_share_of_positive_net']}")
+        print(f"legs: mean {d['leg_mean_net_bps']:.1f}  median {d['leg_median_net_bps']:.1f}  p05 {d['leg_p05_net_bps']:.1f}  worst {d['leg_worst_net_bps']:.1f}  positive {d['leg_positive_share']:.0%}  "
+              f"mean days held {d['mean_days_held']:.1f}  early exits {d['early_exit_share']:.0%}")
         print("basis residual:", json.dumps(d.get("basis_residual")))
+    print(f"post-hoc registration: {out['post_hoc']}; trials counted in the family ledger: {out.get('n_variants_counted')}")
     print("reason:", out.get("reason"))
     print("warnings:", "; ".join(out["warnings"]) or "none")
     print("NOT a trade recommendation: capped at INSUFFICIENT_DATA; descriptive in-sample unless the row count reaches the registered minimum.")
