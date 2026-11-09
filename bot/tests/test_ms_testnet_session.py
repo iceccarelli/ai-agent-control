@@ -549,3 +549,34 @@ def test_reconcile_past_the_lifecycle_says_unwind_required(w):
     w.clock.t += 2 * 3_600_000
     w.run("reconcile")
     assert "LIFECYCLE_EXCEEDED" in w.text()
+
+
+# ---------------------------------------------------------------- the state directory argument (the runbook's S= line passes a literal '~')
+def test_a_literal_tilde_state_dir_is_the_home_directory_not_a_directory_named_tilde(tmp_path, monkeypatch):
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    out = []
+    assert S.main(["--state-dir", "~/.ai-agent-control/ms_testnet", "status"], env={}, out=out.append) == 0
+    assert (home / ".ai-agent-control" / "ms_testnet" / "testnet_session.json").is_file()
+    assert os.listdir(cwd) == [], "a literal '~' directory was created in the working directory"
+
+
+def test_a_state_dir_inside_a_git_work_tree_is_refused_before_anything_is_written(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    out = []
+    target = repo / "bot" / "~" / "state"
+    assert S.main(["--state-dir", str(target), "status"], env={}, out=out.append) == 2
+    assert "STATE_DIR_INSIDE_GIT_WORK_TREE" in "\n".join(out)
+    assert not (repo / "bot").exists(), "the refusal must come before the directory is created"
+
+
+def test_the_session_record_carries_the_git_revision_not_UNKNOWN(w, monkeypatch):
+    monkeypatch.setattr(S.MP, "git_revision", lambda *a, **k: "b" * 40)
+    assert w.run("status") == 0
+    assert w.record()["identity"]["code_revision"] == "b" * 40
+    w.ready()
+    assert w.record()["identity"]["code_revision"] == "b" * 40

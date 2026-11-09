@@ -624,14 +624,14 @@ Bybit TESTNET only (fake money, `api-testnet.bybit.com`). Nothing in this reposi
 3. Set the account to one-way position mode on the testnet site. Fund the testnet wallet with test USDT.
 4. Generate the manifest, review it, and create the capability file yourself (code never creates it): `python3 tools/ms_testnet_adapter.py generate --candidate-id ID --spec-digest HEX --symbols BTCUSDT --session-credentials > manifest.json`; mark `authorisation` as `GRANTED_BY_OWNER:<reference>` and write `{"schema": "ms_testnet_capability/1", "manifest": <it>, "manifest_plan_sha256": <its plan_sha256>}` to `~/.ai-agent-control/ms_testnet_capability.json`, mode 0600.
 
-**Each session** (`S="python3 tools/ms_testnet_session.py --state-dir ~/.ai-agent-control/ms_testnet"`):
+**Each session** (`S="python3 tools/ms_testnet_session.py --state-dir $HOME/.ai-agent-control/ms_testnet"` (use `$HOME`, not `~`: inside double quotes a tilde stays literal; the tool now expands it anyway and refuses a state directory inside the git work tree)):
 1. `$S preflight` READ-ONLY: env presence (booleans), endpoint identity, key permissions, clock skew, account/position mode, wallet, instrument filters, book, flat and no open orders, kill switch. Exit 0 = PASS.
 2. `$S plan --symbol BTCUSDT --notional-usd 90 [--hold-seconds N]` offline from the preflight capture; prints the plan and `PLAN DIGEST`, writes `plan.json`. Aggregate notional <= $100 across all symbols, one group, lifecycle <= 9 h.
 3. `$S execute --confirm-plan-digest <digest>` then TYPE the digest at the prompt. Anything else exits 2 with no network call. It sets the plan leverage, registers the group with the authority (risk on fresh state), sends the hedged pair, waits for fills, holds, exits reduce-only (the spot exit only after the perp exit fill shows on the venue read), and verifies FLAT with a complete venue position read. Exit 0 only if flat is verified.
 4. `$S status` prints `testnet_session.json` (schema `testnet_session/v1`; `net` is exchange-reported and never owner profit; funding is null because it is not read).
 5. After a crash or interruption: `$S reconcile` (read-only recovery from the journal and the venue; an accepted order is adopted, never re-created). If it reports not flat: `$S reconcile --unwind --confirm-plan-digest <digest>`.
 
-**Kill switch.** `touch ~/.ai-agent-control/ms_testnet/MS_KILL` stops new entries at once and makes a running session unwind reduce-only. Only the owner removes it. **If anything remains open and the tool cannot close it: HUMAN MUST ACT on the testnet site.**
+**Kill switch.** `touch $HOME/.ai-agent-control/ms_testnet/MS_KILL` stops new entries at once and makes a running session unwind reduce-only. Only the owner removes it. **If anything remains open and the tool cannot close it: HUMAN MUST ACT on the testnet site.**
 
 **Not verified offline.** Real latency and fill behaviour, real retCodes beyond the documented ones, the real spot fee currency and dust after the exit sell, funding, thin testnet books, IP / region access, and that the real `requests` inner transport follows no redirect (configured, not exercised).
 
