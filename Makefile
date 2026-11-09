@@ -9,13 +9,14 @@ OPS   ?= $(HOME)/.ai-agent-control/ops
 ROOT  ?= $(DATA)/md-collector
 UNI   ?= $(shell ls -d $(DATA)/universe-v3-* 2>/dev/null | sort | tail -1)
 HIST  ?= $(shell ls -d $(DATA)/md-2* 2>/dev/null | sort | tail -1)
+SPOT  ?= $(shell ls -d $(DATA)/spot-snap/spot-instruments/snapshot-* 2>/dev/null | sort | tail -1)
 ART   ?= $(DATA)/pipeline-out
 PY    ?= python3
 PORT  ?= 8787
 S     := $(PY) tools/ms_testnet_session.py --state-dir $(HOME)/.ai-agent-control/ms_testnet
 
 .PHONY: help setup check test-quick scope diagnose plan backfill collect-start collect-stop collect-status collect-log seal backup restore-check audit \
-        control-centre-start control-centre-stop pipeline testnet-preflight testnet-plan testnet-status ops-resume
+        control-centre-start control-centre-stop pipeline regime-eval testnet-preflight testnet-plan testnet-status ops-resume
 
 help:
 	@echo "setup | check | test-quick | scope | diagnose | plan | backfill | collect-start|stop|status|log | seal | backup | restore-check | audit"
@@ -97,6 +98,12 @@ pipeline:
 	@mkdir -p -m 700 $(ART) $(DATA)/ledgers
 	cd $(BOT) && $(PY) tools/ms_pipeline.py run --history-root $(HIST) --universe-dir $(UNI) --spot-dir $(SPOT) --artifacts-dir $(ART)/run-$(END) --ledger-dir $(DATA)/ledgers \
 	  --start-ms $(START) --end-ms $(END) --candidate $${CAND:-research/candidates/cash_and_carry.json} --execution-policy MAKER_FIRST --derive-risk-policy --mode REPLAY
+
+# --- the pre-registered regime-conditioned carry evaluator: offline, read-only, ONE trial in the persistent ledger (an identical re-run is the same trial)
+regime-eval:
+	@test -n "$(HIST)" -a -n "$(UNI)" || { echo "set HIST= (history data root) and UNI="; exit 2; }
+	@mkdir -p -m 700 $(DATA)/ledgers
+	cd $(BOT) && $(PY) tools/regime_entry_eval.py --history-root $(HIST) --universe-dir $(UNI) --spot-dir "$(SPOT)" --mark-interval 240 --ledger-dir $(DATA)/ledgers --json $(DATA)/regime-eval-latest.json
 
 # --- Testnet: READ-ONLY steps only. The execute step is intentionally not a make target (RUNBOOKS: Testnet execution: owner procedure).
 testnet-preflight:
