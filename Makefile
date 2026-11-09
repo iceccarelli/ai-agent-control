@@ -9,6 +9,12 @@ OPS   ?= $(HOME)/.ai-agent-control/ops
 ROOT  ?= $(DATA)/md-collector
 UNI   ?= $(shell ls -d $(DATA)/universe-v3-* 2>/dev/null | sort | tail -1)
 HIST  ?= $(shell ls -d $(DATA)/md-2* 2>/dev/null | sort | tail -1)
+# THE LAYOUT (RUNBOOKS "Codespaces operations"): ~/datasets/universe-v3-<ts>/ (capture), md-<UTC date>/ (history roots, `plan` subtracts the newest), full-history/data (the backfill `make backfill`
+# writes: the history to EVALUATE once it exists), spot-snap/spot-instruments/snapshot-<ms> (market_history.py spot-instruments --out-root ~/datasets/spot-snap), md-collector (the supervised collector).
+# An explicit HIST= on the command line (or in the environment) always wins.
+FULL  ?= $(DATA)/full-history/data
+EVALHIST = $(if $(filter command line environment,$(origin HIST)),$(HIST),$(if $(wildcard $(FULL)),$(FULL),$(HIST)))
+STOPF := $(DATA)/STOP-md-collector
 SPOT  ?= $(shell ls -d $(DATA)/spot-snap/spot-instruments/snapshot-* 2>/dev/null | sort | tail -1)
 ART   ?= $(DATA)/pipeline-out
 PY    ?= python3
@@ -53,23 +59,23 @@ backfill:
 
 # --- continuous PUBLIC collector, supervised; ENABLED marks the owner's intent so a Codespace restart resumes it (see ops-resume)
 collect-start:
-	@mkdir -p -m 700 $(OPS) && rm -f $(DATA)/STOP && touch $(OPS)/ENABLED
+	@mkdir -p -m 700 $(OPS) && rm -f $(STOPF) && touch $(OPS)/ENABLED
 	@if [ -f $(OPS)/supervisor.pid ] && kill -0 $$(cat $(OPS)/supervisor.pid) 2>/dev/null; then echo "already running (pid $$(cat $(OPS)/supervisor.pid))"; else \
-	  nohup $(PY) ops/collector_supervisor.py --root $(ROOT) --state-dir $(OPS) --stop-file $(DATA)/STOP >> $(OPS)/supervisor.log 2>&1 & echo $$! > $(OPS)/supervisor.pid; echo "started pid $$(cat $(OPS)/supervisor.pid); log: $(OPS)/supervisor.log"; fi
+	  nohup $(PY) ops/collector_supervisor.py --root $(ROOT) --state-dir $(OPS) --stop-file $(STOPF) >> $(OPS)/supervisor.log 2>&1 & echo $$! > $(OPS)/supervisor.pid; echo "started pid $$(cat $(OPS)/supervisor.pid); log: $(OPS)/supervisor.log"; fi
 
 collect-stop:
-	@rm -f $(OPS)/ENABLED; touch $(DATA)/STOP; echo "stop file written: the collector stops cleanly after its current cycle"
+	@rm -f $(OPS)/ENABLED; touch $(STOPF); echo "stop file written: the collector stops cleanly after its current cycle"
 
 collect-status:
 	@if [ -f $(OPS)/supervisor.pid ] && kill -0 $$(cat $(OPS)/supervisor.pid) 2>/dev/null; then echo "supervisor: running (pid $$(cat $(OPS)/supervisor.pid))"; else echo "supervisor: not running"; fi
 	@test -f $(OPS)/ALERT && { echo "ALERT:"; cat $(OPS)/ALERT; } || true
-	@test -f $(ROOT)/health.json && $(PY) -c "import json;d=json.load(open('$(ROOT)/health.json'));print({k:d.get(k) for k in ('status','stop_reason','last_cycle','consecutive_failures','refusal','last_seal','last_backup','last_restore_check')})" || echo "no health.json yet"
+	@test -f $(ROOT)/health.json && $(PY) -c "import json;d=json.load(open('$(ROOT)/health.json'));print({k:d.get(k) for k in ('status','stop_reason','last_cycle','consecutive_failures','refusal','disk','last_seal','last_backup','last_restore_check')})" || echo "no health.json yet"
 
 collect-log:
 	@tail -n 40 $(OPS)/supervisor.log
 
 ops-resume:
-	@if [ -f $(OPS)/ENABLED ]; then $(MAKE) --no-print-directory collect-start; fi; if [ -f $(OPS)/ENABLED -a -f $(OPS)/control-centre.enabled ]; then $(MAKE) --no-print-directory control-centre-start; fi
+	@if [ -f $(OPS)/ENABLED ]; then $(MAKE) --no-print-directory collect-start; fi; if [ -f $(OPS)/control-centre.enabled ]; then $(MAKE) --no-print-directory control-centre-start; fi
 
 seal:
 	cd $(BOT) && $(PY) tools/market_collector.py seal --root $(ROOT) --manifest $(HOME)/seals/md-seal.jsonl
@@ -87,7 +93,7 @@ audit:
 control-centre-start:
 	@mkdir -p -m 700 $(OPS) $(ART) && touch $(OPS)/control-centre.enabled
 	@if [ -f $(OPS)/cc.pid ] && kill -0 $$(cat $(OPS)/cc.pid) 2>/dev/null; then echo "control centre already running"; else \
-	  cd $(BOT) && nohup $(PY) tools/control_centre.py --data-root $(ROOT) --universe-dir "$(UNI)" --artifacts-dir $(ART) --port $(PORT) >> $(OPS)/cc.log 2>&1 & echo $$! > $(OPS)/cc.pid; echo "control centre on http://127.0.0.1:$(PORT) (Ports tab, keep it private)"; fi
+	  cd $(BOT) && nohup $(PY) tools/control_centre.py --data-root $(ROOT) --universe-dir "$(UNI)" --artifacts-dir $(ART)/latest --testnet-dir $(HOME)/.ai-agent-control/ms_testnet --port $(PORT) >> $(OPS)/cc.log 2>&1 & echo $$! > $(OPS)/cc.pid; echo "control centre on http://127.0.0.1:$(PORT) (Ports tab, keep it private)"; fi
 
 control-centre-stop:
 	@rm -f $(OPS)/control-centre.enabled; test -f $(OPS)/cc.pid && kill $$(cat $(OPS)/cc.pid) 2>/dev/null; rm -f $(OPS)/cc.pid; echo stopped
@@ -96,14 +102,17 @@ control-centre-stop:
 pipeline:
 	@test -n "$(START)" -a -n "$(END)" -a -n "$(SPOT)" || { echo "usage: make pipeline START=<ms> END=<ms> SPOT=<spot-snapshot-dir> [CAND=research/candidates/cash_and_carry.json]"; exit 2; }
 	@mkdir -p -m 700 $(ART) $(DATA)/ledgers
-	cd $(BOT) && $(PY) tools/ms_pipeline.py run --history-root $(HIST) --universe-dir $(UNI) --spot-dir $(SPOT) --artifacts-dir $(ART)/run-$(END) --ledger-dir $(DATA)/ledgers \
+	cd $(BOT) && $(PY) tools/ms_pipeline.py run --history-root $(EVALHIST) --universe-dir $(UNI) --spot-dir $(SPOT) --artifacts-dir $(ART)/run-$(END) --ledger-dir $(DATA)/ledgers \
 	  --start-ms $(START) --end-ms $(END) --candidate $${CAND:-research/candidates/cash_and_carry.json} --execution-policy MAKER_FIRST --derive-risk-policy --mode REPLAY
+	@# the control centre reads $(ART)/latest (an artifacts dir must be NEW or EMPTY per run, so it cannot read $(ART) itself); linked only after the run succeeded
+	ln -sfn run-$(END) $(ART)/latest
 
 # --- the pre-registered regime-conditioned carry evaluator: offline, read-only, ONE trial in the persistent ledger (an identical re-run is the same trial)
 regime-eval:
-	@test -n "$(HIST)" -a -n "$(UNI)" || { echo "set HIST= (history data root) and UNI="; exit 2; }
+	@test -n "$(EVALHIST)" -a -n "$(UNI)" || { echo "set HIST= (history data root) and UNI="; exit 2; }
+	@test -n "$(SPOT)" || { echo "no spot snapshot under $(DATA)/spot-snap/spot-instruments; set SPOT=<snapshot dir> (market_history.py spot-instruments --out-root $(DATA)/spot-snap)"; exit 2; }
 	@mkdir -p -m 700 $(DATA)/ledgers
-	cd $(BOT) && $(PY) tools/regime_entry_eval.py --history-root $(HIST) --universe-dir $(UNI) --spot-dir "$(SPOT)" --mark-interval 240 --ledger-dir $(DATA)/ledgers --json $(DATA)/regime-eval-latest.json
+	cd $(BOT) && $(PY) tools/regime_entry_eval.py --history-root $(EVALHIST) --universe-dir $(UNI) --spot-dir "$(SPOT)" --mark-interval 240 --ledger-dir $(DATA)/ledgers --json $(DATA)/regime-eval-latest.json
 
 # --- Testnet: READ-ONLY steps only. The execute step is intentionally not a make target (RUNBOOKS: Testnet execution: owner procedure).
 testnet-preflight:
