@@ -286,3 +286,25 @@ def test_the_transports_own_host_and_path_checks_hold_without_the_capability_lay
     ok = tt(spy)
     ok.request("GET", "https://api-testnet.bybit.com/v5/market/time", headers={}, timeout=1)          # positive control: the same bypass lets the right URL through
     assert spy.calls
+
+
+# ---------------------------------------------------------------- the first real contact: a unified account reports its trade permission as Derivatives.DerivativesTrade
+def test_a_unified_account_key_with_only_trade_permissions_passes():
+    bad, summary = TT.key_permission_findings(_perm(Derivatives=["DerivativesTrade"], Spot=["SpotTrade"]))
+    assert bad == [] and "Derivatives.DerivativesTrade" in summary["granted"]
+    bad, _ = TT.key_permission_findings(_perm(ContractTrade=["Order", "Position"], Derivatives=["DerivativesTrade"], Spot=["SpotTrade"]))
+    assert bad == []
+
+
+def test_the_owners_real_broad_key_is_refused_for_exactly_the_wallet_and_exchange_permissions():
+    # the four permissions the real preflight flagged on 2026-11-09, plus the ones it accepted
+    real = _perm(ContractTrade=["Order", "Position"], Derivatives=["DerivativesTrade"], Spot=["SpotTrade"], Wallet=["AccountTransfer", "SubMemberTransfer"], Exchange=["ExchangeHistory"])
+    bad, _ = TT.key_permission_findings(real)
+    assert sorted(bad) == ["KEY_HAS_EXTRA_PERMISSION:Exchange.ExchangeHistory", "KEY_HAS_TRANSFER_OR_WITHDRAW:Wallet.AccountTransfer", "KEY_HAS_TRANSFER_OR_WITHDRAW:Wallet.SubMemberTransfer"]
+
+
+@pytest.mark.parametrize("perms", [{"Derivatives": ["DerivativesTrade", "Withdraw"]}, {"Derivatives": ["DerivativesRead"]}, {"Derivatives": ["Transfer"]}, {"Derivatives": ["DerivativesTrade"], "Wallet": ["Withdraw"]},
+                                    {"Derivatives": ["DerivativesTrade"], "Exchange": ["Convert"]}, {"Derivatives": ["DerivativesTrade"], "Options": ["OptionsTrade"]}])
+def test_nothing_beyond_the_trade_permission_is_accepted_under_derivatives(perms):
+    bad, _ = TT.key_permission_findings({"readOnly": 0, "permissions": perms, "ips": ["*"]})
+    assert bad, perms

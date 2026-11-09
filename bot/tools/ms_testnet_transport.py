@@ -209,12 +209,15 @@ def build_client(creds: TestnetCredentials, inner: Any) -> Tuple[Any, TestnetTra
     return client, transport
 
 
-_ALLOWED_PERMS = {"ContractTrade": {"Order", "Position"}, "Spot": {"SpotTrade"}}
+#: ``Derivatives.DerivativesTrade`` is how a UNIFIED account's key reports Bybit's "Unified Trading - Trade" permission (seen on the first real Testnet preflight, 2026-11-09). It is a TRADE
+#: permission of the same class as ContractTrade, not a transfer, withdrawal, convert or history right; nothing else under ``Derivatives`` is accepted.
+_ALLOWED_PERMS = {"ContractTrade": {"Order", "Position"}, "Spot": {"SpotTrade"}, "Derivatives": {"DerivativesTrade"}}
 _DANGER_WORDS = ("withdraw", "transfer", "deposit", "submember", "subaccount", "api")
 
 
 def key_permission_findings(result: Any) -> Tuple[List[str], Dict[str, Any]]:
-    """(refusal codes, safe summary) for a ``/v5/user/query-api`` result. Least privilege: only ContractTrade[Order, Position] and Spot[SpotTrade] may be granted; any Wallet /
+    """(refusal codes, safe summary) for a ``/v5/user/query-api`` result. Least privilege: only ContractTrade[Order, Position], Derivatives[DerivativesTrade] (a unified account's trade
+    permission) and Spot[SpotTrade] may be granted; any Wallet /
     transfer / withdraw permission, any other non-empty category, a read-only key (cannot trade) or an unreadable shape is refused. The summary never contains the key id or key."""
     if not isinstance(result, Mapping):
         return ["KEY_INFO_UNREADABLE"], {}
