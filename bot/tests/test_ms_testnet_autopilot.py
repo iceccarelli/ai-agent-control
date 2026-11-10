@@ -1136,3 +1136,89 @@ def test_a_lease_lost_between_the_start_of_execute_and_the_first_entry_order_pla
     entry_posts = [r for r in w.fake.requests if r[0] == "POST" and "/order/create" in str(r[1])]
     assert not entry_posts, f"an entry order was sent without fresh authority: {entry_posts}"
     assert res["orders"] == 0 if "orders" in res else True
+
+
+# ---------------------------------------------------------------- the execution lifecycle as evidence (kinds/stages in order, guard-clean, no raw venue ids)
+import exec_lifecycle as EL  # noqa: E402
+
+
+def _collect(w, eng_name="eng_ev", **kw):
+    got = []
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=str(w.tmp / eng_name),
+                      on_event=lambda kind, stage, payload, n=0: got.append((kind, stage, dict(payload), n)), **kw)
+    return res, got
+
+
+def test_a_session_emits_the_whole_lifecycle_in_order_and_every_event_passes_the_evidence_guard(w):
+    _profit_world(w)
+    res, got = _collect(w)
+    assert res["result"] == "DONE", res
+    stages = [g[1] for g in got]
+    order = ["CAPITAL_ALLOCATED", "PLAN_CREATED", "RISK_APPROVED", "LEASE_VERIFIED", "ORDER_VENUE_RECORD", "FILL_VENUE_RECORD", "VENUE_FLAT_VERIFIED", "COSTS_BOOKED", "SESSION_RECONCILED"]
+    idx = [stages.index(x) for x in order]
+    assert idx == sorted(idx), stages
+    assert stages.count("ORDER_VENUE_RECORD") >= 2 and stages.count("FILL_VENUE_RECORD") >= 2                              # both legs entered and both were exited
+    sid = os.path.basename(res["state_dir"])
+    seen_ids = set()
+    for kind, stage, payload, n in got:
+        ev = XE.make_event(kind, {"stage": stage, **payload}, session_id=sid, occurred_at_ms=w.clock.now(), event_id=EL.event_id(sid, kind, stage, n))     # the REAL secret guard
+        assert ev["kind"] in XE.KINDS and ev["event_id"] not in seen_ids
+        seen_ids.add(ev["event_id"])
+
+
+def test_lifecycle_evidence_names_who_said_it_and_never_leaks_raw_venue_ids(w):
+    _profit_world(w)
+    res, got = _collect(w)
+    rec = json.load(open(os.path.join(res["state_dir"], "testnet_session.json")))
+    blob = json.dumps(got, default=str)
+    raw = [str(o["order_id"]) for o in rec["orders"] if o.get("order_id")] + [str(x["exec_id"]) for x in rec["executions"]] + [o["link_id"] for o in rec["orders"]]
+    assert raw and not [r for r in raw if r in blob], "a raw venue identifier reached the evidence payload"
+    src = {g[1]: g[2]["source"] for g in got}
+    assert src["ORDER_VENUE_RECORD"] == "VENUE" and src["FILL_VENUE_RECORD"] == "VENUE" and src["VENUE_FLAT_VERIFIED"] == "VENUE"
+    assert src["COSTS_BOOKED"] == "LEDGER" and src["PLAN_CREATED"] == "LOCAL" and src["RISK_APPROVED"] == "LOCAL"
+    flat = next(g for g in got if g[1] == "VENUE_FLAT_VERIFIED")[2]
+    assert flat["venue_flat_verified"] is True
+    cost = next(g for g in got if g[1] == "COSTS_BOOKED")[2]
+    assert "components only" in cost["note"]                                                                              # costs are not cash and not profit
+
+
+def test_the_next_session_settles_the_previous_one_and_emits_the_settlement_and_the_capital_book(w):
+    _profit_world(w)
+    res1, got1 = _collect(w)
+    assert res1["result"] == "DONE" and not [g for g in got1 if g[1] == "CAPITAL_SETTLED"]
+    w.clock.sleep(1800)                                                                                                   # a later cycle (the fake venue is flat again)
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    res2, got2 = _collect(w)
+    st = [g[1] for g in got2]
+    if res2["result"] in ("DONE", "SKIPPED") and "CAPITAL_SETTLED" in st:
+        ev = next(g for g in got2 if g[1] == "CAPITAL_SETTLED")
+        assert ev[2]["source"] == "CASH" and ev[2]["for_session"] == os.path.basename(res1["state_dir"])
+        book = next(g for g in got2 if g[1] == "CAPITAL_BOOK")
+        assert book[0] == "DAILY_PNL" and "TESTNET SIMULATION" in book[2]["label"] and "verified_result_usd" in book[2]
+        XE.make_event("DAILY_PNL", {"stage": "CAPITAL_BOOK", **book[2]}, session_id="s_settle_1", occurred_at_ms=1)
+    else:
+        pytest.fail(f"the second cycle did not settle the first: {res2['result']} {res2.get('why')} {st}")
+
+
+def test_an_unexplained_cash_refusal_still_leaves_evidence(w):
+    _profit_world(w)
+    eng = str(w.tmp / "eng_ev2")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("1")
+    b.park("prev_session", "1", "0.50", True, True)
+    res, got = _collect(w, "eng_ev2")
+    assert res["result"] == "REFUSED" and [g[1] for g in got] == ["CAPITAL_SETTLED"] and got[0][2]["status"] == "UNEXPLAINED_CASH"
+
+
+def test_the_loop_routes_lifecycle_events_into_the_real_outbox_with_deterministic_ids(w, tmp_path):
+    outbox = XE.Outbox(str(tmp_path / "ob"), clock=lambda: 1_794_312_000_000)                                              # a fixed clock: the same fact is the same content
+    tel = AP.EvidenceTelemetry(outbox, CapturingSync(), w.clock.now)
+    sid = "ms_auto_20261110T000000"
+    eid = EL.event_id(sid, "PLAN", "PLAN_CREATED", 0)
+    assert eid == f"{sid}:PLAN:PLAN_CREATED:0"
+    tel.event("PLAN", {"stage": "PLAN_CREATED", "source": "LOCAL"}, sid, event_id=eid)
+    tel.event("PLAN", {"stage": "PLAN_CREATED", "source": "LOCAL"}, sid, event_id=eid)                                      # a replay of the same fact
+    assert tel.pending() == 1                                                                                              # suppressed, not stored twice
+    with pytest.raises(XE.EventConflict):                                                                                  # the same id for a DIFFERENT fact is refused (and quarantined), never overwritten
+        tel.event("PLAN", {"stage": "PLAN_CREATED", "source": "LOCAL", "notional_usd": "999.0000"}, sid, event_id=eid)
+    assert tel.pending() == 1

@@ -638,6 +638,30 @@ Bybit TESTNET only (fake money, `api-testnet.bybit.com`). Nothing in this reposi
 
 **Not verified offline.** Real latency and fill behaviour, real retCodes beyond the documented ones, the real spot fee currency and dust after the exit sell, funding, thin testnet books, IP / region access, and that the real `requests` inner transport follows no redirect (configured, not exercised).
 
+## Capital book, evidence chain and the inventory tool (owner; no order, no credential)
+
+**What the unattended engine does with capital.** Day one it deploys 40% of the $500 ceiling (never the whole grant); the compounded size never exceeds 80% of the ceiling and never exceeds your grant. Realised results come ONLY from the venue's own USDT wallet cash read at the start of consecutive sessions with the account verified flat in between: a loss is booked in full, a gain only as far as the ledger's known components explain it, unexplained cash credits nothing, and unexplained cash with funding read raises an ALERT and stops new entries. 25% of every verified gain is withheld from the sizing basis (the reserve). Two consecutive losses halve the size; four stop entries until you acknowledge. Everything is Testnet simulation, not real performance.
+
+```bash
+cd bot
+python3 tools/ms_testnet_autopilot.py capital                                   # the verified-realised book (no network)
+python3 tools/ms_testnet_autopilot.py capital --ack-halt                        # ONLY after you reviewed the losses that stopped entries
+python3 tools/ms_testnet_autopilot.py capital --reserve-fraction 0.5            # withhold more of each verified gain (0..0.9)
+python3 tools/ms_testnet_autopilot.py capital --declare-transfer faucet-1 500   # a deposit (+) or withdrawal (-) YOU made: never a trading result
+```
+
+Declare a deposit or withdrawal BEFORE the next session starts; an undeclared one shows up as unexplained cash (a gain is never credited, a loss is).
+
+**Evidence chain.** Each session writes these to the durable outbox, in order: `CAPITAL_ALLOCATED`, `PLAN_CREATED`, `RISK_APPROVED`, `LEASE_VERIFIED`, `ORDER_VENUE_RECORD`, `FILL_VENUE_RECORD`, `VENUE_FLAT_VERIFIED`, `COSTS_BOOKED`, `SESSION_RECONCILED`; the NEXT session adds `CAPITAL_SETTLED` and `CAPITAL_BOOK`. Every event says WHO said it (`source`: LOCAL decision, VENUE record, LEDGER arithmetic, CASH read). Raw venue order and fill ids never leave the machine (16-hex references only). An outbox append is not venue confirmation, a venue-flat read is not profit, and the `COSTS_BOOKED` components are not cash.
+
+**Read-only data inventory (run in your Codespace; it never opens a database or a credential file and never writes in the folders it inspects):**
+
+```bash
+cd bot && python3 tools/dataset_inventory.py --root $HOME/datasets --root $HOME/backups --root $HOME/seals --out $HOME/inventory.json
+```
+
+Coverage is derived from day tokens in file names and says so; file times only say when something was written.
+
 ## Codespaces operations: arm the Codespace, keep the public collector alive (offline-safe; no order path)
 Everything below is run by the owner in the Codespace terminal from the repository root. The root `Makefile`, `ops/collector_supervisor.py` and `.devcontainer/devcontainer.json` contain NO order path, NO live switch and NO credential value; `tests/test_ops_layer.py` fails if an active line names an execute/unwind path, `LIVE_TRADING_ACK`, `USE_TESTNET=0`, `PAPER_TRADING=0`, a mainnet host or a generic `BYBIT_API_*` key. The Testnet `execute` step is deliberately not a make target.
 

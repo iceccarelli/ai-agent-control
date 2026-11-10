@@ -41,6 +41,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import exec_lifecycle as EL  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
@@ -225,13 +226,17 @@ def _res(result: str, why: Sequence[str] = (), **kw: Any) -> Dict[str, Any]:
     return {"result": result, "why": list(why), **kw}
 
 
+def _noop_event(_kind: str, _stage: str, _payload: Mapping[str, Any], _n: int = 0) -> None:
+    return None
+
+
 def _noop_state(_state: str, _source: str) -> None:
     return None
 
 
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
              out: Callable[[str], None] = print, state_root: Optional[str] = None, engine_root: Optional[str] = None, lease: Any = None,
-             on_state: Callable[[str, str], None] = _noop_state, dry_run: bool = False, **_ignored: Any) -> Dict[str, Any]:
+             on_state: Callable[[str, str], None] = _noop_state, on_event: Callable[..., None] = _noop_event, dry_run: bool = False, **_ignored: Any) -> Dict[str, Any]:
     clock = clock or (lambda: int(time.time() * 1000))
     sleep = sleep or time.sleep
     now = int(clock())
@@ -271,15 +276,28 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
     try:
-        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state)
+        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event)
     finally:
         _ACTIVE["dir"] = None
 
 
 def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], d: str, sym: str, g: Mapping[str, Any], hold_s: int,
                  rate: float, session_class: str, verdict: EG.EdgeVerdict, manifest: Mapping[str, Any], engine_root: str, lease: Any,
-                 on_state: Callable[[str, str], None]) -> Dict[str, Any]:
+                 on_state: Callable[[str, str], None], on_event: Callable[..., None] = _noop_event) -> Dict[str, Any]:
     lines: List[str] = []
+    counts: Dict[Tuple[str, str], int] = {}
+
+    def emit(evt: Optional[Tuple[str, str, Dict[str, Any]]]) -> None:
+        """One lifecycle fact -> the durable outbox, with a deterministic per-session sequence. Evidence must never affect safety or availability."""
+        if evt is None:
+            return
+        kind, stage, payload = evt
+        n = counts.get((kind, stage), 0)
+        counts[(kind, stage)] = n + 1
+        try:
+            on_event(kind, stage, payload, n)
+        except Exception:                                            # noqa: BLE001
+            pass
 
     def step(*argv: str, sl: Optional[Callable[[float], None]] = None, poc: Optional[Callable[[], Optional[str]]] = None) -> int:
         return S.main(["--state-dir", d, *argv], env=env, inner_transport=inner, clock_ms=clock, sleep=sl or sleep, input_fn=lambda _p: "", out=lines.append, pre_order_check=poc)
@@ -294,6 +312,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     book.ensure_baseline(usdt_now)
     settled = book.settle(usdt_now)                                   # what the venue's cash REALLY did since the last verified-flat session (losses in full; gains only as far as explained)
     if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
+        emit(EL.capital_settled(settled))
         ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
         return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     cb = book.load()
@@ -301,6 +320,10 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
                         loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
                                                           "edge": verdict.as_dict(), "allocation": alloc.as_dict(), "capital_settlement": settled})
+    emit(EL.capital_settled(settled))
+    if settled.get("status") not in ("NO_PENDING", "CASH_UNKNOWN"):
+        emit(EL.capital_book(book.report()))
+    emit(EL.capital_allocated(alloc.as_dict(), settled))
     if alloc.notional <= 0:                                           # the allocator can only say LESS than the owner's limits; zero is a decision to stay idle
         return _res("SKIPPED", ["ALLOCATION_ZERO:" + alloc.binding], state_dir=d, allocation=alloc.as_dict())
     if step("plan", "--symbol", sym, "--notional-usd", str(alloc.notional), "--hold-seconds", str(hold_s)) != 0:
@@ -310,6 +333,11 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
             digest = json.load(fh)["plan_digest"]
     except (OSError, ValueError, KeyError):
         return _res("ERROR", ["PLAN_UNREADABLE"], state_dir=d)
+    try:
+        with open(os.path.join(d, "plan.json"), encoding="utf-8") as fh:
+            emit(EL.plan_created(json.load(fh)))
+    except (OSError, ValueError):
+        pass
     on_state("PLAN_PROPOSED", "plan_written")
     lines.clear()
     if step("assess") != 0:
@@ -321,6 +349,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("SKIPPED", ["ASSESS_UNREADABLE"], state_dir=d)
     if bad:
         return _res("SKIPPED", ["ASSESS_NOT_APPROVED:" + ",".join(bad)], state_dir=d)
+    emit(EL.risk_approved(a))
     on_state("RISK_APPROVED", "assess_approved")
     lines.clear()
     if _STOP.is_set():                                               # a stop arrived before any order: nothing was placed, no entry was counted
@@ -328,6 +357,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     why_now = revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
+    emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
 
@@ -349,6 +379,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     known = None if (fees is None or price is None) else price - fees + (fund or D(0))
     book.park(os.path.basename(d), usdt_now, known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT flat cash read, never from fill arithmetic alone
     summary["allocation"] = alloc.as_dict()
+    for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT")):
+        emit(evt)
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
@@ -501,7 +533,7 @@ class NullTelemetry:
     def heartbeat(self, hb: Mapping[str, Any], drain: bool = True) -> None:
         return None
 
-    def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None) -> None:
+    def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None, event_id: Optional[str] = None) -> None:
         return None
 
     def pending(self) -> int:
@@ -589,8 +621,8 @@ class EvidenceTelemetry:
     def pending(self) -> int:
         return int(self.outbox.pending)                                  # a property on exec_evidence.Outbox
 
-    def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None) -> None:
-        self.outbox.append(kind, payload, session_id=session_id)
+    def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None, event_id: Optional[str] = None) -> None:
+        self.outbox.append(kind, payload, session_id=session_id, event_id=event_id)
 
     def heartbeat(self, hb: Mapping[str, Any], drain: bool = True) -> None:
         now = int(self._clock())
@@ -700,6 +732,14 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             pass
         return st
 
+    def on_event(kind: str, stage: str, payload: Mapping[str, Any], n: int = 0) -> None:
+        """A lifecycle fact from the session -> the durable outbox under a deterministic id (a duplicate is a no-op, never a second record)."""
+        sid = os.path.basename(_ACTIVE["dir"]) if _ACTIVE.get("dir") else None
+        try:
+            tel.event(kind, {"stage": stage, **payload}, sid, event_id=EL.event_id(sid or "engine", kind, stage, n))
+        except Exception:                                            # noqa: BLE001 - evidence must never affect safety or availability
+            pass
+
     def alert(code: str, body: Mapping[str, Any], why: Sequence[str] = ()) -> None:
         """Set the persistent ALERT marker AND emit an INCIDENT event (the independent monitor alerts the owner on it)."""
         eng.set("ALERT", {"code": code, **body})
@@ -781,7 +821,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             idle("DRAINING", "drain_requested")
             continue
         try:
-            res = once(env, clock=clock, sleep=session_sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src), **kw)
+            res = once(env, clock=clock, sleep=session_sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src), on_event=on_event, **kw)
         except Exception as exc:                                     # noqa: BLE001 - a session died with an exception: it may have legs open. Never carry on; prove the venue flat first.
             res = {"result": "ERROR", "why": [f"UNEXPECTED_EXCEPTION:{type(exc).__name__}"]}
             recovered = False
