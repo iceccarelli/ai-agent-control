@@ -1,8 +1,8 @@
 # Money mission and operator handover
 
-**Repository:** `iceccarelli/ai-agent-control`  
-**Snapshot date:** 2026-11-10 (UTC)  
-**Snapshot main before this handover update:** `e146212e040e3bf0eca9eafa643c286cc2ec411b`  
+**Repository:** `iceccarelli/ai-agent-control`
+**Snapshot date:** 2026-11-10 (UTC)
+**Snapshot main before this handover update:** `e146212e040e3bf0eca9eafa643c286cc2ec411b`
 **Purpose:** give Claude Code a verified starting point and an economically ranked plan. Re-check all dated operational facts before acting.
 
 ## 1. Commercial objective
