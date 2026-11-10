@@ -28,9 +28,7 @@ OUT="$(docker run --rm -v "$VOL":/data "$IMG" sh -c 'id -un; stat -c "%U %a" /da
 [ "$(echo "$OUT" | sed -n 4p)" = "/data" ] || fail "HOME is not /data: $OUT"
 
 echo "== an owner file that arrives root-owned and world-readable is fixed by the entrypoint"
-mkdir -p "$VOL/.ai-agent-control"
-echo '{}' > "$VOL/.ai-agent-control/ms_autopilot_grant.json"
-chmod 644 "$VOL/.ai-agent-control/ms_autopilot_grant.json"
+docker run --rm -v "$VOL":/data --entrypoint sh "$IMG" -c 'mkdir -p /data/.ai-agent-control && echo "{}" > /data/.ai-agent-control/ms_autopilot_grant.json && chown root:root /data/.ai-agent-control/ms_autopilot_grant.json && chmod 644 /data/.ai-agent-control/ms_autopilot_grant.json'
 MODE="$(docker run --rm -v "$VOL":/data "$IMG" stat -c '%U %a' /data/.ai-agent-control/ms_autopilot_grant.json)"
 [ "$MODE" = "bot 600" ] || fail "the grant file is not bot:600 after the entrypoint: $MODE"
 
@@ -67,7 +65,8 @@ CID="$(docker run -d -v "$VOL2":/data "$IMG")"
 sleep 10
 docker exec "$CID" sh -c 'test "$(awk "/^Uid:/ {print \$2}" /proc/1/status)" = "$(id -u bot)"' || fail "PID 1 is not running as bot"
 docker exec "$CID" sh -c 'tr "\0" " " < /proc/1/cmdline' | grep -q 'ms_testnet_autopilot.py loop' || fail "PID 1 is not the autopilot loop"
-[ -f "$VOL2/.ai-agent-control/ms_autopilot/engine_state.json" ] || fail "the engine wrote no state to the volume"
+vol2_sh() { docker run --rm -v "$VOL2":/data --entrypoint sh "$IMG" -c "$1"; }       # the volume belongs to bot: inspect it from inside a container, never from the host user
+vol2_sh 'test -f /data/.ai-agent-control/ms_autopilot/engine_state.json' || fail "the engine wrote no state to the volume"
 START="$(date +%s)"
 docker stop -t 30 "$CID" >/dev/null
 ELAPSED=$(( $(date +%s) - START ))
@@ -75,5 +74,5 @@ CODE="$(docker inspect -f '{{.State.ExitCode}}' "$CID")"
 [ "$CODE" = "0" ] || fail "the engine did not exit cleanly on SIGTERM (exit code $CODE; 137 means it was killed)"
 [ "$ELAPSED" -lt 20 ] || fail "the engine took ${ELAPSED}s to stop on SIGTERM"
 docker logs "$CID" 2>&1 | grep -q 'stop signal: stopped' || fail "the loop did not report the stop signal"
-grep -q '"state": "STOPPED"' "$VOL2/.ai-agent-control/ms_autopilot/engine_state.json" || fail "the final persisted state is not STOPPED"
+vol2_sh 'grep -q "\"state\": \"STOPPED\"" /data/.ai-agent-control/ms_autopilot/engine_state.json && test "$(stat -c %a /data/.ai-agent-control/ms_autopilot/engine_state.json)" = 600' || fail "the final persisted state is not STOPPED (or the state file is not mode 600)"
 echo "ALL AUTOPILOT IMAGE CHECKS PASSED"
