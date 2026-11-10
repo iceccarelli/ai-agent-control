@@ -135,3 +135,55 @@ def test_scrub_env_is_an_allow_list_with_a_deny_overlay():
 def test_the_deny_overlay_holds_even_if_a_secret_looking_name_were_allow_listed(monkeypatch):
     monkeypatch.setattr(RS, "RECORDER_ENV_ALLOW", RS.RECORDER_ENV_ALLOW + ("BYBIT_API_KEY", "MY_TOKEN"))
     assert RS.scrub_env({"PATH": "/bin", "BYBIT_API_KEY": "k", "MY_TOKEN": "t"}) == {"PATH": "/bin"}
+
+
+# ---------------------------------------------------------------- the watchdog: a recorder that is ALIVE but SILENT
+def heartbeat_cmd(directory):
+    """A stand-in recorder that keeps rewriting its status file (the supervisor scrubs the child's environment, so the path is embedded, not passed)."""
+    return ("import time\n"
+            f"p = {os.path.join(str(directory), 'recorder_status.json')!r}\n"
+            "while True:\n"
+            "    open(p, 'w').write('{}')\n"
+            "    time.sleep(0.05)\n")
+
+
+def test_a_hung_recorder_is_terminated_and_restarted_once_per_backoff_step_and_counted(tmp_path):
+    """REPRODUCED: the supervisor only reacted to a recorder PROCESS EXIT, so a recorder that stayed alive without rewriting its status file was STALE for ever."""
+    s = sup("import time; time.sleep(2.5)", "import time; time.sleep(60)", tmp_path, watchdog_stale_s=0.3, watchdog_check_s=0.05)
+    assert s.run() == 0
+    assert 1 <= s.recorder_watchdog_kills <= 10                                  # repaired, and never in a tight loop
+    assert s.recorder_restarts >= 1
+    status = json.load(open(os.path.join(str(tmp_path), RS.STATUS_FILE)))
+    assert status["recorder_watchdog_kills"] == s.recorder_watchdog_kills and "recorder_status_age_s" in status
+
+
+def test_a_recorder_that_keeps_rewriting_its_status_is_never_touched(tmp_path):
+    s = sup("import time; time.sleep(1.5)", heartbeat_cmd(tmp_path), tmp_path, watchdog_stale_s=0.4, watchdog_check_s=0.05)
+    assert s.run() == 0
+    assert s.recorder_watchdog_kills == 0 and s.recorder_restarts == 0
+
+
+def test_a_stale_file_from_an_earlier_process_is_not_this_processs_heartbeat_but_does_not_cause_an_instant_kill(tmp_path):
+    p = tmp_path / RS.RECORDER_STATUS_FILE
+    p.write_text("{}")
+    old = time.time() - 3600
+    os.utime(p, (old, old))                                                      # an hour-old file left by the previous recorder
+    s = sup("import time; time.sleep(0.6)", "import time; time.sleep(60)", tmp_path, watchdog_stale_s=5.0, watchdog_check_s=0.05)
+    assert s.run() == 0
+    assert s.recorder_watchdog_kills == 0, "the age must count from THIS process's start, not from the old file's mtime"
+    age = RS.Supervisor.recorder_status_age_s
+    t = {"wall": 1000.0}
+    s2 = RS.Supervisor([PY, "-c", "pass"], [PY, "-c", "pass"], status_dir=str(tmp_path), wall=lambda: t["wall"])
+    s2.recorder, s2.recorder_started_wall = object(), 990.0
+    os.utime(p, (500.0, 500.0))
+    assert s2.recorder_status_age_s() == pytest.approx(10.0)                    # max(mtime, process start): the file predates the process, so the process start counts
+    os.utime(p, (995.0, 995.0))
+    assert s2.recorder_status_age_s() == pytest.approx(5.0)
+    assert age is RS.Supervisor.recorder_status_age_s
+
+
+def test_the_watchdog_can_be_disabled_and_needs_a_status_directory(tmp_path):
+    s = sup("import time; time.sleep(0.8)", "import time; time.sleep(60)", tmp_path, watchdog_stale_s=0, watchdog_check_s=0.05)
+    assert s.run() == 0 and s.recorder_watchdog_kills == 0
+    s2 = RS.Supervisor([PY, "-c", "pass"], [PY, "-c", "pass"])
+    assert s2.recorder_status_age_s() is None

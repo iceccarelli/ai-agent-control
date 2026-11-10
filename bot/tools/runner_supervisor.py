@@ -12,6 +12,9 @@ process that records the depth feed. This supervisor makes that arrangement safe
     it saw before the recorder existed;
   * the RECORDER is restarted when it dies, with a capped exponential backoff that resets
     after it has run stably; a recorder that cannot start never stops the monitor;
+  * a HUNG recorder (alive, but its ``recorder_status.json`` has not been rewritten for ``watchdog_stale_s``, measured from the later of the file's mtime and the process start) is
+    terminated like a dead one and restarted under the SAME backoff, counted in ``recorder_watchdog_kills``: a recorder that cannot recover is restarted at most once per backoff
+    step, never in a tight loop, and the monitor keeps reporting the stale status for as long as it is stale (the watchdog repairs the process, it never hides the condition);
   * SIGTERM/SIGINT (a deploy, a stop) is forwarded to both, with a grace period, then
     SIGKILL; the supervisor exits 143;
   * without ``--recorder`` it replaces itself with the monitor (``exec``), i.e. it is
@@ -34,6 +37,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXIT_SIGNALLED = 143
 STATUS_FILE = "supervisor_status.json"
+RECORDER_STATUS_FILE = "recorder_status.json"
+WATCHDOG_STALE_S = 600.0             # twice the monitor's own staleness limit (300 s): the monitor alerts first, the watchdog repairs second
+WATCHDOG_CHECK_S = 15.0
 
 
 def _atomic_write(path: str, obj: Any) -> None:
@@ -71,7 +77,8 @@ class Supervisor:
                  status_dir: Optional[str] = None, grace_s: float = 30.0,
                  backoff_base_s: float = 5.0, backoff_max_s: float = 300.0,
                  stable_after_s: float = 600.0, poll_s: float = 0.25,
-                 mono: Callable[[], float] = time.monotonic) -> None:
+                 mono: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
+                 watchdog_stale_s: float = WATCHDOG_STALE_S, watchdog_check_s: float = WATCHDOG_CHECK_S) -> None:
         self.monitor_cmd, self.recorder_cmd = list(monitor_cmd), list(recorder_cmd) if recorder_cmd else None
         self.status_dir, self.grace_s = status_dir, float(grace_s)
         self.backoff_base_s, self.backoff_max_s = backoff_base_s, backoff_max_s
@@ -84,7 +91,12 @@ class Supervisor:
         self.recorder_next_start = 0.0
         self.recorder_last_exit: Optional[int] = None
         self.stopping = False
-        self.started_wall = time.time()
+        self.wall = wall
+        self.started_wall = self.wall()
+        self.watchdog_stale_s, self.watchdog_check_s = float(watchdog_stale_s), float(watchdog_check_s)
+        self.recorder_watchdog_kills = 0
+        self.recorder_started_wall = 0.0
+        self._next_watchdog = 0.0
 
     # -- children --------------------------------------------------------------------------------------
     def _spawn(self, cmd: Sequence[str], *, scrub: bool = False) -> subprocess.Popen:
@@ -96,6 +108,7 @@ class Supervisor:
         try:
             self.recorder = self._spawn(self.recorder_cmd or [], scrub=True)
             self.recorder_started_at = self.mono()
+            self.recorder_started_wall = self.wall()
         except OSError as exc:
             print(f"supervisor: the recorder could not be started ({type(exc).__name__}); "
                   "the monitor is unaffected", file=sys.stderr, flush=True)
@@ -106,6 +119,30 @@ class Supervisor:
         self.recorder_failures = 0 if lived_s >= self.stable_after_s else self.recorder_failures + 1
         delay = min(self.backoff_max_s, self.backoff_base_s * (2 ** max(0, self.recorder_failures - 1)))
         self.recorder_next_start = self.mono() + delay
+
+    def recorder_status_age_s(self) -> Optional[float]:
+        """Seconds since the recorder last REWROTE its status file, counted from its own start when it has not yet written one (a stale file from an earlier process is not this process's
+        heartbeat). None without a status directory or a recorder process."""
+        if not self.status_dir or self.recorder is None:
+            return None
+        try:
+            written = os.stat(os.path.join(self.status_dir, RECORDER_STATUS_FILE)).st_mtime
+        except OSError:
+            written = 0.0
+        return max(0.0, self.wall() - max(written, self.recorder_started_wall))
+
+    def _watchdog(self) -> None:
+        """Terminate a recorder that is alive but silent. The normal exit path below then restarts it under the capped backoff."""
+        if self.watchdog_stale_s <= 0 or self.recorder is None or self.recorder.poll() is not None:
+            return
+        age = self.recorder_status_age_s()
+        if age is None or age <= self.watchdog_stale_s:
+            return
+        self.recorder_watchdog_kills += 1
+        print(f"supervisor: the recorder (pid {self.recorder.pid}) has not rewritten its status for {age:.0f}s (limit {self.watchdog_stale_s:.0f}s): terminating it for a bounded restart",
+              file=sys.stderr, flush=True)
+        self._terminate([self.recorder])
+        self._write_status()
 
     def _write_status(self) -> None:
         if not self.status_dir:
@@ -120,7 +157,9 @@ class Supervisor:
                 "recorder_pid": getattr(self.recorder, "pid", None),
                 "recorder_restarts": self.recorder_restarts,
                 "recorder_consecutive_failures": self.recorder_failures,
-                "recorder_last_exit": self.recorder_last_exit})
+                "recorder_last_exit": self.recorder_last_exit,
+                "recorder_watchdog_kills": self.recorder_watchdog_kills,
+                "recorder_status_age_s": None if self.recorder_status_age_s() is None else round(self.recorder_status_age_s() or 0.0, 1)})
         except OSError:
             pass                           # status is a convenience, never a reason to stop
 
@@ -164,6 +203,9 @@ class Supervisor:
                 self._write_status()
                 return int(rc)
             if self.recorder_cmd:
+                if self.recorder is not None and self.mono() >= self._next_watchdog:
+                    self._next_watchdog = self.mono() + self.watchdog_check_s
+                    self._watchdog()
                 if self.recorder is not None:
                     r = self.recorder.poll()
                     if r is not None:

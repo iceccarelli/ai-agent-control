@@ -111,3 +111,34 @@ Every work item must close with:
 - Remaining owner-only action stated as a precise command or dashboard operation.
 
 Do not return another broad architecture proposal, a dashboard, a speculative ML layer, a new worker, or a documentation-only PR unless it unblocks one of the ranked priorities. The shortest path to more money is the path with the best verified net edge and the least risk of losing capital—not the largest codebase.
+
+## 9. Execution log (one status system: this file)
+
+### Phase A: recorder staleness (branch `claude/money-phase-a-recorder`, base `70be57e`)
+
+**Root-cause classes found in the repository (offline, reproduced by `tests/test_recorder_liveness.py` and `tests/test_runner_supervisor.py`; none of them is yet proven to be what the Fly machine hit, see the read-only checks below):**
+
+| # | Fault | Effect on `recorder_status.json` | Fix |
+|---|---|---|---|
+| 1 | `Recorder.run` was one unguarded loop; an `OSError` writing the status (a full volume) or in `prune_capacity` ended the process | process dies, supervisor backoff (capped 300 s = the monitor's stale limit) leaves the file stale | heartbeat write is guarded and counted (`heartbeat.status_errors`); slow work isolated |
+| 2 | capacity capture and prune ran on the heartbeat thread | one slow capture froze the heartbeat: `STALE` while the feed was recording | capacity, prune and the row count now run on a maintenance thread |
+| 3 | every status write called `store.count()` (flush + `SELECT COUNT(*)` over every segment of a ~1.5 GB/day log) | seconds of scan and writer contention on a 1-vCPU machine, on the heartbeat path | heartbeat uses an O(1) lock-free `newest_id()`; the exact count is refreshed every 10 min off-thread |
+| 4 | a recorder alive but silent was never restarted (the supervisor only saw process exit) | stale for ever | supervisor watchdog: terminate and restart after 600 s without a rewrite, under the same capped backoff, counted in `recorder_watchdog_kills` |
+| 5 | no way to tell "alive and persisting" from "alive and not persisting" | a fresh heartbeat over a dead log looked `RECORDING` | status `progress.growth_age_s`; the monitor reports `NOT_PERSISTING` after 300 s without a new record (still alerts) |
+| 6 | `STALE` carried no detail and the age was dropped | the alert read "no detail recorded" | `STALE` / `NOT_PERSISTING` now say the age and what the supervisor reports (running or not, restarts, last exit, watchdog kills); the history line keeps the age |
+
+Alert semantics are unchanged: three cycles not `RECORDING` still raise `recorder_down`; a stale status is never reported healthy and a data gap stays a gap.
+
+**Not proven (needs the Fly machine; read-only, valid in a container without `ps`):**
+
+```bash
+fly ssh console -a carry-drill -C "sh -c 'cat /data/market/supervisor_status.json; echo; cat /data/market/recorder_status.json | head -c 1800'"
+fly ssh console -a carry-drill -C "python3 -c \"import os;[print(p, open('/proc/'+p+'/cmdline').read().replace(chr(0),' ')) for p in sorted(os.listdir('/proc')) if p.isdigit()]\""
+fly ssh console -a carry-drill -C "sh -c 'df -h /data; du -sh /data/market /data/runs /data/shadow /data/monitor /data/mainnet 2>/dev/null; ls -la --time-style=full-iso /data/market | tail -12'"
+fly ssh console -a carry-drill -C "tail -n 6 /data/monitor/monitor.jsonl"
+fly logs -a carry-drill --no-tail | tail -80
+```
+
+How to read them: `supervisor_status.json` `recorder_pid` null with a growing `recorder_restarts` and a non-zero `recorder_last_exit` means a crash loop (look for `ENOSPC`/permission errors in the logs); a live pid with an old `recorder_status.json` means a hung recorder (fault 2 or 4); a fresh status with a flat `store.segments` listing means not persisting (fault 5); a full `/data` volume (the drill volume is 5 GB, the depth log retains 2 days) points at fault 1.
+
+**Deployed status: NOT deployed.** The Fly machine still runs the 2026-11-05 image. The fixes take effect only after the owner redeploys `carry-drill` from the merged source and the running machine is verified (see "Legacy apps" in `bot/RUNBOOKS.md`).

@@ -92,6 +92,13 @@ class Recorder:
         self.chain_head: Optional[Dict[str, Any]] = None      # {"file", "n", "head"} of the newest row
         self._resealed = 0
         self._repairs = 0
+        # liveness bookkeeping (all lock-free reads/writes of small values; a heartbeat must never wait on the engine, the store or the disk scan)
+        self.status_errors, self.last_status_error = 0, ""
+        self.maintenance_errors, self.last_maintenance_error, self.maintenance_ok_ms = 0, "", None
+        self._count_cache: Optional[int] = None
+        self._count_ms: Optional[int] = None
+        self._last_id: Optional[int] = None
+        self._last_growth_ms = self.started_ms
         os.makedirs(self.dir, exist_ok=True)
 
     # -- capacity ----------------------------------------------------------------------------------------
@@ -195,7 +202,10 @@ class Recorder:
             "symbol": self.engine.state.symbol, "started_ms": self.started_ms, "now_ms": now,
             "uptime_s": round((now - self.started_ms) / 1000.0, 1),
             "feed": self.feed.status(),
-            "store": {"records": store.count(), "segments": len(store.segments()),
+            "heartbeat": {"status_errors": self.status_errors, "last_status_error": self.last_status_error, "maintenance_errors": self.maintenance_errors,
+                          "last_maintenance_error": self.last_maintenance_error, "maintenance_ok_ms": self.maintenance_ok_ms},
+            "progress": self._progress(now),
+            "store": {"records": self._count_cache, "records_counted_ms": self._count_ms, "segments": len(store.segments()),
                       "free_bytes": free, "min_free_bytes": self.min_free_bytes,
                       "retention_days": self.retention_days,
                       "capacity_retention_days": self.capacity_retention_days,
@@ -208,10 +218,42 @@ class Recorder:
                          "repairs_while_running": self._repairs},
         }
 
+    def _progress(self, now_ms: int) -> Dict[str, Any]:
+        """Is the log GROWING? The newest record id is an O(1) lock-free read; the age of its last change is what separates a recorder that is alive and persisting from one whose heartbeat
+        is fresh while nothing is being written (a dead feed, a wedged writer, a full volume). ``growth_age_s`` counts from the recorder's start until the first record lands."""
+        try:
+            rid: Optional[int] = self.engine.store.newest_id()
+        except Exception:  # noqa: BLE001 - an old store without the counter reports nothing rather than a false alarm
+            rid = None
+        if rid is not None and rid != self._last_id:
+            self._last_id, self._last_growth_ms = rid, now_ms
+        return {"newest_record_id": rid, "last_growth_ms": self._last_growth_ms, "growth_age_s": round(max(0, now_ms - self._last_growth_ms) / 1000.0, 1) if rid is not None else None}
+
+    def refresh_count(self) -> None:
+        """The exact row count scans every segment: it runs on the MAINTENANCE thread, rarely, never on the heartbeat."""
+        try:
+            self._count_cache = int(self.engine.store.count())
+            self._count_ms = self.wall_ms()
+        except Exception as exc:  # noqa: BLE001
+            self._maintenance_failed("count", exc)
+
+    def _maintenance_failed(self, what: str, exc: BaseException) -> None:
+        self.maintenance_errors += 1
+        self.last_maintenance_error = f"{what}: {type(exc).__name__}: {exc}"[:200]
+
     def write_status(self) -> Dict[str, Any]:
         st = self.status()
         _atomic_write(os.path.join(self.dir, STATUS_FILE), st)
         return st
+
+    def write_status_guarded(self) -> Optional[Dict[str, Any]]:
+        """The heartbeat: a failed write (a full volume, a permissions fault) is COUNTED and reported in the next status that does get written, never raised into the run loop."""
+        try:
+            return self.write_status()
+        except Exception as exc:  # noqa: BLE001 - the heartbeat must outlive the fault it reports
+            self.status_errors += 1
+            self.last_status_error = f"{type(exc).__name__}: {exc}"[:200]
+            return None
 
     # -- lifecycle ---------------------------------------------------------------------------------------
     def start(self) -> None:
@@ -227,7 +269,7 @@ class Recorder:
         except Exception:  # noqa: BLE001 - evidence repair must not stop collection
             pass
         self.feed.start()
-        self.write_status()
+        self.write_status_guarded()
 
     def stop(self) -> None:
         try:
@@ -238,23 +280,43 @@ class Recorder:
             finally:
                 self.engine.store.close()
 
-    def run(self, stop: threading.Event, *, status_every_s: float = 30.0,
-            capacity_every_s: float = 300.0, prune_every_s: float = 3600.0) -> None:
-        """Block until `stop` is set."""
-        next_status = next_capacity = next_prune = self.mono()
+    def _maintenance(self, stop: threading.Event, capacity_every_s: float, prune_every_s: float, count_every_s: float) -> None:
+        """Capacity capture, pruning and the row count, on their OWN thread: any of them may be slow (an engine-lock wait, a chain repair, a directory scan, a count over a large log) and none
+        of them may delay the status heartbeat. Every task is isolated: one failing task is counted and the others still run."""
+        now = self.mono()
+        next_capacity, next_prune, next_count = now, now, now
         while not stop.is_set():
             now = self.mono()
-            if now >= next_capacity:
-                next_capacity = now + capacity_every_s
-                self.capture_capacity()
-            if now >= next_prune:
-                next_prune = now + prune_every_s
-                self.prune_capacity()
+            for name, due, every, fn in (("capacity", next_capacity, capacity_every_s, self.capture_capacity), ("prune", next_prune, prune_every_s, self.prune_capacity),
+                                         ("count", next_count, count_every_s, self.refresh_count)):
+                if now >= due:
+                    if name == "capacity":
+                        next_capacity = now + every
+                    elif name == "prune":
+                        next_prune = now + every
+                    else:
+                        next_count = now + every
+                    try:
+                        fn()
+                        self.maintenance_ok_ms = self.wall_ms()              # a task COMPLETED (refresh_count records its own failure and returns)
+                    except Exception as exc:  # noqa: BLE001
+                        self._maintenance_failed(name, exc)
+            stop.wait(max(0.01, min(1.0, capacity_every_s, prune_every_s, count_every_s)))
+
+    def run(self, stop: threading.Event, *, status_every_s: float = 30.0,
+            capacity_every_s: float = 300.0, prune_every_s: float = 3600.0, count_every_s: float = 600.0) -> None:
+        """Block until `stop` is set. This thread is only the HEARTBEAT (a guarded status write every ``status_every_s``); the slow work runs on a maintenance thread."""
+        worker = threading.Thread(target=self._maintenance, args=(stop, capacity_every_s, prune_every_s, count_every_s), name="recorder-maintenance", daemon=True)
+        worker.start()
+        next_status = self.mono()
+        while not stop.is_set():
+            now = self.mono()
             if now >= next_status:
                 next_status = now + status_every_s
-                self.write_status()
-            stop.wait(1.0)
-        self.write_status()
+                self.write_status_guarded()
+            stop.wait(min(1.0, max(0.01, status_every_s)))
+        worker.join(5.0)
+        self.write_status_guarded()
 
 
 def build(directory: str, *, environment: str = "mainnet", symbol: str = "BTCUSDT",

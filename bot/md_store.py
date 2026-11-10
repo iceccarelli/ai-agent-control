@@ -390,6 +390,11 @@ class MarketStore:
             finally:
                 conn.close()
 
+    def newest_id(self) -> int:
+        """The id of the newest record this store has accepted (0 = none), read WITHOUT the writer lock and without touching the disk: a liveness/progress counter for a heartbeat that must
+        never wait on the writer or scan the log (``count()`` flushes and scans every segment)."""
+        return int(self._next_id) - 1
+
     def count(self) -> int:
         self.flush()
         total = 0
