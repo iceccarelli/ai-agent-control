@@ -111,3 +111,10 @@ Every work item must close with:
 - Remaining owner-only action stated as a precise command or dashboard operation.
 
 Do not return another broad architecture proposal, a dashboard, a speculative ML layer, a new worker, or a documentation-only PR unless it unblocks one of the ranked priorities. The shortest path to more money is the path with the best verified net edge and the least risk of losing capital—not the largest codebase.
+
+### Phase B: read-only decision without execution authority (branch `claude/money-phase-b-readonly-eval`, base `70be57e`)
+
+- **Finding (verified in code):** `run_once(dry_run=True)`, which `evaluate` calls, loaded the capability file, the grant and the dedicated credentials BEFORE reading funding or computing the economics verdict, so the owner could not ask "should I trade?" without holding the authority to trade. The `evaluate` output also only described the session class, not a decision.
+- **Fix:** `evaluate_readonly` (the single implementation; `run_once(dry_run=True)` delegates to it before any authority check). It needs no grant, no capability and no lease, writes nothing, and returns one of `WAIT_FOR_DATA`, `SKIP_NO_OPPORTUNITY`, `REJECT_UNECONOMIC`, `INCONCLUSIVE`, `ELIGIBLE_FOR_OWNER_TESTNET_DECISION` with an `authority` snapshot and `authority_gaps`. Eligibility is explicitly not authority. Dedicated Testnet credentials remain required only to build the client and read the account's fee tier; without them the answer is `WAIT_FOR_DATA`.
+- **Unchanged (tested):** the order-capable cycle still refuses without the capability file and the grant, and no gate was weakened.
+- **Not yet done in this decision engine:** the full decision RECORD (data and code digests, candidate and specification digest, capital basis, worst credible loss) is only partly present in the evaluate output; making it a durable evidence event is the next Phase B item.

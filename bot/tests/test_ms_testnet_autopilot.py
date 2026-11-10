@@ -1222,3 +1222,97 @@ def test_the_loop_routes_lifecycle_events_into_the_real_outbox_with_deterministi
     with pytest.raises(XE.EventConflict):                                                                                  # the same id for a DIFFERENT fact is refused (and quarantined), never overwritten
         tel.event("PLAN", {"stage": "PLAN_CREATED", "source": "LOCAL", "notional_usd": "999.0000"}, sid, event_id=eid)
     assert tel.pending() == 1
+
+
+# ---------------------------------------------------------------- Phase B: the read-only decision needs NO execution authority
+def _tree(root):
+    out = {}
+    for dp, _d, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(dp, f)
+            out[p] = (os.stat(p).st_size, os.stat(p).st_mtime_ns)
+    return out
+
+
+def _evaluate(w, **kw):
+    return AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), dry_run=True, **kw)
+
+
+def _measured_world(w, funding="0.0080"):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = funding, 600_000
+
+
+def test_evaluate_needs_no_grant_no_capability_and_no_lease_and_writes_nothing(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)                                    # NO capability file, NO grant
+    _measured_world(w)
+    assert not os.path.exists(w.cap_path) and not os.path.exists(AP.grant_path())
+    before = _tree(str(tmp_path))
+    w.fake.requests.clear()
+    res = _evaluate(w, notional_usd="200")
+    assert res["result"] == "EVALUATED" and res["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION", res
+    assert res["authority"]["grant"] == "ABSENT" and res["authority"]["capability"] == "ABSENT" and res["read_only"] is True
+    assert {"CAPABILITY_FILE", "UNATTENDED_GRANT", "EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"} <= set(res["authority_gaps"])        # eligibility is NOT authority
+    assert "eligibility is not authority" in " ".join(res["why"]) and res["edge"]["session_class"] == "PROFIT_CANDIDATE"
+    assert not [r for r in w.fake.requests if r[0] == "POST"], "a read-only evaluation placed an order"
+    assert _tree(str(tmp_path)) == before, "a read-only evaluation wrote something"
+
+
+def test_the_decision_classes_are_unambiguous_and_economics_decide_them(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w, funding="0.0001")                                             # 1 bp: far below the cost chain
+    assert _evaluate(w, notional_usd="200")["decision"] == "REJECT_UNECONOMIC"
+    _measured_world(w)
+    w.fake.fee_rates = None                                                          # the key cannot read its own fee tier: ASSUMED, so never a PASS even at 80 bps
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and any("ASSUMED_INPUTS_CANNOT_PASS" in x for x in res["why"])
+    _measured_world(w)
+    res = _evaluate(w, notional_usd="200", min_funding_bps="100")                    # the owner's own floor is above this funding: economics clear, the floor does not
+    assert res["decision"] == "SKIP_NO_OPPORTUNITY" and res["edge"]["session_class"] == "PROFIT_CANDIDATE"
+    w.fake.funding_in_ms = 30_000                                                    # a settlement 30 s away cannot be held across
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "SKIP_NO_OPPORTUNITY" and "edge" not in res and res["funding_check"].startswith("SETTLEMENT_TOO_CLOSE")
+
+
+def test_missing_credentials_or_bad_parameters_are_wait_for_data_and_send_nothing(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    w.fake.requests.clear()
+    res = AP.run_once({}, inner=w.fake, clock=w.clock.now, dry_run=True)
+    assert res["decision"] == "WAIT_FOR_DATA" and "NO_DEDICATED_CREDENTIALS" in res["why"][0] and not w.fake.requests
+    for kw, why in (({"notional_usd": "501"}, "EVALUATION_PARAMETERS_OUT_OF_RANGE"), ({"notional_usd": "0"}, "EVALUATION_PARAMETERS_OUT_OF_RANGE"), ({"notional_usd": "x"}, "EVALUATION_PARAMETERS_INVALID"),
+                    ({"min_funding_bps": "-1"}, "EVALUATION_PARAMETERS_OUT_OF_RANGE"), ({"symbol": "btc usdt"}, "SYMBOL_INVALID")):
+        r = _evaluate(w, **kw)
+        assert r["decision"] == "WAIT_FOR_DATA" and r["why"] == [why], (kw, r)
+    assert not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_a_grant_changes_the_defaults_never_the_economics(tmp_path, monkeypatch):
+    a = World(tmp_path / "a", monkeypatch, grant=False)
+    _measured_world(a)
+    ra = _evaluate(a, notional_usd="200")                                            # evaluated BEFORE any capability or grant exists (the patched paths are process-wide)
+    b = World(tmp_path / "b", monkeypatch)
+    _measured_world(b)
+    write_grant(b, max_notional_usd=200.0, min_funding_bps=0.5)
+    rb = _evaluate(b)                                                                # defaults come from the grant: BTCUSDT, $200, floor 0.5 bp
+    assert rb["authority"]["grant"] == "VALID" and rb["notional_usd"] == "200.00" and rb["owner_funding_floor_bps"] == 0.5
+    assert ra["decision"] == rb["decision"] and ra["edge"]["digest"] == rb["edge"]["digest"], "the same inputs must give the same economic answer with or without authority"
+    assert "UNATTENDED_GRANT" in ra["authority_gaps"] and "UNATTENDED_GRANT" not in rb["authority_gaps"]
+
+
+def test_the_order_capable_cycle_still_requires_every_authority_gate(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    w.fake.requests.clear()
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"))
+    assert res["result"] == "REFUSED" and any("OWNER_CAPABILITY_FILE" in x for x in res["why"]) and not [r for r in w.fake.requests if r[0] == "POST"]
+    w.write_capability()
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"))
+    assert res["result"] == "REFUSED" and "GRANT_MISSING" in res["why"] and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_the_evaluate_command_exposes_symbol_notional_and_floor_and_nothing_that_grants_authority():
+    a = AP._parser().parse_args(["evaluate", "--symbol", "ETHUSDT", "--notional-usd", "150", "--min-funding-bps", "3"])
+    assert (a.cmd, a.symbol, a.notional_usd, a.min_funding_bps) == ("evaluate", "ETHUSDT", "150", "3")
+    evaluate = next(sp for sp in AP._parser()._subparsers._group_actions[0].choices.values() if sp.prog.endswith("evaluate"))
+    assert not [o for act in evaluate._actions for o in act.option_strings if any(w in o for w in ("grant", "capability", "lease", "confirm", "execute", "order"))]
