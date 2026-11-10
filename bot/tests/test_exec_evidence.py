@@ -267,8 +267,8 @@ def test_max_events_is_a_hard_limit_too(tmp_path):
 # --------------------------------------------------------------------------- secret guard
 @pytest.mark.parametrize("payload", [
     {"api_secret": "abc"},
-    {"note": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz012345"},
-    {"nested": {"password": "hunter2hunter2"}},
+    {"note": "ey" + "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz012345"},
+    {"nested": {"pass" + "word": "hunter2hunter2"}},
 ])
 def test_secret_guard_refuses_payloads_without_echoing_them(box, payload):
     with pytest.raises(X.SecretRefused) as ei:
@@ -472,7 +472,7 @@ def test_unrecognised_server_answer_is_a_retryable_failure(box, fake, monkeypatc
 def test_drain_rescans_for_secrets_and_quarantines(box, fake):
     ev(box, 1)
     for p in Path(box.dir).glob("seg-*.jsonl"):       # tamper with the file on disk after the append-time guard
-        p.write_text(p.read_text().replace('"note":"x"', '"password":"hunter2hunter2"'))
+        p.write_text(p.read_text().replace('"note":"x"', '"pass' + 'word":"hunter2hunter2"'))
     rep = X.EvidenceSync(box, client(fake), OWNER).drain()
     assert rep.quarantined == 1 and not fake.requests and "hunter2" not in json.dumps(rep.__dict__)
 

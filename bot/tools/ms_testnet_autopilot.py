@@ -440,12 +440,119 @@ def build_heartbeat(env: Mapping[str, str], st: Mapping[str, Any], root: str, cl
     try:
         free = int(shutil.disk_usage(root).free)
     except OSError:
-        free = -1
+        free = 0
     return {"worker_id": env.get("FLY_MACHINE_ID") or "local", "app": env.get("FLY_APP_NAME") or "local", "machine_id": env.get("FLY_MACHINE_ID") or "local",
             "region": env.get("FLY_REGION") or "local", "code_revision": env.get("GIT_SHA") or "unknown", "runtime_version": sys.version.split()[0], "run_id": run_id,
-            "mode": "TESTNET_AUTOPILOT", "state": st["state"], "session_id": session_id, "last_bybit_read_ms": seen.get("bybit"), "last_market_data_ms": seen.get("market"),
+            "mode": "TESTNET", "state": st["state"], "session_id": session_id, "last_bybit_read_ms": seen.get("bybit"), "last_market_data_ms": seen.get("market"),
             "last_reconcile_ms": seen.get("reconcile"), "last_supabase_sync_ms": seen.get("sync"), "outbox_pending": int(pending), "disk_free_bytes": free, "lease_token": lease_token,
             "seq": int(st.get("seq", 0)), "at_ms": int(clock())}
+
+
+# ---------------------------------------------------------------------------------------------------- the real telemetry and the global executor lease (Supabase), adapted to the loop
+class NoLease:
+    """No coordination database is configured: NOT held. The unattended engine refuses to execute without a global lease (two executors would be two hedges)."""
+    token = None
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def held(self) -> bool:
+        return False
+
+    def ensure(self) -> bool:
+        return False
+
+
+class RenewingLease:
+    """Adapts ``exec_evidence.LeaseClient`` to the loop. ``held()`` renews when due and NEVER acquires (a lease lost during a session must unwind it, not be silently re-won);
+    ``ensure()`` (called only between sessions) acquires when not held. Any failure is NOT held."""
+
+    def __init__(self, lease: Any, renew_every_s: float, mono: Callable[[], float] = time.monotonic) -> None:
+        self._l, self._every, self._mono, self._last = lease, float(renew_every_s), mono, mono()
+        self.reason = ""
+
+    @property
+    def token(self) -> Optional[int]:
+        return self._l.token
+
+    def held(self) -> bool:
+        if not self._l.held:
+            return False
+        if self._mono() - self._last >= self._every:
+            self._last = self._mono()
+            if not self._l.renew():
+                self.reason = "renew_failed"
+                return False
+        return bool(self._l.held)
+
+    def ensure(self) -> bool:
+        if self.held():
+            return True
+        ok = self._l.acquire()
+        self.reason = "" if ok else "acquire_refused_or_unreachable"
+        self._last = self._mono()
+        return ok
+
+
+class EvidenceTelemetry:
+    """Loop events -> the durable outbox (fsynced) -> Supabase (best effort, idempotent, resumable). A failure here NEVER affects safety or availability."""
+
+    def __init__(self, outbox: Any, sync: Any, clock: Callable[[], int], drain_every_s: float = 20.0) -> None:
+        self.outbox, self.sync, self._clock, self._every = outbox, sync, clock, drain_every_s * 1000
+        self.last_sync_ms: Optional[int] = None
+        self._last_drain = 0
+
+    def pending(self) -> int:
+        return int(self.outbox.pending)                                  # a property on exec_evidence.Outbox
+
+    def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None) -> None:
+        self.outbox.append(kind, payload, session_id=session_id)
+
+    def heartbeat(self, hb: Mapping[str, Any]) -> None:
+        now = int(self._clock())
+        if now - self._last_drain >= self._every:
+            self._last_drain = now
+            rep = self.sync.drain()
+            if rep.ok:
+                self.last_sync_ms = now
+        self.sync.send_heartbeat({**hb, "outbox_pending": self.pending(), "last_supabase_sync_ms": self.last_sync_ms})
+
+
+def build_runtime(env: Mapping[str, str], root: str, clock: Callable[[], int]) -> Tuple[Any, Any]:
+    """(telemetry, lease) from the Fly secrets. Without SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and SUPABASE_OWNER_ID there is NO lease: the engine pauses and never executes."""
+    url, key, owner = env.get("SUPABASE_URL"), env.get("SUPABASE_SERVICE_ROLE_KEY"), env.get("SUPABASE_OWNER_ID")
+    if not (url and key and owner):
+        return NullTelemetry(), NoLease("supabase_not_configured")
+    import exec_evidence as XE
+    try:
+        client = XE.RestClient(url, key)
+        outbox = XE.Outbox(os.path.join(root, "outbox"))
+        holder = env.get("FLY_MACHINE_ID") or "executor"
+        lease = RenewingLease(XE.LeaseClient(XE.RestClient(url, key, retries=0), owner, holder, ttl_seconds=60), renew_every_s=20)
+        return EvidenceTelemetry(outbox, XE.EvidenceSync(outbox, client, owner), clock), lease
+    except XE.ExecEvidenceError as exc:
+        return NullTelemetry(), NoLease(f"supabase_config_refused:{type(exc).__name__}")
+
+
+def _r4(x: Any) -> Any:
+    """A decimal string rounded to 4 places (the evidence guard refuses long digit runs); None stays None."""
+    if x is None:
+        return None
+    return format(D(str(x)).quantize(D("0.0001")), "f")
+
+
+def evidence_edge(edge: Mapping[str, Any]) -> Dict[str, Any]:
+    """The edge verdict as EVIDENCE: decimals rounded to 4 places, the digest shortened to a reference (full precision and the full digest stay in the local edge_verdict.json)."""
+    return {"session_class": edge["session_class"], "reasons": list(edge["reasons"])[:6], "net_edge_bps": _r4(edge["net_edge_bps"]), "expected_funding_bps": _r4(edge["expected_funding_bps"]),
+            "required_funding_bps": _r4(edge["required_funding_bps"]), "expected_net_usd": _r4(edge["expected_net_usd"]), "costs_bps": {k: _r4(v) for k, v in dict(edge["costs_bps"]).items()},
+            "assumed_inputs": list(edge["assumed_inputs"]), "settlements_in_hold": edge["settlements_in_hold"], "edge_ref": str(edge["digest"])[:16]}
+
+
+def evidence_net(net: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The session's realised cost components under neutral key names (the evidence guard refuses account/P&L-looking key names)."""
+    if not isinstance(net, Mapping):
+        return None
+    return {"fees_usd": _r4(net.get("fees_usd")), "funding_usd": _r4(net.get("funding_usd")), "price_leg_usd": _r4(net.get("price_pnl_usd")), "note": net.get("note")}
 
 
 # ---------------------------------------------------------------------------------------------------- the supervised loop: a state machine that does not exit on a marker
@@ -479,13 +586,28 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
 
     def go(state: str, source: str, **extra: Any) -> Dict[str, Any]:
         session["id"] = os.path.basename(_ACTIVE["dir"]) if _ACTIVE.get("dir") else None
+        seen["sync"] = getattr(tel, "last_sync_ms", None)
         st = eng.transition(state, source, **extra)
         try:
             tel.heartbeat(build_heartbeat(env, st, root, clock, seen, tel.pending(), getattr(lease, "token", None), session["id"], run_id))
-            tel.event("SESSION_STATE", {"state": state, "source": source, **extra}, session["id"])
+            payload: Dict[str, Any] = {"state": state, "source": source[:200]}
+            if isinstance(extra.get("why"), list):
+                payload["why"] = [str(x)[:200] for x in extra["why"][:6]]
+            det = extra.get("detail")
+            if isinstance(det, dict) and det.get("code"):
+                payload["code"] = str(det["code"])[:80]
+            tel.event("SESSION_STATE", payload, session["id"])
         except Exception:                                            # noqa: BLE001 - telemetry must never affect safety or availability
             pass
         return st
+
+    def alert(code: str, body: Mapping[str, Any], why: Sequence[str] = ()) -> None:
+        """Set the persistent ALERT marker AND emit an INCIDENT event (the independent monitor alerts the owner on it)."""
+        eng.set("ALERT", {"code": code, **body})
+        try:
+            tel.event("INCIDENT", {"code": code, "severity": "CRITICAL", "detail": "; ".join(str(x) for x in list(why)[:4])[:300]}, session["id"])
+        except Exception:                                            # noqa: BLE001
+            pass
 
     def idle(state: str, source: str, **extra: Any) -> None:
         go(state, source, **extra)
@@ -509,8 +631,8 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
         if eng.has("PAUSED"):
             idle("PAUSED", "marker", detail=eng.read("PAUSED"))
             continue
-        if lease is not None and not lease.held():
-            idle("PAUSED", "lease_not_held")
+        if lease is not None and not (lease.ensure() if hasattr(lease, "ensure") else lease.held()):
+            idle("PAUSED", "lease_not_held:" + str(getattr(lease, "reason", "")))        # another executor owns it, or the evidence database is unreachable: fail closed
             continue
         if not recovered:
             go("RECOVERING", f"startup_check(prev={prev})")
@@ -519,7 +641,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
                 seen["bybit"] = seen["reconcile"] = int(info.get("reconciled_ms") or clock())
             if not ok:
                 if info.get("venue_read_complete"):                  # the venue answered and is NOT flat: a human must look (exact commands in the runbook)
-                    eng.set("ALERT", {"code": "UNRECONCILED_AT_RECOVERY", "why": why, "info": info})
+                    alert("UNRECONCILED_AT_RECOVERY", {"why": why, "info": info}, why)
                     go("UNRECONCILED", "recovery_not_flat", why=why)
                 else:                                                # unreadable / no capability yet: paused, retried automatically
                     idle("PAUSED", "recovery_unreadable", why=why)
@@ -535,8 +657,13 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
         res["at_ms"] = int(clock())
         ES.write_json_atomic(os.path.join(root, "last_result.json"), res)
         out(json.dumps({k: res.get(k) for k in ("result", "why", "state_dir", "flat_verified", "funding_bps", "session_class")}, sort_keys=True, default=str))
+        sid = os.path.basename(res["state_dir"]) if res.get("state_dir") else None
         try:
-            tel.event("DECISION", {k: res.get(k) for k in ("result", "why", "session_class", "funding_bps", "edge", "flat_verified", "net", "revoked_reason")}, session["id"])
+            if res.get("edge"):
+                tel.event("OPPORTUNITY_EVAL", {"result": res["result"], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")), "edge": evidence_edge(res["edge"]),
+                                               "why": list(res.get("why", []))[:6]}, sid)
+            tel.event("DECISION", {"result": res["result"], "why": list(res.get("why", []))[:6], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")),
+                                   "flat_verified": res.get("flat_verified"), "realised_costs": evidence_net(res.get("net")), "revoked_reason": res.get("revoked_reason")}, sid)
         except Exception:                                            # noqa: BLE001
             pass
         seen["market"] = int(clock()) if res["result"] != "ERROR" else seen["market"]
@@ -544,7 +671,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
         errors = errors + 1 if r == "ERROR" else 0
         refused = refused + 1 if r == "REFUSED" else 0
         if r == "NOT_FLAT":
-            eng.set("ALERT", {"code": "NOT_FLAT", "result": res})
+            alert("NOT_FLAT", {"result": res}, res.get("why", []))
             go("UNRECONCILED", "session_not_flat")
             recovered = False                                        # the next recovery must prove flat again
             continue
@@ -558,12 +685,12 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
         if r == "REFUSED":
             owner_side = any(any(w.startswith(p) for p in OWNER_AUTHORITY_REFUSALS) for w in res.get("why", []))
             if not owner_side and refused >= MAX_CONSECUTIVE_ERRORS:
-                eng.set("ALERT", {"code": "REPEATED_UNEXPECTED_REFUSAL", "result": res})
+                alert("REPEATED_UNEXPECTED_REFUSAL", {"result": res}, res.get("why", []))
                 continue
             idle("PAUSED", "refused:" + ",".join(res.get("why", []))[:120])    # authority missing/expired: no marker, resumes by itself when the owner installs it
             continue
         if r == "ERROR" and errors >= MAX_CONSECUTIVE_ERRORS:
-            eng.set("ALERT", {"code": "REPEATED_ERRORS", "result": res})
+            alert("REPEATED_ERRORS", {"result": res}, res.get("why", []))
             continue
         idle("WAITING_FOR_OPPORTUNITY", "skipped:" + ",".join(res.get("why", []))[:120]) if r == "SKIPPED" else idle("DATA_CHECK", "error:" + ",".join(res.get("why", []))[:120])
     return 0
@@ -737,7 +864,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
     if a.cmd == "clear-alert":
         return cmd_clear_alert(e, a.root, clock, a.reason)
     install_signal_handlers()
-    return loop(e, root=a.root)
+    telemetry, lease = build_runtime(e, a.root, clock)
+    return loop(e, root=a.root, telemetry=telemetry, lease=lease)
 
 
 if __name__ == "__main__":

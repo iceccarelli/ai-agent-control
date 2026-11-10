@@ -601,3 +601,126 @@ def test_a_session_nobody_revokes_runs_to_the_end_with_no_revocation(w, tmp_path
     root = tmp_path / "ap"
     res = revoke_cycle(w, root, lambda n: None)
     assert res["result"] == "DONE" and res["revoked_reason"] is None and not os.path.exists(os.path.join(res["state_dir"], "revocation.json"))
+
+
+# ================================================================ the real telemetry (durable outbox) and the global lease, adapted to the loop
+import exec_evidence as XE  # noqa: E402
+
+
+class StubLeaseClient:
+    """Shaped like exec_evidence.LeaseClient: `held` is a PROPERTY."""
+
+    def __init__(self, free=True):
+        self.free, self.acquires, self.renews, self._held, self.token_n = free, 0, 0, False, 0
+        self.renew_ok = True
+
+    @property
+    def held(self):
+        return self._held
+
+    @property
+    def token(self):
+        return self.token_n if self._held else None
+
+    def acquire(self):
+        self.acquires += 1
+        if not self.free:
+            return False
+        self._held, self.token_n = True, self.token_n + 1
+        return True
+
+    def renew(self):
+        self.renews += 1
+        if not self.renew_ok:
+            self._held = False
+            return False
+        return True
+
+
+def test_the_lease_adapter_never_reacquires_inside_held_and_renews_only_when_due():
+    t = {"m": 0.0}
+    lc = StubLeaseClient()
+    rl = AP.RenewingLease(lc, renew_every_s=20, mono=lambda: t["m"])
+    assert rl.held() is False and lc.acquires == 0                                   # held() never acquires: a lease lost mid-session must unwind, not be silently re-won
+    assert rl.ensure() is True and lc.acquires == 1 and rl.token == 1
+    t["m"] = 10
+    assert rl.held() is True and lc.renews == 0
+    t["m"] = 25
+    assert rl.held() is True and lc.renews == 1
+    lc.renew_ok = False
+    t["m"] = 50
+    assert rl.held() is False and rl.reason == "renew_failed" and rl.token is None
+    assert rl.held() is False and lc.acquires == 1                                   # still not re-won by held()
+    lc.renew_ok = True
+    assert rl.ensure() is True and lc.acquires == 2 and rl.token == 2                # between sessions it may re-acquire: a NEW fencing token
+
+
+def test_a_lease_held_by_another_executor_keeps_this_one_paused(w, tmp_path, stop_state):
+    rl = AP.RenewingLease(StubLeaseClient(free=False), renew_every_s=20)
+    root = tmp_path / "ap"
+    run_loop(w, root, NEVER, n=3, recover_fn=OK_RECOVERY, lease=rl)
+    st = ES.EngineState(str(root), w.clock.now).load()
+    assert st["state"] == "PAUSED" and st["source"].startswith("lease_not_held:acquire_refused")
+
+
+def test_without_supabase_configuration_there_is_no_lease_and_the_engine_never_executes(w, tmp_path, stop_state):
+    tel, lease = AP.build_runtime({}, str(tmp_path / "ap"), w.clock.now)
+    assert isinstance(tel, AP.NullTelemetry) and isinstance(lease, AP.NoLease) and lease.reason == "supabase_not_configured"
+    root = tmp_path / "ap"
+    run_loop(w, root, NEVER, n=2, recover_fn=OK_RECOVERY, lease=lease)
+    assert ES.EngineState(str(root), w.clock.now).load()["source"] == "lease_not_held:supabase_not_configured"
+    tel2, lease2 = AP.build_runtime({"SUPABASE_URL": "http://evil.example.com", "SUPABASE_SERVICE_ROLE_KEY": "k" * 20, "SUPABASE_OWNER_ID": "0" * 8 + "-0000-0000-0000-" + "0" * 12}, str(tmp_path / "ap2"), w.clock.now)
+    assert isinstance(lease2, AP.NoLease) and lease2.reason.startswith("supabase_config_refused")                # a non-*.supabase.co / non-https URL is refused
+
+
+def test_a_configured_runtime_builds_the_real_client_lease_and_outbox_without_touching_the_network(w, tmp_path):
+    env = {"SUPABASE_URL": "https://abcdefgh.supabase.co", "SUPABASE_SERVICE_ROLE_KEY": "k" * 30, "SUPABASE_OWNER_ID": "11111111-2222-3333-4444-555555555555", "FLY_MACHINE_ID": "m1"}
+    tel, lease = AP.build_runtime(env, str(tmp_path / "ap"), w.clock.now)
+    assert isinstance(tel, AP.EvidenceTelemetry) and isinstance(lease, AP.RenewingLease) and lease.held() is False and tel.pending() == 0
+    assert "k" * 30 not in repr(tel.sync.client) and "k" * 30 not in repr(lease)
+
+
+class CapturingSync:
+    def __init__(self):
+        self.hbs, self.drains = [], 0
+
+    def drain(self):
+        self.drains += 1
+        return type("R", (), {"ok": True})()
+
+    def send_heartbeat(self, hb):
+        self.hbs.append(XE.validate_heartbeat(hb))                                   # the shared contract, validated by the real function
+        return "INSERTED"
+
+
+def test_every_heartbeat_and_event_the_loop_emits_satisfies_the_evidence_contract_through_the_real_outbox(w, tmp_path, stop_state):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0008", 600_000
+    box = XE.Outbox(str(tmp_path / "outbox"))
+    sync = CapturingSync()
+    errors = []
+
+    class Tel(AP.EvidenceTelemetry):
+        def event(self, kind, payload, session_id=None):
+            try:
+                super().event(kind, payload, session_id)
+            except Exception as exc:                                                 # the loop swallows telemetry errors by design: this test must SEE them
+                errors.append((kind, repr(exc)))
+    tel = Tel(box, sync, w.clock.now)
+    root = tmp_path / "ap"
+    rc, _ = run_loop(w, root, AP.run_once, n=1, recover_fn=lambda *a, **k: (True, [], {"venue_read_complete": True, "reconciled_ms": 1}), telemetry=tel, sleep=w.clock.sleep)
+    assert rc == 0 and errors == [], errors
+    kinds = [ev["kind"] for _s, _o, ev in box.iter_pending()]
+    assert "SESSION_STATE" in kinds and "OPPORTUNITY_EVAL" in kinds and "DECISION" in kinds
+    assert sync.hbs and {h["state"] for h in sync.hbs} <= set(XE.ENGINE_STATES) and all(h["mode"] == "TESTNET" and h["disk_free_bytes"] >= 0 for h in sync.hbs)
+    assert sync.drains >= 1 and tel.last_sync_ms is not None and sync.hbs[-1]["last_supabase_sync_ms"] is not None
+
+
+def test_an_alert_emits_a_critical_incident_event_that_satisfies_the_evidence_contract(w, tmp_path, stop_state):
+    box = XE.Outbox(str(tmp_path / "outbox"))
+    tel = AP.EvidenceTelemetry(box, CapturingSync(), w.clock.now)
+    w.fake.inject_position("BTCUSDT", -0.005)
+    run_loop(w, tmp_path / "ap", NEVER, n=1, telemetry=tel)
+    inc = [ev for _s, _o, ev in box.iter_pending() if ev["kind"] == "INCIDENT"]
+    assert inc and inc[0]["payload"]["code"] == "UNRECONCILED_AT_RECOVERY" and inc[0]["payload"]["severity"] == "CRITICAL" and "PERP_POSITION_OPEN" in inc[0]["payload"]["detail"]
