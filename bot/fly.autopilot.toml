@@ -28,7 +28,6 @@ policy = "always"
 
 [env]
 USE_TESTNET = "1"
-PAPER_TRADING = "0"
 BYBIT_VENUE = "testnet"
 HOME = "/data"
 

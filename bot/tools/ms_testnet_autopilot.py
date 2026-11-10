@@ -31,6 +31,7 @@ import stat
 import sys
 import threading
 import time
+import uuid
 from decimal import Decimal as D
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -51,6 +52,7 @@ GRANT_SCHEMA = "ms_autopilot_grant/v1"
 GRANT_KEYS = frozenset({"schema", "reference", "created_ms", "expires_ms", "manifest_plan_sha256", "symbols", "max_sessions_per_day", "max_notional_usd", "max_hold_s",
                         "min_funding_bps", "allow_mechanics_sessions", "grant_sha256"})
 MAX_GRANT_DAYS = 30
+MAX_GRANT_BYTES = 65_536
 MAX_HOLD_S = 3300                       # the session's lifecycle is one hour: hold + 60 s entry wait + 180 s exit wait must fit
 EXIT_MARGIN_S = 120                     # the hedge is held this long PAST the settlement
 MIN_SECONDS_TO_SETTLEMENT = 90          # entry (up to 60 s) must complete before the settlement
@@ -108,7 +110,10 @@ def load_grant(now_ms: int, manifest: Mapping[str, Any], path: Optional[str] = N
         return None, ["GRANT_FILE_NOT_PRIVATE"]
     try:
         with open(p, "rb") as fh:
-            g = json.loads(fh.read().decode("utf-8"))
+            raw = fh.read(MAX_GRANT_BYTES + 1)
+        if len(raw) > MAX_GRANT_BYTES:
+            return None, ["GRANT_TOO_LARGE"]
+        g = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError):
         return None, ["GRANT_UNREADABLE"]
     why: List[str] = []
@@ -225,7 +230,7 @@ def _noop_state(_state: str, _source: str) -> None:
 
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
              out: Callable[[str], None] = print, state_root: Optional[str] = None, engine_root: Optional[str] = None, lease: Any = None,
-             on_state: Callable[[str, str], None] = _noop_state, **_ignored: Any) -> Dict[str, Any]:
+             on_state: Callable[[str, str], None] = _noop_state, dry_run: bool = False, **_ignored: Any) -> Dict[str, Any]:
     clock = clock or (lambda: int(time.time() * 1000))
     sleep = sleep or time.sleep
     now = int(clock())
@@ -257,6 +262,8 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     session_class, why_not = classify_session(verdict, D(str(rate)), g)
+    if dry_run:                                                       # the owner's read-only `evaluate`: the verdict and the class, never a session
+        return _res("EVALUATED", why_not, funding_bps=rate * 1e4, hold_s=hold_s, session_class=session_class, edge=verdict.as_dict())
     if session_class is None:
         return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict())
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
@@ -273,8 +280,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
                  on_state: Callable[[str, str], None]) -> Dict[str, Any]:
     lines: List[str] = []
 
-    def step(*argv: str, sl: Optional[Callable[[float], None]] = None) -> int:
-        return S.main(["--state-dir", d, *argv], env=env, inner_transport=inner, clock_ms=clock, sleep=sl or sleep, input_fn=lambda _p: "", out=lines.append)
+    def step(*argv: str, sl: Optional[Callable[[float], None]] = None, poc: Optional[Callable[[], Optional[str]]] = None) -> int:
+        return S.main(["--state-dir", d, *argv], env=env, inner_transport=inner, clock_ms=clock, sleep=sl or sleep, input_fn=lambda _p: "", out=lines.append, pre_order_check=poc)
 
     if _STOP.is_set():
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
@@ -304,9 +311,17 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     lines.clear()
     if _STOP.is_set():                                               # a stop arrived before any order: nothing was placed, no entry was counted
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
+    why_now = revocation_reason(int(clock()), manifest, engine_root, lease)
+    if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
+        return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
-    rc = step("execute", "--confirm-plan-digest", digest, "--unattended", sl=watch_sleep)
+
+    def pre_order() -> Optional[str]:
+        if _STOP.is_set():
+            return "STOP_SIGNAL"
+        return revocation_reason(int(clock()), manifest, engine_root, lease)
+    rc = step("execute", "--confirm-plan-digest", digest, "--unattended", sl=watch_sleep, poc=pre_order)
     try:
         with open(os.path.join(d, "testnet_session.json"), encoding="utf-8") as fh:
             rec = json.load(fh)
@@ -337,20 +352,39 @@ def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str
 
 
 def _watching_sleep(sleep: Callable[[float], None], state_dir: str, clock: Callable[[], int], manifest: Mapping[str, Any], engine_root: str, lease: Any
-                    ) -> Tuple[Callable[[float], None], Dict[str, Optional[str]]]:
-    """Wraps the session's own sleep: every poll of the running session first re-checks the authority, so a revocation is seen within one poll (about a second), not once per session."""
-    box: Dict[str, Optional[str]] = {"reason": None}
+                    ) -> Tuple[Callable[[float], None], Dict[str, Any]]:
+    """Wraps the session's own sleep: every poll of the running session first re-checks the authority, so a revocation is seen within one poll (about a second), not once per session.
+    FAIL CLOSED: a watcher that cannot run is a revocation, an unengageable kill switch is retried on every poll and raises an ALERT, and nothing here ever raises into the session."""
+    box: Dict[str, Any] = {"reason": None, "engaged": False}
 
-    def watch(seconds: float) -> None:
-        if box["reason"] is None:
-            why = revocation_reason(int(clock()), manifest, engine_root, lease)
-            if why is not None:
-                box["reason"] = why
+    def engage() -> None:
+        try:
+            AD.engage_kill_switch(os.path.join(state_dir, "MS_KILL"), "revoked:" + str(box["reason"]))
+            box["engaged"] = True
+        except OSError:
+            if not box.get("kill_alerted"):                                  # the session cannot be told to stop: a human must know NOW
+                box["kill_alerted"] = True
                 try:
-                    AD.engage_kill_switch(os.path.join(state_dir, "MS_KILL"), "revoked:" + why)
+                    ES.EngineState(engine_root, clock).set("ALERT", {"code": "KILL_SWITCH_UNENGAGEABLE", "state_dir": state_dir, "reason": str(box["reason"])})
                 except OSError:
                     pass
-                ES.write_json_atomic(os.path.join(state_dir, "revocation.json"), {"reason": why, "at_ms": int(clock())})
+        try:
+            ES.write_json_atomic(os.path.join(state_dir, "revocation.json"), {"reason": box["reason"], "at_ms": int(clock()), "kill_engaged": box["engaged"]})
+        except OSError:
+            pass
+
+    def watch(seconds: float) -> None:
+        try:
+            if box["reason"] is None:
+                box["reason"] = revocation_reason(int(clock()), manifest, engine_root, lease)
+            if box["reason"] is not None and not box["engaged"]:
+                engage()
+        except Exception as exc:                                             # noqa: BLE001 - any failure of the authority check is itself a revocation
+            box["reason"] = box["reason"] or f"WATCHER_ERROR:{type(exc).__name__}"
+            try:
+                engage()
+            except Exception:                                                # noqa: BLE001
+                pass
         sleep(seconds)
     return watch, box
 
@@ -364,58 +398,69 @@ def session_dirs(state_root: str) -> List[str]:
 
 
 def venue_flat_proof(ex: Any, symbol: str, baseline: Optional[float], entry_qty: Optional[float]) -> Tuple[bool, List[str], bool]:
-    """(flat, reasons, venue_read_complete). FLAT is the venue's OWN complete position read: the perp is zero, the spot balance equals the session baseline within dust, and no order is
-    open (ours or foreign). An incomplete read is not 'flat': it is unknown."""
+    """(flat, reasons, venue_read_complete). FLAT is the venue's OWN complete position read: NO perp position is open on ANY symbol, the spot balance of ``symbol`` equals the session
+    baseline within dust, and no order is open (ours or foreign). An incomplete read is not 'flat': it is unknown."""
     v = ex.venue_state()
     pos = v.get("positions")
     if not v.get("complete") or pos is None:
         return False, ["VENUE_READ_INCOMPLETE"], False
     why: List[str] = []
-    if abs(pos.get(f"linear:{symbol}", 0.0)) >= 1e-12:
-        why.append(f"PERP_POSITION_OPEN:{pos.get(f'linear:{symbol}')}")
+    for k, q in sorted(pos.items()):
+        if k.startswith("linear:") and abs(q) >= 1e-12:
+            why.append(f"PERP_POSITION_OPEN:{k[7:]}:{q}")
     if baseline is not None:
         dust = max(float(ex.filters("spot", symbol).qty_step), 0.002 * float(entry_qty or 0.0))
         delta = S._minus(pos.get(f"spot:{symbol}", 0.0), baseline)
         if abs(delta) > dust:
-            why.append(f"SPOT_DELTA_OPEN:{delta}")
+            why.append(f"SPOT_DELTA_OPEN:{symbol}:{delta}")
     if v.get("foreign_open_orders") or [o for o in v.get("orders", {}).values() if o.get("status") in ("New", "PartiallyFilled")]:
-        why.append("OPEN_ORDERS")
+        why.append(f"OPEN_ORDERS:{symbol}")
     return (not why), why, True
 
 
 def recover(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, state_root: Optional[str] = None, symbol: Optional[str] = None, **_k: Any
             ) -> Tuple[bool, List[str], Dict[str, Any]]:
-    """(ok, reasons, info). ok = the venue PROVES the account flat relative to the last session's baseline and no order is open. An unresolved prior session whose venue state is flat is
-    recorded (recovery.json: accounting must be reconciled) and allowed; anything open, incomplete or unreadable is not ok (the caller pauses or raises an ALERT)."""
+    """(ok, reasons, info). ok = the venue PROVES the account flat for EVERY symbol the manifest allows (not just the one a grant names), relative to the last session's baseline, and no
+    order is open. An unresolved prior session whose venue state is flat is recorded (recovery.json: accounting must be reconciled) and allowed; anything open, incomplete or unreadable
+    is not ok (the caller pauses or raises an ALERT)."""
     clock = clock or (lambda: int(time.time() * 1000))
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
     manifest, st = S._load_capability_manifest()
-    sym = symbol or ((manifest or {}).get("symbol_allowlist") or [None])[0]
-    if manifest is None or sym is None:
+    syms = [symbol] if symbol else list((manifest or {}).get("symbol_allowlist") or [])
+    if manifest is None or not syms:
         return False, ["OWNER_CAPABILITY_FILE:" + ",".join(st.get("reasons", []))], {"venue_read_complete": False}
     last = (session_dirs(root) or [None])[-1]
-    baseline = entry_qty = None
+    baselines: Dict[str, Optional[float]] = {}
+    entry_qty = None
     unresolved = False
     if last:
         lim = ES.read_json(os.path.join(last, "run_limits.json")) or {}
-        b = (lim.get("baseline") or {}).get(f"spot:{sym}")
-        baseline = float(b) if isinstance(b, (int, float)) and not isinstance(b, bool) else None
+        for sym in syms:
+            b = (lim.get("baseline") or {}).get(f"spot:{sym}")
+            baselines[sym] = float(b) if isinstance(b, (int, float)) and not isinstance(b, bool) else None
         plan = ES.read_json(os.path.join(last, "plan.json")) or {}
         try:
             entry_qty = float(plan["group"]["legs"][0]["qty"])
         except (KeyError, IndexError, TypeError, ValueError):
             entry_qty = None
         rec = ES.read_json(os.path.join(last, "testnet_session.json")) or {}
-        journal = os.path.join(last, "journal.jsonl")
-        started = os.path.exists(os.path.join(last, "journal")) or os.path.exists(journal) or bool(rec.get("orders"))
+        jp = os.path.join(last, S.FILES["journal"])
+        started = (os.path.exists(jp) and os.path.getsize(jp) > 0) or bool(rec.get("orders"))
         unresolved = bool(started and rec.get("flat_verified") is not True)
-    try:
-        flat, why, complete = venue_flat_proof(_executor(env, inner, clock, sym), sym, baseline, entry_qty)
-    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, TT.TestnetCredentialsMissing, KeyError, ValueError, TypeError) as exc:
-        return False, [f"VENUE_UNREADABLE:{type(exc).__name__}"], {"venue_read_complete": False, "last_session": last, "unresolved": unresolved}
-    info = {"venue_read_complete": complete, "last_session": last, "unresolved": unresolved, "reconciled_ms": int(clock())}
-    if not flat:
-        return False, why, info
+    all_why: List[str] = []
+    complete_all = True
+    for sym in syms:
+        try:
+            flat, why, complete = venue_flat_proof(_executor(env, inner, clock, sym), sym, baselines.get(sym), entry_qty)
+        except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, TT.TestnetCredentialsMissing, KeyError, ValueError, TypeError) as exc:
+            return False, [f"VENUE_UNREADABLE:{type(exc).__name__}"], {"venue_read_complete": False, "last_session": last, "unresolved": unresolved}
+        complete_all = complete_all and complete
+        for w in why:
+            if w not in all_why:
+                all_why.append(w)
+    info = {"venue_read_complete": complete_all, "last_session": last, "unresolved": unresolved, "reconciled_ms": int(clock()), "symbols": syms}
+    if all_why:
+        return False, all_why, info
     if unresolved and last:
         ES.write_json_atomic(os.path.join(last, "recovery.json"), {"resolved_by": "VENUE_FLAT_PROOF", "at_ms": int(clock()), "accounting_must_be_reconciled": True})
     return True, [], info
@@ -425,7 +470,7 @@ def recover(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callab
 class NullTelemetry:
     """The default: nothing is sent anywhere. The Fly worker injects a real one (durable outbox -> Supabase) in ``main``; the loop never depends on it for SAFETY."""
 
-    def heartbeat(self, hb: Mapping[str, Any]) -> None:
+    def heartbeat(self, hb: Mapping[str, Any], drain: bool = True) -> None:
         return None
 
     def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None) -> None:
@@ -508,9 +553,9 @@ class EvidenceTelemetry:
     def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None) -> None:
         self.outbox.append(kind, payload, session_id=session_id)
 
-    def heartbeat(self, hb: Mapping[str, Any]) -> None:
+    def heartbeat(self, hb: Mapping[str, Any], drain: bool = True) -> None:
         now = int(self._clock())
-        if now - self._last_drain >= self._every:
+        if drain and now - self._last_drain >= self._every:
             self._last_drain = now
             rep = self.sync.drain()
             if rep.ok:
@@ -527,8 +572,8 @@ def build_runtime(env: Mapping[str, str], root: str, clock: Callable[[], int]) -
     try:
         client = XE.RestClient(url, key)
         outbox = XE.Outbox(os.path.join(root, "outbox"))
-        holder = env.get("FLY_MACHINE_ID") or "executor"
-        lease = RenewingLease(XE.LeaseClient(XE.RestClient(url, key, retries=0), owner, holder, ttl_seconds=60), renew_every_s=20)
+        holder = f"{env.get('FLY_MACHINE_ID') or 'executor'}:{uuid.uuid4().hex[:8]}"             # one holder name per PROCESS: two processes can never share a lease by name
+        lease = RenewingLease(XE.LeaseClient(XE.RestClient(url, key, retries=0), owner, holder, ttl_seconds=120), renew_every_s=20)
         return EvidenceTelemetry(outbox, XE.EvidenceSync(outbox, client, owner), clock), lease
     except XE.ExecEvidenceError as exc:
         return NullTelemetry(), NoLease(f"supabase_config_refused:{type(exc).__name__}")
@@ -557,6 +602,7 @@ def evidence_net(net: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
 
 # ---------------------------------------------------------------------------------------------------- the supervised loop: a state machine that does not exit on a marker
 IDLE_POLL_S = 30
+IN_SESSION_HEARTBEAT_S = 30
 DRAINED_FRESH_MS = 300_000
 OWNER_AUTHORITY_REFUSALS = ("GRANT_", "OWNER_CAPABILITY_FILE", "DEDICATED_TESTNET_CREDENTIALS_MISSING")
 
@@ -567,9 +613,10 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
     """The unattended engine. It NEVER exits because of a marker or a refusal (so an always-on restart policy cannot loop): ALERT, PAUSED, STOP, DRAIN are STATES it reports while it idles.
     It exits only on a stop SIGNAL (SIGTERM/SIGHUP/SIGINT: the active session is asked to unwind first) or ``max_iterations`` (tests). A restart is not permission to trade: before any
     session it must PROVE the account flat from the venue (``recover``); a non-flat venue is an ALERT; an unreadable one is PAUSED and retried. One loop per root (lock file); an
-    optional global executor ``lease`` must be held (fail closed) before any session starts."""
+    optional global executor ``lease`` must be held (fail closed) before any session starts. An unexpected exception around a session forces a fresh venue proof before anything else."""
     clock = clock or (lambda: int(time.time() * 1000))
-    sleep = sleep or (lambda s: _STOP.wait(s))                       # a stop signal wakes the wait at once
+    idle_sleep = sleep or (lambda s: _STOP.wait(s))                  # IDLE waits wake at once on a stop signal ...
+    sess_sleep = sleep or time.sleep                                  # ... but a SESSION's polling must keep its real pace after a signal (unwind polls must not busy-loop)
     tel = telemetry or NullTelemetry()
     os.makedirs(root, mode=0o700, exist_ok=True)
     lock = open(os.path.join(root, "lock"), "a+")
@@ -583,13 +630,26 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
     run_id = f"run_{int(clock())}"
     seen: Dict[str, Optional[int]] = {"bybit": None, "market": None, "reconcile": None, "sync": None}
     session: Dict[str, Optional[str]] = {"id": None}
+    hb = {"seq": 0, "at": 0}
+
+    def emit(drain: bool = True) -> None:
+        """One heartbeat with a UNIQUE seq per heartbeat (the database keys heartbeats by run and seq: a repeat would be dropped and the worker would look stale)."""
+        hb["seq"] += 1
+        hb["at"] = int(clock())
+        session["id"] = os.path.basename(_ACTIVE["dir"]) if _ACTIVE.get("dir") else None
+        seen["sync"] = getattr(tel, "last_sync_ms", None)
+        st = eng.load()
+        beat = build_heartbeat(env, {**st, "seq": hb["seq"]}, root, clock, seen, tel.pending(), getattr(lease, "token", None), session["id"], run_id)
+        try:
+            tel.heartbeat(beat) if drain else tel.heartbeat(beat, drain=False)
+        except TypeError:
+            tel.heartbeat(beat)
 
     def go(state: str, source: str, **extra: Any) -> Dict[str, Any]:
         session["id"] = os.path.basename(_ACTIVE["dir"]) if _ACTIVE.get("dir") else None
-        seen["sync"] = getattr(tel, "last_sync_ms", None)
         st = eng.transition(state, source, **extra)
         try:
-            tel.heartbeat(build_heartbeat(env, st, root, clock, seen, tel.pending(), getattr(lease, "token", None), session["id"], run_id))
+            emit()
             payload: Dict[str, Any] = {"state": state, "source": source[:200]}
             if isinstance(extra.get("why"), list):
                 payload["why"] = [str(x)[:200] for x in extra["why"][:6]]
@@ -609,9 +669,31 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
         except Exception:                                            # noqa: BLE001
             pass
 
+    def wait(seconds: float) -> None:
+        """Sleep in chunks: heartbeat every chunk (a long cooldown must not look like a dead worker) and return the moment a stop signal or a marker appears."""
+        left = float(seconds)
+        while left > 0:
+            chunk = min(float(IDLE_POLL_S), left)
+            idle_sleep(chunk)
+            left -= chunk
+            if _STOP.is_set() or any(eng.has(m) for m in ("ALERT", "STOP", "PAUSED", "DRAIN")):
+                return
+            try:
+                emit()
+            except Exception:                                        # noqa: BLE001
+                pass
+
     def idle(state: str, source: str, **extra: Any) -> None:
         go(state, source, **extra)
-        sleep(IDLE_POLL_S)
+        idle_sleep(IDLE_POLL_S)
+
+    def session_sleep(seconds: float) -> None:
+        sess_sleep(seconds)
+        if int(clock()) - hb["at"] >= IN_SESSION_HEARTBEAT_S * 1000:      # the hold can last almost an hour: keep reporting, without draining the outbox inside a session
+            try:
+                emit(drain=False)
+            except Exception:                                        # noqa: BLE001
+                pass
 
     go("INITIALISING", f"loop_start(prev={prev})")
     recovered = False
@@ -649,11 +731,21 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             recovered = True
         if eng.has("DRAIN"):
             d = eng.read("DRAINED")
-            if not (isinstance(d, dict) and int(clock()) - int(d.get("at_ms", 0)) < DRAINED_FRESH_MS):
-                eng.set("DRAINED", {"venue_flat_proof": True, "at_ms": int(clock())})
+            fresh = isinstance(d, dict) and int(clock()) - int(d.get("at_ms", 0)) < DRAINED_FRESH_MS
+            if not fresh:                                            # a drain proof needs a venue read NOW, not the flag from startup
+                ok, why, info = recover_fn(env, clock=clock, **{k: v for k, v in kw.items() if k in ("inner", "state_root", "symbol")})
+                if ok:
+                    eng.set("DRAINED", {"venue_flat_proof": True, "reconciled_ms": int(clock())})
+                    seen["bybit"] = seen["reconcile"] = int(clock())
+                else:
+                    go("DRAINING", "drain_waiting_for_a_flat_venue", why=why)
             idle("DRAINING", "drain_requested")
             continue
-        res = once(env, clock=clock, sleep=sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src), **kw)
+        try:
+            res = once(env, clock=clock, sleep=session_sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src), **kw)
+        except Exception as exc:                                     # noqa: BLE001 - a session died with an exception: it may have legs open. Never carry on; prove the venue flat first.
+            res = {"result": "ERROR", "why": [f"UNEXPECTED_EXCEPTION:{type(exc).__name__}"]}
+            recovered = False
         res["at_ms"] = int(clock())
         ES.write_json_atomic(os.path.join(root, "last_result.json"), res)
         out(json.dumps({k: res.get(k) for k in ("result", "why", "state_dir", "flat_verified", "funding_bps", "session_class")}, sort_keys=True, default=str))
@@ -680,7 +772,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             go("FLAT", "session_done")
             if res.get("revoked_reason"):
                 go("PAUSED", f"revoked:{res['revoked_reason']}")
-            sleep(COOLDOWN_AFTER_SESSION_S)
+            wait(COOLDOWN_AFTER_SESSION_S)
             continue
         if r == "REFUSED":
             owner_side = any(any(w.startswith(p) for p in OWNER_AUTHORITY_REFUSALS) for w in res.get("why", []))
@@ -814,7 +906,7 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--days", type=int, default=7, help=f"validity, <= {MAX_GRANT_DAYS}")
     g.add_argument("--allow-mechanics-sessions", action="store_true", help="ALSO allow bounded TESTNET_MECHANICS sessions (fake-money lifecycle/fee/fill measurement, expected net NEGATIVE, never "
                    "an opportunity) when the economics gate says the trade does not pay; without it only a PROFIT_CANDIDATE session can run")
-    sub.add_parser("once", help="one cycle")
+    sub.add_parser("evaluate", help="READ-ONLY: what the economics gate says right now (never starts a session; the only order path is `loop`)")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
     for name, helptext in (("status", "print the grant, engine state, markers and last result (no network)"), ("deploy-check", "exit 0 only if a deployment is safe now (fresh DRAINED proof, no active session, no ALERT)")):
@@ -849,10 +941,10 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
                           "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json"))},
                          indent=2, sort_keys=True, default=str))
         return 0
-    if a.cmd == "once":
-        res = run_once(e)
+    if a.cmd == "evaluate":
+        res = run_once(e, dry_run=True)
         print(json.dumps(res, indent=2, sort_keys=True, default=str))
-        return 0 if res["result"] in ("DONE", "SKIPPED") else 3
+        return 0 if res["result"] in ("EVALUATED", "SKIPPED") else 3
     if a.cmd == "drain":
         return cmd_drain(a.root, clock, a.wait)
     if a.cmd == "deploy-check":

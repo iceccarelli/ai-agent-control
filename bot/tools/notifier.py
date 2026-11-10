@@ -339,9 +339,13 @@ def dispatch(notifiers: Sequence[Notifier], alerts: Sequence[Alert], state: dict
     """
     active = state.setdefault("active", {})
     current = {a.key: a for a in alerts}
-    due = [a for a in alerts
-           if a.key not in active
-           or now_ms - int(active[a.key].get("last_notified_ms", 0)) >= renotify_interval_ms]
+
+    def last_ms(key: str) -> int:
+        """The persisted time of the last notification, SANITISED: a non-integer, negative or FUTURE value (a tampered state file) counts as never notified, so it can neither crash the
+        monitor nor silence an alert forever."""
+        v = active[key].get("last_notified_ms", 0) if isinstance(active.get(key), dict) else 0
+        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= now_ms else 0
+    due = [a for a in alerts if a.key not in active or now_ms - last_ms(a.key) >= renotify_interval_ms]
     cleared = [k for k in active if k not in current] if allow_recovery else []
     results: List[SendResult] = []
     sent: List[str] = []

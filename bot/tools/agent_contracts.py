@@ -22,6 +22,11 @@ MAX_PARAMS = 20
 # Parameter and field NAMES an agent may never set: they are the engine's decision inputs (the owner's, or fixed by code), not research output.
 FORBIDDEN_KEYS = re.compile(r"(?i)(secret|token|api[_-]?key|password|credential|grant|capability|authori[sz]|hurdle|min_net_edge|haircut|max_notional|max_loss|cap_|_cap|policy|kill|"
                             r"leverage|live|mainnet|testnet_ack|order|submit|execute|digest|plan_|command|shell|script|exec|eval|url|webhook|endpoint)")
+# Whole underscore-separated TOKENS that name an engine decision input (so `holding_settlements` is fine, `hold_s` is not): sizes, limits, stops, floors, sessions, risk.
+FORBIDDEN_TOKENS = frozenset({"notional", "hold", "session", "sessions", "risk", "size", "stop", "halt", "limit", "limits", "exposure", "loss", "threshold", "floor", "ceiling", "hurdle",
+                              "haircut", "leverage", "cap", "caps", "budget", "drawdown", "margin", "override", "bypass", "disable", "enable", "unlock"})
+INJECTIONISH = re.compile(r"(?i)(ignore\s+(all|any|the|previous|prior|above)|disregard|system\s+prompt|you\s+(must|should|need\s+to)\s+(now\s+)?(set|change|disable|enable|run|delete|touch|raise|lower)|"
+                          r"\bms_kill\b|\bms_testnet\w*|\btouch\s+\S|grant\s+file|capability\s+file|\bsudo\b|\bbypass\b|\boverride\b|new\s+instructions)")
 SECRETISH = re.compile(r"(?i)(-----BEGIN|eyJ[A-Za-z0-9_-]{10,}\.|[A-Za-z0-9+/]{40,}={0,2}|\b(?:sk|pk|ghp|xox[bp])[-_][A-Za-z0-9]{16,})")
 CODEISH = re.compile(r"(?i)(import\s+\w+|__\w+__|subprocess|os\.system|eval\(|exec\(|curl\s|wget\s|rm\s+-|\bsudo\b|\$\(|`|;\s*\w+\s*\(|api\.bybit\.com)")
 
@@ -35,8 +40,8 @@ def _check_text(name: str, v: Any, limit: int = MAX_TEXT) -> str:
         raise ProposalRefused(f"{name}: a non-empty string of at most {limit} characters is required")
     if SECRETISH.search(v):
         raise ProposalRefused(f"{name}: looks like a secret or a key")
-    if CODEISH.search(v):
-        raise ProposalRefused(f"{name}: looks like code or a command (proposals are data, never instructions)")
+    if CODEISH.search(v) or INJECTIONISH.search(v):
+        raise ProposalRefused(f"{name}: looks like code, a command or an instruction (proposals are data, never instructions)")
     return v.strip()
 
 
@@ -57,7 +62,7 @@ def validate(p: Mapping[str, Any]) -> Dict[str, Any]:
         raise ProposalRefused("parameters: a small mapping of scalars")
     clean_params: Dict[str, Any] = {}
     for k, v in params.items():
-        if not isinstance(k, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,40}", k) or FORBIDDEN_KEYS.search(k):
+        if not isinstance(k, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,40}", k) or FORBIDDEN_KEYS.search(k) or FORBIDDEN_TOKENS & set(k.split("_")) or "min_funding" in k or "min_net" in k:
             raise ProposalRefused(f"parameters.{k!r}: a decision input / secret / command-like name is not allowed")
         if isinstance(v, bool) or not isinstance(v, (int, float, str)) or (isinstance(v, str) and len(v) > 200):
             raise ProposalRefused(f"parameters.{k}: scalars only")

@@ -429,7 +429,7 @@ def test_a_flat_venue_after_an_unresolved_prior_session_is_recorded_and_allowed(
     write_grant(w, min_funding_bps=0.5)
     prior = w.tmp / "auto" / "ms_auto_20261110T000000"
     os.makedirs(prior)
-    open(prior / "journal", "w").write("x\n")                                           # a session started and never reached flat_verified
+    open(prior / S.FILES["journal"], "w").write("x\n")                                  # a session started (the REAL journal file) and never reached flat_verified
     ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
     assert ok and why == [] and info["unresolved"] is True
     assert json.load(open(prior / "recovery.json"))["accounting_must_be_reconciled"] is True
@@ -724,3 +724,249 @@ def test_an_alert_emits_a_critical_incident_event_that_satisfies_the_evidence_co
     run_loop(w, tmp_path / "ap", NEVER, n=1, telemetry=tel)
     inc = [ev for _s, _o, ev in box.iter_pending() if ev["kind"] == "INCIDENT"]
     assert inc and inc[0]["payload"]["code"] == "UNRECONCILED_AT_RECOVERY" and inc[0]["payload"]["severity"] == "CRITICAL" and "PERP_POSITION_OPEN" in inc[0]["payload"]["detail"]
+
+
+# ================================================================ red-team regressions (tree 4399e60): each asserts the SAFE behaviour
+def creates(w):
+    return [r for r in w.fake.requests if r[0] == "POST" and r[1] == "/v5/order/create"]
+
+
+class CountingLease:
+    """held() is True for the first `ok_calls` calls, then False (or raises)."""
+    token = 3
+
+    def __init__(self, ok_calls, raises=False):
+        self.n, self.ok_calls, self.raises = 0, ok_calls, raises
+
+    def held(self):
+        self.n += 1
+        if self.n > self.ok_calls:
+            if self.raises:
+                raise RuntimeError("lease backend exploded")
+            return False
+        return True
+
+
+def prepared(w, **grant_over):
+    write_grant(w, **{"min_funding_bps": 0.5, "allow_mechanics_sessions": True, **grant_over})
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0008", 600_000
+
+
+def run(w, root, **kw):
+    return AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(root), **kw)
+
+
+def test_RT1_a_lease_lost_between_the_gates_and_the_first_order_places_no_entry(w, tmp_path):
+    prepared(w)
+    res = run(w, tmp_path / "ap", lease=CountingLease(ok_calls=1))                       # held() True for the pre-execute check, False at the pre-ORDER check
+    assert creates(w) == [], "an entry order was placed although the lease was lost before it"
+    assert res["flat_verified"] is True or res["result"] in ("DONE", "SKIPPED")
+
+
+def test_RT1b_a_stop_marker_set_at_the_execute_boundary_places_no_entry(w, tmp_path):
+    prepared(w)
+    root = tmp_path / "ap"
+    res = run(w, root, on_state=lambda s, src: ES.EngineState(str(root), w.clock.now).set("STOP", {"by": "owner"}) if s == "EXECUTING" else None)
+    assert creates(w) == [], "an entry order was placed after STOP was set"
+    assert all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_RT1c_a_stop_signal_before_the_order_places_no_entry(w, tmp_path, stop_state):
+    prepared(w)
+    res = run(w, tmp_path / "ap", on_state=lambda s, src: AP._STOP.set() if s == "EXECUTING" else None)
+    assert creates(w) == [] and res["result"] in ("DONE", "SKIPPED", "NOT_FLAT") and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_RT2_an_exception_in_the_authority_check_mid_session_never_escapes_and_unwinds_flat(w, tmp_path):
+    prepared(w)
+    res = run(w, tmp_path / "ap", lease=CountingLease(ok_calls=6, raises=True))          # the lease backend raises a non-OSError in the middle of the hold
+    assert res["revoked_reason"].startswith("WATCHER_ERROR:RuntimeError") and res["flat_verified"] is True and res["result"] == "DONE"
+    assert all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_RT2b_an_exception_in_the_pre_order_check_is_a_refusal_not_a_pass(w, tmp_path):
+    prepared(w)
+    run(w, tmp_path / "ap", lease=CountingLease(ok_calls=1, raises=True))
+    assert creates(w) == []
+
+
+def test_RT2c_an_exception_out_of_a_session_forces_a_fresh_venue_proof_and_never_kills_the_loop(w, tmp_path, stop_state):
+    calls = {"recover": 0, "once": 0}
+
+    def recover_fn(*a, **k):
+        calls["recover"] += 1
+        return True, [], {"venue_read_complete": True, "reconciled_ms": 1}
+
+    def boom(*a, **k):
+        calls["once"] += 1
+        raise RuntimeError("session blew up with legs possibly open")
+    rc, _ = run_loop(w, tmp_path / "ap", boom, n=3, recover_fn=recover_fn)
+    assert rc == 0 and calls["once"] == 3 and calls["recover"] == 3                      # recovery is re-run after EVERY exception, before the next session may start
+    assert ES.EngineState(str(tmp_path / "ap"), w.clock.now).has("ALERT")                # three in a row -> ALERT
+
+
+def test_RT8_a_kill_switch_that_cannot_be_created_is_retried_every_poll_and_raises_an_alert(w, tmp_path, monkeypatch):
+    prepared(w)
+    root = tmp_path / "ap"
+    real = AP.AD.engage_kill_switch
+    n = {"calls": 0}
+
+    def flaky(path, reason=""):
+        n["calls"] += 1
+        if n["calls"] <= 3:
+            raise OSError("read-only file system")
+        return real(path, reason)
+    monkeypatch.setattr(AP.AD, "engage_kill_switch", flaky)
+    res = run(w, root, lease=CountingLease(ok_calls=5))
+    assert n["calls"] >= 4 and os.path.exists(os.path.join(res["state_dir"], "MS_KILL"))   # retried until it worked
+    assert ES.EngineState(str(root), w.clock.now).has("ALERT") and ES.EngineState(str(root), w.clock.now).read("ALERT")["code"] == "KILL_SWITCH_UNENGAGEABLE"
+    assert res["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_RT3_recovery_proves_flat_for_EVERY_allowlisted_symbol_not_just_the_first(w):
+    w.fake.inject_position("ETHUSDT", -1)                                                 # the manifest allows BTCUSDT and ETHUSDT; only ETH is open
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert not ok and any(x.startswith("PERP_POSITION_OPEN:ETHUSDT") for x in why) and info["venue_read_complete"] and info["symbols"] == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_RT3b_an_open_perp_on_any_symbol_blocks_even_when_asked_about_another(w):
+    w.fake.inject_position("ETHUSDT", -1)
+    ok, why, _ = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"), symbol="BTCUSDT")
+    assert not ok and any("ETHUSDT" in x for x in why)
+
+
+def test_RT9_there_is_no_once_command_and_evaluate_never_starts_a_session(w, tmp_path):
+    with pytest.raises(SystemExit):
+        AP.main(["once"], env={})
+    prepared(w)
+    w.fake.funding_rate = "0.0100"
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), dry_run=True)
+    assert res["result"] == "EVALUATED" and res["session_class"] in ("PROFIT_SEEKING", "TESTNET_MECHANICS", None) and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_RT9b_run_once_is_reachable_from_the_cli_only_as_a_dry_run_and_otherwise_only_through_the_loop():
+    import ast
+    tree = ast.parse(open(AP.__file__, encoding="utf-8").read())
+    main_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    uses = [n for n in ast.walk(main_fn) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "run_once"]
+    assert uses and all(any(k.arg == "dry_run" and getattr(k.value, "value", None) is True for k in c.keywords) for c in uses)
+
+
+def test_RT4_every_heartbeat_has_a_unique_increasing_seq_even_when_the_state_does_not_change(w, tmp_path, stop_state):
+    class Rec(AP.NullTelemetry):
+        def __init__(self):
+            self.hbs = []
+
+        def heartbeat(self, hb, drain=True):
+            self.hbs.append(hb)
+    rec = Rec()
+    ES.EngineState(str(tmp_path / "ap"), w.clock.now).set("STOP", {"by": "owner"})
+    run_loop(w, tmp_path / "ap", NEVER, n=5, recover_fn=OK_RECOVERY, telemetry=rec)       # five idle iterations in the SAME state
+    seqs = [h["seq"] for h in rec.hbs]
+    assert len(seqs) >= 5 and seqs == sorted(set(seqs)), seqs
+
+
+def test_RT5_the_loop_keeps_heartbeating_through_the_cooldown_and_the_hold(w, tmp_path, stop_state):
+    class Rec(AP.NullTelemetry):
+        def __init__(self):
+            self.at = []
+
+        def heartbeat(self, hb, drain=True):
+            self.at.append(hb["at_ms"])
+    rec = Rec()
+    prepared(w)
+    rc, _ = run_loop(w, tmp_path / "ap", AP.run_once, n=1, recover_fn=OK_RECOVERY, telemetry=rec, sleep=w.clock.sleep)      # one full session, then the 30-minute cooldown
+    gaps = [b - a for a, b in zip(rec.at, rec.at[1:])]
+    assert rc == 0 and rec.at and max(gaps) <= 40_000, max(gaps)                         # never silent for more than ~40 s (the monitor's stale threshold is 300 s)
+
+
+def test_RT7_the_cooldown_notices_a_drain_or_stop_marker_at_once(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    seen = {"slept": 0}
+
+    def sleep(s):
+        seen["slept"] += s
+        if seen["slept"] >= 90:
+            ES.EngineState(str(root), w.clock.now).set("DRAIN", {"requested": True})
+
+    def once(*a, **k):
+        return {"result": "DONE", "why": [], "flat_verified": True}
+    run_loop(w, root, once, n=2, recover_fn=OK_RECOVERY, sleep=sleep)
+    assert seen["slept"] < 300, seen["slept"]                                            # it did NOT sleep the whole 1800 s cooldown
+
+
+def test_RT11_a_session_keeps_real_sleep_pacing_after_a_stop_signal(w, tmp_path, stop_state, monkeypatch):
+    got = {}
+
+    def once(env, **k):
+        got["sleep"] = k["sleep"]
+        return {"result": "SKIPPED", "why": []}
+    slept = []
+    monkeypatch.setattr(AP.time, "sleep", lambda s: slept.append(s))
+    out = []
+    AP.loop(w.env, root=str(tmp_path / "ap"), once=once, clock=w.clock.now, out=out.append, max_iterations=1, recover_fn=OK_RECOVERY, inner=w.fake, state_root=str(w.tmp / "auto"))
+    AP._STOP.set()
+    got["sleep"](0.25)                                                                    # the session's sleep is a REAL sleep, not an event wait that returns at once after SIGTERM
+    assert slept == [0.25]
+
+
+def test_RT12_drained_requires_a_fresh_venue_read_not_the_startup_flag(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    AP.cmd_drain(str(root), w.clock.now, 0, out=lambda _m: None)
+    state = {"n": 0}
+
+    def recover_fn(*a, **k):
+        state["n"] += 1
+        return (state["n"] == 1, [] if state["n"] == 1 else ["PERP_POSITION_OPEN:BTCUSDT:-0.005"], {"venue_read_complete": True, "reconciled_ms": 1})       # flat at startup, then NOT flat
+    run_loop(w, root, NEVER, n=2, recover_fn=recover_fn)
+    assert state["n"] >= 2 and not ES.EngineState(str(root), w.clock.now).has("DRAINED")      # no DRAINED proof while the venue shows a position
+
+
+def test_the_lease_holder_name_is_unique_per_process():
+    env = {"SUPABASE_URL": "https://abcdefgh.supabase.co", "SUPABASE_SERVICE_ROLE_KEY": "k" * 30, "SUPABASE_OWNER_ID": "11111111-2222-3333-4444-555555555555", "FLY_MACHINE_ID": "m1"}
+    h1 = AP.build_runtime(env, "/tmp/x1", lambda: 1)[1]._l.holder
+    h2 = AP.build_runtime(env, "/tmp/x2", lambda: 1)[1]._l.holder
+    assert h1 != h2 and h1.startswith("m1:") and h2.startswith("m1:")
+
+
+# ---- the mutations the red team found SURVIVING
+def test_an_ALERT_marker_set_during_a_session_revokes_it(w, tmp_path):
+    prepared(w)
+    root = tmp_path / "ap"
+    res = run(w, root, lease=None, on_state=lambda s, src: None)
+    root2 = tmp_path / "ap2"
+    n = {"i": 0}
+    real = w.clock.sleep
+
+    def sleep(s):
+        n["i"] += 1
+        if n["i"] == 3:
+            ES.EngineState(str(root2), w.clock.now).set("ALERT", {"code": "X"})
+        real(s)
+    prepared(w)
+    res2 = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=sleep, out=lambda _m: None, state_root=str(w.tmp / "auto2"), engine_root=str(root2))
+    assert res2["revoked_reason"] == "ALERT" and res2["flat_verified"] is True
+
+
+def test_recovery_reports_an_open_order_even_when_every_position_is_flat():
+    class Ex:
+        def venue_state(self):
+            return {"complete": True, "positions": {"linear:BTCUSDT": 0.0, "spot:BTCUSDT": 0.0}, "orders": {"x-1": {"status": "New"}}, "foreign_open_orders": []}
+
+        def filters(self, *_a):
+            return type("F", (), {"qty_step": 0.001})()
+    ok, why, complete = AP.venue_flat_proof(Ex(), "BTCUSDT", 0.0, 0.005)
+    assert not ok and complete and any(x.startswith("OPEN_ORDERS") for x in why)
+    class Ex2(Ex):
+        def venue_state(self):
+            return {"complete": True, "positions": {"linear:BTCUSDT": 0.0}, "orders": {}, "foreign_open_orders": ["999"]}
+    assert not AP.venue_flat_proof(Ex2(), "BTCUSDT", None, None)[0]
+
+
+def test_the_same_state_transition_does_not_bump_the_state_seq_but_a_change_does(tmp_path):
+    st = ES.EngineState(str(tmp_path / "r"), lambda: 5)
+    a = st.transition("PAUSED", "x")
+    b = st.transition("PAUSED", "again")
+    c = st.transition("ALERT", "now")
+    assert a["seq"] == b["seq"] and c["seq"] == a["seq"] + 1

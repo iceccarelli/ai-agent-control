@@ -38,8 +38,13 @@ def codes(findings):
     return {f.code for f in findings}
 
 
+def iso(ms):
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ms / 1000.0, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def ev(code, severity="CRITICAL", detail="d", **kw):
-    e = {"kind": "INCIDENT", "worker_id": "w1", "at_ms": NOW - 1000,
+    e = {"kind": "INCIDENT", "worker_id": "w1", "received_at": iso(NOW - 1000),
          "payload": {"code": code, "severity": severity, "detail": detail}}
     e.update(kw)
     return e
@@ -127,7 +132,7 @@ def test_stale_heartbeat_suppresses_noise_but_old_workers_do_not_count_as_multip
 
 
 def test_old_incidents_outside_window_are_ignored_and_latest_row_wins():
-    old = ev("RISK_LIMIT_X", at_ms=NOW - 10_000_000)
+    old = ev("RISK_LIMIT_X", received_at=iso(NOW - 10_000_000))
     assert hm.evaluate([hb()], [old], NOW, {}) == []
     rows = [hb(at_ms=NOW - 900_000, state="ALERT"), hb(at_ms=NOW - 1000)]
     assert hm.evaluate(rows, [], NOW, {}) == []
@@ -451,3 +456,42 @@ def test_monitor_and_notifier_sources_never_touch_the_exchange():
         src = open(os.path.join(os.path.dirname(HERE), "tools", name), encoding="utf-8").read().lower()
         assert "api.bybit" not in src and "bybit_api" not in src and "live_trading" not in src
         assert "import bybit" not in src and "pybit" not in src
+
+
+def test_the_incident_query_uses_the_real_exec_events_column_and_an_iso_timestamp_not_at_ms():
+    """The migration's exec_events has occurred_at / received_at (timestamptz) and NO at_ms: a query on at_ms is a permanent HTTP 400 (the incident path could never work)."""
+    import re as _re
+    sql = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "supabase", "migrations", "20261110000100_exec_evidence_lease.sql"), encoding="utf-8").read()
+    ev_table = sql[sql.index("create table if not exists carry.exec_events"):]
+    ev_table = ev_table[:ev_table.index(");")]
+    assert hm.EVENT_TIME_COLUMN in ev_table and "at_ms" not in ev_table
+    seen = []
+    hm.fetch(lambda table, q: seen.append((table, q)) or [], NOW)
+    q = dict(seen)["exec_events"]
+    assert f"{hm.EVENT_TIME_COLUMN}=gte." in q and "at_ms" not in q and _re.search(r"gte\.\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", q)
+
+
+def test_an_old_incident_outside_the_window_is_ignored_a_recent_one_is_kept_and_an_unparseable_time_is_kept():
+    old = ev("NOT_FLAT", received_at=iso(NOW - (hm.INCIDENT_WINDOW_S + 60) * 1000))
+    recent = ev("NOT_FLAT")
+    weird = ev("NOT_FLAT", received_at="not a time")
+    assert "NOT_FLAT" not in codes(hm.evaluate([hb()], [old], NOW, {}))
+    assert "NOT_FLAT" in codes(hm.evaluate([hb()], [recent], NOW, {}))
+    assert "NOT_FLAT" in codes(hm.evaluate([hb()], [weird], NOW, {}))                  # an event whose age cannot be established is never silently dropped
+
+
+def test_a_tampered_notifier_state_neither_crashes_nor_silences_an_alert_forever():
+    import notifier as N
+    class Sink(N.Notifier):
+        def __init__(self):
+            self.sent = []
+
+        def send(self, text):
+            self.sent.append(text)
+            return N.SendResult("sink", "SENT") if hasattr(N, "SendResult") else None
+    alert = N.Alert(key="k", severity="CRITICAL", text="boom")
+    for bad in ("garbage", -5, NOW + 10 ** 12, None, True, {"x": 1}, 1.5):
+        st = {"version": 1, "active": {"k": {"last_notified_ms": bad, "severity": "CRITICAL"}}}
+        sink = Sink()
+        N.dispatch([sink], [alert], st, NOW)                                            # must not raise; a tampered/future value counts as never notified: the alert is DUE now
+        assert sink.sent, f"the alert was silenced by last_notified_ms={bad!r}"

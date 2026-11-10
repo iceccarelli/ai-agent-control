@@ -48,7 +48,7 @@ echo "$ENVS" | grep -Eq '^(BYBIT_API_KEY|BYBIT_API_SECRET|BYBIT_TESTNET_API_KEY|
 echo "$ENVS" | grep -q '^USE_TESTNET=1$' || fail "USE_TESTNET=1 missing"
 HIST="$(docker history --no-trunc "$IMG")"
 echo "$HIST" | grep -Eiq 'LIVE_TRADING_ACK|BYBIT_API_(KEY|SECRET)|BYBIT_TESTNET_API_(KEY|SECRET)=' && fail "a credential name with a value, or a live switch, appears in the image history"
-HOST="$(docker run --rm -e BYBIT_VENUE=mainnet -e USE_TESTNET=0 -e PAPER_TRADING=0 -e LIVE_TRADING_ACK=1 "$IMG" python3 -c 'import venues; print(venues.get("testnet").host)')"
+HOST="$(docker run --rm -e PYTHONPATH=/app/tools -e BYBIT_VENUE=mainnet -e USE_TESTNET=0 -e PAPER_TRADING=0 -e LIVE_TRADING_ACK=1 "$IMG" python3 -c 'import venues; print(venues.get("testnet").host)')"
 [ "$HOST" = "api-testnet.bybit.com" ] || fail "the testnet host changed under a hostile environment: $HOST"
 docker run --rm -e BYBIT_VENUE=mainnet -e USE_TESTNET=0 -e PAPER_TRADING=0 -e LIVE_TRADING_ACK=1 "$IMG" python3 -c '
 import ms_testnet_transport as TT

@@ -36,7 +36,7 @@ RUN useradd --create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /data && chown -R bot:bot /app /data
 
 # Testnet only, stated again here. HOME=/data puts the capability file, the grant, the entries counter, every state dir and the autopilot root on the volume.
-ENV USE_TESTNET=1 PAPER_TRADING=0 BYBIT_VENUE=testnet HOME=/data
+ENV USE_TESTNET=1 BYBIT_VENUE=testnet HOME=/data
 
 # Starts as root only to chown the volume; the entrypoint drops to `bot` and execs, so Fly's SIGTERM reaches the autopilot, which asks the active session to unwind.
 ENTRYPOINT ["/usr/local/bin/autopilot-entrypoint"]

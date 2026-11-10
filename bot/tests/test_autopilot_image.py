@@ -66,7 +66,8 @@ def test_no_bare_directory_copy_but_signals():
 
 def test_the_image_is_testnet_only_and_carries_no_credential_or_live_switch():
     d = _read("Dockerfile.autopilot")
-    assert "USE_TESTNET=1" in d and "PAPER_TRADING=0" in d and "BYBIT_VENUE=testnet" in d and "HOME=/data" in d
+    assert "USE_TESTNET=1" in d and "BYBIT_VENUE=testnet" in d and "HOME=/data" in d
+    assert "PAPER_TRADING" not in "\n".join(ln for ln in d.splitlines() if not ln.lstrip().startswith("#"))          # CLAUDE.md: PAPER_TRADING=0 is never set
     for token in ("LIVE_TRADING_ACK", "USE_TESTNET=0", "BYBIT_API_KEY", "BYBIT_API_SECRET", "BYBIT_TESTNET_API_KEY=", "BYBIT_TESTNET_API_SECRET=", "api.bybit.com", ".env", "ms_testnet_capability.json",
                   "ms_autopilot_grant.json"):
         assert not [ln for ln in d.splitlines() if not ln.lstrip().startswith("#") and token in ln], token
@@ -88,7 +89,7 @@ def test_the_fly_app_is_one_machine_one_volume_no_public_port_and_no_secret():
     assert 'strategy = "immediate"' in body and "[http_service]" not in body and "[[services]]" not in body
     assert body.count("[[mounts]]") == 1 and 'destination = "/data"' in body and 'dockerfile = "Dockerfile.autopilot"' in body
     assert 'USE_TESTNET = "1"' in body and 'BYBIT_VENUE = "testnet"' in body and 'HOME = "/data"' in body
-    for token in ("LIVE_TRADING_ACK", "USE_TESTNET = \"0\"", "api.bybit.com", "BYBIT_API", "BYBIT_TESTNET_API", "SECRET", "KEY"):
+    for token in ("LIVE_TRADING_ACK", "PAPER_TRADING", "USE_TESTNET = \"0\"", "api.bybit.com", "BYBIT_API", "BYBIT_TESTNET_API", "SECRET", "KEY"):
         assert token not in body, token
 
 

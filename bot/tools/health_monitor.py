@@ -61,7 +61,7 @@ INCIDENT_WINDOW_S = 3600
 HEARTBEAT_LOOKBACK_S = 7 * 86400
 
 #: ASSUMPTION to confirm with the owner of the tables: the epoch-ms column on carry.exec_events.
-EVENT_TIME_COLUMN = "at_ms"
+EVENT_TIME_COLUMN = "received_at"        # carry.exec_events has occurred_at / received_at (timestamptz), NOT at_ms: querying a column that does not exist would be a permanent HTTP 400
 
 ENGINE_STATES = frozenset((
     "INITIALISING", "DATA_CHECK", "RESEARCHING", "WAITING_FOR_OPPORTUNITY", "PLAN_PROPOSED",
@@ -256,8 +256,8 @@ def evaluate(heartbeats: Sequence[dict], incidents: Sequence[dict], now_ms: int,
         if p is None:
             findings.append(Finding("UNKNOWN", "CRITICAL", "*", "unreadable INCIDENT event payload"))
             continue
-        t = ev.get(EVENT_TIME_COLUMN) if isinstance(ev, dict) else None
-        if _is_int(t) and (now_ms - t) / 1000.0 > incident_window_s:
+        t = _event_ms(ev.get(EVENT_TIME_COLUMN)) if isinstance(ev, dict) else None
+        if t is not None and (now_ms - t) / 1000.0 > incident_window_s:
             continue
         code = str(p.get("code", "")).strip()[:60]
         sev = str(p.get("severity", "")).upper()
@@ -326,11 +326,29 @@ def postgrest_reader(base_url: str, key: str, *, timeout: float = 20.0, opener=N
     return read
 
 
+def _iso(ms: int) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ms / 1000.0, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _event_ms(v: Any) -> Optional[int]:
+    """An event time as epoch ms: an int (ms) or an ISO-8601 timestamptz string. Anything else is None (the event is then KEPT, never skipped)."""
+    if _is_int(v):
+        return int(v)
+    if isinstance(v, str):
+        import datetime as _dt
+        try:
+            return int(_dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            return None
+    return None
+
+
 def fetch(read: Callable[[str, str], List[dict]], now_ms: int):
     since = now_ms - HEARTBEAT_LOOKBACK_S * 1000
     hb = read("exec_heartbeats", f"select=*&at_ms=gte.{since}&order=at_ms.desc&limit=500")
     inc_since = now_ms - INCIDENT_WINDOW_S * 1000
-    ev = read("exec_events", f"select=*&kind=eq.INCIDENT&{EVENT_TIME_COLUMN}=gte.{inc_since}"
+    ev = read("exec_events", f"select=*&kind=eq.INCIDENT&{EVENT_TIME_COLUMN}=gte.{_iso(inc_since)}"
                              f"&order={EVENT_TIME_COLUMN}.desc&limit=200")
     return hb, ev
 

@@ -128,3 +128,10 @@ def test_collect_falls_back_to_an_assumed_tier_when_the_account_fee_read_is_refu
     assert inp.perp_fee is None and inp.fee_observed_ms is None
     v = EG.evaluate_edge(inp)
     assert "fees" in v.assumed_inputs and v.session_class != EG.PROFIT_CANDIDATE
+
+
+def test_a_settlement_that_already_happened_or_is_exactly_now_is_not_inside_the_hold():
+    for nxt in (NOW - 1, NOW, NOW - 600_000):
+        v = EG.evaluate_edge(inputs("0.0100", next_funding_ms=nxt))
+        assert v.session_class == EG.REJECTED and v.reasons == ("NO_SETTLEMENT_INSIDE_THE_HOLD",), nxt
+    assert EG.evaluate_edge(inputs("0.0100", next_funding_ms=NOW + 720_000)).settlements_in_hold == 1       # exactly at the end of the hold: inside
