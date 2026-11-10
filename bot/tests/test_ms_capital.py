@@ -111,17 +111,66 @@ def test_when_funding_was_read_a_cash_difference_the_ledger_cannot_explain_is_fl
     assert b.basis() == D("10000") + D("-41")
 
 
-def test_a_session_that_did_not_end_verified_flat_is_not_parked_and_settle_is_idempotent(tmp_path):
+def test_a_session_that_did_not_end_flat_counts_its_losses_but_never_its_gains_and_settle_is_idempotent(tmp_path):
     b = book(tmp_path)
     b.ensure_baseline("10000")
-    b.park("s1", "10000", "1.00", True, False)
-    assert b.load()["pending"] is None
-    b.park("s2", "10000", "-2.00", True, True)
-    b.park("s2", "10000", "-2.00", True, True)                               # duplicate park: ignored
-    assert b.settle("9998")["status"] == "SETTLED"
-    assert b.settle("9998")["status"] == "NO_PENDING" and b.load()["loss_streak"] == 1
-    b.park("s2", "9998", "-2.00", True, True)                                # an already-settled session id is never booked twice
+    b.park("s1", "10000", "1.00", True, False)                                # ended NOT flat: parked, so a loss cannot go missing
+    r = b.settle("10001")
+    assert r["status"] == "NOT_FLAT_SESSION" and r["credited_usd"] == "0" and b.basis() == D("10000")
+    b.park("s2", "10001", "-2.00", True, False)
+    b.park("s2", "10001", "-2.00", True, False)                               # duplicate park: ignored
+    assert b.settle("9999")["credited_usd"] == "-2" and b.load()["loss_streak"] == 1
+    assert b.settle("9999")["status"] == "NO_PENDING"
+    b.park("s2", "9999", "-2.00", True, True)                                 # an already-settled session id is never booked twice
     assert b.load()["pending"] is None and b.basis() == D("9998")
+
+
+def test_the_reserve_is_withheld_from_the_sizing_basis_but_never_softens_a_loss(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "40.00", True, True)
+    b.settle("10040")
+    assert b.basis() == D("10040") and b.reserve_usd() == D("10.00") and b.sizing_basis() == D("10030.00")      # 25% default reserve of the 40 gain
+    b.park("s2", "10040", "-10.00", True, True)
+    b.settle("10030")
+    assert b.basis() == D("10030") and b.sizing_basis() == D("10020.00")                                           # the loss is debited in full; the reserve stays
+    assert b.set_reserve_fraction("0.5") and b.reserve_usd() == D("20.00")
+    assert not b.set_reserve_fraction("0.95") and not b.set_reserve_fraction("-1") and not b.set_reserve_fraction("x")
+    assert alloc(basis=b.sizing_basis(), start_cash=D(10000)).notional <= alloc(basis=b.basis(), start_cash=D(10000)).notional
+
+
+def test_a_declared_deposit_or_withdrawal_is_never_a_trading_result(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.declare_transfer("dep-1", "500") and not b.declare_transfer("dep-1", "500") and not b.declare_transfer("", "5") and not b.declare_transfer("z", "0")
+    b.park("s1", "10000", "-1.00", True, True)
+    r = b.settle("10499")                                                    # +500 deposit, -1 trading loss
+    assert r["status"] == "SETTLED" and r["transfers_removed_usd"] == "500" and r["credited_usd"] == "-1" and b.basis() == D("9999")
+    assert not b.declare_transfer("dep-1", "500")                            # applied ids stay known: a retry cannot re-subtract it
+    b.park("s2", "10499", "0.50", True, True)
+    assert b.declare_transfer("wd-1", "-200")
+    assert b.settle("10299.50")["credited_usd"] == "0.50"                    # withdrawal removed too
+
+
+def test_concurrent_settlement_credits_exactly_once(tmp_path):
+    import threading
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "5.00", True, True)
+    out = []
+    ths = [threading.Thread(target=lambda: out.append(C.CapitalBook(str(tmp_path)).settle("10005")["status"])) for _ in range(8)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    assert sorted(out).count("SETTLED") == 1 and out.count("NO_PENDING") == 7
+    assert b.load()["realised_usd"] == "5" and len(b.load()["history"]) == 1
+
+
+def test_a_restart_between_park_and_settle_loses_nothing_and_duplicates_nothing(tmp_path):
+    C.CapitalBook(str(tmp_path)).ensure_baseline("10000")
+    C.CapitalBook(str(tmp_path)).park("s1", "10000", "-3.00", True, True)       # process 1 dies here
+    b2 = C.CapitalBook(str(tmp_path))                                           # process 2 starts from the file
+    assert b2.load()["pending"]["session_id"] == "s1"
+    assert b2.settle("9997")["credited_usd"] == "-3" and C.CapitalBook(str(tmp_path)).settle("9997")["status"] == "NO_PENDING"
 
 
 def test_a_failed_cash_read_leaves_the_session_pending_and_credits_nothing(tmp_path):

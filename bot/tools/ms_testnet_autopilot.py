@@ -297,7 +297,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
         return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     cb = book.load()
-    alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
+    alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.sizing_basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
                         loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
                                                           "edge": verdict.as_dict(), "allocation": alloc.as_dict(), "capital_settlement": settled})
@@ -928,6 +928,8 @@ def _parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
     cp.add_argument("--root", default=DEFAULT_ROOT)
     cp.add_argument("--ack-halt", action="store_true")
+    cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
+    cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
     sub.add_parser("evaluate", help="READ-ONLY: what the economics gate says right now (never starts a session; the only order path is `loop`)")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
@@ -967,6 +969,10 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         cbk = CC.CapitalBook(a.root)
         if a.ack_halt:
             print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        if a.reserve_fraction is not None:
+            print("reserve set" if cbk.set_reserve_fraction(a.reserve_fraction) else "refused: reserve must be between 0 and 0.9")
+        if a.declare_transfer:
+            print("transfer declared" if cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]) else "refused or already declared")
         print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "evaluate":
