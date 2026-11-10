@@ -27,7 +27,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      md_book.py md_broker.py md_capacity.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py \
      md_state.py md_store.py md_transport.py md_wire.py \
      capacity_schema.py evidence_chain.py evidence_stats.py funding_eval.py recorder_reliability.py \
-     trade_economics.py opportunity_engine.py strategy_measure.py statistical_power.py capital_survival.py execution_model.py ./
+     trade_economics.py opportunity_engine.py strategy_measure.py statistical_power.py capital_survival.py execution_model.py economic_model.py ./
 COPY signals/ ./signals/
 COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/unattended_drill.py tools/next_settlement.py tools/recon_summary.py \
@@ -37,6 +37,8 @@ COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/carry_performance.py tools/owner_policy_check.py \
      tools/execution_samples_report.py tools/market_recorder.py tools/runner_supervisor.py tools/capacity_summary.py \
      tools/profitability_report.py tools/state_backup.py tools/anchor_archive.py \
+     tools/legacy_executor_guard.py tools/exec_evidence.py tools/supabase_sync.py tools/account_review.py tools/carry_prospective.py \
+     tools/carry_teardown.py tools/deflated_sharpe.py tools/hypothesis_registry.py tools/strategy_verdict.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
@@ -58,4 +60,7 @@ ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]
 # (tools/unattended_drill.py --conformance) ships in the image but is never the
 # default; it must be invoked explicitly, e.g. `fly machine run ... -- python3
 # tools/unattended_drill.py --conformance --loop --run-dir /data/runs`.
+# That order-capable run takes the SAME global Supabase lease as the autopilot before every armed run
+# (tools/legacy_executor_guard.py) and places nothing without SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and
+# SUPABASE_OWNER_ID: the autopilot is the only order-capable service unless you deliberately wire this one in.
 CMD ["python3", "tools/runner_supervisor.py", "--recorder", "--recorder-dir", "/data/market", "--recorder-environment", "mainnet", "--recorder-min-free-mb", "512", "--recorder-retention-days", "2", "--", "python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db", "--mainnet-db", "/data/mainnet/mainnet_public.jsonl", "--recorder-status", "/data/market/recorder_status.json"]

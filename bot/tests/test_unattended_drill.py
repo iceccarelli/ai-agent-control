@@ -494,10 +494,22 @@ class TestHousekeeping:
         monkeypatch.setenv("BYBIT_API_SECRET", "s")
         monkeypatch.setattr(U, "install_signal_handlers", lambda: None)
 
+        import legacy_executor_guard as LG
+
+        class _Lease:                                   # the single-writer lease is a precondition of every armed run; this test is about the shutdown path, so it is granted
+            token, freed = 1, []
+
+            def release(self):
+                self.freed.append(1)
+                return True
+        lease = _Lease()
+        monkeypatch.setattr(LG, "acquire", lambda env, **k: (LG.Handle(lease), ""))
+
         def boom(*a, **k):
             raise U.Shutdown("signal 15")
         monkeypatch.setattr(U, "run_once", boom)
         assert U.main(["--conformance", "--run-dir", str(tmp_path)]) == U.EXIT_SIGNALLED
+        assert lease.freed == [1]                       # and the lease is freed on the way out
 
 
 STUB = textwrap.dedent("""
