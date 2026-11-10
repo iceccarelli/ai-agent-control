@@ -1335,3 +1335,68 @@ def test_a_crash_between_execute_and_the_end_of_the_session_leaves_the_cash_pend
     assert p is not None and p["flat_verified"] is False and p["ledger_net_known_usd"] is None, "no conservative placeholder was parked before execution"
     r = CC.CapitalBook(eng).settle("1")                                        # the venue's cash is thousands lower than this: a LOSS, booked in full
     assert r["status"] == "SETTLED" and CC.CapitalBook(eng).load()["loss_streak"] == 1
+
+
+# ---------------------------------------------------------------- the durable, reproducible decision record
+def test_every_evaluation_carries_a_decision_record_whose_id_is_reproducible_from_its_inputs(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    r1 = _evaluate(w, notional_usd="200")
+    r2 = _evaluate(w, notional_usd="200")
+    rec1, rec2 = r1["decision_record"], r2["decision_record"]
+    assert rec1["decision_id"].startswith("dec_") and rec1 == rec2, "the same market inputs, size and code must give the same record"
+    assert rec1["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and rec1["fee_tier"] == "MEASURED" and rec1["inputs_ref"] and rec1["edge"]["edge_ref"] and rec1["data_scope"].startswith("TESTNET_DATA")
+    assert rec1["capital_required_usd"] == "232.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
+    assert "inputs_digest" in r1 and len(r1["inputs_digest"]) == 64                                  # the full digest stays in the local result; the record carries a 16-hex reference
+
+
+def test_a_different_market_state_size_fee_tier_or_code_can_never_share_a_decision_id(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    base = _evaluate(w, notional_usd="200")["decision_record"]["decision_id"]
+    assert _evaluate(w, notional_usd="150")["decision_record"]["decision_id"] != base                  # size
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0003", "0.0006")}
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # fee tier
+    _measured_world(w, funding="0.0090")
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # funding observation
+    _measured_world(w)
+    w.clock.sleep(5)
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # a later observation
+    _measured_world(w)
+    w.env = {**w.env, "GIT_SHA": "a" * 40}
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # code revision
+
+
+def test_the_decision_record_passes_the_evidence_guard_and_is_stored_once_on_explicit_opt_in(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    rec = _evaluate(w, notional_usd="200")["decision_record"]
+    XE.make_event("DECISION", {"stage": "DECISION_RECORDED", **rec}, session_id=None, occurred_at_ms=rec["observed_ms"], event_id=EL.event_id("decision", "DECISION", rec["decision_id"], 0))   # the REAL secret guard
+    d = str(tmp_path / "ob")
+    assert not os.path.exists(d), "evaluate wrote an outbox without the opt-in flag"
+    assert AP.record_decision(d, rec, w.clock.now()) == "STORED"
+    assert AP.record_decision(d, rec, w.clock.now() + 99_000) == "DUPLICATE"                          # the same decision, even much later: byte-identical, never a second record
+    assert XE.Outbox(d).pending == 1
+    assert AP.record_decision(d, {**rec, "decision": "REJECT_UNECONOMIC"}, w.clock.now()).startswith("REFUSED")      # the same id with a different fact is a conflict, never an overwrite
+
+
+def test_every_decision_class_yields_a_valid_record(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    for setup, expect in ((lambda: _measured_world(w, funding="0.0001"), "REJECT_UNECONOMIC"), (lambda: (_measured_world(w), setattr(w.fake, "fee_rates", None)), "INCONCLUSIVE"),
+                          (lambda: (_measured_world(w), setattr(w.fake, "funding_in_ms", 30_000)), "SKIP_NO_OPPORTUNITY")):
+        setup()
+        res = _evaluate(w, notional_usd="200")
+        rec = res["decision_record"]
+        assert rec["decision"] == expect and rec["decision_id"].startswith("dec_")
+        XE.make_event("DECISION", {"stage": "DECISION_RECORDED", **rec}, session_id=None, occurred_at_ms=rec["observed_ms"] or w.clock.now(), event_id=EL.event_id("decision", "DECISION", rec["decision_id"], 0))
+    r = AP.run_once({}, inner=w.fake, clock=w.clock.now, dry_run=True)                               # WAIT_FOR_DATA (no credentials): a record without inputs, still deterministic and valid
+    assert r["decision"] == "WAIT_FOR_DATA" and r["decision_record"]["inputs_ref"] is None and r["decision_record"]["decision_id"].startswith("dec_")
+
+
+def test_the_order_capable_cycle_carries_the_same_decision_id_shape_into_its_result_and_event(w, tmp_path):
+    _profit_world(w)
+    res, _eng = _cycle_eng(w)
+    assert res["result"] == "DONE" and str(res["decision_id"]).startswith("dec_"), res
+    w.clock.sleep(1800)
+    res2, _ = _cycle_eng(w)
+    assert str(res2.get("decision_id", "dec_")).startswith("dec_") and res2["decision_id"] != res["decision_id"]          # a later observation is a different decision

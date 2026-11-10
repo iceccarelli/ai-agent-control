@@ -60,6 +60,17 @@ class EdgeInputs:
     spot_fee: Optional[Tuple[D, D]] = None
     fee_observed_ms: Optional[int] = None
 
+    def digest(self) -> str:
+        """A digest of EVERYTHING the verdict was computed from: the instrument rows, both books (every level), the funding observation, the horizon, the size and the fee tiers (with whether
+        they were MEASURED). The verdict's own digest covers its outputs; this one covers its inputs, so a decision can be reproduced and a different market state can never share an id."""
+        def book(b: Any) -> Dict[str, Any]:
+            return {"ts_ms": int(b.ts_ms), "bids": [[str(p), str(q)] for p, q in b.bids], "asks": [[str(p), str(q)] for p, q in b.asks]}
+        body = {"symbol": self.symbol, "notional": str(self.notional_usd), "now_ms": int(self.now_ms), "funding_rate": str(self.funding_rate), "next_funding_ms": int(self.next_funding_ms),
+                "hold_s": int(self.hold_s), "leverage": int(self.leverage), "perp_row": self.perp_row, "spot_row": self.spot_row, "perp_book": book(self.perp_book), "spot_book": book(self.spot_book),
+                "perp_fee": None if self.perp_fee is None else [str(x) for x in self.perp_fee], "spot_fee": None if self.spot_fee is None else [str(x) for x in self.spot_fee],
+                "fee_observed_ms": self.fee_observed_ms}
+        return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
 
 @dataclasses.dataclass(frozen=True)
 class EdgeVerdict:

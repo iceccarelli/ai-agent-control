@@ -252,6 +252,7 @@ def authority_snapshot(now_ms: int, env: Mapping[str, str]) -> Dict[str, Any]:
         out["capability_problems"] = list(st.get("reasons", []))[:4]
         return out
     out["capability"], out["capability_symbols"] = "VALID", list(manifest.get("symbol_allowlist", []))
+    out["candidate_id"], out["spec_digest"] = manifest.get("candidate_id"), manifest.get("spec_digest")
     g, why = load_grant(now_ms, manifest)
     if g is None:
         out["grant_problems"] = list(why)[:4]
@@ -278,7 +279,9 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
 
     def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
-        return _res("EVALUATED", why, decision=decision, **{**base, **kw})
+        res = _res("EVALUATED", why, decision=decision, **{**base, **kw})
+        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD)
+        return res
     if not re.fullmatch(r"[A-Z0-9]{3,20}", str(sym)):
         return done("WAIT_FOR_DATA", ["SYMBOL_INVALID"])
     try:
@@ -309,7 +312,7 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return done("WAIT_FOR_DATA", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     edge = verdict.as_dict()
-    base.update(hold_s=hold_for_edge, edge=edge)
+    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms))
     if verdict.session_class == EG.PROFIT_CANDIDATE and go:
         return done("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", [reason, "ECONOMICS_CLEAR_THE_HURDLE: eligibility is not authority; see authority_gaps"], session_class="PROFIT_SEEKING")
     if verdict.session_class == EG.REJECTED:
@@ -317,6 +320,20 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     if verdict.session_class == EG.PROFIT_CANDIDATE:                  # economics clear, the owner's own funding floor does not
         return done("SKIP_NO_OPPORTUNITY", [reason], session_class=None)
     return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
+
+
+def record_decision(directory: str, record: Mapping[str, Any], at_ms: int) -> str:
+    """Append a decision record to the durable outbox under its own id. STORED / DUPLICATE / REFUSED:<why>. A decision record is evidence, never authority; the outbox refuses a payload that
+    looks like a secret, and the same decision id with different content is a conflict, never an overwrite."""
+    import exec_evidence as XE
+    try:
+        ob = XE.Outbox(directory)
+        before = ob.pending
+        ob.append("DECISION", {"stage": "DECISION_RECORDED", **record}, session_id=None, event_id=EL.event_id("decision", "DECISION", str(record["decision_id"]), 0),
+                  occurred_at_ms=int(record.get("observed_ms") or at_ms))             # the OBSERVATION time, so the same decision stored twice is byte-identical (a duplicate, never a conflict)
+        return "STORED" if ob.pending > before else "DUPLICATE"
+    except Exception as exc:                                                    # noqa: BLE001
+        return f"REFUSED:{type(exc).__name__}"
 
 
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
@@ -355,13 +372,18 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     session_class, why_not = classify_session(verdict, D(str(rate)), g)
+    drec = EL.decision_record({"decision": "SESSION_" + str(session_class), "symbol": sym, "notional_usd": str(g["max_notional_usd"]), "owner_funding_floor_bps": g["min_funding_bps"],
+                               "funding_bps": rate * 1e4, "hold_s": hold_s, "why": why_not, "edge": verdict.as_dict(), "inputs_digest": inp.digest(), "observed_ms": inp.now_ms,
+                               "authority": {"candidate_id": manifest.get("candidate_id"), "spec_digest": manifest.get("spec_digest")}}, code_sha=env.get("GIT_SHA"),
+                              margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD)
+    did = drec["decision_id"]                                         # the SAME record shape the read-only evaluation produces: a session is traceable to the decision that preceded it
     if session_class is None:
-        return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict())
+        return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict(), decision_id=did)
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
     try:
-        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event)
+        return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event), "decision_id": did}
     finally:
         _ACTIVE["dir"] = None
 
@@ -920,7 +942,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             if res.get("edge"):
                 tel.event("OPPORTUNITY_EVAL", {"result": res["result"], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")), "edge": evidence_edge(res["edge"]),
                                                "why": list(res.get("why", []))[:6]}, sid)
-            tel.event("DECISION", {"result": res["result"], "why": list(res.get("why", []))[:6], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")),
+            tel.event("DECISION", {"decision_id": res.get("decision_id"), "result": res["result"], "why": list(res.get("why", []))[:6], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")),
                                    "flat_verified": res.get("flat_verified"), "realised_costs": evidence_net(res.get("net")), "revoked_reason": res.get("revoked_reason")}, sid)
         except Exception:                                            # noqa: BLE001
             pass
@@ -1082,6 +1104,7 @@ def _parser() -> argparse.ArgumentParser:
     ev.add_argument("--symbol", help="default: the grant's / capability's first symbol, else BTCUSDT")
     ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40% of the ceiling)")
     ev.add_argument("--min-funding-bps", help="the owner's extra funding floor; default: the grant's, else none (the economics gate derives the real requirement)")
+    ev.add_argument("--record-to", help="OPT-IN: append the decision record (no authority, no order) to the durable evidence outbox in this directory (outside git); the same decision is never stored twice")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
     for name, helptext in (("status", "print the grant, engine state, markers and last result (no network)"), ("deploy-check", "exit 0 only if a deployment is safe now (fresh DRAINED proof, no active session, no ALERT)")):
@@ -1130,6 +1153,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         return 0
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps)
+        if a.record_to and isinstance(res.get("decision_record"), dict):
+            res["recorded"] = record_decision(a.record_to, res["decision_record"], clock())
         print(json.dumps(res, indent=2, sort_keys=True, default=str))
         # exit contract (a wrapper or cron can tell a DECISION from a failure to decide): 0 = a decisive answer (eligible / reject / skip), 3 = could not decide (wait for data / inconclusive) or any other result
         return 0 if res.get("decision") in ("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", "REJECT_UNECONOMIC", "SKIP_NO_OPPORTUNITY") else 3
