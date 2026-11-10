@@ -38,6 +38,12 @@ echo "== the autopilot imports and reports (no credential, no capability: it mus
 ST="$(docker run --rm -v "$VOL":/data "$IMG" python3 tools/ms_testnet_autopilot.py status)"
 echo "$ST" | grep -q '"dedicated_key_present": false' || fail "status does not report the missing credential: $ST"
 
+echo "== the owner control wrapper runs as bot and reads state"
+CTL="$(docker run --rm -v "$VOL":/data --entrypoint autopilot-ctl "$IMG" status)"
+echo "$CTL" | grep -q '"dedicated_key_present": false' || fail "autopilot-ctl status did not run: $CTL"
+CTLUSER="$(docker run --rm -v "$VOL":/data --entrypoint sh "$IMG" -c 'sed -n "s/.*exec setpriv --reuid=\([a-z]*\).*/\1/p" /usr/local/bin/autopilot-ctl | head -1')"
+[ "$CTLUSER" = "bot" ] || fail "autopilot-ctl does not drop to bot"
+
 echo "== no credential or live switch in the image; testnet only; mainnet cannot be selected by environment"
 ENVS="$(docker run --rm --entrypoint env "$IMG")"
 echo "$ENVS" | grep -Eq '^(BYBIT_API_KEY|BYBIT_API_SECRET|BYBIT_TESTNET_API_KEY|BYBIT_TESTNET_API_SECRET|LIVE_TRADING_ACK)=' && fail "a credential or live switch is in the image environment"

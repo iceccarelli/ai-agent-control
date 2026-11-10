@@ -31,6 +31,7 @@ COPY tools/account_review.py tools/backfill_plan.py tools/candidate_competition.
      tools/strategy_verdict.py tools/supabase_sync.py tools/testnet_action_manifest.py tools/testnet_certificate.py \
      tools/universe_capture.py tools/venue_evidence.py ./tools/
 COPY deploy/autopilot-entrypoint.sh /usr/local/bin/autopilot-entrypoint
+COPY deploy/autopilot-ctl.sh /usr/local/bin/autopilot-ctl
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /data && chown -R bot:bot /app /data
 

@@ -109,3 +109,23 @@ def test_an_assembled_image_directory_imports_the_autopilot(tmp_path):
     r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'tools'); import ms_testnet_autopilot as AP; print(AP.GRANT_SCHEMA)"], cwd=str(app), env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "ms_autopilot_grant/v1" in r.stdout, (r.stdout[-300:], r.stderr[-600:])
+
+
+def test_the_owner_control_wrapper_runs_as_the_worker_user_and_loads_secrets_from_pid1():
+    sh = _read("deploy/autopilot-ctl.sh")
+    assert "exec setpriv --reuid=bot" in sh and "/proc/1/environ" in sh and "HOME=/data" in sh and "ms_testnet_autopilot.py" in sh
+    assert "BYBIT_TESTNET_API_KEY" in sh and "LIVE_TRADING_ACK" not in sh and "BYBIT_API_KEY" not in sh
+    assert "deploy/autopilot-ctl.sh" in _read("Dockerfile.autopilot") and os.access(os.path.join(BOT, "deploy", "autopilot-ctl.sh"), os.X_OK)
+
+
+def test_the_smoke_script_covers_the_runtime_properties_the_review_demanded():
+    sh = _read("deploy/autopilot-image-smoke.sh")
+    for needle in ("setpriv", "docker stop", "SIGTERM", "stat -c", "bot 700", "bot 600", "docker history", "api-testnet.bybit.com", "LIVE_TRADING_ACK", "STOPPED", "ExitCode"):
+        assert needle in sh, needle
+
+
+def test_the_safe_deploy_script_drains_checks_and_only_then_deploys_and_refuses_otherwise():
+    sh = _read("deploy/safe-deploy.sh")
+    assert sh.index("drain --wait") < sh.index("deploy-check") < sh.index("fly deploy -c fly.autopilot.toml --ha=false")
+    assert sh.count("exit 1") >= 2 and "set -eu" in sh and "fly launch" not in sh.replace("never fly launch", "")
+    assert "resume --reason" in sh
