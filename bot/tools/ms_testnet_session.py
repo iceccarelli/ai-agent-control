@@ -1179,5 +1179,28 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str
     return {"preflight": cmd_preflight, "plan": cmd_plan, "execute": cmd_execute, "reconcile": cmd_reconcile, "status": cmd_status, "assess": cmd_assess}[a.cmd](ctx)
 
 
+def guarded_main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str]] = None, acquire: Optional[Callable[..., Any]] = None,
+                 run: Optional[Callable[..., int]] = None) -> int:
+    """The OWNER'S command-line entry point. ``execute`` places Testnet orders, so it takes THE shared single-writer lease first (the autopilot holds the same one; a second order-capable
+    process on the account would be a second hedge) and releases it in ``finally``; refused (nothing sent) when the lease is not configured, is held by another executor, or does not answer.
+    Every other command is read-only and runs as before. The autopilot calls ``main`` directly while it already holds the lease, so it is not double-locked."""
+    import time as _time
+    argv_l = list(argv) if argv is not None else sys.argv[1:]
+    environ = dict(env if env is not None else os.environ)
+    run = run or main
+    cmd = _parser().parse_args(argv_l).cmd
+    if cmd != "execute":
+        return run(argv_l, env=environ)
+    import legacy_executor_guard as LG
+    handle, why = (acquire or LG.acquire)(environ)
+    if handle is None:
+        print("execute REFUSED (no order was sent): " + why)
+        return EXIT_REFUSED
+    try:
+        return run(argv_l, env=environ)
+    finally:
+        handle.release()
+
+
 if __name__ == "__main__":
-    sys.exit(main(env=os.environ))
+    sys.exit(guarded_main())

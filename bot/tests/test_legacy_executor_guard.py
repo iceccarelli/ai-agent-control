@@ -156,3 +156,51 @@ def test_the_guard_module_can_reach_no_exchange_by_construction():
     low = src.lower()
     assert "bybit" not in low.replace("order-capable", "") or "api.bybit" not in low
     assert "place_order" not in low and "environ" not in low
+
+
+# ---- the owner's manual `ms_testnet_session.py execute` takes the same lease (it places Testnet orders)
+import ms_testnet_session as MTS  # noqa: E402
+
+
+def _acquirer(server):
+    return lambda env: LG.acquire(env, lease_factory=factory_for(server))
+
+
+def test_manual_execute_without_a_lease_configuration_places_nothing(capsys):
+    called = []
+    rc = MTS.guarded_main(["execute"], env={}, run=lambda *a, **k: called.append(1) or 0)
+    assert rc == MTS.EXIT_REFUSED and not called
+    assert "REFUSED" in capsys.readouterr().out
+
+
+def test_manual_execute_is_refused_while_the_autopilot_holds_the_lease_and_runs_under_it_otherwise():
+    server = FakeServer()
+    autopilot = XE.LeaseClient(server, OWNER, "autopilot:m1", ttl_seconds=3600)
+    assert autopilot.acquire()
+    called = []
+    assert MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=lambda *a, **k: called.append(1) or 0) == MTS.EXIT_REFUSED and not called
+    autopilot.release()
+    seen = []
+
+    def run(argv, env):
+        seen.append(server.holder)                                  # the lease is HELD while the order-capable run executes
+        return 0
+    assert MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=run) == 0
+    assert seen and seen[0] is not None and server.holder is None   # ... and released afterwards
+
+
+def test_manual_execute_releases_the_lease_even_when_the_run_raises():
+    server = FakeServer()
+
+    def boom(argv, env):
+        raise RuntimeError("venue exploded")
+    with pytest.raises(RuntimeError):
+        MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=boom)
+    assert server.holder is None
+
+
+def test_read_only_session_commands_do_not_touch_the_lease():
+    def must_not_acquire(env):
+        raise AssertionError("a read-only command must not take the executor lease")
+    for cmd in ("preflight", "plan --symbol BTCUSDT --notional-usd 100", "assess", "status", "reconcile"):
+        assert MTS.guarded_main(cmd.split(), env={}, acquire=must_not_acquire, run=lambda *a, **k: 0) == 0
