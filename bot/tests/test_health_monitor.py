@@ -495,3 +495,19 @@ def test_a_tampered_notifier_state_neither_crashes_nor_silences_an_alert_forever
         sink = Sink()
         N.dispatch([sink], [alert], st, NOW)                                            # must not raise; a tampered/future value counts as never notified: the alert is DUE now
         assert sink.sent, f"the alert was silenced by last_notified_ms={bad!r}"
+
+
+def test_workflow_carries_the_notification_state_between_runs_with_read_only_scopes(wf):
+    """Dedup/recovery need the previous run's state: it is restored with the runner's own gh (actions: read) and kept with the already-pinned upload-artifact. No write scope, no cache action."""
+    code = "\n".join(l for l in wf.splitlines() if not l.lstrip().startswith("#"))
+    assert "gh run download" in code and "--name monitor-notify-state" in code and "notify-state.json" in code
+    assert re.search(r"uses: actions/upload-artifact@[0-9a-f]{40}", code) and "name: monitor-notify-state" in code and "if: always()" in code
+    perms = re.findall(r"permissions:\n((?:\s+[\w-]+: \w+\n)+)", code)
+    assert perms, "permissions blocks are missing"
+    for block in perms:
+        for line in block.strip().splitlines():
+            scope, level = [x.strip() for x in line.split(":")]
+            assert level == "read", (scope, level)                 # nothing in this workflow can write to the repository, the actions cache or anything else
+    assert "actions/cache" not in code and "contents: write" not in code and "GITHUB_TOKEN" not in code.replace("github.token", "")
+    assert code.index("Restore the previous run") < code.index("Judge the stored heartbeat") < code.index("Keep the notification state")
+    assert '--state-file "$RUNNER_TEMP/notify-state.json"' in code

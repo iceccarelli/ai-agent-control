@@ -15,6 +15,7 @@ for _p in (HERE, os.path.dirname(HERE), os.path.join(os.path.dirname(HERE), "too
 import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
+import ms_capital as CC  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
 
@@ -970,3 +971,168 @@ def test_the_same_state_transition_does_not_bump_the_state_seq_but_a_change_does
     b = st.transition("PAUSED", "again")
     c = st.transition("ALERT", "now")
     assert a["seq"] == b["seq"] and c["seq"] == a["seq"] + 1
+
+
+# ---------------------------------------------------------------- capital allocation and realised-only compounding wired into the session path
+def _profit_world(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+
+
+def _cycle_eng(w):
+    eng = str(w.tmp / "eng")
+    return AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=eng), eng
+
+
+def test_the_session_is_sized_by_the_allocator_not_the_grants_full_maximum_and_is_parked_for_settlement(w):
+    _profit_world(w)
+    res, eng = _cycle_eng(w)
+    assert res["result"] == "DONE" and res["flat_verified"] is True, res
+    plan = json.load(open(os.path.join(res["state_dir"], "plan.json")))
+    assert float(plan["notional_usd"]) <= 200.0 + 1e-6 < 400.0                                        # grant max is 400: day one deploys 40% of the $500 ceiling
+    assert res["allocation"]["binding_limit"] == "COMPOUNDED_SIZE"
+    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    assert ev["allocation"]["notional_usd"] == "200.00" and ev["capital_settlement"]["status"] == "NO_PENDING"
+    book = CC.CapitalBook(eng).load()
+    assert book["start_cash_usd"] is not None and book["pending"]["session_id"] == os.path.basename(res["state_dir"]) and book["realised_usd"] == "0"   # parked, NOT credited yet
+
+
+def test_cash_the_ledger_cannot_explain_raises_an_alert_and_places_nothing(w):
+    _profit_world(w)
+    eng = str(w.tmp / "eng")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("1")
+    b.park("prev_session", "1", "0.50", True, True)                                                   # the venue's cash is thousands of dollars away from this
+    w.fake.requests.clear()
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "REFUSED" and res["why"] == ["ACCOUNT_CASH_UNEXPLAINED"] and not [r for r in w.fake.requests if r[0] == "POST"]
+    assert AP.ES.EngineState(eng, w.clock.now).has("ALERT")
+    assert CC.CapitalBook(eng).load()["realised_usd"] == "0"                                          # and nothing unexplained was credited
+
+
+def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
+    _profit_world(w)
+    eng = str(w.tmp / "eng")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("10000")
+    bk = b.load()
+    bk["halted"], bk["loss_streak"] = True, 4
+    b._save(bk)
+    w.fake.requests.clear()
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "SKIPPED" and res["why"][0].startswith("ALLOCATION_ZERO") and not [r for r in w.fake.requests if r[0] == "POST"]
+    assert b.acknowledge_halt() is True
+    res, _ = _cycle_eng(w)
+    assert res["result"] in ("DONE", "SKIPPED") and "ALLOCATION_ZERO" not in "".join(res["why"])
+
+
+# ---------------------------------------------------------------- the STALE EXECUTOR: a frozen process must be refused by the server before any entry order
+class SimServer:
+    """The server's lease record: one holder at a time, a fencing token that only grows, expiry on the SERVER clock."""
+
+    def __init__(self):
+        self.holder, self.token, self.now, self.expires = None, 0, 0.0, 0.0
+
+    def client(self, name):
+        return SimClient(self, name)
+
+
+class SimClient:
+    """Shaped like exec_evidence.LeaseClient; `held` answers from LOCAL memory (a deadline this process measured earlier), renew/acquire go to the server."""
+
+    def __init__(self, srv, name):
+        self.srv, self.name, self._tok, self.local_deadline = srv, name, None, None
+
+    @property
+    def held(self):
+        return self._tok is not None and self.local_deadline is not None and self.local_deadline > 0          # local belief only: frozen clocks never expire it
+
+    @property
+    def token(self):
+        return self._tok
+
+    def acquire(self):
+        s = self.srv
+        if s.holder not in (None, self.name) and s.expires > s.now:
+            return False
+        s.token += 1
+        s.holder, s.expires, self._tok, self.local_deadline = self.name, s.now + 30, s.token, 1.0
+        return True
+
+    def renew(self):
+        s = self.srv
+        if self._tok is None or s.holder != self.name or s.token != self._tok or s.expires <= s.now:
+            self._tok = None
+            return False
+        s.expires = s.now + 30
+        return True
+
+
+def _stale_world(w):
+    prepared(w)
+    srv = SimServer()
+    a, b = AP.RenewingLease(srv.client("A"), renew_every_s=1e9), AP.RenewingLease(srv.client("B"), renew_every_s=1e9)    # renew_every huge: the cheap check NEVER renews
+    assert a.ensure() is True and a.token == 1
+    srv.now = 100.0                                                       # process A is frozen; its lease expires on the server
+    assert b.ensure() is True and b.token == 2                            # process B legitimately takes over with a NEWER fencing token
+    return srv, a, b
+
+
+def test_a_frozen_process_still_believes_in_its_lease_but_the_strong_check_asks_the_server(w, tmp_path):
+    srv, a, b = _stale_world(w)
+    manifest = S._load_capability_manifest()[0]
+    assert a.held() is True                                               # the cheap local check is fooled: this is the bug the strong check exists for
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), a) is None
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), a, strong=True) == "LEASE_LOST"
+    assert a.reason == "renew_failed_pre_order" and a.token is None and a.held() is False      # and it stays lost: held() never re-wins
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), b, strong=True) is None  # the legitimate holder passes, and renewing keeps its token
+
+
+def test_a_woken_stale_executor_is_refused_before_a_single_order_is_sent(w, tmp_path):
+    srv, a, b = _stale_world(w)
+    w.fake.requests.clear()
+    res = run(w, tmp_path / "eng", lease=a)
+    assert res["result"] == "SKIPPED" and res["why"] == ["REVOKED_BEFORE_ORDER:LEASE_LOST"], res
+    assert not [r for r in w.fake.requests if r[0] == "POST"], "a stale executor reached the order endpoint"
+
+
+def test_an_unanswerable_lease_check_is_not_authority(w, tmp_path):
+    class Exploding:
+        token = 1
+
+        def held(self):
+            return True
+
+        def held_fresh(self):
+            raise RuntimeError("supabase unreachable")
+    manifest = S._load_capability_manifest()[0]
+    prepared(w)
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), Exploding(), strong=True) == "LEASE_CHECK_ERROR"
+    w.fake.requests.clear()
+    res = run(w, tmp_path / "eng2", lease=Exploding())
+    assert res["result"] == "SKIPPED" and res["why"] == ["REVOKED_BEFORE_ORDER:LEASE_CHECK_ERROR"] and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_a_lease_lost_between_the_start_of_execute_and_the_first_entry_order_places_nothing(w, tmp_path):
+    class FreshOnce:
+        """The server says yes for the pre-execute check and no from then on (another executor took over in between)."""
+        token = 1
+
+        def __init__(self):
+            self.fresh_calls = 0
+
+        def held(self):
+            return True                                                   # the cheap local belief never changes
+
+        def held_fresh(self):
+            self.fresh_calls += 1
+            return self.fresh_calls == 1
+    prepared(w)
+    lease = FreshOnce()
+    w.fake.requests.clear()
+    res = run(w, tmp_path / "eng3", lease=lease)
+    assert lease.fresh_calls >= 2, "the per-order check never asked the server"
+    entry_posts = [r for r in w.fake.requests if r[0] == "POST" and "/order/create" in str(r[1])]
+    assert not entry_posts, f"an entry order was sent without fresh authority: {entry_posts}"
+    assert res["orders"] == 0 if "orders" in res else True

@@ -41,6 +41,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import ms_capital as CC  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
@@ -287,9 +288,22 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
+    pf = ES.read_json(os.path.join(d, "preflight.json")) or {}
+    book = CC.CapitalBook(engine_root)
+    usdt_now = pf.get("usdt")
+    book.ensure_baseline(usdt_now)
+    settled = book.settle(usdt_now)                                   # what the venue's cash REALLY did since the last verified-flat session (losses in full; gains only as far as explained)
+    if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
+        return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
+    cb = book.load()
+    alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.sizing_basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
+                        loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
-                                                          "edge": verdict.as_dict()})
-    if step("plan", "--symbol", sym, "--notional-usd", str(g["max_notional_usd"]), "--hold-seconds", str(hold_s)) != 0:
+                                                          "edge": verdict.as_dict(), "allocation": alloc.as_dict(), "capital_settlement": settled})
+    if alloc.notional <= 0:                                           # the allocator can only say LESS than the owner's limits; zero is a decision to stay idle
+        return _res("SKIPPED", ["ALLOCATION_ZERO:" + alloc.binding], state_dir=d, allocation=alloc.as_dict())
+    if step("plan", "--symbol", sym, "--notional-usd", str(alloc.notional), "--hold-seconds", str(hold_s)) != 0:
         return _res("SKIPPED", ["PLAN_REFUSED"], state_dir=d, detail=lines[-3:])
     try:
         with open(os.path.join(d, "plan.json"), encoding="utf-8") as fh:
@@ -311,7 +325,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     lines.clear()
     if _STOP.is_set():                                               # a stop arrived before any order: nothing was placed, no entry was counted
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
-    why_now = revocation_reason(int(clock()), manifest, engine_root, lease)
+    why_now = revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     on_state("EXECUTING", "execute_started")
@@ -320,7 +334,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     def pre_order() -> Optional[str]:
         if _STOP.is_set():
             return "STOP_SIGNAL"
-        return revocation_reason(int(clock()), manifest, engine_root, lease)
+        return revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)      # before EVERY entry order: the server must say this holder still holds the lease
     rc = step("execute", "--confirm-plan-digest", digest, "--unattended", sl=watch_sleep, poc=pre_order)
     try:
         with open(os.path.join(d, "testnet_session.json"), encoding="utf-8") as fh:
@@ -330,13 +344,18 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     summary = {"state_dir": d, "plan_digest": digest, "hold_s": hold_s, "funding_bps": rate * 1e4, "flat_verified": rec.get("flat_verified"), "orders": len(rec.get("orders", [])),
                "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:], "session_class": session_class, "edge": verdict.as_dict(), "revoked_reason": watch["reason"]}
     on_state("RECONCILING", "session_ended")
+    net = rec.get("net") or {}
+    fees, price, fund = (CC._d(net.get(k)) for k in ("fees_usd", "price_pnl_usd", "funding_usd"))
+    known = None if (fees is None or price is None) else price - fees + (fund or D(0))
+    book.park(os.path.basename(d), usdt_now, known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT flat cash read, never from fill arithmetic alone
+    summary["allocation"] = alloc.as_dict()
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
 
 
 # ---------------------------------------------------------------------------------------------------- authority can be REVOKED while a session is running
-def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str, lease: Any) -> Optional[str]:
+def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str, lease: Any, strong: bool = False) -> Optional[str]:
     """Why new authority is gone RIGHT NOW (None = still authorised): the grant vanished / expired / was tampered, the owner set STOP or an ALERT appeared, or the executor lease is not
     held. A DRAIN is not revocation (the active session finishes). Revocation never abandons a hedge: it engages the session's kill switch (cancel entries, reduce-only unwind, flat check)."""
     g, why = load_grant(now_ms, manifest)
@@ -346,8 +365,17 @@ def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str
     for m in ("STOP", "ALERT"):
         if st.has(m):
             return m
-    if lease is not None and not lease.held():
-        return "LEASE_LOST"
+    if lease is not None:
+        fresh = getattr(lease, "held_fresh", None)
+        if strong and fresh is not None:                             # STRONG = the server's own answer (a renew), never this process's memory of a deadline
+            try:
+                ok = bool(fresh())
+            except Exception:                                        # an unanswerable authority check is not authority
+                return "LEASE_CHECK_ERROR"
+        else:
+            ok = bool(lease.held())                                  # the cheap check: an exception propagates to the watcher, which fails closed as WATCHER_ERROR
+        if not ok:
+            return "LEASE_LOST"
     return None
 
 
@@ -528,6 +556,17 @@ class RenewingLease:
             if not self._l.renew():
                 self.reason = "renew_failed"
                 return False
+        return bool(self._l.held)
+
+    def held_fresh(self) -> bool:
+        """The STRONG check, used immediately before an entry order: a server-side renew. A process that was frozen past its expiry (a paused VM, a stopped container, a stalled monotonic
+        clock) still believes in its local deadline; the server, which owns the clock and the holder record, refuses it here. Never acquires. Any failure is NOT held."""
+        if not self._l.held:
+            return False
+        self._last = self._mono()
+        if not self._l.renew():
+            self.reason = "renew_failed_pre_order"
+            return False
         return bool(self._l.held)
 
     def ensure(self) -> bool:
@@ -906,6 +945,11 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--days", type=int, default=7, help=f"validity, <= {MAX_GRANT_DAYS}")
     g.add_argument("--allow-mechanics-sessions", action="store_true", help="ALSO allow bounded TESTNET_MECHANICS sessions (fake-money lifecycle/fee/fill measurement, expected net NEGATIVE, never "
                    "an opportunity) when the economics gate says the trade does not pay; without it only a PROFIT_CANDIDATE session can run")
+    cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
+    cp.add_argument("--root", default=DEFAULT_ROOT)
+    cp.add_argument("--ack-halt", action="store_true")
+    cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
+    cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
     sub.add_parser("evaluate", help="READ-ONLY: what the economics gate says right now (never starts a session; the only order path is `loop`)")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
@@ -940,6 +984,16 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "grant_problems": why, "engine": {k: v for k, v in eng.load().items() if k != "history"},
                           "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json"))},
                          indent=2, sort_keys=True, default=str))
+        return 0
+    if a.cmd == "capital":
+        cbk = CC.CapitalBook(a.root)
+        if a.ack_halt:
+            print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        if a.reserve_fraction is not None:
+            print("reserve set" if cbk.set_reserve_fraction(a.reserve_fraction) else "refused: reserve must be between 0 and 0.9")
+        if a.declare_transfer:
+            print("transfer declared" if cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]) else "refused or already declared")
+        print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True)
