@@ -62,6 +62,7 @@ class FakeBybitTestnet:
         self.liquidity: Dict[str, D] = {}
         self.rest_filled_on_create: Dict[str, float] = {}
         self.maker_rate, self.taker_rate = D("0.0002"), D("0.00055")
+        self.funding_rate, self.funding_in_ms = "0.0001", 3_600_000            # the perp ticker's funding rate and the time to the next settlement (tests set these)
         self.fill_delay_ms = 0                                       # >0: a crossing order is ACCEPTED now and its fill appears only after this long (asynchronous matching, as on a real venue)
         self.pending: List[Tuple[int, str, D, D]] = []
         self.reject: Dict[str, Tuple[int, str]] = {}                  # orderLinkId suffix -> (retCode, retMsg) answered INSTEAD of creating the order
@@ -198,7 +199,7 @@ class FakeBybitTestnet:
         if cat == "spot":
             return self._ok({"category": cat, "list": [{"symbol": s, "bid1Price": b["spot_bid"], "ask1Price": b["spot_ask"], "lastPrice": b["spot_mark"], "markPrice": ""}]})
         return self._ok({"category": cat, "list": [{"symbol": s, "bid1Price": b["bid"], "ask1Price": b["ask"], "lastPrice": b["mark"], "markPrice": b["mark"], "indexPrice": b["spot_mark"],
-                                                     "fundingRate": "0.0001", "nextFundingTime": str(self.now_ms() + 3_600_000)}]})
+                                                     "fundingRate": self.funding_rate, "nextFundingTime": str(self.now_ms() + self.funding_in_ms)}]})
 
     def _orderbook(self, q: Dict[str, str]) -> Dict[str, Any]:
         s, cat = q.get("symbol", ""), q.get("category")

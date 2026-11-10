@@ -1,0 +1,65 @@
+# UNATTENDED Bybit TESTNET carry sessions (fake money), scheduled by GitHub, executed on a SELF-HOSTED runner.
+#
+# WHY SELF-HOSTED: Bybit's CDN blocks GitHub-hosted runners (HTTP 403, see carry-drill-testnet.yml), so an order cannot be placed from GitHub's own machines. This workflow therefore
+# runs ONLY on a runner you register on a host that can reach api-testnet.bybit.com (your Codespace, a small server, a Fly machine). The runner host already holds everything the
+# autopilot needs: BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET in its environment, and in its home directory the owner capability file and the owner's autopilot grant
+# (bot/tools/ms_testnet_autopilot.py grant). NO exchange secret is stored in GitHub, and none is read by this file.
+#
+# WHAT A RUN DOES: bot/tools/ms_testnet_autopilot.py once. It reads the public funding rate and the next settlement and starts a hedged session ONLY when the funding would pay for
+# the ~31 bps of round-trip fees and the settlement is near enough to hold across it; otherwise it exits SKIPPED in seconds. A started session is preflight -> plan -> assess ->
+# `execute --unattended` (the grant replaces the typed digest; the caps, loss limit, authority, hedge-keeping rule, kill switch, entries-per-day cap and flat verification are
+# unchanged), then ends FLAT or the run goes red.
+#
+# WHAT IT CANNOT DO: touch mainnet (the Testnet host is pinned by the venue registry; no live switch exists here), run without a valid, unexpired, owner-signed grant, exceed the
+# grant or the manifest, or run on a pull request, a fork or any branch but main.
+#
+# OFF BY DEFAULT: nothing runs until the repository VARIABLE TESTNET_AUTOPILOT_ENABLED is "true" (Settings -> Secrets and variables -> Actions -> Variables). Delete it to stop all
+# scheduled runs; `touch ~/.ai-agent-control/ms_autopilot/STOP` or deleting the grant file stops it on the host.
+#
+# A GREEN RUN IS NOT A PROFIT: Testnet money is fake. A SKIPPED run is the autopilot doing its job.
+name: testnet-autopilot
+
+on:
+  schedule:
+    # every 10 minutes; a run that finds no worthwhile settlement exits SKIPPED immediately
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testnet-autopilot
+  cancel-in-progress: false
+
+jobs:
+  autopilot:
+    name: testnet autopilot (self-hosted)
+    if: ${{ github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.TESTNET_AUTOPILOT_ENABLED == 'true' }}
+    runs-on: [self-hosted, linux, bybit-testnet]
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install dependencies and build the native core
+        run: |
+          python3 -m pip install -q -r requirements.txt -c constraints.txt
+          make -C ../cpp
+      - name: Run one autopilot cycle
+        run: |
+          set -o pipefail
+          python3 tools/ms_testnet_autopilot.py once | tee autopilot-result.json
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### testnet autopilot (fake money)"
+            echo '```json'
+            cat autopilot-result.json 2>/dev/null || echo '{"result": "NO_RESULT"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

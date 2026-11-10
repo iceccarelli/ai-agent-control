@@ -20,6 +20,7 @@ ALLOWED = {
     "carry_shadow.py": 1,                # CODE_REVISION stamp
     "tools/reserved_holdout.py": 1,      # a disable switch
     "tools/testnet_session.py": 1,       # BYBIT_VENUE guard for the testnet session
+    "tools/ms_testnet_autopilot.py": 1,   # owner CLI ``__main__`` only: hands os.environ to ``main(env=...)``; the dedicated testnet variables are the only ones used, nothing else reads it
     "tools/ms_testnet_session.py": 1,    # owner CLI ``__main__`` only: hands os.environ to ``main(env=...)``; the transport/executor/authority never read it, and the dedicated testnet variables are the only ones used
     "tools/operator_paper_daily.py": 1,  # hands env to config
     "tools/testnet_action_manifest.py": 1,   # records only whether the NAMED testnet credential variables are set (presence booleans), never a value

@@ -899,7 +899,8 @@ def record_entry(now_ms: int, gid: str) -> None:
 def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     a = ctx.args
     why: List[str] = []
-    if ctx.inner is None and (ctx.env.get("CI") or ctx.env.get("PYTEST_CURRENT_TEST")):
+    unattended = bool(getattr(a, "unattended", False))
+    if ctx.inner is None and (ctx.env.get("PYTEST_CURRENT_TEST") or (ctx.env.get("CI") and not unattended)):       # CI is allowed ONLY on the unattended path, and only with a valid grant (below)
         why.append("EXECUTE_REFUSED_IN_CI_OR_TEST_WITHOUT_AN_EXPLICITLY_INJECTED_TRANSPORT")
     manifest, st = _load_capability_manifest()
     if manifest is None:
@@ -918,6 +919,12 @@ def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Option
             why.append("PLAN_IS_FOR_ANOTHER_MANIFEST")
         if ctx.clock() - int(plan.get("created_ms", 0)) > MAX_PLAN_AGE_MIN * 60_000:
             why.append("PLAN_TOO_OLD")
+    if unattended:                                                      # the owner's standing, bounded, expiring authorisation replaces the typed digest: nothing else is relaxed
+        import ms_testnet_autopilot as AP
+        if manifest is not None and isinstance(plan, dict) and not plan_refusals(plan):
+            why += ["UNATTENDED:" + r for r in AP.unattended_refusals(int(ctx.clock()), plan, manifest)]
+        else:
+            why.append("UNATTENDED:NEEDS_A_VALID_PLAN_AND_MANIFEST")
     pre = _read_json(ctx.path("preflight"))
     if not (isinstance(pre, dict) and pre.get("status") == "PASS" and pre.get("preflight_digest") == digest_of(pre, ("preflight_digest",))):
         why.append("NO_PASSING_PREFLIGHT")
@@ -931,7 +938,7 @@ def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Option
         why.append("MAX_ENTRIES_PER_UTC_DAY_REACHED")
     if os.path.exists(ctx.path("journal")) and os.path.getsize(ctx.path("journal")) > 0:
         why.append("SESSION_ALREADY_EXECUTED_USE_RECONCILE")
-    if not why:
+    if not why and not unattended:
         typed = ctx.input_fn(f"Type the plan digest to confirm TESTNET execution ({digest}): ").strip()
         if typed != digest:
             why.append("TYPED_CONFIRMATION_DOES_NOT_MATCH")
@@ -946,6 +953,9 @@ def cmd_execute(ctx: Ctx) -> int:
     assert plan is not None and manifest is not None
     rec = load_record(ctx)
     rec["confirmation"] = {"state": "CONFIRMED", "plan_digest_confirmed": plan["plan_digest"]}
+    if getattr(ctx.args, "unattended", False):                          # provenance that the record schema (and the control centre) do not carry: who authorised it, and that no human typed the digest
+        import ms_testnet_autopilot as AP
+        AP.write_provenance(ctx.dir, int(ctx.clock()), plan, manifest)
     ctx.plan_poll = plan["timing"]["poll_s"]
     save_record(ctx, rec)
     try:
@@ -1137,6 +1147,9 @@ def _parser() -> argparse.ArgumentParser:
             s.add_argument("--max-lifecycle-hours", type=float, default=1.0)
         if name in ("execute", "reconcile"):
             s.add_argument("--confirm-plan-digest", default="")
+        if name == "execute":
+            s.add_argument("--unattended", action="store_true",
+                           help="no typed digest, and allowed inside CI: ONLY with a valid owner-signed bounded autopilot grant (tools/ms_testnet_autopilot.py grant); every other gate still applies")
         if name == "reconcile":
             s.add_argument("--unwind", action="store_true")
     return ap

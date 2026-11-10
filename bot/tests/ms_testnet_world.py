@@ -23,7 +23,7 @@ from ms_fake_bybit_testnet import FAKE_KEY, FAKE_SECRET, FakeBybitTestnet  # noq
 
 class SimClock:
     def __init__(self) -> None:
-        self.t = int(time.time() * 1000)
+        self.t = 1_794_312_000_000                                       # 2026-11-10 12:00:00 UTC, FIXED: a run near midnight UTC must not cross a UTC day mid-test (the entries-per-day counter)
 
     def now(self) -> int:
         return self.t
