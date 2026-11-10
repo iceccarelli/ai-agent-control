@@ -84,6 +84,7 @@ def test_the_fly_app_is_one_machine_one_volume_no_public_port_and_no_secret():
     t = _read("fly.autopilot.toml")
     body = "\n".join(ln for ln in t.splitlines() if not ln.lstrip().startswith("#"))
     assert 'app = "carry-autopilot"' in body and 'primary_region = "fra"' in body and 'kill_timeout = "300s"' in body and 'kill_signal = "SIGTERM"' in body
+    assert re.search(r'\[\[restart\]\]\s*policy = "always"', body) and "retries" not in body       # always-on: the loop never exits on ALERT/PAUSED/STOP/DRAIN, so `always` cannot create a restart loop
     assert 'strategy = "immediate"' in body and "[http_service]" not in body and "[[services]]" not in body
     assert body.count("[[mounts]]") == 1 and 'destination = "/data"' in body and 'dockerfile = "Dockerfile.autopilot"' in body
     assert 'USE_TESTNET = "1"' in body and 'BYBIT_VENUE = "testnet"' in body and 'HOME = "/data"' in body

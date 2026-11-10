@@ -4,7 +4,7 @@
 # Deploy with `fly deploy -c fly.autopilot.toml --ha=false` (never `fly launch`, which rewrites config). tests/test_autopilot_image.py pins these properties.
 #
 #   one machine, one volume     two loops would be two hedges
-#   no [http_service]           nothing to serve (so Fly never auto-stops it)
+#   no [http_service]           nothing to serve (so Fly never auto-stops it); restart policy `always` is safe because the loop never exits on a marker
 #   kill_timeout 300s           SIGTERM engages the active session's kill switch; the session unwinds reduce-only and verifies flat
 #   no secrets in this file     `fly secrets set BYBIT_TESTNET_API_KEY=... BYBIT_TESTNET_API_SECRET=... -a carry-autopilot` (typed by the owner, never pasted in chat)
 #   the capability file and the grant are put on the volume by the owner; the loop refuses to start while an ALERT file exists
@@ -20,9 +20,11 @@ dockerfile = "Dockerfile.autopilot"
 [deploy]
 strategy = "immediate"
 
+# `always`, deliberately: this process never exits because of an ALERT / PAUSED / STOP / DRAIN marker (those are STATES it keeps reporting while it idles) and a restart is not
+# permission to trade (it must prove the account flat from the venue first). It exits only on a stop SIGNAL (Fly stop/deploy) or a fatal error, and an always-on worker must come
+# back after either, or after a host reboot. (`on-failure` is meant for apps with services and would leave a cleanly-stopped worker down.)
 [[restart]]
-policy = "on-failure"
-retries = 10
+policy = "always"
 
 [env]
 USE_TESTNET = "1"
