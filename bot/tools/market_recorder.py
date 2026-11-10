@@ -58,6 +58,17 @@ DAY_MS = 86_400_000
 
 def _atomic_write(path: str, obj: Any) -> None:
     tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        _atomic_write_inner(path, tmp, obj)
+    except BaseException:
+        try:
+            os.remove(tmp)                                    # a failed write must not leave a litter of temp files on a volume that is already full
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_inner(path: str, tmp: str, obj: Any) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, sort_keys=True, default=str)
         fh.flush()
@@ -95,6 +106,8 @@ class Recorder:
         # liveness bookkeeping (all lock-free reads/writes of small values; a heartbeat must never wait on the engine, the store or the disk scan)
         self.status_errors, self.last_status_error = 0, ""
         self.maintenance_errors, self.last_maintenance_error, self.maintenance_ok_ms = 0, "", None
+        self._entry_refusals: Optional[List[str]] = None      # cached by the maintenance thread: status() must not take the engine lock
+        self._entry_refusals_ms: Optional[int] = None
         self._count_cache: Optional[int] = None
         self._count_ms: Optional[int] = None
         self._last_id: Optional[int] = None
@@ -118,6 +131,13 @@ class Recorder:
             out[f"{key}_seq"] = None if bk is None else getattr(bk, "seq", None)
         return out
 
+    def _rejection_total(self) -> Optional[int]:
+        """A lock-free read of a dict the feed threads mutate: copy first, and never let a racing resize cost a capacity row."""
+        try:
+            return sum(int(v) for v in list((self.engine.state.rejections or {}).values()))
+        except Exception:  # noqa: BLE001
+            return None
+
     def _health(self) -> Dict[str, Any]:
         fs = self.feed.status()
         streams = fs.get("streams") or {}
@@ -132,7 +152,7 @@ class Recorder:
                 "linear_connected": (streams.get(E.LINEAR) or {}).get("connected"),
                 "spot_connected": (streams.get(E.SPOT) or {}).get("connected"),
                 "rest_errors": rest.get("errors"), "rest_bootstrapped": rest.get("bootstrapped"),
-                "book_rejections": sum(int(v) for v in (self.engine.state.rejections or {}).values()),
+                "book_rejections": self._rejection_total(),
                 "store_fault": self.engine.state.store_fault,
                 "free_bytes": free, "min_free_bytes": self.min_free_bytes}
 
@@ -146,6 +166,7 @@ class Recorder:
             # the view's own verdict is recorded with the curve: a curve taken from a view the
             # entry gate would refuse is still data, but it must say so
             row["entry_refusals"] = list(view.refusals(S.ENTRY))
+            self._entry_refusals, self._entry_refusals_ms = list(row["entry_refusals"]), now
             path = self._capacity_path(now)
             try:
                 n, head = EC.append(path, row)
@@ -192,11 +213,7 @@ class Recorder:
             free = store.free_bytes()
         except Exception:  # noqa: BLE001
             free = None
-        view_refusals: Optional[List[str]] = None
-        try:
-            view_refusals = list(self.feed.view().refusals(S.ENTRY))
-        except Exception:  # noqa: BLE001
-            pass
+        view_refusals = self._entry_refusals      # from the last capacity capture: reading the view here would wait on the engine lock the writer holds, and a heartbeat must never wait on the writer
         return {
             "schema": SCHEMA, "pid": os.getpid(), "environment": self.environment,
             "symbol": self.engine.state.symbol, "started_ms": self.started_ms, "now_ms": now,
@@ -222,12 +239,14 @@ class Recorder:
         """Is the log GROWING? The newest record id is an O(1) lock-free read; the age of its last change is what separates a recorder that is alive and persisting from one whose heartbeat
         is fresh while nothing is being written (a dead feed, a wedged writer, a full volume). ``growth_age_s`` counts from the recorder's start until the first record lands."""
         try:
-            rid: Optional[int] = self.engine.store.newest_id()
-        except Exception:  # noqa: BLE001 - an old store without the counter reports nothing rather than a false alarm
-            rid = None
-        if rid is not None and rid != self._last_id:
-            self._last_id, self._last_growth_ms = rid, now_ms
-        return {"newest_record_id": rid, "last_growth_ms": self._last_growth_ms, "growth_age_s": round(max(0, now_ms - self._last_growth_ms) / 1000.0, 1) if rid is not None else None}
+            rid: Optional[int] = self.engine.store.newest_id()                  # newest DURABLE record (informational: VIEW and CONN records advance it with no market data)
+            inputs: Optional[int] = int(self.engine.input_count)                # market INPUT records (frames, REST) appended and committed: what growth is measured on
+        except Exception:  # noqa: BLE001 - an old store/engine without the counters reports nothing rather than a false alarm
+            rid = inputs = None
+        if inputs is not None and inputs != self._last_id:
+            self._last_id, self._last_growth_ms = inputs, now_ms
+        return {"newest_record_id": rid, "market_inputs": inputs, "last_growth_ms": self._last_growth_ms,
+                "growth_age_s": round(max(0, now_ms - self._last_growth_ms) / 1000.0, 1) if inputs is not None else None}
 
     def refresh_count(self) -> None:
         """The exact row count scans every segment: it runs on the MAINTENANCE thread, rarely, never on the heartbeat."""
@@ -253,10 +272,13 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001 - the heartbeat must outlive the fault it reports
             self.status_errors += 1
             self.last_status_error = f"{type(exc).__name__}: {exc}"[:200]
+            if self.status_errors == 1 or self.status_errors % 10 == 0:
+                print(f"market_recorder: status write failed ({self.status_errors}x): {self.last_status_error}", file=sys.stderr, flush=True)   # visible in `fly logs` even when the file cannot be written
             return None
 
     # -- lifecycle ---------------------------------------------------------------------------------------
     def start(self) -> None:
+        self.write_status_guarded()          # a heartbeat BEFORE the (possibly slow) chain repair and feed start: a slow start is not a silent one
         # a crash between a row and its chain entry leaves an unchained tail: seal it visibly
         try:
             # every capacity file, not just today's: a crash near midnight leaves YESTERDAY's head behind

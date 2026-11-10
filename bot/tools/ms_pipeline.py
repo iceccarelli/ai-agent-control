@@ -773,10 +773,13 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
                      "net_definition": "net = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection), each modelled cost once"}
 
     # ---- ledger_pnl (realised / unrealised split; a simulated ledger is never realised cash)
-    rg = (p["realised"] + p["fees"] + p["slippage"]) if complete else None     # realised price leg AT MID + funding
+    # realised_gross_usd is the realised PRICE result at mid ALONE: funding is its own line (funding_usd). The one definition, stated identically in replay_report and in the control centre:
+    #   realised_net = realised_gross + funding - fees - slippage (taker walk + adverse selection). The previous value ALSO contained the funding, so a consumer adding funding again counted it twice.
+    rg = (p["realised"] + p["fees"] + p["slippage"] - L["funding"]) if complete else None
     ledger_pnl = {"schema": "ledger_pnl/v1", "basis": "SIMULATED", **common, "period_start_ms": cfg.start_ms, "period_end_ms": cfg.end_ms, "realised_gross_usd": rg,
                   "fees_usd": fees, "funding_usd": L["funding"], "slippage_usd": p["slippage"] if complete else None, "taker_slippage_usd": p["taker_slippage"] if complete else None,
-                  "adverse_selection_usd": p["adverse_selection"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": p["unrealised"], "net_usd": net,
+                  "adverse_selection_usd": p["adverse_selection"] if complete else None, "realised_net_usd": p["realised"] if complete else None, "unrealised_usd": p["unrealised"],
+                  "exit_adjustment_usd": p["exit_adjustment"] if complete else None, "net_usd": net,
                   "net_definition": "net_usd = realised_net + unrealised = gross (price leg at mid + funding) - fees - slippage (taker walk + adverse selection); ms_accounting's own net omits adverse selection",
                   "ledger_status": L["status"], "ledger_flags": [_short(f, 120) for f in L["flags"][:20]]}
 

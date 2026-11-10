@@ -35,6 +35,9 @@ class Engine:
         self.last_pong_mono: Dict[str, float] = {}
         self.sub_failures: List[str] = []
         self._unlogged = 0
+        #: market INPUT records (frames and REST exchanges) appended successfully since start. A lock-free progress counter: the audit VIEW records the feed writes every few seconds
+        #: and connection events advance the log WITHOUT any market data, so the log's length is not evidence that the market is being recorded.
+        self.input_count = 0
 
     # -- live helpers: append then apply, atomically ------------------------------------
 
@@ -70,6 +73,8 @@ class Engine:
             try:
                 rec = self.store.append(kind, wall_ms=w, mono_s=m, category=category,
                                         conn_id=conn_id, topic=topic, payload=payload)
+                if kind in (ST.FRAME, ST.REST):
+                    self.input_count += 1
             except Exception as exc:  # noqa: BLE001 - disk full, locked, corrupt: do not die
                 self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
                 self._unlogged += 1

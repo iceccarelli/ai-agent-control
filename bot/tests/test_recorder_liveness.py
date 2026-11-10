@@ -125,10 +125,10 @@ def test_progress_is_the_newest_record_id_and_a_log_that_stops_growing_shows_its
     clock["ms"] += 400_000                                                     # 400 s pass, nothing is recorded
     stalled = rec.write_status()
     assert stalled["progress"]["growth_age_s"] == pytest.approx(400.0) and stalled["progress"]["newest_record_id"] == first["progress"]["newest_record_id"]
-    _inject_event(rec)                                                         # a record lands
+    rec.engine.input_count += 1                                                # a market input record lands (the counter the engine increments on a committed frame / REST append)
     clock["ms"] += 1000
     moved = rec.write_status()
-    assert moved["progress"]["growth_age_s"] == 0.0 and moved["progress"]["newest_record_id"] > first["progress"]["newest_record_id"]
+    assert moved["progress"]["growth_age_s"] == 0.0 and moved["progress"]["market_inputs"] == first["progress"]["market_inputs"] + 1
 
 
 # ---------------------------------------------------------------- what the monitor reports
@@ -212,3 +212,197 @@ def test_the_alert_names_the_age_and_the_supervisor_instead_of_no_detail_recorde
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(base + 60 * k))
         assert RM._history_line(str(tmp_path), {"at": at, "outcome": "OK", "reasons": [], "recorder": RM.recorder_observation(ok_p, now=now2), "decision": {}})
     assert not [a for a in RA.evaluate((tmp_path / "monitor.jsonl").read_text(), base + 200) if a.key == "recorder_down"]
+
+
+# ================================================================ second round: findings from the independent review, each verified in code first
+import md_store as ST  # noqa: E402
+import md_engine as EN  # noqa: E402
+
+
+def test_the_heartbeat_does_not_wait_on_the_engine_lock(tmp_path):
+    """REPRODUCED by review: status() called feed.view(), which takes engine.lock; a stalled writer (slow fsync, a long retention pass) froze the heartbeat and the watchdog then killed a recorder that was only waiting."""
+    rec, store, _ = make(tmp_path)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with rec.engine.lock:
+            held.set()
+            release.wait(10)
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert held.wait(3)
+    done = threading.Event()
+    th = threading.Thread(target=lambda: (rec.write_status(), done.set()), daemon=True)
+    th.start()
+    assert done.wait(2.0), "the heartbeat blocked on the engine lock"
+    release.set()
+    t.join(3)
+
+
+def test_the_view_logger_and_connection_events_are_not_market_input(tmp_path):
+    """REPRODUCED by review: the feed appends a VIEW record every 5 s and CONN events on reconnects, so the log grew with both streams DOWN and NOT_PERSISTING could not fire."""
+    rec, store, wall = make(tmp_path)
+    before_inputs, before_id = rec.engine.input_count, store.newest_id()
+    rec.engine.log_view(1.0, wall)                                              # an audit VIEW record
+    rec.engine.record(ST.CONN, wall_ms=wall, mono_s=2.0, payload=json.dumps({"event": "disconnected"}))
+    assert store.newest_id() > before_id and rec.engine.input_count == before_inputs, "audit/connection records must not count as market input"
+    rec.engine.record(ST.FRAME, wall_ms=wall, mono_s=3.0, category="linear", conn_id="c1", topic="orderbook.50.BTCUSDT", payload=json.dumps({"topic": "orderbook.50.BTCUSDT", "type": "delta", "data": {}}))
+    assert rec.engine.input_count == before_inputs + 1
+
+
+def test_growth_is_measured_on_market_input_so_a_dead_feed_with_a_live_view_logger_is_not_persisting(tmp_path):
+    rec, store, _ = make(tmp_path)
+    clock = {"ms": 1_700_000_000_000}
+    rec.wall_ms = lambda: clock["ms"]
+    rec.started_ms = rec._last_growth_ms = clock["ms"]
+    rec.write_status()
+    for _ in range(3):                                                           # 400 s of view records and reconnect events only
+        rec.engine.log_view(1.0, clock["ms"])
+        clock["ms"] += 140_000
+    st = rec.write_status()
+    assert st["progress"]["growth_age_s"] >= 400 and st["progress"]["newest_record_id"] > 0
+    rec.engine.input_count += 1                                                  # a market frame lands
+    clock["ms"] += 1000
+    assert rec.write_status()["progress"]["growth_age_s"] == 0.0
+
+
+def test_a_failed_commit_rolls_back_so_ids_stay_contiguous_and_nothing_phantom_is_persisted(tmp_path):
+    """REPRODUCED by review: _next_id advanced before the commit; a failed commit (ENOSPC) left the id ahead and the row in the open transaction, so a later commit persisted a row the engine had reported unlogged."""
+    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1, environment="mainnet")
+    store.append(ST.CONN, wall_ms=1_700_000_000_000, mono_s=1.0, payload="{}")
+    good = store.newest_id()
+    class FailingCommit:
+        """A connection whose FIRST commit fails (sqlite3.Connection attributes are read-only, so wrap it)."""
+
+        def __init__(self, conn):
+            self._c, self.n = conn, 0
+
+        def commit(self):
+            self.n += 1
+            if self.n == 1:
+                raise OSError(28, "No space left on device")
+            return self._c.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+    store._conn = FailingCommit(store._conn)
+    with pytest.raises(OSError):
+        store.append(ST.CONN, wall_ms=1_700_000_000_001, mono_s=2.0, payload="{}")
+    assert store.newest_id() == good, "the durable id must not advance past a failed commit"
+    store.append(ST.CONN, wall_ms=1_700_000_000_002, mono_s=3.0, payload="{}")        # the disk recovered
+    assert store.newest_id() == good + 1 and store.count() == good + 1 and store.verify() == []
+    store.close()
+
+
+def test_emergency_prune_frees_the_oldest_closed_segment_keeps_the_chain_and_never_touches_the_newest(tmp_path):
+    """REPRODUCED by review: age-based retention keeps retention_days+1 segments; a volume that fills inside that window sat in FAULT until a human acted."""
+    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1, environment="mainnet")
+    day = 86_400_000
+    base = 1_700_000_000_000
+    for d in range(4):
+        for k in range(3):
+            store.append(ST.CONN, wall_ms=base + d * day + k, mono_s=float(d * 10 + k), payload="{}")
+    assert len(store.segments()) == 4
+    store.min_free_bytes = 10 ** 15                                              # the reserve is breached
+    assert store.low_space() is True
+    first = store.emergency_prune()
+    assert len(first) == 1 and first[0] == min(first) and len(store.segments()) == 3 and store.emergency_prunes == 1
+    store.emergency_prune()
+    assert len(store.segments()) == 2
+    assert store.emergency_prune() == [] and len(store.segments()) == 2, "never prune the newest or the segment being written"
+    assert store.verify() == [], "the retained log must still verify from the pruned checkpoint"
+    assert os.path.exists(store._manifest_path()) and len(open(store._manifest_path()).read().strip().splitlines()) == 2
+    store.close()
+
+
+def test_the_feed_runs_the_emergency_pass_only_when_the_reserve_is_breached(tmp_path):
+    rec, store, _ = make(tmp_path)
+    assert rec.feed.emergency_retention() == []                                  # plenty of space: nothing happens
+    day = 86_400_000
+    for d in range(3):
+        store.append(ST.CONN, wall_ms=1_700_000_000_000 + d * day, mono_s=float(d), payload="{}")
+    store.min_free_bytes = 10 ** 15
+    assert len(rec.feed.emergency_retention()) >= 1 and store.emergency_prunes >= 1
+
+
+def test_a_failed_status_write_is_visible_on_stderr_and_leaves_no_temp_file(tmp_path, monkeypatch, capsys):
+    rec, store, _ = make(tmp_path)
+    monkeypatch.setattr(os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+    for _ in range(11):
+        assert rec.write_status_guarded() is None
+    monkeypatch.undo()
+    err = capsys.readouterr().err
+    assert err.count("status write failed") == 2 and "No space left" in err and "(10x)" in err          # the first failure and every 10th: visible in `fly logs`
+    assert not [n for n in os.listdir(rec.dir) if ".tmp." in n], "a failed write left a temp file on a full volume"
+
+
+def test_a_heartbeat_is_written_before_the_slow_start_work(tmp_path, monkeypatch):
+    """A slow start must not be a silent one: the status exists even when the feed start never returns usefully."""
+    rec, store, _ = make(tmp_path)
+    monkeypatch.setattr(rec.feed, "start", lambda: (_ for _ in ()).throw(RuntimeError("feed start failed")))
+    with pytest.raises(RuntimeError):
+        rec.start()
+    assert os.path.exists(os.path.join(rec.dir, MR.STATUS_FILE))
+
+
+def test_no_runtime_status_file_is_committed_into_the_source_tree():
+    root = os.path.dirname(BOT)
+    assert not os.path.exists(os.path.join(BOT, "recorder_status.json")), "a stray runtime file in bot/"
+    ign = open(os.path.join(root, ".gitignore"), encoding="utf-8").read()
+    assert "bot/recorder_status.json" in ign and "bot/supervisor_status.json" in ign
+
+
+# ---------------------------------------------------------------- the supervisor and the alert rules
+def test_a_recorder_that_needed_the_watchdog_is_not_a_stable_run_so_the_backoff_keeps_growing(tmp_path):
+    """REPRODUCED by review: a hung recorder lived >= stable_after_s, so _schedule_restart reset the failure count and supervisor_status showed 0-1 failures for a persistent fault."""
+    import runner_supervisor as RS
+    s = RS.Supervisor([sys.executable, "-c", "import time; time.sleep(3.5)"], [sys.executable, "-c", "import time; time.sleep(60)"], status_dir=str(tmp_path), poll_s=0.02,
+                      backoff_base_s=0.05, backoff_max_s=0.3, stable_after_s=0.01, grace_s=2.0, watchdog_stale_s=0.25, watchdog_check_s=0.05)
+    assert s.run() == 0
+    assert s.recorder_watchdog_kills >= 3 and s.recorder_failures >= 3, (s.recorder_watchdog_kills, s.recorder_failures)
+
+
+def history_rows(tmp_path, counters, base=1_794_312_000):
+    import runner_alerts as RA
+    lines = []
+    for k, (restarts, kills) in enumerate(counters):
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(base + 600 * k))
+        lines.append(json.dumps({"at": at, "outcome": "OK", "reasons": [], "recorder_state": "RECORDING", "recorder_restarts": restarts, "recorder_watchdog_kills": kills,
+                                 "recorder_consecutive_failures": 2}, sort_keys=True))
+    return RA, "\n".join(lines) + "\n", base + 600 * len(counters)
+
+
+def test_a_recorder_that_is_recording_at_every_sample_but_keeps_being_restarted_alerts(tmp_path):
+    RA, text, now = history_rows(tmp_path, [(3, 1), (3, 1), (4, 2), (4, 2), (5, 3)])
+    alerts = [a for a in RA.evaluate(text, now) if a.key == "recorder_restarting"]
+    assert len(alerts) == 1 and "restarts 3 -> 5" in alerts[0].text and "watchdog kills 1 -> 3" in alerts[0].text and "not healthy" in alerts[0].text
+
+
+def test_a_steady_restart_counter_or_a_single_sample_raises_no_restart_alert(tmp_path):
+    RA, text, now = history_rows(tmp_path, [(3, 1)] * 6)
+    assert not [a for a in RA.evaluate(text, now) if a.key == "recorder_restarting"]
+    RA, text, now = history_rows(tmp_path, [(9, 9)])
+    assert not [a for a in RA.evaluate(text, now) if a.key == "recorder_restarting"]
+
+
+def test_the_monitor_copies_the_supervisors_counters_into_the_history_line(tmp_path):
+    p, now = status_file(tmp_path, age_s=10, growth_age_s=1)
+    (tmp_path / "supervisor_status.json").write_text(json.dumps({"recorder_pid": 5, "recorder_restarts": 4, "recorder_watchdog_kills": 2, "recorder_consecutive_failures": 3}))
+    rec = {"at": "2026-11-10T00:00:00Z", "outcome": "OK", "reasons": [], "recorder": RM.recorder_observation(p, now=now), "decision": {}}
+    assert RM._history_line(str(tmp_path), rec) is True
+    line = json.loads((tmp_path / "monitor.jsonl").read_text().splitlines()[-1])
+    assert line["recorder_restarts"] == 4 and line["recorder_watchdog_kills"] == 2 and line["recorder_consecutive_failures"] == 3 and "recorder_recorder_restarts" not in line
+
+
+# ---------------------------------------------------------------- the evaluate exit-code contract and label
+def test_the_evaluate_exit_code_tells_a_decision_from_a_failure_to_decide(monkeypatch, capsys):
+    import ms_testnet_autopilot as AP
+    codes = {}
+    for decision in AP.DECISIONS:
+        monkeypatch.setattr(AP, "run_once", lambda *a, _d=decision, **k: {"result": "EVALUATED", "why": [], "decision": _d})
+        codes[decision] = AP.main(["evaluate"], env={})
+    capsys.readouterr()
+    assert codes == {"WAIT_FOR_DATA": 3, "INCONCLUSIVE": 3, "SKIP_NO_OPPORTUNITY": 0, "REJECT_UNECONOMIC": 0, "ELIGIBLE_FOR_OWNER_TESTNET_DECISION": 0}
+    monkeypatch.setattr(AP, "run_once", lambda *a, **k: {"result": "REFUSED", "why": ["X"]})
+    assert AP.main(["evaluate"], env={}) == 3
+    capsys.readouterr()

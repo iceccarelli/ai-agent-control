@@ -533,6 +533,22 @@ class Feed:
             if self.cfg.retention_days > 0 and self.mono() >= next_retention:
                 next_retention = self.mono() + self.cfg.retention_every_s
                 self.apply_retention()
+            self.emergency_retention()
+
+    def emergency_retention(self) -> List[str]:
+        """When the volume is below its reserve, free the OLDEST closed segment now instead of waiting for the age-based pass (a volume that fills inside one retention window would sit in
+        FAULT for ever). Counted in ``emergency_prunes``; a failure is counted, never raised into the feed."""
+        store = self.engine.store
+        if store is None or not hasattr(store, "low_space"):
+            return []
+        try:
+            if not store.low_space():
+                return []
+            with self.engine.lock:
+                return store.emergency_prune()
+        except Exception:  # noqa: BLE001
+            self.retention_errors += 1
+            return []
 
     def apply_retention(self) -> List[str]:
         """Prune old segments under the engine's lock so no append interleaves with it.

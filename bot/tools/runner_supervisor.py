@@ -95,6 +95,7 @@ class Supervisor:
         self.started_wall = self.wall()
         self.watchdog_stale_s, self.watchdog_check_s = float(watchdog_stale_s), float(watchdog_check_s)
         self.recorder_watchdog_kills = 0
+        self._watchdog_killed = False
         self.recorder_started_wall = 0.0
         self._next_watchdog = 0.0
 
@@ -139,6 +140,7 @@ class Supervisor:
         if age is None or age <= self.watchdog_stale_s:
             return
         self.recorder_watchdog_kills += 1
+        self._watchdog_killed = True            # a recorder that had to be killed is NOT a stable run, however long it lived: the backoff must keep growing
         print(f"supervisor: the recorder (pid {self.recorder.pid}) has not rewritten its status for {age:.0f}s (limit {self.watchdog_stale_s:.0f}s): terminating it for a bounded restart",
               file=sys.stderr, flush=True)
         self._terminate([self.recorder])
@@ -209,7 +211,8 @@ class Supervisor:
                 if self.recorder is not None:
                     r = self.recorder.poll()
                     if r is not None:
-                        lived = self.mono() - self.recorder_started_at
+                        lived = 0.0 if self._watchdog_killed else self.mono() - self.recorder_started_at
+                        self._watchdog_killed = False
                         self.recorder_last_exit = int(r)
                         self.recorder = None
                         self.recorder_restarts += 1

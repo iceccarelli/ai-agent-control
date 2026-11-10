@@ -182,6 +182,9 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
         for key in ("age_s", "growth_age_s", "heartbeat_errors"):
             if isinstance(recorder.get(key), (int, float)):
                 line["recorder_" + key] = recorder[key]
+        for key in ("recorder_restarts", "recorder_watchdog_kills", "recorder_consecutive_failures"):          # already prefixed: the supervisor's own counters
+            if isinstance(recorder.get(key), (int, float)):
+                line[key] = recorder[key]
         for key in ("records", "free_mb", "capacity_rows", "max_fillable_usd", "chain_n"):
             if isinstance(recorder.get(key), (int, float)):
                 line["recorder_" + key] = recorder[key]
@@ -213,6 +216,17 @@ RECORDER_STALE_S = 300.0
 #: A recorder whose HEARTBEAT is fresh but whose log has not grown for this long is alive and not persisting (a dead feed, a wedged writer, a full volume). BTCUSDT's books update many
 #: times a second, so five minutes without one new record is not a quiet market.
 RECORDER_NO_GROWTH_S = 300.0
+
+
+def _supervisor_counters(status_path: str) -> Dict[str, Any]:
+    """The supervisor's own restart counters (numbers only), for the history line: a recorder that is RECORDING at every sample but keeps being restarted is a fault the state alone hides."""
+    sup = os.path.join(os.path.dirname(os.path.abspath(status_path)), "supervisor_status.json")
+    try:
+        with open(sup, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {k: d.get(k) for k in ("recorder_restarts", "recorder_watchdog_kills", "recorder_consecutive_failures") if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool)}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _supervisor_summary(status_path: str) -> str:
@@ -262,7 +276,7 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None
             detail = (f"the recorder reports (heartbeat {age:.0f} s old) but its log has not grown for {growth_age:.0f} s "
                       f"(limit {RECORDER_NO_GROWTH_S:.0f} s): nothing is being persisted; {_supervisor_summary(path)}")[:300]
         return {"state": state, "age_s": round(age, 1), "detail": detail, "growth_age_s": growth_age,
-                "heartbeat_errors": (st.get("heartbeat") or {}).get("status_errors"), "records": store.get("records"),
+                "heartbeat_errors": (st.get("heartbeat") or {}).get("status_errors"), **_supervisor_counters(path), "records": store.get("records"),
                 "free_mb": None if store.get("free_bytes") is None else round(store["free_bytes"] / 1048576.0, 1),
                 "fault": fault, "capacity_rows": cap.get("rows"),
                 "max_fillable_usd": cap.get("max_displayed_fillable_notional_usd"),

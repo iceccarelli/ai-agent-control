@@ -1316,3 +1316,22 @@ def test_the_evaluate_command_exposes_symbol_notional_and_floor_and_nothing_that
     assert (a.cmd, a.symbol, a.notional_usd, a.min_funding_bps) == ("evaluate", "ETHUSDT", "150", "3")
     evaluate = next(sp for sp in AP._parser()._subparsers._group_actions[0].choices.values() if sp.prog.endswith("evaluate"))
     assert not [o for act in evaluate._actions for o in act.option_strings if any(w in o for w in ("grant", "capability", "lease", "confirm", "execute", "order"))]
+
+
+def test_a_crash_between_execute_and_the_end_of_the_session_leaves_the_cash_pending_for_settlement(w, tmp_path, monkeypatch):
+    """REPRODUCED by review: the capital book was only parked after execute returned; a crash after orders left nothing to settle and the loss was invisible."""
+    _profit_world(w)
+    real_main = S.main
+
+    def dying(argv, **kw):
+        if "execute" in argv:
+            raise RuntimeError("process killed after orders were placed")
+        return real_main(argv, **kw)
+    monkeypatch.setattr(AP.S, "main", dying)
+    eng = str(w.tmp / "eng_crash")
+    with pytest.raises(RuntimeError):
+        AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=eng)
+    p = CC.CapitalBook(eng).load()["pending"]
+    assert p is not None and p["flat_verified"] is False and p["ledger_net_known_usd"] is None, "no conservative placeholder was parked before execution"
+    r = CC.CapitalBook(eng).settle("1")                                        # the venue's cash is thousands lower than this: a LOSS, booked in full
+    assert r["status"] == "SETTLED" and CC.CapitalBook(eng).load()["loss_streak"] == 1

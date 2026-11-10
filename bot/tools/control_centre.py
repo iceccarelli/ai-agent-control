@@ -48,7 +48,9 @@ A missing file => section shows an empty state. A malformed/oversize/symlink/NaN
       alerts [ {severity "INFO"|"WARN"|"CRITICAL", code str, detail str} ]
   ledger_pnl.json       schema "ledger_pnl/v1"      basis: SIMULATED | MEASURED | EXCHANGE_REPORTED | OWNER_SUPPLIED_UNVERIFIED
       period_start_ms int|null, period_end_ms int|null
-      realised_gross_usd num|null, fees_usd num|null, funding_usd num|null, realised_net_usd num|null, unrealised_usd num|null
+      realised_gross_usd num|null (the realised PRICE result at mid ALONE: funding is funding_usd), fees_usd num|null, funding_usd num|null, realised_net_usd num|null, unrealised_usd num|null
+      (identity: realised_net = realised_gross + funding - fees - taker_slippage - adverse_selection)
+      exit_adjustment_usd num|null (OPTIONAL: unrealised_usd is the LIQUIDATION value of what is open; portfolio unrealised is mark-to-market; unrealised_usd - exit_adjustment_usd = portfolio unrealised)
       taker_slippage_usd num|null, adverse_selection_usd num|null (OPTIONAL modelled costs, shown as slippage / adverse selection with their source field)
       net_usd num|null (OPTIONAL: the TOTAL net, = realised_net_usd + unrealised_usd, the same figure as replay_report net_pnl_usd; absent = not stated)
       (a SIMULATED ledger is shown as simulated P&L, never as realised; net is never inferred from gross)
@@ -248,7 +250,8 @@ def _v_replay(o: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(gbs, dict) or len(gbs) > 32 or not all(k in MST.GROUP_STATES and isinstance(v, int) and not isinstance(v, bool) and v >= 0 for k, v in gbs.items()):
         raise _bad("'groups_by_state' must map GroupState names to non-negative integers")
     return {"universe_scope": scope, "period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), "n_groups": _int(o, "n_groups"),
-            "groups_by_state": dict(gbs), "gross_pnl_usd": _num(o, "gross_pnl_usd"), "fees_usd": _num(o, "fees_usd"), "net_pnl_usd": _num(o, "net_pnl_usd"), "symbols": syms}
+            "groups_by_state": dict(gbs), "gross_pnl_usd": _num(o, "gross_pnl_usd"), "fees_usd": _num(o, "fees_usd"), "net_pnl_usd": _num(o, "net_pnl_usd"), "symbols": syms,
+            **{k: (_num(o, k) if k in o else None) for k in ("slippage_usd", "taker_slippage_usd", "adverse_selection_usd")}}      # optional modelled costs the producer states; absent = not stated
 
 
 def _v_portfolio(o: Mapping[str, Any]) -> Dict[str, Any]:
@@ -273,7 +276,7 @@ def _v_ledger(o: Mapping[str, Any]) -> Dict[str, Any]:
     return {"period_start_ms": _int(o, "period_start_ms", null=True), "period_end_ms": _int(o, "period_end_ms", null=True), **{k: _num(o, k) for k in
             ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd")},
             "net_usd": _num(o, "net_usd") if "net_usd" in o else None,          # optional: the TOTAL net as the producer states it (the replay's net_pnl_usd); never derived here
-            **{k: (_num(o, k) if k in o else None) for k in ("taker_slippage_usd", "adverse_selection_usd")}}      # optional modelled costs the producer states; absent / null = unknown (MISSING), never zero
+            **{k: (_num(o, k) if k in o else None) for k in ("taker_slippage_usd", "adverse_selection_usd", "exit_adjustment_usd")}}      # optional: modelled costs and the open-leg exit adjustment the producer states; absent / null = unknown (MISSING), never zero
 
 
 def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
@@ -894,7 +897,7 @@ def _figures(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any]) -> Tuple
         "gross": pick("gross", [(R.get("gross_pnl_usd"), "SIMULATED", "replay_report.json:gross_pnl_usd")], "GROSS: before fees"),
         "fees": pick("fees", [(R.get("fees_usd"), "SIMULATED", "replay_report.json:fees_usd"), (L.get("fees_usd"), lb, "ledger_pnl.json:fees_usd")], "fees paid or modelled"),
         "funding": pick("funding", [(L.get("funding_usd"), lb, "ledger_pnl.json:funding_usd")], "funding received less paid, as the ledger states it"),
-        "closed_gross": pick("closed_gross", [(L.get("realised_gross_usd"), lb, "ledger_pnl.json:realised_gross_usd")], "realised price result before fees; GROSS"),
+        "closed_gross": pick("closed_gross", [(L.get("realised_gross_usd"), lb, "ledger_pnl.json:realised_gross_usd")], "realised PRICE result at mid, before funding, fees and modelled slippage; GROSS (funding is its own line)"),
         "closed_net": pick("closed_net", [(L.get("realised_net_usd"), lb, "ledger_pnl.json:realised_net_usd")], "realised after fees and funding; NET of the realised part"),
         "unrealised": pick("unrealised", [(L.get("unrealised_usd"), lb, "ledger_pnl.json:unrealised_usd")] + ([] if lg["state"] == "OK" else [(P.get("unrealised_pnl_usd"), pb, "portfolio_state.json:unrealised_pnl_usd")]), "mark-to-market; not cash"),
         "slippage": pick("slippage", [(L.get("taker_slippage_usd"), lb, "ledger_pnl.json:taker_slippage_usd")], "modelled taker walk of the book (inside the fill prices, charged once)"),
@@ -911,13 +914,27 @@ def _figures(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any]) -> Tuple
         else:
             ok = abs(lhs - rhs) <= TOL
             checks.append({"id": cid, "label": label, "state": "PASS" if ok else "FAIL", "detail": f"{detail}: {lhs:,.2f} vs {rhs:,.2f}"})
+    def modelled(d: Mapping[str, Any]) -> Tuple[bool, float, str]:
+        """(checkable, modelled cost total, what was used). The identity is net = gross (+ funding) - fees - slippage (taker walk + adverse selection). A producer that states NO modelled cost
+        is checked without one (its numbers either reconcile or they do not); a PARTIALLY stated pair is not checkable (an unknown part is never zero)."""
+        tot, tk, ad = d.get("slippage_usd"), d.get("taker_slippage_usd"), d.get("adverse_selection_usd")
+        if tot is not None:
+            return True, tot, "slippage"
+        if tk is not None and ad is not None:
+            return True, tk + ad, "taker slippage + adverse selection"
+        if tk is None and ad is None:
+            return True, 0.0, "no modelled cost stated"
+        return False, 0.0, "only one of taker slippage / adverse selection stated"
     g, f, n = R.get("gross_pnl_usd"), R.get("fees_usd"), R.get("net_pnl_usd")
-    chk("gross_minus_fees", "gross - fees = net (replay)", None if g is None or f is None else g - f, n, "replay gross - fees vs net")
+    ok_r, slip_r, used_r = modelled(R)
+    chk("gross_minus_fees", "gross - fees - modelled slippage = net (replay)", None if (g is None or f is None or not ok_r) else g - f - slip_r, n, f"replay gross - fees - {used_r} vs net")
     syms = R.get("symbols") or []
     sn = [s["net_pnl_usd"] for s in syms]
     chk("symbols_sum", "sum of symbol nets = net (replay)", None if (not syms or any(x is None for x in sn)) else sum(sn), n, "symbols vs total")
     rg, rf, fu, rn, un = (L.get(k) for k in ("realised_gross_usd", "fees_usd", "funding_usd", "realised_net_usd", "unrealised_usd"))
-    chk("ledger_components", "realised gross + funding - fees = realised net (ledger)", None if None in (rg, rf, fu) else rg + fu - rf, rn, "components vs realised net")
+    ok_l, slip_l, used_l = modelled(L)
+    chk("ledger_components", "realised gross + funding - fees - modelled slippage = realised net (ledger)", None if (None in (rg, rf, fu) or not ok_l) else rg + fu - rf - slip_l, rn,
+        f"realised gross + funding - fees - {used_l} vs realised net")
     tot = F["net"]["v"]
     chk("realised_plus_unrealised", "realised net + unrealised = net", None if (rn is None or un is None) else rn + un, tot, "realised + unrealised vs the one net")
     if L.get("net_usd") is not None and n is not None:
@@ -925,7 +942,11 @@ def _figures(art: Mapping[str, Dict[str, Any]], coh: Mapping[str, Any]) -> Tuple
     if L.get("fees_usd") is not None and f is not None:
         chk("fees_match", "ledger fees = replay fees", L["fees_usd"], f, "ledger vs replay")
     if L.get("unrealised_usd") is not None and P.get("unrealised_pnl_usd") is not None:
-        chk("unrealised_matches_portfolio", "ledger unrealised = portfolio unrealised", L["unrealised_usd"], P["unrealised_pnl_usd"], "ledger vs portfolio")
+        # The ledger values what is open at its LIQUIDATION value (exit side of the book, less the taker exit fee: what the one net includes); the portfolio shows MARK-TO-MARKET. They differ by exactly
+        # the exit adjustment the ledger states. A ledger that states none is compared directly (its own claim is that the two valuations coincide).
+        adj = L.get("exit_adjustment_usd") or 0.0
+        chk("unrealised_matches_portfolio", "ledger unrealised - exit adjustment = portfolio mark-to-market unrealised", L["unrealised_usd"] - adj, P["unrealised_pnl_usd"],
+            "ledger (liquidation value) less its exit adjustment vs portfolio (mark-to-market)")
     pu = [p["unrealised_pnl_usd"] for p in (P.get("positions") or [])]
     if P and P.get("unrealised_pnl_usd") is not None and pu:
         chk("positions_sum", "sum of position unrealised = portfolio unrealised", None if any(x is None for x in pu) else sum(pu), P["unrealised_pnl_usd"], "positions vs total")

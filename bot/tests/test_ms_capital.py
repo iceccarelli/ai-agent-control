@@ -142,14 +142,14 @@ def test_the_reserve_is_withheld_from_the_sizing_basis_but_never_softens_a_loss(
 def test_a_declared_deposit_or_withdrawal_is_never_a_trading_result(tmp_path):
     b = book(tmp_path)
     b.ensure_baseline("10000")
-    assert b.declare_transfer("dep-1", "500") and not b.declare_transfer("dep-1", "500") and not b.declare_transfer("", "5") and not b.declare_transfer("z", "0")
     b.park("s1", "10000", "-1.00", True, True)
+    assert b.declare_transfer("dep-1", "500") and not b.declare_transfer("dep-1", "500") and not b.declare_transfer("", "5") and not b.declare_transfer("z", "0")      # made, THEN declared
     r = b.settle("10499")                                                    # +500 deposit, -1 trading loss
     assert r["status"] == "SETTLED" and r["transfers_removed_usd"] == "500" and r["credited_usd"] == "-1" and b.basis() == D("9999")
     assert not b.declare_transfer("dep-1", "500")                            # applied ids stay known: a retry cannot re-subtract it
     b.park("s2", "10499", "0.50", True, True)
     assert b.declare_transfer("wd-1", "-200")
-    assert b.settle("10299.50")["credited_usd"] == "0.50"                    # withdrawal removed too
+    assert D(b.settle("10299.50")["credited_usd"]) == D("0.50")              # withdrawal removed too
 
 
 def test_concurrent_settlement_credits_exactly_once(tmp_path):
@@ -209,3 +209,102 @@ def test_a_corrupt_book_file_reads_as_empty_not_as_money(tmp_path):
     (tmp_path / "capital.json").write_text("{not json")
     b = book(tmp_path)
     assert b.basis() is None and alloc(basis=b.basis(), start_cash=None).notional == D(0)
+
+
+# ================================================================ round two: findings from the independent accounting review (verified in code first)
+import json as _json  # noqa: E402
+import time as _time  # noqa: E402
+
+
+def test_a_session_parked_before_execution_still_gets_its_loss_debited_and_never_a_gain_credited_if_the_process_died(tmp_path):
+    """REPRODUCED by review: park ran only AFTER execute returned, so a crash after orders left no pending record: the next settle said NO_PENDING and the loss was never booked."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", None, False, False) is True                   # the conservative placeholder, written BEFORE any order
+    # ... the process dies here: update_pending is never called ...
+    r = b.settle("9996")
+    assert r["status"] == "SETTLED" and r["credited_usd"] == "-4" and b.basis() == D("9996") and b.load()["loss_streak"] == 1
+    b.park("s2", "9996", None, False, False)
+    r = b.settle("10050")                                                       # a gain from a session nobody could verify
+    assert r["credited_usd"] == "0" and r["status"] in ("UNVERIFIED_GAIN", "NOT_FLAT_SESSION") and b.basis() == D("9996")
+
+
+def test_update_pending_replaces_the_placeholder_only_for_the_same_session(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", None, False, False)
+    assert b.update_pending("other", "5", True, True) is False and b.load()["pending"]["flat_verified"] is False
+    assert b.update_pending("s1", "2.00", True, True) is True
+    p = b.load()["pending"]
+    assert p["flat_verified"] is True and p["ledger_net_known_usd"] == "2.00" and p["parked_ms"] > 0
+    assert D(b.settle("10002")["credited_usd"]) == D("2")
+
+
+def test_a_different_unsettled_session_is_never_overwritten(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", None, False, False) is True
+    assert b.park("s2", "9990", None, False, False) is False                   # refused: s1's cash result must be booked first
+    assert b.load()["pending"]["session_id"] == "s1"
+    assert b.park("s1", "10000", None, False, False) is True                   # the same session is idempotent
+    assert b.park("s3", None, None, False, False) is False                     # no trustworthy starting cash
+
+
+def test_a_transfer_declared_before_the_session_was_parked_is_not_part_of_its_delta(tmp_path, monkeypatch):
+    """REPRODUCED by review: a declared deposit was subtracted from whichever session settled next, even when it was already inside that session's starting cash (a phantom loss)."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(_time, "time", lambda: clock["t"])
+    assert b.declare_transfer("dep-1", "500")                                  # declared at t=1000 and made before the session started
+    clock["t"] = 2_000.0
+    b.park("s1", "10500", None, False, False)                                  # starting cash ALREADY includes the deposit
+    r = b.settle("10500")
+    assert r["transfers_removed_usd"] == "0" and r["credited_usd"] == "0", r
+    applied = {t["event_id"]: t for t in b.load()["transfers_applied"]}
+    assert applied["dep-1"]["counted"] is False and applied["dep-1"]["applied_to"] == "s1"
+    clock["t"] = 3_000.0
+    b.park("s2", "10500", None, False, False)
+    clock["t"] = 4_000.0
+    assert b.declare_transfer("dep-2", "100")                                  # declared AFTER the session started: it is inside this session's delta
+    r = b.settle("10600")
+    assert r["transfers_removed_usd"] == "100" and r["credited_usd"] == "0"
+
+
+def test_only_a_verified_credited_gain_breaks_a_losing_streak(tmp_path):
+    """REPRODUCED by review: any zero-credit outcome reset the streak, so losses interleaved with unverified gains never reached the stop."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    cash = D(10000)
+    for k, delta in enumerate(("-1", "+30", "-1", "+30", "-1")):               # +30 with no ledger net: UNVERIFIED, credited 0
+        b.park(f"s{k}", str(cash), None, False, True)
+        cash += D(delta)
+        b.settle(str(cash))
+    assert b.load()["loss_streak"] == 3 and b.load()["unverified_excess_usd"] == "60"
+    b.park("s9", str(cash), "5.00", True, True)
+    cash += D(5)
+    assert D(b.settle(str(cash))["credited_usd"]) == D("5") and b.load()["loss_streak"] == 0
+
+
+def test_the_drawdown_stop_has_an_owner_acknowledgement_that_changes_no_money(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "20.00", True, True)
+    b.settle("10020")                                                          # a verified +20 sets the peak
+    b.park("s2", "10020", "-15.00", True, True)
+    b.settle("10005")                                                          # -15 from the peak: beyond the 11.10 stop
+    dd = b.drawdown()
+    assert dd == D("15.00") and alloc(basis=b.sizing_basis(), start_cash=D(10000), drawdown_usd=dd).notional == D(0)
+    realised, history = b.load()["realised_usd"], len(b.load()["history"])
+    assert b.acknowledge_drawdown() is True and b.drawdown() == D(0)
+    assert b.load()["realised_usd"] == realised and len(b.load()["history"]) == history and b.load()["drawdown_acknowledged"][0]["from_peak_usd"] == "10020"
+    assert b.acknowledge_drawdown() is False                                   # nothing left to acknowledge
+    assert alloc(basis=b.sizing_basis(), start_cash=D(10000), drawdown_usd=b.drawdown()).notional > 0
+
+
+def test_the_capital_constants_cannot_drift_from_the_testnet_manifest_limits():
+    import ms_testnet_adapter as AD
+    assert C.DRAWDOWN_STOP_USD == D(str(AD.MAX_LOSS_CEILING_USD)) * 2, "the drawdown stop must stay twice the per-session loss ceiling"
+    ceiling = D(str(AD.AGGREGATE_CEILING_USD))
+    assert C.INITIAL_FRACTION * ceiling <= C.MAX_FRACTION * ceiling <= ceiling and C.MAX_SCALE >= 1
+    assert C.MIN_NOTIONAL_USD < C.INITIAL_FRACTION * ceiling

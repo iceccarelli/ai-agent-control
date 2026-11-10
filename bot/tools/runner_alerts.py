@@ -257,6 +257,24 @@ def _mainnet_stall(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+#: Cycles looked back over for a RISING recorder restart / watchdog-kill counter.
+RECORDER_RESTART_WINDOW = 12
+
+
+def _recorder_restarting(rows: Sequence[Mapping[str, object]]):
+    """(first, last) rows of the recent window when the supervisor's restart or watchdog-kill counter ROSE across it, else None. A recorder that is RECORDING at every sample but keeps being
+    restarted (a crash loop, a watchdog repair) is a fault the state alone hides; the alert needs no three consecutive bad samples."""
+    with_ctr = [r for r in rows if isinstance(r.get("recorder_restarts"), (int, float)) or isinstance(r.get("recorder_watchdog_kills"), (int, float))]
+    tail = with_ctr[-RECORDER_RESTART_WINDOW:]
+    if len(tail) < 2:
+        return None
+    for key in ("recorder_restarts", "recorder_watchdog_kills"):
+        a, b = tail[0].get(key), tail[-1].get(key)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b > a:
+            return tail[0], tail[-1]
+    return None
+
+
 def _recorder_down(rows: Sequence[Mapping[str, object]], n: int):
     """The last `n` rows that carry a `recorder_state`, when none of them says RECORDING;
     else None. Rows without the field (no recorder configured) count neither way."""
@@ -385,6 +403,14 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
             "recorder_down", WARNING,
             f"the last {RECORDER_DOWN_CYCLES} cycles found the market recorder not recording "
             f"(state {last['recorder_state']}: {why}). Order-book depth is not accumulating."))
+    rising = _recorder_restarting(rows)
+    if rising:
+        a, b = rising
+        alerts.append(Alert(
+            "recorder_restarting", WARNING,
+            f"the supervisor restarted the market recorder within the last {RECORDER_RESTART_WINDOW} cycles (restarts {a.get('recorder_restarts')} -> {b.get('recorder_restarts')}, "
+            f"watchdog kills {a.get('recorder_watchdog_kills', 0)} -> {b.get('recorder_watchdog_kills', 0)}, consecutive failures {b.get('recorder_consecutive_failures')}): "
+            "it is being repaired, not healthy; find why it exits or hangs."))
     alerts.extend(forward_alerts(forward))
     return alerts, s
 

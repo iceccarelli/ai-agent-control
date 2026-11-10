@@ -153,3 +153,29 @@ How to read them: `supervisor_status.json` `recorder_pid` null with a growing `r
 ### Operating contract (2026-11-10, owner directive)
 
 The binding rules are in `CLAUDE.md` section "Operating contract": one integration owner, ONE mission PR (this file's execution log is the single status system), no PR per phase, no stopping after a PR is opened, mandatory read-only subagents (recorder, research, execution, capital/accounting, red team), full self-testing on the exact head SHA, permitted self-merge only after every acceptance gate, continuous work through the backlog, money-first acceptance and no unauthorised production or trading action. PR #245 is the mission PR; #244 (empty) and #246 (carried in #245) were closed as superseded.
+
+### Integration round 2 (mission branch `claude/money-phase-a-recorder`, PR #245): independent review dispositions
+
+Five read-only reviews (recorder, quant research, execution, capital/accounting, red team) were run; each finding was checked in the code before acting. Dispositions:
+
+**Fixed and tested (each reproduced by a failing test first, or by an end-to-end run):**
+- Recorder `status()` waited on the engine lock through `feed.view()`; it now uses cached refusals (heartbeat test holds the lock).
+- `NOT_PERSISTING` could not fire with dead feeds because the feed writes an audit VIEW record every 5 s and CONN events: progress now counts committed market input (FRAME/REST) only.
+- A failed commit (ENOSPC) left `_next_id` ahead and the row in the open transaction: it now rolls back to the last durable id; `newest_id` is the committed id.
+- Disk budget: age-based retention keeps `retention_days + 1` segments (about 4.5 GB at 1.5 GB/day, never fitting a 5 GB volume with a 512 MB reserve): an emergency prune removes the oldest closed segment (checkpointed, counted in `emergency_prunes`) when the reserve is breached. The 1.5 GB/day figure is from the repository's docs, NOT measured here; the owner's `du` output decides the retention setting.
+- Watchdog kills no longer reset the supervisor backoff; a slow start writes a heartbeat first; failed status writes are logged to stderr and leave no temp file; restart/kill counters reach the history line and raise a `recorder_restarting` alert even when every sample says RECORDING.
+- A stray `bot/recorder_status.json` (written by my first, broken supervisor test) was committed in error: removed and ignored.
+- `evaluate` exit codes distinguish a decision (0: eligible, reject, skip) from a failure to decide (3: wait for data, inconclusive); the output carries `data_scope: TESTNET_DATA_NOT_MAINNET_EXPECTANCY`.
+- Control-centre identities (reproduced on a filled run with slippage, adverse selection and funding): the producer's `realised_gross_usd` contained the funding line (consumer then added it again) and the checks ignored modelled slippage; the ledger's liquidation-value unrealised was compared with the portfolio's mark-to-market. Producer and consumer now share one definition (see RUNBOOKS "Identity"); `exit_adjustment_usd` is stated explicitly.
+- Capital book: the session is parked with a conservative placeholder BEFORE execution (a crash after orders is still settled: loss debited, gain never credited); a different unsettled session is never overwritten; a transfer declared before a session parked is not subtracted from it; only a verified credited gain breaks a losing streak; `capital --ack-drawdown` is the owner's explicit resume after a drawdown stop; constants are pinned against the Testnet manifest limits.
+
+**Checked in code and NOT confirmed (no change):**
+- "reconcile invents fills into the session net": the session ledger is fed only from the venue's execution rows (`feed_ledger`, provenance MEASURED); `recon:` fills affect the engine's group state only.
+- "closed orders are never read": `openOnly=1` returns open AND recent closed orders (executor docstring, Bybit semantics) and the per-order lookup also reads `/v5/order/history`.
+
+**Open, repository-side, not yet done (stated, not hidden):**
+- Funding is not read per session (`rec["net"]["funding_usd"]` is None): it needs the venue's `execType=Funding` rows booked with the verified sign convention against a real row, and the account transaction-log cross-check (the dedicated key's permission check currently refuses Wallet-class rights: an owner decision).
+- Per-leg execution measurements (reference bid/ask, order timestamps, cancel latency, slippage vs reference, effective fee) are not recorded, so maker-vs-taker cannot be evaluated on real fills; entry is always taker/taker.
+- Manual `ms_testnet_session.py execute` and several legacy tools (`drill.py --arm`, `close_testnet_short.py --arm`, `testnet_session.py`, ...) are order-capable without the shared lease; the scheduled drill workflow is off unless `CARRY_DRILL_ENABLED=true` (keep it unset).
+- The quantitative competition has no winner: only cash-and-carry and funding-dispersion have evaluators that can run, and both reach at most INSUFFICIENT_DATA on the committed corpus; cross-interval, basis, RV and microstructure candidates are specification-only. A fair common-data run needs the owner's 457-day backfill and the inventory output. Break-even funding per settlement (repo functions, taker/taker, 31.4 bps round trip, 0.259 bps/settlement in-sample mean): about 1.05 bps over 10 days, so the in-sample mean is far below the hurdle; an owned-spot overlay (11.4 bps round trip) needs about 0.38 bps over 10 days. These are modelled/venue-stated inputs, none measured.
+- Duplicated net formulas in `ms_pipeline.LocalLedgerAdapter` and `ms_replay.LocalLedger` (the `realised` field means gross in one and net in the other) should call `canonical_net` only.

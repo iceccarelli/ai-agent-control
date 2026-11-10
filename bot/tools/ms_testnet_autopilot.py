@@ -275,7 +275,7 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     sym = symbol or (gv.get("symbols") or [None])[0] or (auth["capability_symbols"] or [None])[0] or "BTCUSDT"
     gaps = [g for g, ok in (("CAPABILITY_FILE", auth["capability"] == "VALID"), ("UNATTENDED_GRANT", auth["grant"] == "VALID"),
                             ("DEDICATED_TESTNET_CREDENTIALS", auth["credentials"]["dedicated_key_present"] and auth["credentials"]["dedicated_secret_present"])) if not ok]
-    base: Dict[str, Any] = {"symbol": sym, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
+    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
 
     def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
         return _res("EVALUATED", why, decision=decision, **{**base, **kw})
@@ -443,6 +443,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
+    if not book.park(os.path.basename(d), usdt_now, None, False, False):          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
+        return _res("SKIPPED", ["CAPITAL_PENDING_UNSETTLED_OR_CASH_UNKNOWN"], state_dir=d)
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
 
@@ -462,7 +464,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     net = rec.get("net") or {}
     fees, price, fund = (CC._d(net.get(k)) for k in ("fees_usd", "price_pnl_usd", "funding_usd"))
     known = None if (fees is None or price is None) else price - fees + (fund or D(0))
-    book.park(os.path.basename(d), usdt_now, known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT flat cash read, never from fill arithmetic alone
+    book.update_pending(os.path.basename(d), known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT cash read, never from fill arithmetic alone
     summary["allocation"] = alloc.as_dict()
     for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT")):
         emit(evt)
@@ -1073,6 +1075,7 @@ def _parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
     cp.add_argument("--root", default=DEFAULT_ROOT)
     cp.add_argument("--ack-halt", action="store_true")
+    cp.add_argument("--ack-drawdown", action="store_true", help="after YOU reviewed the losses that hit the drawdown stop: resume from the current verified basis (a new drawdown peak)")
     cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
     cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
     ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
@@ -1117,6 +1120,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         cbk = CC.CapitalBook(a.root)
         if a.ack_halt:
             print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        if a.ack_drawdown:
+            print("drawdown acknowledged" if cbk.acknowledge_drawdown() else "no drawdown to acknowledge")
         if a.reserve_fraction is not None:
             print("reserve set" if cbk.set_reserve_fraction(a.reserve_fraction) else "refused: reserve must be between 0 and 0.9")
         if a.declare_transfer:
@@ -1126,7 +1131,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps)
         print(json.dumps(res, indent=2, sort_keys=True, default=str))
-        return 0 if res["result"] in ("EVALUATED", "SKIPPED") else 3
+        # exit contract (a wrapper or cron can tell a DECISION from a failure to decide): 0 = a decisive answer (eligible / reject / skip), 3 = could not decide (wait for data / inconclusive) or any other result
+        return 0 if res.get("decision") in ("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", "REJECT_UNECONOMIC", "SKIP_NO_OPPORTUNITY") else 3
     if a.cmd == "drain":
         return cmd_drain(a.root, clock, a.wait)
     if a.cmd == "deploy-check":
