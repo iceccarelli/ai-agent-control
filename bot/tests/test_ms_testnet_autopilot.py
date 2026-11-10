@@ -222,15 +222,18 @@ def test_mainnet_is_unreachable_from_the_autopilot():
     assert venues.get("testnet").host == "api-testnet.bybit.com"
 
 
-def test_the_autopilot_workflow_is_off_by_default_self_hosted_main_only_and_holds_no_exchange_secret():
-    import re
-    text = open(os.path.join(os.path.dirname(os.path.dirname(HERE)), ".github", "workflows", "testnet-autopilot.yml"), encoding="utf-8").read()
-    assert "vars.TESTNET_AUTOPILOT_ENABLED == 'true'" in text and "github.ref == 'refs/heads/main'" in text and "github.repository == 'iceccarelli/ai-agent-control'" in text
-    assert re.search(r"runs-on:\s*\[self-hosted, linux, bybit-testnet\]", text) and "ubuntu-latest" not in text
-    assert "secrets." not in text.lower() and "pull_request" not in text and "LIVE_TRADING_ACK" not in text and "api.bybit.com" not in text
-    assert re.search(r"^permissions:\n  contents: read\n", text, re.M) and "cancel-in-progress: false" in text
-    steps = text[text.index("\njobs:"):]
-    assert "ms_testnet_autopilot.py once" in steps and "--unattended" not in steps and "ms_testnet_session.py" not in steps     # the workflow only calls the autopilot; the grant gate lives in the engine
+def test_no_github_workflow_may_run_an_order_capable_command_fly_is_the_only_executor():
+    """The canonical Testnet executor is the one Fly worker (holding the global lease). A self-hosted runner, a scheduled workflow or a hosted runner must never run the autopilot's
+    order-capable commands or `execute`: that would be a SECOND executor (two hedges)."""
+    import re as _re
+    wf_dir = os.path.join(os.path.dirname(os.path.dirname(HERE)), ".github", "workflows")
+    assert not os.path.exists(os.path.join(wf_dir, "testnet-autopilot.yml"))
+    for name in sorted(os.listdir(wf_dir)):
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+        assert not _re.search(r"ms_testnet_autopilot\.py\s+(once|loop|grant)", body), name
+        assert "--unattended" not in body and not _re.search(r"ms_testnet_session\.py[^\n]*\bexecute\b", body), name
+        assert "self-hosted" not in body or name in ("carry-drill-testnet.yml",), name
 
 
 @pytest.fixture
