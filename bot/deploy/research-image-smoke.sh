@@ -33,8 +33,14 @@ OUT="$(docker run --rm -v "$VOL":/data "$IMG" sh -c 'stat -c "%U %a" /data/resea
 docker run --rm -v "$VOL":/data "$IMG" python3 -c 'import json; s=json.load(open("/data/research/status.json")); assert s["capabilities"]=={"orders":False,"exchange_credentials":False,"network":False}; print("status-ok")' | grep -q status-ok || fail "status does not declare no capabilities"
 
 echo "== SIGTERM reaches the worker and it stops cleanly and quickly"
+docker run --rm -v "$VOL":/data --entrypoint rm "$IMG" -f /data/research/status.json    # the earlier --once run left one: wait for a file the NEW process writes (its handlers are installed by then)
 CID="$(docker run -d -v "$VOL":/data "$IMG" python3 tools/research_service.py run --state-dir /data/research --root datasets=/data/datasets --tick-seconds 3600)"
-for i in 1 2 3 4 5 6 7 8 9 10; do docker exec "$CID" sh -c 'test -f /data/research/status.json' 2>/dev/null && break; [ "$i" = 10 ] && fail "the worker never wrote a status file"; done
+UP=""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if docker exec "$CID" sh -c 'test -f /data/research/status.json' 2>/dev/null; then UP=1; break; fi
+  sleep 1
+done
+[ -n "$UP" ] || fail "the worker never wrote a status file"
 docker exec "$CID" sh -c 'test "$(awk "/^Uid:/ {print \$2}" /proc/1/status)" = "$(id -u bot)"' || fail "PID 1 is not running as bot"
 T0="$(date +%s)"
 docker stop -t 20 "$CID" >/dev/null

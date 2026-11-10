@@ -186,6 +186,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             p.add_argument("--once", action="store_true")
             p.add_argument("--tick-seconds", type=int, default=TICK_S)
     a = ap.parse_args(list(argv) if argv is not None else None)
+    if a.cmd == "run":                                              # FIRST thing after parsing: a PID 1 with no handler ignores SIGTERM, so every later step (queue, scheduling) is covered
+        _STOP.clear()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, _on_signal)
     roots = {}
     for r in a.root:
         label, _, path = r.partition("=")
@@ -197,9 +201,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if a.cmd == "status":
         print(json.dumps(svc.status(), indent=1, sort_keys=True))
         return 0
-    _STOP.clear()
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, _on_signal)
     try:
         while True:
             res = svc.tick()
