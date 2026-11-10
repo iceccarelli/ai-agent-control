@@ -122,7 +122,9 @@ the bot's state, as the authority.
 - **Already in:** the supervisor restarts the recorder with backoff (`/data/market/supervisor_status.json`
   shows restarts); the monitor and the shadow book are unaffected; entries are not involved (read-only).
 - **FAULT with "reserve":** the volume is below the 512 MB reserve. Extend it (owner:
-  `fly volumes extend <id> -s <GB>`) or lower `--recorder-retention-days` in the image CMD.
+  `fly volumes extend <id> -s <GB>`) or lower `--recorder-retention-days` in the image CMD. The recorder never deletes a day that has no
+  verified off-volume copy to free space: `emergency_prunes_denied` in `recorder_status.json` counts the refusals. To let a full volume free its oldest BACKED-UP day,
+  run `md_seal.py seal` + `backup` and start the recorder with `--emergency-backup-dir DIR --emergency-receipts R.jsonl` (owner decision).
 - **Never:** delete files under `/data/market` by hand; the log is hash-chained and prunes itself by day.
 
 ## Backups

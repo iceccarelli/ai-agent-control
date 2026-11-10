@@ -447,6 +447,24 @@ def backup(directory: str, dest: str, receipts: str, *, manifest: str, now_ms: O
     return {"ok": unsealed == 0, "backed_up": done, "skipped": skipped}
 
 
+def backed_up(directory: str, name: str, receipts: str, backup_dir: str) -> bool:
+    """True only when ``name`` has a verified off-volume copy: the receipts chain verifies, holds a receipt for it, the copy exists with the receipted sha256, and the receipt's last_chain
+    equals the local segment's. Anything unreadable is False (default-deny); used as the recorder's emergency-prune predicate."""
+    try:
+        if not os.path.isfile(receipts) or not EC.verify(receipts).get("ok", False):
+            return False
+        rows = [r for r in EC.rows_of(EC.read_lines(receipts)[0]) if isinstance(r, dict) and r.get("segment") == name]
+        if not rows:
+            return False
+        r = rows[-1]
+        copy = os.path.join(backup_dir, name)
+        if not os.path.isfile(copy) or _sha256(copy) != r.get("sha256"):
+            return False
+        return describe(directory, name, closed=False)["last_chain"] == r.get("last_chain")
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.DatabaseError, EC.ChainDesync):
+        return False
+
+
 def restore_check(backup_dir: str, receipts: str, manifest: str) -> Dict[str, Any]:
     """Prove the backup restores: every receipted copy exists, hashes as receipted and recomputes its own chain from the payloads, AND every closed day the seal
     ``manifest`` holds has a receipt whose record count, last id and last chain equal the sealed ones (a receipt of a truncated or missing day proves nothing)."""

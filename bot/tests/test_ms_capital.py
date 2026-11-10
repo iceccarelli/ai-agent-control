@@ -308,3 +308,37 @@ def test_the_capital_constants_cannot_drift_from_the_testnet_manifest_limits():
     ceiling = D(str(AD.AGGREGATE_CEILING_USD))
     assert C.INITIAL_FRACTION * ceiling <= C.MAX_FRACTION * ceiling <= ceiling and C.MAX_SCALE >= 1
     assert C.MIN_NOTIONAL_USD < C.INITIAL_FRACTION * ceiling
+
+
+def test_a_transfer_declared_between_the_cash_read_and_the_park_is_in_the_delta_not_the_starting_cash(tmp_path, monkeypatch):
+    """Red-team MED: the deposit was declared AFTER the starting cash was read but BEFORE park(): comparing against the park time excluded it, so a real deposit became a phantom gain.
+    The comparison is against the instant the cash was READ."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(_time, "time", lambda: clock["t"])
+    cash_read_ms = 1_000_000                                                   # starting cash (10000) read at t=1000
+    clock["t"] = 1_500.0
+    assert b.declare_transfer("dep-straddle", "500")                          # declared after the read ...
+    clock["t"] = 2_000.0
+    assert b.park("s1", "10000", None, False, False, cash_read_ms=cash_read_ms)    # ... but before the park
+    r = b.settle("10500")                                                      # the deposit landed in cash after the read
+    assert r["transfers_removed_usd"] == "500" and r["credited_usd"] == "0", r
+
+
+def test_halt_and_drawdown_acknowledgements_are_reachable_only_from_the_owner_cli():
+    """Red-team MED: the autopilot must never clear its own capital stop. Only the `capital --ack-*` CLI branch may call the acknowledgements; no other function in the tools tree does."""
+    import ast
+    tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+    offenders = []
+    for fn in sorted(os.listdir(tools)):
+        if not fn.endswith(".py"):
+            continue
+        tree = ast.parse(open(os.path.join(tools, fn), encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Attribute) and sub.attr in ("acknowledge_halt", "acknowledge_drawdown") and not (fn == "ms_testnet_autopilot.py" and node.name == "main"):
+                        offenders.append((fn, node.name, sub.attr))
+    offenders = [o for o in offenders if o[0] != "ms_capital.py"]
+    assert offenders == [], offenders

@@ -226,6 +226,7 @@ class Recorder:
                       "free_bytes": free, "min_free_bytes": self.min_free_bytes,
                       "retention_days": self.retention_days,
                       "capacity_retention_days": self.capacity_retention_days,
+                      "emergency_prunes": getattr(store, "emergency_prunes", 0), "emergency_prunes_denied": getattr(store, "emergency_prunes_denied", 0),
                       "fault": self.engine.state.store_fault},
             "entry_refusals": view_refusals,
             "capacity": {"rows": self.capacity_rows, "errors": self.capacity_errors,
@@ -274,6 +275,10 @@ class Recorder:
             self.last_status_error = f"{type(exc).__name__}: {exc}"[:200]
             if self.status_errors == 1 or self.status_errors % 10 == 0:
                 print(f"market_recorder: status write failed ({self.status_errors}x): {self.last_status_error}", file=sys.stderr, flush=True)   # visible in `fly logs` even when the file cannot be written
+            try:
+                os.utime(os.path.join(self.dir, STATUS_FILE))       # a METADATA-only touch works on a full volume: the process is alive, so the supervisor's watchdog (mtime) must not kill it for a disk fault; the monitor reads the file's own now_ms, so it still reports STALE
+            except OSError:
+                pass
             return None
 
     # -- lifecycle ---------------------------------------------------------------------------------------
@@ -369,6 +374,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="UTC days of the (large) depth log to keep")
     ap.add_argument("--capacity-retention-days", type=int, default=365,
                     help="UTC days of the (small) capacity curve files to keep; 0 = keep all")
+    ap.add_argument("--emergency-backup-dir", default=None, help="off-volume backup directory; with --emergency-receipts it lets a full volume free its oldest BACKED-UP day (default: never delete an unbacked day)")
+    ap.add_argument("--emergency-receipts", default=None, help="md_seal backup receipts file matching --emergency-backup-dir")
     ap.add_argument("--status-every", type=float, default=30.0)
     ap.add_argument("--capacity-every", type=float, default=300.0)
     ap.add_argument("--no-rest", action="store_true")
@@ -386,6 +393,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rec = build(a.dir, environment=a.environment, symbol=a.symbol, min_free_mb=a.min_free_mb,
                 retention_days=a.retention_days, capacity_retention_days=a.capacity_retention_days, use_rest=not a.no_rest,
                 proxy_url=a.proxy_url, ca_file=a.ca_file)
+    if a.emergency_backup_dir and a.emergency_receipts:
+        import md_seal as SEAL      # noqa: E402 - only needed when an owner named a verified backup
+        rec.feed.emergency_may_prune = lambda name: SEAL.backed_up(a.dir, name, a.emergency_receipts, a.emergency_backup_dir)
     rec.start()
     try:
         rec.run(stop, status_every_s=a.status_every, capacity_every_s=a.capacity_every)

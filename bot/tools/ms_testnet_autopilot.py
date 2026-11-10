@@ -322,10 +322,27 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
 
 
+def _decision_dir_refusal(directory: str) -> Optional[str]:
+    """A decision record is evidence, never state: refuse a directory that is (or is inside) the repository, the bot's state directory or the owner's engine/authority root (realpath, so a
+    symlink cannot smuggle it in). Writing evidence files next to a grant or capability would also muddy what the owner's file-integrity checks see."""
+    real = os.path.realpath(directory)
+    home = os.path.expanduser("~")
+    forbidden = [os.path.dirname(BOT), os.path.join(BOT, "state"), os.path.join(home, ".ai-agent-control")]
+    for f in forbidden:
+        fr = os.path.realpath(f)
+        if real == fr or real.startswith(fr + os.sep):
+            return "DIRECTORY_INSIDE_" + os.path.basename(f.rstrip(os.sep)).upper().replace("-", "_")
+    return None
+
+
 def record_decision(directory: str, record: Mapping[str, Any], at_ms: int) -> str:
     """Append a decision record to the durable outbox under its own id. STORED / DUPLICATE / REFUSED:<why>. A decision record is evidence, never authority; the outbox refuses a payload that
-    looks like a secret, and the same decision id with different content is a conflict, never an overwrite."""
+    looks like a secret, and the same decision id with different content is a conflict, never an overwrite. The directory must be OUTSIDE the repository, bot/state and the engine root."""
     import exec_evidence as XE
+    bad = _decision_dir_refusal(directory)
+    if bad is not None:
+        return "REFUSED:" + bad
+    ob = None
     try:
         ob = XE.Outbox(directory)
         before = ob.pending
@@ -334,6 +351,12 @@ def record_decision(directory: str, record: Mapping[str, Any], at_ms: int) -> st
         return "STORED" if ob.pending > before else "DUPLICATE"
     except Exception as exc:                                                    # noqa: BLE001
         return f"REFUSED:{type(exc).__name__}"
+    finally:
+        if ob is not None:
+            try:
+                ob.close()
+            except Exception:                                                   # noqa: BLE001
+                pass
 
 
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
@@ -411,6 +434,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
 
     if _STOP.is_set():
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
+    cash_read_ms = int(time.time() * 1000)                           # BEFORE the venue cash read inside preflight: a transfer declared after this instant is not provably in the starting cash
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
     pf = ES.read_json(os.path.join(d, "preflight.json")) or {}
@@ -465,7 +489,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
-    if not book.park(os.path.basename(d), usdt_now, None, False, False):          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
+    if not book.park(os.path.basename(d), usdt_now, None, False, False, cash_read_ms=cash_read_ms):          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
         return _res("SKIPPED", ["CAPITAL_PENDING_UNSETTLED_OR_CASH_UNKNOWN"], state_dir=d)
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)

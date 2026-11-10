@@ -1400,3 +1400,20 @@ def test_the_order_capable_cycle_carries_the_same_decision_id_shape_into_its_res
     w.clock.sleep(1800)
     res2, _ = _cycle_eng(w)
     assert str(res2.get("decision_id", "dec_")).startswith("dec_") and res2["decision_id"] != res["decision_id"]          # a later observation is a different decision
+
+
+def test_a_decision_record_is_refused_inside_the_repository_the_state_dir_or_the_engine_root(tmp_path, monkeypatch):
+    """Red-team MED: --record-to could point at the checkout, bot/state or the owner's authority directory; evidence must never be written beside a grant or capability."""
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    rec = _evaluate(w, notional_usd="200")["decision_record"]
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for bad in (os.path.join(AP.BOT, "evidence_out"), os.path.join(AP.BOT, "state", "x"), os.path.dirname(AP.BOT), str(tmp_path / "home" / ".ai-agent-control" / "ev")):
+        existed = os.path.exists(bad)
+        r = AP.record_decision(bad, rec, w.clock.now())
+        assert r.startswith("REFUSED:DIRECTORY_INSIDE_"), (bad, r)
+        assert os.path.exists(bad) == existed, bad                                   # a refusal creates nothing
+    link = tmp_path / "innocent"
+    os.symlink(AP.BOT, str(link))
+    assert AP.record_decision(str(link / "ev2"), rec, w.clock.now()).startswith("REFUSED:DIRECTORY_INSIDE_")        # a symlink does not smuggle it in
+    assert AP.record_decision(str(tmp_path / "fine"), rec, w.clock.now()) == "STORED"

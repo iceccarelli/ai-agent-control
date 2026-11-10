@@ -305,11 +305,12 @@ def test_emergency_prune_frees_the_oldest_closed_segment_keeps_the_chain_and_nev
     assert len(store.segments()) == 4
     store.min_free_bytes = 10 ** 15                                              # the reserve is breached
     assert store.low_space() is True
-    first = store.emergency_prune()
+    allow = lambda n: True      # noqa: E731 - a verified-backup predicate (default is deny; see test_emergency_prune.py)
+    first = store.emergency_prune(allow, min_interval_s=0)
     assert len(first) == 1 and first[0] == min(first) and len(store.segments()) == 3 and store.emergency_prunes == 1
-    store.emergency_prune()
+    store.emergency_prune(allow, min_interval_s=0)
     assert len(store.segments()) == 2
-    assert store.emergency_prune() == [] and len(store.segments()) == 2, "never prune the newest or the segment being written"
+    assert store.emergency_prune(allow, min_interval_s=0) == [] and len(store.segments()) == 2, "never prune the newest or the segment being written"
     assert store.verify() == [], "the retained log must still verify from the pruned checkpoint"
     assert os.path.exists(store._manifest_path()) and len(open(store._manifest_path()).read().strip().splitlines()) == 2
     store.close()
@@ -322,6 +323,10 @@ def test_the_feed_runs_the_emergency_pass_only_when_the_reserve_is_breached(tmp_
     for d in range(3):
         store.append(ST.CONN, wall_ms=1_700_000_000_000 + d * day, mono_s=float(d), payload="{}")
     store.min_free_bytes = 10 ** 15
+    import dataclasses
+    rec.feed.cfg = dataclasses.replace(rec.feed.cfg, retention_days=2)
+    assert rec.feed.emergency_retention() == [] and store.emergency_prunes == 0 and store.emergency_prunes_denied == 1      # no verified backup named: refused, counted
+    rec.feed.emergency_may_prune = lambda n: True
     assert len(rec.feed.emergency_retention()) >= 1 and store.emergency_prunes >= 1
 
 
@@ -406,3 +411,60 @@ def test_the_evaluate_exit_code_tells_a_decision_from_a_failure_to_decide(monkey
     monkeypatch.setattr(AP, "run_once", lambda *a, **k: {"result": "REFUSED", "why": ["X"]})
     assert AP.main(["evaluate"], env={}) == 3
     capsys.readouterr()
+
+
+# ---- round 3: a failed commit loses the WHOLE open batch; progress counts only durable inputs
+def _failing_commit_store(tmp_path):
+    import md_store as ST
+    import md_engine as EN
+    import md_state as S
+
+    st = ST.MarketStore(str(tmp_path / "fc"), commit_every=5, commit_interval_s=3600, environment="mainnet")
+    eng = EN.Engine(S.MarketState("BTCUSDT", environment="mainnet"), st)
+    eng.record("conn", wall_ms=1_699_999_999_000, mono_s=0.0, payload="{}")      # opens today's segment so there is a real connection to wrap
+    st.flush()
+    real = st._conn
+
+    class Proxy:
+        fail = False
+
+        def __getattr__(self, n):
+            return getattr(real, n)
+
+        def commit(self):
+            if Proxy.fail:
+                raise OSError("disk full")
+            return real.commit()
+    st._conn = Proxy()
+    return st, eng, Proxy
+
+
+def test_progress_counts_only_committed_inputs_and_a_rollback_counts_every_lost_row(tmp_path):
+    st, eng, proxy = _failing_commit_store(tmp_path)
+    rec = lambda i: eng.record("frame", wall_ms=1_700_000_000_000 + i, mono_s=float(i), category="linear", conn_id="c", topic="tickers.BTCUSDT", payload="{}")   # noqa: E731
+    rec(0); rec(1)
+    assert eng.input_count == 0                       # appended, not yet durable
+    proxy.fail = True
+    for i in range(2, 5):
+        rec(i)                                        # the fifth append triggers the commit, which fails: the WHOLE batch is gone
+    assert eng.input_count == 0
+    assert eng._unlogged >= 5, eng._unlogged          # every dropped row is accounted for, not just the one in flight
+    proxy.fail = False
+    rec(5)                                            # recovers: a store_gap marker is written, then the input
+    assert eng._unlogged == 0
+
+
+def test_a_full_volume_does_not_make_the_supervisor_watchdog_kill_a_live_recorder(tmp_path, monkeypatch):
+    """Red-team MED: the watchdog measures the status file's mtime; a full disk stops the rewrite, so a perfectly alive recorder looked hung and was killed in a loop. A failed write now
+    touches the existing file's mtime (metadata only) while its CONTENT stays stale, so the monitor still reports STALE."""
+    rec, store, _ = make(tmp_path)
+    assert rec.write_status_guarded() is not None
+    path = os.path.join(rec.dir, MR.STATUS_FILE)
+    old = time.time() - 4000
+    os.utime(path, (old, old))
+    before = open(path).read()
+    monkeypatch.setattr(os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+    assert rec.write_status_guarded() is None
+    monkeypatch.undo()
+    assert time.time() - os.stat(path).st_mtime < 60, "mtime must show the process is alive"
+    assert open(path).read() == before, "the content must stay stale: a status that could not be written is not a fresh status"

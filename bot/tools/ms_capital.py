@@ -199,7 +199,7 @@ class CapitalBook:
         return True
 
     # ---- a session is parked until the NEXT cash read says what the cash really did (a session that ended NOT flat is parked as well: its losses count, its gains never do)
-    def park(self, session_id: str, usdt_before: Any, ledger_net_known: Any, funding_was_read: bool, flat_verified: bool) -> bool:
+    def park(self, session_id: str, usdt_before: Any, ledger_net_known: Any, funding_was_read: bool, flat_verified: bool, cash_read_ms: Optional[int] = None) -> bool:
         """Park a session for settlement. True = parked (or already parked / already settled: idempotent); False = REFUSED: a different session is still unsettled (its cash result must be booked
         first, never overwritten) or there is no trustworthy starting cash."""
         if _d(usdt_before) is None:
@@ -212,7 +212,8 @@ class CapitalBook:
                 return False
             kn = _d(ledger_net_known)
             b["pending"] = {"session_id": session_id, "usdt_before": str(_d(usdt_before)), "ledger_net_known_usd": None if kn is None else str(kn), "funding_was_read": bool(funding_was_read),
-                            "flat_verified": bool(flat_verified), "parked_ms": int(time.time() * 1000)}
+                            "flat_verified": bool(flat_verified), "parked_ms": int(time.time() * 1000),
+                            "cash_read_ms": int(cash_read_ms) if cash_read_ms is not None else int(time.time() * 1000)}
             self._save(b)
             return True
 
@@ -243,8 +244,8 @@ class CapitalBook:
                 return {"status": "NO_PENDING"}
             if now is None:
                 return {"status": "CASH_UNKNOWN"}                       # stays pending: nothing is credited on a cash read that failed
-            parked_ms = int(p.get("parked_ms") or 0)
-            # a transfer declared BEFORE the session was parked was already inside its starting cash: it is not part of this session's delta (recorded as applied, with its reason)
+            parked_ms = int(p.get("cash_read_ms") or p.get("parked_ms") or 0)       # the instant the starting cash was READ (a deposit declared between that read and the park is not in it)
+            # a transfer declared BEFORE the starting cash was read was already inside it: it is not part of this session's delta (recorded as applied, with its reason)
             counted = [t for t in b["transfers_pending"] if int(t.get("declared_ms") or 0) >= parked_ms]
             transfers = sum((D(t["amount_usd"]) for t in counted), D(0))
             before = D(p["usdt_before"])
