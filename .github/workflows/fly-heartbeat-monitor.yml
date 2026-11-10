@@ -18,10 +18,12 @@
 #   TELEGRAM_CHAT_ID      secret  }
 # At least one notifier is required: with none, the job goes RED on purpose.
 #
-# Notifier de-duplication state is written to $RUNNER_TEMP for the run. Carrying it across
-# runs needs a cache action pinned by SHA; none is pinned in this repository yet, so until
-# the owner adds one a persisting incident is re-notified on every run and no recovery
-# message can be matched. See bot/tools/health_monitor.py.
+# Notifier de-duplication state survives between runs WITHOUT any new third-party action: the
+# previous run's state file is fetched with the runner's own `gh` (token scope: actions read only)
+# and the new one is uploaded with the already-pinned upload-artifact. A persisting incident is
+# therefore notified once, and the recovery message matches the incident it resolves. A missing
+# or unreadable previous artifact is treated as "no previous state" (the worst case is one
+# repeated notification, never a lost one). See bot/tools/health_monitor.py.
 name: fly-heartbeat-monitor
 
 on:
@@ -42,6 +44,9 @@ jobs:
     if: github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.FLY_MONITOR_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read                  # list/download this workflow's own previous artifact; no write scope anywhere
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
         with:
@@ -49,6 +54,17 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
         with:
           python-version: "3.11"
+      - name: Restore the previous run's notification state (read-only, fail-soft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/prev"
+          prev="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow fly-heartbeat-monitor.yml --status completed --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+          if [ -n "$prev" ] && gh run download "$prev" --repo "$GITHUB_REPOSITORY" --name monitor-notify-state --dir "$RUNNER_TEMP/prev" 2>/dev/null && [ -f "$RUNNER_TEMP/prev/notify-state.json" ]; then
+            cp "$RUNNER_TEMP/prev/notify-state.json" "$RUNNER_TEMP/notify-state.json"; echo "restored previous notification state from run $prev"
+          else
+            echo "no previous notification state (first run, expired, or unreadable): starting clean"
+          fi
       - name: Judge the stored heartbeat
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL || vars.SUPABASE_URL }}
@@ -60,3 +76,11 @@ jobs:
           python bot/tools/health_monitor.py
           --state-file "$RUNNER_TEMP/notify-state.json"
           --summary-file "$GITHUB_STEP_SUMMARY"
+      - name: Keep the notification state for the next run
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # actions/upload-artifact v7.0.2
+        with:
+          name: monitor-notify-state
+          path: ${{ runner.temp }}/notify-state.json
+          retention-days: 7
+          if-no-files-found: ignore
