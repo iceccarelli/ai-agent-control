@@ -158,7 +158,10 @@ needs_make = pytest.mark.skipif(shutil.which("make") is None, reason="make not i
 
 
 def _make(args, tmp_path, **env):
-    return subprocess.run(["make", *args, f"HOME={tmp_path}"], cwd=REPO, capture_output=True, text=True, env={**os.environ, **env})
+    # run as a TOP-LEVEL make: when the suite itself runs under `make test-quick`, an inherited MAKELEVEL/MAKEFLAGS makes this child print
+    # "make[1]: Leaving directory", which landed after the `ln -sfn` line and broke the "last command" assertion (the assertion is unchanged).
+    base = {k: v for k, v in os.environ.items() if k not in ("MAKELEVEL", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES")}
+    return subprocess.run(["make", "--no-print-directory", *args, f"HOME={tmp_path}"], cwd=REPO, capture_output=True, text=True, env={**base, **env})
 
 
 def _layout(tmp_path):
