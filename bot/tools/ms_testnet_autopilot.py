@@ -335,9 +335,9 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int:
     a = _parser().parse_args(list(argv) if argv is not None else None)
-    e = dict(os.environ if env is None else env)
+    e = dict(env)
     if a.cmd == "grant":
         if not sys.stdin.isatty():
             print("refused: the grant needs an interactive terminal (you type the reference yourself)")
@@ -356,4 +356,4 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(env=os.environ))
