@@ -366,11 +366,14 @@ def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str
         if st.has(m):
             return m
     if lease is not None:
-        try:
-            fresh = getattr(lease, "held_fresh", None)
-            ok = bool(fresh() if (strong and fresh is not None) else lease.held())   # STRONG = the server's own answer (a renew), never this process's memory of a deadline
-        except Exception:                                            # an unanswerable authority check is not authority
-            return "LEASE_CHECK_ERROR"
+        fresh = getattr(lease, "held_fresh", None)
+        if strong and fresh is not None:                             # STRONG = the server's own answer (a renew), never this process's memory of a deadline
+            try:
+                ok = bool(fresh())
+            except Exception:                                        # an unanswerable authority check is not authority
+                return "LEASE_CHECK_ERROR"
+        else:
+            ok = bool(lease.held())                                  # the cheap check: an exception propagates to the watcher, which fails closed as WATCHER_ERROR
         if not ok:
             return "LEASE_LOST"
     return None
