@@ -37,7 +37,8 @@ ALLOWED = {
                                          # settings; reads nothing else, prints no value
     "tools/execution_samples_report.py": 1,  # defaults mode/symbols from the deployment env
     "tools/close_testnet_experiment.py": 1,  # default env mapping for the LIVE_TRADING_ACK-present refusal
-    "tools/runner_supervisor.py": 1,     # copies os.environ ONLY to SCRUB it (allow-list, no BYBIT_*/LIVE_*/SUPABASE_*/secrets) for the public recorder child
+    "tools/health_monitor.py": 1,        # CLI __main__ only: copies os.environ into cli(env=...) for the named read-only Supabase and notifier variables; never echoed, no exchange credential
+    "tools/runner_supervisor.py": 1,    # copies os.environ ONLY to SCRUB it (allow-list, no BYBIT_*/LIVE_*/SUPABASE_*/secrets) for the public recorder child
 }
 
 #: Nothing here may read the environment: these are the order, risk and
