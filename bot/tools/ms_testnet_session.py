@@ -111,6 +111,7 @@ class Ctx:
     def __init__(self, args: argparse.Namespace, env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], input_fn: Callable[[str], str],
                  out: Callable[[str], None]) -> None:
         self.args, self.env, self.inner, self.clock, self.sleep, self.input_fn, self.out = args, env, inner, clock, sleep, input_fn, out
+        self.pre_order_check: Optional[Callable[[], Optional[str]]] = None      # an ENTRY order is refused (nothing is sent) when this returns a reason or raises; exits are never gated
         self.dir = resolve_state_dir(args.state_dir)
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
 
@@ -621,6 +622,14 @@ class Run:
 
     def send(self, req: EX.OrderRequest) -> Any:
         if not req.leg.leg_id.startswith("x"):
+            chk = getattr(self.ctx, "pre_order_check", None)
+            if chk is not None:                                          # authority (grant, STOP/ALERT, lease, stop signal) is re-checked IMMEDIATELY before each entry order
+                try:
+                    why = chk()
+                except Exception as exc:                                  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
+                    why = f"CHECK_ERROR:{type(exc).__name__}"
+                if why:
+                    return EX.Ack(req.link_id, "REJECTED", None, f"PRE_ORDER_CHECK:{why}")
             self.settle_filled_entries(skip_leg=req.leg.leg_id)              # the leg being sent is SENT already but not on the venue yet: never wait for it
         if req.leg.leg_id.startswith("x"):
             self.release_dead_exits()
@@ -1156,7 +1165,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str]] = None, inner_transport: Any = None, clock_ms: Optional[Callable[[], int]] = None,
-         sleep: Optional[Callable[[float], None]] = None, input_fn: Optional[Callable[[str], str]] = None, out: Optional[Callable[[str], None]] = None) -> int:
+         sleep: Optional[Callable[[float], None]] = None, input_fn: Optional[Callable[[str], str]] = None, out: Optional[Callable[[str], None]] = None,
+         pre_order_check: Optional[Callable[[], Optional[str]]] = None) -> int:
     import time as _time
     a = _parser().parse_args(list(argv) if argv is not None else None)
     try:
@@ -1165,6 +1175,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str
         (out or print)(f"refused (nothing was created): {exc}")
         return EXIT_REFUSED
     ctx.plan_poll = 1                                                   # type: ignore[attr-defined]
+    ctx.pre_order_check = pre_order_check
     return {"preflight": cmd_preflight, "plan": cmd_plan, "execute": cmd_execute, "reconcile": cmd_reconcile, "status": cmd_status, "assess": cmd_assess}[a.cmd](ctx)
 
 

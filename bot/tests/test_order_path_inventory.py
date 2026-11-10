@@ -368,7 +368,9 @@ EXPECTED_HTTP_FILES = frozenset({
     "bybit_connection.py", "carry_shadow.py", "md_rest.py", "tools/market_collector.py", "md_transport.py", "private_ws_consumer.py", "ws_transport.py",
     "tools/append_closed_corpus.py", "tools/append_spot_corpus.py", "tools/connector_check.py", "tools/fetch_binance_klines.py", "tools/fetch_borrow_rates.py",
     "tools/fetch_funding_history.py", "tools/fetch_linear_klines_1d.py", "tools/fetch_settlement_klines.py", "tools/funding_capture.py", "tools/kill_switch_drill.py",
-    "tools/mainnet_public.py", "tools/runner_alerts.py", "tools/unattended_drill.py", "tools/universe_capture.py"})
+    "tools/mainnet_public.py", "tools/runner_alerts.py", "tools/unattended_drill.py", "tools/universe_capture.py",
+    # the unattended-Fly additions: Supabase evidence REST (https *.supabase.co only), the heartbeat monitor reading it, and the notifier webhook; none is order-capable (asserted below)
+    "tools/exec_evidence.py", "tools/health_monitor.py", "tools/notifier.py"})
 ORDER_CAPABLE_HTTP_FILES = frozenset({"bybit_connection.py"})
 
 #: Sites that do NOT reach BybitClient._request, and why that is not an opening path to a venue.

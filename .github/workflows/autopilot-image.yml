@@ -1,0 +1,38 @@
+# REAL container checks for the Testnet autopilot image (Dockerfile.autopilot): build it, run the real entrypoint, check the unprivileged user, the volume ownership and modes, that SIGTERM
+# reaches the Python process and stops the engine cleanly, and that no credential or live switch is in the image and the testnet host cannot be changed by environment.
+# Offline and secret-free: it never contacts Bybit or any service and uses no credential. It runs only when the image's inputs change (or on demand).
+name: autopilot-image
+
+on:
+  pull_request:
+    paths:
+      - "bot/Dockerfile.autopilot"
+      - "bot/fly.autopilot.toml"
+      - "bot/deploy/**"
+      - "bot/tools/ms_*.py"
+      - "bot/tools/exec_evidence.py"
+      - "bot/economic_model.py"
+      - "bot/requirements.txt"
+      - "bot/constraints.txt"
+      - ".github/workflows/autopilot-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autopilot-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: autopilot image builds and runs (real container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - name: Real container checks
+        run: sh deploy/autopilot-image-smoke.sh carry-autopilot-ci

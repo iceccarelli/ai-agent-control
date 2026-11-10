@@ -55,7 +55,7 @@ def sha(s: str) -> str:
 def test_migrations_present_ordered_and_timestamped():
     assert len(FILES) >= 7
     names = [f.name for f in FILES]
-    assert all(re.fullmatch(r"2026110[78]\d{6}_[a-z0-9_]+\.sql", n) for n in names), names
+    assert all(re.fullmatch(r"(2026110[78]|20261110)\d{6}_[a-z0-9_]+\.sql", n) for n in names), names
     assert names == sorted(names) and len(set(n.split("_")[0] for n in names)) == len(names)
     assert names[0].startswith("20261107000100_")
 
@@ -381,7 +381,7 @@ RT5 = MIG_DIR / "20261108000200_carry_rt5_sync_hardening.sql"
 
 
 def test_hardening_migration_is_last_additive_and_documents_what_it_cannot_close():
-    assert FILES[-3] == HARDENING and FILES[-2] == RT4 and FILES[-1] == RT5          # the rt5 migration is the newest; nothing numbered was edited to make room for it
+    assert FILES[-4:-1] == [HARDENING, RT4, RT5] and FILES[-1].name.startswith("20261110")          # the rt5 migration closed the old set; the execution-evidence migration is ADDITIVE after it; nothing numbered was edited to make room
     raw = HARDENING.read_text()
     code = strip_comments(raw).lower()
     assert not re.search(r"\bcreate table\b|\bdrop\b|\bgrant\b[^;]*\b(insert|update|delete|truncate|all)\b|disable row level|security definer", code)
@@ -560,7 +560,8 @@ def test_rt4_the_write_closed_tables_are_exactly_the_tables_the_sync_writer_does
     created = set(re.findall(r"create table if not exists carry\.(\w+) \(", sql))
     closed = set(NO_WRITER_TABLES) | {"order_refs", "fill_refs", "account_snapshots"}
     mapped = set(SS.TABLE_ORDER)
-    assert created == mapped | closed and not (mapped & closed), (sorted(created - mapped - closed), sorted(mapped & closed))
+    exec_owned = {"exec_events", "exec_heartbeats", "exec_lease_log"}                       # written by tools/exec_evidence.py (its own migration, RPC-only writes), not by the sync writer
+    assert created == mapped | closed | exec_owned and not (mapped & closed) and not (exec_owned & (mapped | closed)), (sorted(created - mapped - closed - exec_owned), sorted(mapped & closed))
     body = strip_comments(RT4.read_text())
     listed = set(re.findall(r"'(\w+)'", re.search(r"foreach t in array array\[(.*?)\] loop", body, re.S).group(1)))
     assert listed == set(NO_WRITER_TABLES)

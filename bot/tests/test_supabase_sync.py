@@ -188,7 +188,7 @@ def test_table_order_respects_foreign_keys_and_unmapped_tables_are_the_trading_o
             assert parent in pos and pos[parent] < pos[t], (t, parent)
     unmapped = set(SQL) - set(SS.TABLE_ORDER)
     assert unmapped == {"risk_decisions", "execution_sessions", "execution_session_events", "order_refs", "fill_refs", "reconciliation_exceptions",
-                        "reconciliation_exception_resolutions", "account_snapshots"}
+                        "reconciliation_exception_resolutions", "account_snapshots", "exec_events", "exec_heartbeats", "exec_lease_log"}
 
 
 def test_vocabularies_match_their_sources():
@@ -2061,7 +2061,7 @@ def test_rt5_2_mutation_the_cross_row_binding_is_load_bearing():
 
 # ---- rt5-3: the whitelist is mirrored in SQL
 
-NEWEST = FILES[-1]
+NEWEST = next(f for f in reversed(FILES) if "exec_evidence" not in f.name)   # the sync-owned set closes at rt5; the execution-evidence migration is separate and additive
 
 
 def _sql_key_arrays():

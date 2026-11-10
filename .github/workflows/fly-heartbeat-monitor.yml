@@ -1,0 +1,62 @@
+# Independent health monitor for the Fly execution worker.
+#
+# A heartbeat emitted by the worker cannot detect a dead worker, so this runs on a
+# GitHub-hosted runner and judges ONLY what the worker stored in Supabase (read-only).
+# It NEVER contacts the exchange and no exchange credential is, or may ever be, in this
+# repository's secrets: the exchange blocks hosted runners and the secret belongs on Fly.
+#
+# OFF BY DEFAULT. It runs only on main, in this repository, and only when the repository
+# variable FLY_MONITOR_ENABLED is exactly 'true'. It never runs on pull_request or forks.
+#
+# Configuration the OWNER sets (repository variables or secrets; nothing is defaulted):
+#   FLY_MONITOR_ENABLED   variable: 'true' to turn it on
+#   SUPABASE_URL          variable or secret: https://<project>.supabase.co
+#   SUPABASE_MONITOR_KEY  secret: a restricted READ-ONLY key (select on the carry heartbeat
+#                         and event tables only)
+#   NOTIFY_WEBHOOK_URL    secret: https webhook that receives JSON {"text": ...}   (optional)
+#   TELEGRAM_BOT_TOKEN    secret  } both needed for Telegram                       (optional)
+#   TELEGRAM_CHAT_ID      secret  }
+# At least one notifier is required: with none, the job goes RED on purpose.
+#
+# Notifier de-duplication state is written to $RUNNER_TEMP for the run. Carrying it across
+# runs needs a cache action pinned by SHA; none is pinned in this repository yet, so until
+# the owner adds one a persisting incident is re-notified on every run and no recovery
+# message can be matched. See bot/tools/health_monitor.py.
+name: fly-heartbeat-monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-heartbeat-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    name: worker health (reads Supabase only)
+    if: github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.FLY_MONITOR_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Judge the stored heartbeat
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || vars.SUPABASE_URL }}
+          SUPABASE_MONITOR_KEY: ${{ secrets.SUPABASE_MONITOR_KEY }}
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: >
+          python bot/tools/health_monitor.py
+          --state-file "$RUNNER_TEMP/notify-state.json"
+          --summary-file "$GITHUB_STEP_SUMMARY"
