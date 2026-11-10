@@ -12,10 +12,13 @@ for _p in (HERE, os.path.dirname(HERE), os.path.join(os.path.dirname(HERE), "too
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
+
+EG_MIN = float(EG.MIN_NET_EDGE_BPS)
 
 
 @pytest.fixture
@@ -27,7 +30,7 @@ def write_grant(w, **over):
     manifest = S._load_capability_manifest()[0]
     now = w.clock.now()
     g = {"schema": AP.GRANT_SCHEMA, "reference": "owner test 2026-11-10", "created_ms": now, "expires_ms": now + 3 * 86_400_000, "manifest_plan_sha256": manifest["plan_sha256"],
-         "symbols": ["BTCUSDT"], "max_sessions_per_day": 2, "max_notional_usd": 400.0, "max_hold_s": 1500, "min_funding_bps": 0.5, "grant_sha256": ""}
+         "symbols": ["BTCUSDT"], "max_sessions_per_day": 2, "max_notional_usd": 400.0, "max_hold_s": 1500, "min_funding_bps": 0.5, "allow_mechanics_sessions": True, "grant_sha256": ""}
     g.update(over)
     g["grant_sha256"] = AP._sha(g)
     path = AP.grant_path()
@@ -211,7 +214,7 @@ def test_the_loop_honours_stop_alerts_on_not_flat_and_allows_one_loop_per_root(t
 
 def test_the_owner_grant_command_needs_the_capability_file_a_typed_reference_and_refuses_to_overwrite(w):
     import argparse
-    a = argparse.Namespace(symbols=["BTCUSDT"], max_sessions=2, max_notional_usd=400.0, max_hold_s=1500, min_funding_bps=5.0, days=7)
+    a = argparse.Namespace(symbols=["BTCUSDT"], max_sessions=2, max_notional_usd=400.0, max_hold_s=1500, min_funding_bps=5.0, days=7, allow_mechanics_sessions=False)
     msgs = []
     assert AP.cmd_grant(a, input_fn=lambda _p: "", now_ms=w.clock.now(), out=msgs.append) == 2                                   # no reference typed: nothing written
     assert not os.path.exists(AP.grant_path())
@@ -286,3 +289,76 @@ def test_the_loop_does_not_start_while_an_alert_exists_so_a_fly_restart_cannot_s
     calls = []
     msgs = []
     assert AP.loop({}, root=str(root), once=lambda *a, **k: calls.append(1) or {"result": "DONE"}, out=msgs.append) == 0 and calls == [] and "ALERT present" in msgs[0]
+
+
+# ---------------------------------------------------------------- the ECONOMICS gate: a funding rate is not a profit
+def test_a_funding_rate_above_the_owners_floor_is_still_refused_when_the_expected_net_edge_is_negative(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}                  # the account's own measured tier
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000                                      # 1 bp: clears the 0.5 bp floor, nowhere near the ~53 bps the round trip needs
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and res["why"][0] == "EDGE_REJECTED_UNECONOMIC", res
+    assert float(res["edge"]["net_edge_bps"]) < 0 and float(res["edge"]["required_funding_bps"]) > 40
+    assert not [r for r in w.fake.requests if r[0] == "POST"] and S.entries_today(w.clock.now()) == 0
+
+
+def test_lowering_the_owners_funding_threshold_cannot_make_an_uneconomic_trade_pass(w):
+    write_grant(w, min_funding_bps=0.0, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0030", 600_000                                      # 30 bps: more funding, still below the derived requirement
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and res["why"][0] == "EDGE_REJECTED_UNECONOMIC" and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_an_assumed_fee_tier_blocks_a_profit_session_even_with_huge_funding(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = None                                                                            # the key cannot read its own fee rate: the published tier is only ASSUMED
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0100", 600_000
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and res["why"][0] == "EDGE_INCONCLUSIVE" and any("ASSUMED_INPUTS_CANNOT_PASS" in x for x in res["why"])
+
+
+def test_a_profit_candidate_session_runs_labelled_profit_seeking_with_its_edge_evidence(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000                                      # 80 bps: above the derived requirement with a measured tier
+    res, _ = cycle(w)
+    assert res["result"] == "DONE" and res["session_class"] == "PROFIT_SEEKING" and res["flat_verified"] is True
+    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    assert ev["session_class"] == "PROFIT_SEEKING" and ev["edge"]["session_class"] == "PROFIT_CANDIDATE" and float(ev["edge"]["net_edge_bps"]) >= EG_MIN
+
+
+def test_a_mechanics_session_needs_the_owner_to_allow_it_and_is_never_called_an_opportunity(w):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
+    res, _ = cycle(w)
+    assert res["result"] == "DONE" and res["session_class"] == "TESTNET_MECHANICS" and float(res["edge"]["net_edge_bps"]) < 0
+    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    assert ev["label"] == "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY"
+
+
+def test_a_mechanics_session_is_refused_when_the_market_is_unusable_even_if_allowed(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
+    w.fake.liquidity["BTCUSDT"] = __import__("decimal").Decimal("0.0001")                              # the book cannot absorb the size
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_an_old_style_grant_without_the_mechanics_field_is_no_grant(w):
+    g = write_grant(w)
+    del g["allow_mechanics_sessions"]
+    g["grant_sha256"] = AP._sha(g)
+    with open(AP.grant_path(), "w", encoding="utf-8") as fh:
+        json.dump(g, fh)
+    res, _ = cycle(w)
+    assert res["result"] == "REFUSED" and res["why"] == ["GRANT_SHAPE"]
+
+
+def test_the_grant_command_records_the_mechanics_choice_explicitly(w):
+    import argparse
+    a = argparse.Namespace(symbols=["BTCUSDT"], max_sessions=2, max_notional_usd=400.0, max_hold_s=1500, min_funding_bps=5.0, days=7, allow_mechanics_sessions=True)
+    assert AP.cmd_grant(a, input_fn=lambda _p: "owner", now_ms=w.clock.now(), out=lambda _m: None) == 0
+    assert AP.load_grant(w.clock.now(), S._load_capability_manifest()[0])[0]["allow_mechanics_sessions"] is True

@@ -30,6 +30,7 @@ import stat
 import sys
 import threading
 import time
+from decimal import Decimal as D
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +39,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_executor as TE  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
@@ -45,7 +47,7 @@ import ms_testnet_transport as TT  # noqa: E402
 
 GRANT_SCHEMA = "ms_autopilot_grant/v1"
 GRANT_KEYS = frozenset({"schema", "reference", "created_ms", "expires_ms", "manifest_plan_sha256", "symbols", "max_sessions_per_day", "max_notional_usd", "max_hold_s",
-                        "min_funding_bps", "grant_sha256"})
+                        "min_funding_bps", "allow_mechanics_sessions", "grant_sha256"})
 MAX_GRANT_DAYS = 30
 MAX_HOLD_S = 3300                       # the session's lifecycle is one hour: hold + 60 s entry wait + 180 s exit wait must fit
 EXIT_MARGIN_S = 120                     # the hedge is held this long PAST the settlement
@@ -138,6 +140,8 @@ def load_grant(now_ms: int, manifest: Mapping[str, Any], path: Optional[str] = N
         why.append("GRANT_MAX_HOLD")
     if not (_num(g["min_funding_bps"]) and float(g["min_funding_bps"]) >= 0):
         why.append("GRANT_MIN_FUNDING")
+    if not isinstance(g["allow_mechanics_sessions"], bool):
+        why.append("GRANT_ALLOW_MECHANICS")
     return (None, why) if why else (g, [])
 
 
@@ -181,12 +185,31 @@ def funding_decision(rate: float, next_funding_ms: int, now_ms: int, grant: Mapp
     return True, hold, f"FUNDING_OK:{bps:.2f}bps settlement in {secs:.0f}s"
 
 
+def _executor(env: Mapping[str, str], inner: Any, clock: Callable[[], int], symbol: str) -> Any:
+    """A read-only TestnetExecutor view (the registry-pinned Testnet host, no redirects) for the public reads and the one signed fee-rate read."""
+    client, _t = TT.build_client(TT.TestnetCredentials.from_mapping(env), inner if inner is not None else TT.NoRedirectInner())
+    return TE.TestnetExecutor(client, symbols=[symbol], spot_symbols=[symbol], clock_ms=clock, kill_reader=lambda: (False, "read only"))
+
+
 def fetch_funding(env: Mapping[str, str], inner: Any, clock: Callable[[], int], symbol: str) -> Tuple[float, int]:
     """PUBLIC read of the perp's funding rate and next settlement on the Testnet host."""
-    client, _t = TT.build_client(TT.TestnetCredentials.from_mapping(env), inner if inner is not None else TT.NoRedirectInner())
-    ex = TE.TestnetExecutor(client, symbols=[symbol], spot_symbols=[symbol], clock_ms=clock, kill_reader=lambda: (False, "funding read"))
-    row = ex._get("/v5/market/tickers", {"category": "linear", "symbol": symbol}, signed=False)["list"][0]
+    row = _executor(env, inner, clock, symbol)._get("/v5/market/tickers", {"category": "linear", "symbol": symbol}, signed=False)["list"][0]
     return float(row["fundingRate"]), int(row["nextFundingTime"])
+
+
+MARKET_QUALITY_BLOCKERS = ("BOOK", "NOT_TRADING", "INSTRUMENT_INVALID", "MODEL_REFUSED", "QTY", "NOTIONAL")
+
+
+def classify_session(verdict: EG.EdgeVerdict, rate: D, grant: Mapping[str, Any]) -> Tuple[Optional[str], List[str]]:
+    """(session_class, why_not). PROFIT_SEEKING only for an EG.PROFIT_CANDIDATE whose funding also clears the grant's own floor. TESTNET_MECHANICS (a bounded fake-money measurement
+    of lifecycle, fees and fills, NEVER an opportunity) only when the OWNER allowed it in the grant, the market is usable and the funding is not negative. Anything else is no session."""
+    floor_ok = rate * EG.BPS >= D(str(grant["min_funding_bps"]))
+    if verdict.session_class == EG.PROFIT_CANDIDATE and floor_ok:
+        return "PROFIT_SEEKING", []
+    why = [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4]
+    if grant["allow_mechanics_sessions"] is True and rate >= 0 and not any(b in r for r in verdict.reasons for b in MARKET_QUALITY_BLOCKERS):
+        return "TESTNET_MECHANICS", why
+    return None, why
 
 
 # ---------------------------------------------------------------------------------------------------- one cycle
@@ -219,17 +242,25 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     go, hold_s, reason = funding_decision(rate, nxt, now, g)
     if not go:
         return _res("SKIPPED", [reason], funding_bps=rate * 1e4)
+    try:                                                              # the ECONOMICS gate: expected NET edge on the one economic model, from the venue's own rows, books and fee tier
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()))
+        verdict = EG.evaluate_edge(inp)
+    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
+        return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
+    session_class, why_not = classify_session(verdict, D(str(rate)), g)
+    if session_class is None:
+        return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict())
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
     try:
-        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate)
+        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict)
     finally:
         _ACTIVE["dir"] = None
 
 
 def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], d: str, sym: str, g: Mapping[str, Any], hold_s: int,
-                 rate: float) -> Dict[str, Any]:
+                 rate: float, session_class: str, verdict: EG.EdgeVerdict) -> Dict[str, Any]:
     lines: List[str] = []
 
     def step(*argv: str) -> int:
@@ -239,6 +270,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
+    S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
+                                                          "edge": verdict.as_dict()})
     if step("plan", "--symbol", sym, "--notional-usd", str(g["max_notional_usd"]), "--hold-seconds", str(hold_s)) != 0:
         return _res("SKIPPED", ["PLAN_REFUSED"], state_dir=d, detail=lines[-3:])
     try:
@@ -266,7 +299,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     except (OSError, ValueError):
         rec = {}
     summary = {"state_dir": d, "plan_digest": digest, "hold_s": hold_s, "funding_bps": rate * 1e4, "flat_verified": rec.get("flat_verified"), "orders": len(rec.get("orders", [])),
-               "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:]}
+               "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:], "session_class": session_class, "edge": verdict.as_dict()}
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
@@ -321,7 +354,7 @@ def cmd_grant(a: argparse.Namespace, *, input_fn: Callable[[str], str] = input, 
         return 2
     g: Dict[str, Any] = {"schema": GRANT_SCHEMA, "reference": "", "created_ms": now, "expires_ms": now + int(a.days) * 86_400_000, "manifest_plan_sha256": manifest["plan_sha256"],
                          "symbols": list(a.symbols), "max_sessions_per_day": int(a.max_sessions), "max_notional_usd": float(a.max_notional_usd), "max_hold_s": int(a.max_hold_s),
-                         "min_funding_bps": float(a.min_funding_bps), "grant_sha256": ""}
+                         "min_funding_bps": float(a.min_funding_bps), "allow_mechanics_sessions": bool(a.allow_mechanics_sessions), "grant_sha256": ""}
     g["reference"] = "pending"
     g["grant_sha256"] = _sha(g)
     _, why = load_grant_body(g, now, manifest)
@@ -367,6 +400,8 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--max-hold-s", type=int, default=1500, help=f"hold per session, <= {MAX_HOLD_S}; a settlement farther away than this is skipped")
     g.add_argument("--min-funding-bps", type=float, default=5.0, help="only trade when the funding rate pays at least this many bps per settlement")
     g.add_argument("--days", type=int, default=7, help=f"validity, <= {MAX_GRANT_DAYS}")
+    g.add_argument("--allow-mechanics-sessions", action="store_true", help="ALSO allow bounded TESTNET_MECHANICS sessions (fake-money lifecycle/fee/fill measurement, expected net NEGATIVE, never "
+                   "an opportunity) when the economics gate says the trade does not pay; without it only a PROFIT_CANDIDATE session can run")
     sub.add_parser("once", help="one cycle")
     lp = sub.add_parser("loop", help="repeat until STOP, a NOT_FLAT/REFUSED result, or repeated errors")
     lp.add_argument("--root", default=DEFAULT_ROOT)

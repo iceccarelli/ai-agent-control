@@ -62,6 +62,7 @@ class FakeBybitTestnet:
         self.liquidity: Dict[str, D] = {}
         self.rest_filled_on_create: Dict[str, float] = {}
         self.maker_rate, self.taker_rate = D("0.0002"), D("0.00055")
+        self.fee_rates: Optional[Dict[str, Tuple[str, str]]] = None             # {"spot": (maker, taker), "linear": (maker, taker)} as fractions; None = the fee-rate read is refused
         self.funding_rate, self.funding_in_ms = "0.0001", 3_600_000            # the perp ticker's funding rate and the time to the next settlement (tests set these)
         self.fill_delay_ms = 0                                       # >0: a crossing order is ACCEPTED now and its fill appears only after this long (asynchronous matching, as on a real venue)
         self.pending: List[Tuple[int, str, D, D]] = []
@@ -158,6 +159,11 @@ class FakeBybitTestnet:
             return self._ok({"list": [{"accountType": "UNIFIED", "totalEquity": _s(eq), "coin": coins}]})
         if path == "/v5/account/info":
             return self._ok({"marginMode": "REGULAR_MARGIN", "unifiedMarginStatus": 4, "updatedTime": str(self.now_ms())})
+        if path == "/v5/account/fee-rate":
+            if self.fee_rates is None:                                              # the key is not permitted to read it (the real Testnet key's permissions may not allow it)
+                return self._err(10005, "permission denied")
+            maker, taker = self.fee_rates[q.get("category", "")]
+            return self._ok({"category": q.get("category"), "list": [{"symbol": q.get("symbol", ""), "takerFeeRate": taker, "makerFeeRate": maker}]})
         if path == "/v5/position/list":
             return self._position_list(q)
         if path == "/v5/position/set-leverage":
@@ -181,7 +187,7 @@ class FakeBybitTestnet:
         if cat == "linear":
             for s, i in self.instruments.items():
                 if sym in (None, s):
-                    rows.append({"symbol": s, "status": i["status"], "baseCoin": i["base"], "quoteCoin": "USDT", "fundingInterval": i["funding"],
+                    rows.append({"symbol": s, "status": i["status"], "baseCoin": i["base"], "quoteCoin": "USDT", "fundingInterval": i["funding"], "upperFundingRate": "0.0075", "lowerFundingRate": "-0.0075",
                                  "priceFilter": {"tickSize": i["tick"]}, "leverageFilter": {"minLeverage": "1", "maxLeverage": "100", "leverageStep": "0.01"},
                                  "lotSizeFilter": {"minNotionalValue": i["min_notional"], "maxOrderQty": "1000", "maxMktOrderQty": "500", "minOrderQty": i["min_qty"], "qtyStep": i["step"]}})
         elif cat == "spot":
