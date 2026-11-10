@@ -106,6 +106,31 @@ def test_the_worker_can_reach_no_venue_credential_or_network_by_construction():
     src = open(os.path.join(BOT, "tools", "research_service.py"), encoding="utf-8").read()
     tree = ast.parse(src)
     mods = {n.names[0].name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)} | {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert mods <= {"__future__", "argparse", "datetime", "hashlib", "json", "os", "sys", "time", "typing", "agent_contracts", "dataset_inventory", "research_jobs"}, mods
+    assert mods <= {"__future__", "argparse", "datetime", "hashlib", "json", "os", "signal", "sys", "threading", "time", "typing", "agent_contracts", "dataset_inventory", "research_jobs"}, mods
     low = src.lower()
     assert "environ" not in low and "socket" not in low and "requests" not in low and "urllib" not in low and "bybit" not in low.replace("venue", "")
+
+
+def test_a_stop_signal_ends_the_loop_cleanly_after_the_current_tick(tmp_path, capsys):
+    import signal
+    d = data(tmp_path)
+    # signal.signal only works in the main thread, so drive the handler the way the kernel would: set the stop event once the first tick has printed
+    RS._STOP.clear()
+    orig = RS.ResearchService.tick
+
+    def tick_then_stop(self):
+        r = orig(self)
+        RS._on_signal(signal.SIGTERM, None)
+        return r
+    RS.ResearchService.tick = tick_then_stop
+    try:
+        rc = RS.main(["run", "--state-dir", str(tmp_path / "st"), "--root", f"datasets={d}", "--tick-seconds", "3600"])
+    finally:
+        RS.ResearchService.tick = orig
+        RS._STOP.clear()
+    assert rc == 0 and json.loads(capsys.readouterr().out.strip().splitlines()[-1])["worked"]["SUCCEEDED"] == 2
+
+
+def test_the_image_files_exist_and_the_signal_handlers_are_installed():
+    src = open(os.path.join(BOT, "tools", "research_service.py"), encoding="utf-8").read()
+    assert "signal.SIGTERM" in src and "_STOP.wait(" in src

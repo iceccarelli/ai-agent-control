@@ -1,0 +1,35 @@
+# REAL container checks for the carry-research image (Dockerfile.research): build it, run the real entrypoint, check the unprivileged user and volume modes, that no credential or venue module is in
+# the image, that one real tick finds a data gap and writes a private status + queue, and that SIGTERM stops the worker cleanly. Offline and secret-free; runs only when the image's inputs change.
+name: research-image
+
+on:
+  pull_request:
+    paths:
+      - "bot/Dockerfile.research"
+      - "bot/fly.research.toml"
+      - "bot/deploy/research-*"
+      - "bot/tools/research_*.py"
+      - "bot/tools/dataset_inventory.py"
+      - "bot/tools/agent_contracts.py"
+      - ".github/workflows/research-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: research image builds and runs (real container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - name: Real container checks
+        run: sh deploy/research-image-smoke.sh carry-research-ci

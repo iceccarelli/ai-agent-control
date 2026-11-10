@@ -20,7 +20,9 @@ import datetime as dt
 import hashlib
 import json
 import os
+import signal
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -165,7 +167,15 @@ class ResearchService:
         return {"scheduled": made, "worked": done, "status": self.status()}
 
 
-def main(argv: Optional[Sequence[str]] = None, *, sleep: Callable[[float], None] = time.sleep) -> int:
+_STOP = threading.Event()
+
+
+def _on_signal(_signum: int, _frame: Any) -> None:
+    """A container's PID 1 ignores a signal that has no handler: without this, `docker stop` / Fly's SIGTERM would wait out the kill timeout and end in SIGKILL."""
+    _STOP.set()
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="carry-research worker core (public data only; no credential, no order)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("run", "status"):
@@ -187,12 +197,17 @@ def main(argv: Optional[Sequence[str]] = None, *, sleep: Callable[[float], None]
     if a.cmd == "status":
         print(json.dumps(svc.status(), indent=1, sort_keys=True))
         return 0
-    while True:
-        res = svc.tick()
-        print(json.dumps({"scheduled": res["scheduled"], "worked": res["worked"]}, sort_keys=True), flush=True)
-        if a.once:
-            return 0
-        sleep(a.tick_seconds)
+    _STOP.clear()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+    try:
+        while True:
+            res = svc.tick()
+            print(json.dumps({"scheduled": res["scheduled"], "worked": res["worked"]}, sort_keys=True), flush=True)
+            if a.once or _STOP.is_set() or _STOP.wait(a.tick_seconds):          # the wait returns the moment a stop signal arrives
+                return 0
+    finally:
+        svc.q.close()
 
 
 if __name__ == "__main__":
