@@ -25,8 +25,10 @@ import hashlib
 import json
 import math
 import os
+import signal
 import stat
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -52,6 +54,27 @@ POLL_S = 120                            # a cheap public read between cycles
 COOLDOWN_AFTER_SESSION_S = 1800
 MAX_CONSECUTIVE_ERRORS = 3
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".ai-agent-control", "ms_autopilot")
+
+
+# SIGTERM / SIGHUP / SIGINT (a Fly stop or deploy, a closed terminal, Ctrl-c): stop starting sessions and ask the ACTIVE session to unwind. The session already honours its per-state-dir
+# kill switch (cancel entries, reduce-only unwind, verify flat), so the handler only engages that switch; the process then ends when the session does (Fly's kill_timeout is 300 s).
+_STOP = threading.Event()
+_ACTIVE: Dict[str, Optional[str]] = {"dir": None}
+
+
+def _on_signal(signum: int, _frame: Any = None) -> None:
+    _STOP.set()
+    d = _ACTIVE.get("dir")
+    if d:
+        try:
+            AD.engage_kill_switch(os.path.join(d, "MS_KILL"), f"autopilot received signal {signum}")
+        except OSError:
+            pass
+
+
+def install_signal_handlers() -> None:
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _on_signal)
 
 
 def grant_path() -> str:
@@ -198,11 +221,22 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
         return _res("SKIPPED", [reason], funding_bps=rate * 1e4)
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
+    _ACTIVE["dir"] = d
+    try:
+        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate)
+    finally:
+        _ACTIVE["dir"] = None
+
+
+def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], d: str, sym: str, g: Mapping[str, Any], hold_s: int,
+                 rate: float) -> Dict[str, Any]:
     lines: List[str] = []
 
     def step(*argv: str) -> int:
         return S.main(["--state-dir", d, *argv], env=env, inner_transport=inner, clock_ms=clock, sleep=sleep, input_fn=lambda _p: "", out=lines.append)
 
+    if _STOP.is_set():
+        return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
     if step("plan", "--symbol", sym, "--notional-usd", str(g["max_notional_usd"]), "--hold-seconds", str(hold_s)) != 0:
@@ -223,6 +257,8 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     if bad:
         return _res("SKIPPED", ["ASSESS_NOT_APPROVED:" + ",".join(bad)], state_dir=d)
     lines.clear()
+    if _STOP.is_set():                                               # a stop arrived before any order: nothing was placed, no entry was counted
+        return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
     rc = step("execute", "--confirm-plan-digest", digest, "--unattended")
     try:
         with open(os.path.join(d, "testnet_session.json"), encoding="utf-8") as fh:
@@ -241,8 +277,11 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
          sleep: Optional[Callable[[float], None]] = None, out: Callable[[str], None] = print, max_iterations: Optional[int] = None, **kw: Any) -> int:
     """Repeat ``once`` until STOP exists, a NOT_FLAT / REFUSED result (a human must look: ALERT file, exit 3), or three errors in a row. One loop per root (lock file)."""
     clock = clock or (lambda: int(time.time() * 1000))
-    sleep = sleep or time.sleep
+    sleep = sleep or (lambda s: _STOP.wait(s))                       # a stop signal wakes the wait at once
     os.makedirs(root, mode=0o700, exist_ok=True)
+    if os.path.exists(os.path.join(root, "ALERT")):                  # a human must look first: after a restart (Fly restarts a failed machine) the loop must NOT carry on
+        out(f"ALERT present in {root}: not starting. Read it, fix the cause, remove the ALERT file, then start again")
+        return 0
     lock = open(os.path.join(root, "lock"), "a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -252,8 +291,8 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
     errors, n = 0, 0
     while max_iterations is None or n < max_iterations:
         n += 1
-        if os.path.exists(os.path.join(root, "STOP")):
-            out("STOP file present: stopping")
+        if _STOP.is_set() or os.path.exists(os.path.join(root, "STOP")):
+            out("stop requested: stopping")
             return 0
         res = once(env, clock=clock, sleep=sleep, out=out, **kw)
         res["at_ms"] = int(clock())
@@ -352,6 +391,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         res = run_once(e)
         print(json.dumps(res, indent=2, sort_keys=True, default=str))
         return 0 if res["result"] in ("DONE", "SKIPPED") else 3
+    install_signal_handlers()
     return loop(e, root=a.root)
 
 

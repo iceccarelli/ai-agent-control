@@ -1,0 +1,40 @@
+# The UNATTENDED TESTNET AUTOPILOT (fake money). A separate app from carry-book and carry-drill.
+# It runs tools/ms_testnet_autopilot.py loop: funding-gated hedged Testnet sessions under the OWNER'S signed, bounded, expiring grant (bot/RUNBOOKS.md "Unattended Testnet autopilot").
+# Bybit blocks GitHub-hosted runners but not Frankfurt, which is why this runs here.
+# Deploy with `fly deploy -c fly.autopilot.toml --ha=false` (never `fly launch`, which rewrites config). tests/test_autopilot_image.py pins these properties.
+#
+#   one machine, one volume     two loops would be two hedges
+#   no [http_service]           nothing to serve (so Fly never auto-stops it)
+#   kill_timeout 300s           SIGTERM engages the active session's kill switch; the session unwinds reduce-only and verifies flat
+#   no secrets in this file     `fly secrets set BYBIT_TESTNET_API_KEY=... BYBIT_TESTNET_API_SECRET=... -a carry-autopilot` (typed by the owner, never pasted in chat)
+#   the capability file and the grant are put on the volume by the owner; the loop refuses to start while an ALERT file exists
+
+app = "carry-autopilot"
+primary_region = "fra"
+kill_signal = "SIGTERM"
+kill_timeout = "300s"
+
+[build]
+dockerfile = "Dockerfile.autopilot"
+
+[deploy]
+strategy = "immediate"
+
+[[restart]]
+policy = "on-failure"
+retries = 10
+
+[env]
+USE_TESTNET = "1"
+PAPER_TRADING = "0"
+BYBIT_VENUE = "testnet"
+HOME = "/data"
+
+[[mounts]]
+source = "autopilot_data"
+destination = "/data"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"
+cpus = 1

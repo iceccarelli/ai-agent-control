@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+# The UNATTENDED TESTNET AUTOPILOT image (fake money), its own Fly app (fly.autopilot.toml): neither the carry-book nor the carry-drill app is touched.
+# Default command: tools/ms_testnet_autopilot.py loop (funding-gated hedged sessions under the owner's signed grant). Same dependency pins as Dockerfile; the modules are named one by one,
+# never `COPY tools/`. tests/test_autopilot_image.py recomputes the import closure of the autopilot and fails if a file is missing, if this image could be aimed at mainnet, or if it
+# carries a credential. Credentials arrive as Fly secrets; the capability file and the grant live on the volume (HOME=/data), put there by the OWNER.
+FROM python:3.11-slim AS base
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
+
+COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.py carry_costs.py carry_engine.py carry_evidence.py \
+     carry_risk.py close_executor.py close_plan.py close_policy.py config.py directional_funding.py economic_model.py \
+     entry_authority.py entry_benefit_gate.py evidence_chain.py evidence_stats.py execution_cost_estimate.py execution_record.py \
+     features.py fingerprint.py forward_status.py funding_reconcile.py ledger.py main.py margin_facts.py market_data.py \
+     market_snapshot.py md_book.py md_broker.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py md_state.py \
+     md_store.py md_transport.py md_wire.py memory.py ml_strategy.py order_lifecycle.py order_recovery.py owner_policy.py \
+     performance_analytics.py persistence.py policy.py portfolio_state.py position_sizing.py private_ws_consumer.py project_status.py \
+     promotion_gate.py protective_restart.py pure_indicators.py risk_input_provider.py risk_management.py risk_policy.py \
+     runtime_capability.py session_log.py shadow.py shadow_strategy.py statistical_power.py strategy_evidence.py technical_analysis.py \
+     testnet_readiness.py trade_economics.py trading_engine.py venue_fees.py venues.py ws_transport.py ./
+COPY signals/ ./signals/
+COPY tools/account_review.py tools/backfill_plan.py tools/candidate_competition.py tools/candidate_readiness.py \
+     tools/carry_backtest.py tools/carry_performance.py tools/carry_prospective.py tools/carry_replay.py tools/carry_teardown.py \
+     tools/corpus_health.py tools/deflated_sharpe.py tools/drill.py tools/hypothesis_registry.py tools/market_collector.py \
+     tools/market_history.py tools/ms_accounting.py tools/ms_authority.py tools/ms_execution.py tools/ms_fillmodel.py \
+     tools/ms_microstructure.py tools/ms_pipeline.py tools/ms_portfolio.py tools/ms_reconcile.py tools/ms_replay.py tools/ms_risk.py \
+     tools/ms_scanner.py tools/ms_testnet_adapter.py tools/ms_testnet_autopilot.py tools/ms_testnet_executor.py \
+     tools/ms_testnet_session.py tools/ms_testnet_transport.py tools/ms_types.py tools/opportunity_map.py tools/provenance.py \
+     tools/research_harness.py tools/reserved_holdout.py tools/strategy_verdict.py tools/supabase_sync.py \
+     tools/testnet_action_manifest.py tools/testnet_certificate.py tools/universe_capture.py tools/venue_evidence.py ./tools/
+COPY deploy/autopilot-entrypoint.sh /usr/local/bin/autopilot-entrypoint
+RUN useradd --create-home --shell /usr/sbin/nologin bot \
+    && mkdir -p /data && chown -R bot:bot /app /data
+
+# Testnet only, stated again here. HOME=/data puts the capability file, the grant, the entries counter, every state dir and the autopilot root on the volume.
+ENV USE_TESTNET=1 PAPER_TRADING=0 BYBIT_VENUE=testnet HOME=/data
+
+# Starts as root only to chown the volume; the entrypoint drops to `bot` and execs, so Fly's SIGTERM reaches the autopilot, which asks the active session to unwind.
+ENTRYPOINT ["/usr/local/bin/autopilot-entrypoint"]
+CMD ["python3", "tools/ms_testnet_autopilot.py", "loop"]

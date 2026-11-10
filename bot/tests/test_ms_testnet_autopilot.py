@@ -242,3 +242,47 @@ def test_the_autopilot_workflow_is_off_by_default_self_hosted_main_only_and_hold
     assert re.search(r"^permissions:\n  contents: read\n", text, re.M) and "cancel-in-progress: false" in text
     steps = text[text.index("\njobs:"):]
     assert "ms_testnet_autopilot.py once" in steps and "--unattended" not in steps and "ms_testnet_session.py" not in steps     # the workflow only calls the autopilot; the grant gate lives in the engine
+
+
+@pytest.fixture
+def stop_state():
+    AP._STOP.clear()
+    AP._ACTIVE["dir"] = None
+    yield
+    AP._STOP.clear()
+    AP._ACTIVE["dir"] = None
+
+
+def test_a_signal_engages_the_active_sessions_kill_switch_and_stops_the_loop(tmp_path, stop_state):
+    d = tmp_path / "ms_auto_x"
+    d.mkdir()
+    AP._ACTIVE["dir"] = str(d)
+    AP._on_signal(15)
+    assert (d / "MS_KILL").exists() and AP._STOP.is_set()                              # the engine's own kill path: cancel entries, reduce-only unwind, verify flat
+    calls = []
+    root = str(tmp_path / "ap")
+    assert AP.loop({}, root=root, once=lambda *a, **k: calls.append(1) or {"result": "DONE"}, sleep=lambda _s: None, out=lambda _m: None) == 0 and calls == []
+
+
+def test_a_signal_with_no_active_session_only_stops_and_never_raises(tmp_path, stop_state):
+    AP._on_signal(2)
+    assert AP._STOP.is_set()
+    AP._ACTIVE["dir"] = str(tmp_path / "does-not-exist")                               # the state dir was not created yet: the handler must not raise
+    AP._on_signal(15)
+
+
+def test_a_stop_before_the_order_places_nothing_and_counts_no_entry(w, stop_state):
+    write_grant(w, min_funding_bps=0.5)
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0008", 600_000
+    AP._STOP.set()
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and res["why"] == ["STOP_REQUESTED"] and not [r for r in w.fake.requests if r[0] == "POST"] and S.entries_today(w.clock.now()) == 0
+
+
+def test_the_loop_does_not_start_while_an_alert_exists_so_a_fly_restart_cannot_skip_the_human(tmp_path, stop_state):
+    root = tmp_path / "ap"
+    root.mkdir()
+    (root / "ALERT").write_text("{}")
+    calls = []
+    msgs = []
+    assert AP.loop({}, root=str(root), once=lambda *a, **k: calls.append(1) or {"result": "DONE"}, out=msgs.append) == 0 and calls == [] and "ALERT present" in msgs[0]
