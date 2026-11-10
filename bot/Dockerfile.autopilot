@@ -22,7 +22,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
 COPY signals/ ./signals/
 COPY tools/account_review.py tools/backfill_plan.py tools/candidate_competition.py tools/candidate_readiness.py \
      tools/carry_backtest.py tools/carry_performance.py tools/carry_prospective.py tools/carry_replay.py tools/carry_teardown.py \
-     tools/corpus_health.py tools/deflated_sharpe.py tools/drill.py tools/exec_evidence.py tools/hypothesis_registry.py \
+     tools/corpus_health.py tools/deflated_sharpe.py tools/drill.py tools/exec_evidence.py tools/exec_lifecycle.py tools/hypothesis_registry.py \
      tools/market_collector.py tools/market_history.py tools/ms_accounting.py tools/ms_authority.py tools/ms_capital.py tools/ms_edge_gate.py \
      tools/ms_engine_state.py tools/ms_execution.py tools/ms_fillmodel.py tools/ms_microstructure.py tools/ms_pipeline.py \
      tools/ms_portfolio.py tools/ms_reconcile.py tools/ms_replay.py tools/ms_risk.py tools/ms_scanner.py tools/ms_testnet_adapter.py \

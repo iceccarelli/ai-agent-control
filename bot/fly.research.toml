@@ -1,0 +1,32 @@
+# The carry-research WORKER: PUBLIC-DATA RESEARCH ONLY. A separate app from carry-autopilot, carry-drill and carry-book; it never holds an exchange credential and cannot place an order.
+# Deploy (owner, after reading bot/RUNBOOKS.md):  fly apps create carry-research  &&  fly volumes create research_data --region fra --size 3 -a carry-research  &&
+#                                                  fly deploy -c fly.research.toml --ha=false         (never `fly launch`, which rewrites config)
+# tests/test_research_image.py pins these properties.
+#
+#   one machine, one volume     the job queue is a single sqlite file on the volume
+#   no [http_service]           nothing to serve
+#   no secrets, no [env]        nothing here is a credential; HOME=/data is set in the image
+#   restart policy `always`     the worker loop only ends on a stop signal or a fatal error; an always-on worker must come back after either
+
+app = "carry-research"
+primary_region = "fra"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+dockerfile = "Dockerfile.research"
+
+[deploy]
+strategy = "immediate"
+
+[[restart]]
+policy = "always"
+
+[[mounts]]
+source = "research_data"
+destination = "/data"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"
+cpus = 1
