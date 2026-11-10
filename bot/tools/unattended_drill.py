@@ -606,6 +606,20 @@ def _loop(root: str, *, env: Mapping[str, str], max_runs: int,
             sleep(30.0)
 
 
+def guarded_run_once(run_dir: str, *, env: Mapping[str, str], acquire: Callable[..., Any] = None, **kw: Any) -> int:
+    """The order-capable entry point the CLI uses: ONE armed run under the shared single-writer lease (legacy_executor_guard). Refused (nothing sent) without it; released in ``finally``."""
+    import legacy_executor_guard as LG
+    handle, why = (acquire or LG.acquire)(env)
+    if handle is None:
+        os.makedirs(run_dir, exist_ok=True)
+        _say(run_dir, "refusing to place any order: " + why)
+        return EXIT_REFUSED
+    try:
+        return run_once(run_dir, env=env, **kw)
+    finally:
+        handle.release()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--conformance", action="store_true",
@@ -636,7 +650,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     install_signal_handlers()
     if not args.loop:
         try:
-            return run_once(args.run_dir, env=os.environ)
+            return guarded_run_once(args.run_dir, env=os.environ)
         except Shutdown as exc:
             print(f"told to stop ({exc}); the safety net has run", flush=True)
             return EXIT_SIGNALLED
@@ -646,7 +660,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               file=sys.stderr)
         return EXIT_REFUSED
     try:
-        return loop(args.run_dir, env=os.environ, max_runs=args.max_runs)
+        return loop(args.run_dir, env=os.environ, max_runs=args.max_runs, once=guarded_run_once)
     finally:
         lock.close()
 

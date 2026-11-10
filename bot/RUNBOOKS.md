@@ -662,6 +662,29 @@ cd bot && python3 tools/dataset_inventory.py --root $HOME/datasets --root $HOME/
 
 Coverage is derived from day tokens in file names and says so; file times only say when something was written.
 
+## Legacy apps: carry-drill and carry-book (owner; read-only checks first, nothing here is changed by an agent)
+
+**What your Fly output shows (2026-11-10).** `carry-drill`: one machine `d894911a069d58`, Frankfurt, started, 1 shared vCPU / 512 MB, volume `vol_vz807ed2loyjy9zv`, deployed 2026-11-05 (version 21), with an EMPTY command and entrypoint in the machine config. An empty command means the machine runs the image's own default, which in `Dockerfile.drill` is the READ-ONLY supervisor (`runner_monitor.py` + the public `market_recorder.py`). `carry-book`: one machine `08054eda399e48`, stopped since 2026-09-15, one health-check warning. It is stopped and stays stopped.
+
+**What that does and does not prove.** It shows the machine has no explicit command that would start an order-capable run. It does NOT prove which commit the 2026-11-05 image was built from, nor that nobody started `unattended_drill.py --conformance` by hand in it. Check, read-only:
+
+```bash
+fly ssh console -a carry-drill -C "ps -eo pid,user,args"          # expect the supervisor, the monitor and the recorder; NOT unattended_drill.py / drill.py / close_testnet_short.py
+fly secrets list -a carry-drill                                    # NAMES only. Generic BYBIT_API_KEY / BYBIT_API_SECRET names do not tell you which account they point at
+fly logs -a carry-drill --no-tail | tail -50                       # recent activity
+gh variable list                                                   # CARRY_DRILL_ENABLED must be absent or not "true"
+gh secret list --env testnet-drill                                 # expect NO Bybit secret in GitHub (the project rule: no exchange secret in GitHub)
+```
+
+**Order-capable paths that exist, and how each is now fenced.**
+1. `carry-drill` image, `unattended_drill.py --conformance`: explicit command only. From this code on it takes the same Supabase lease as the autopilot before every armed run (`tools/legacy_executor_guard.py`), refuses without Supabase configuration, refuses while the autopilot holds the lease, and releases in `finally`. The deployed image does not have this yet; it takes effect when you redeploy `carry-drill` (safe while no conformance process is running: check `ps` above first). Until then do not start a conformance run while the autopilot is deployed.
+2. `.github/workflows/carry-drill-testnet.yml`: off unless the repository variable `CARRY_DRILL_ENABLED` is `true`, main-only, environment-gated, and it fails closed at the reachability probe because Bybit blocks GitHub's runners. Keep the variable unset. If you ever see it set, remove it and delete any Bybit secret in the `testnet-drill` environment.
+3. `carry-book`: stopped. Do not start it while the autopilot is live. Its 1 GB volume is untouched; to keep an independent copy before ever touching it: `fly volumes snapshots create <volume-id> -a carry-book` (additive; review the volume's contents first).
+
+**Single-writer rule in one sentence.** The autopilot's lease is the only authority to place an order against the Testnet account; the legacy runner cannot hold it at the same time, and the autopilot's own recovery proves the venue flat (any open linear position on any symbol) before it will trade, so a leftover legacy position stops it in `ALERT` rather than mixing with a new hedge.
+
+**Using the same Testnet account for both is the risk.** The new executor uses the dedicated `BYBIT_TESTNET_API_KEY`; `carry-drill` uses the generic `BYBIT_API_KEY`. If both keys belong to ONE Testnet account the guard above is what keeps them from trading at once; if they are different accounts there is no collision, but the capital book is per account.
+
 ## Codespaces operations: arm the Codespace, keep the public collector alive (offline-safe; no order path)
 Everything below is run by the owner in the Codespace terminal from the repository root. The root `Makefile`, `ops/collector_supervisor.py` and `.devcontainer/devcontainer.json` contain NO order path, NO live switch and NO credential value; `tests/test_ops_layer.py` fails if an active line names an execute/unwind path, `LIVE_TRADING_ACK`, `USE_TESTNET=0`, `PAPER_TRADING=0`, a mainnet host or a generic `BYBIT_API_*` key. The Testnet `execute` step is deliberately not a make target.
 
@@ -705,7 +728,7 @@ Review hardening (independent reviewer, all failing-test-first): the exit quanti
 12. **ALERT**: the engine STAYS ALIVE in state `ALERT` / `UNRECONCILED` and never trades again by itself. Read it (`autopilot-ctl status`, `fly logs`), reconcile by hand on the venue, then `fly ssh console -a carry-autopilot -C "autopilot-ctl clear-alert --reason 'what I examined and fixed'"`; it is refused unless the venue is proven flat. The alert is kept in `marker_log.jsonl`.
 13. **Recover from an unresolved session**: after a crash or a host failure the process proves flat from the venue before anything else. Flat and no open order = recorded in `recovery.json` (reconcile the accounting) and trading may continue; anything open = `UNRECONCILED` + ALERT: close it by hand with the session tool's reconcile (`fly ssh console -a carry-autopilot` then `autopilot-ctl` is not needed for that: use `cd /app && su -s /bin/sh bot -c 'HOME=/data python3 tools/ms_testnet_session.py --state-dir /data/.ai-agent-control/ms_auto_<UTC time> reconcile --unwind --confirm-plan-digest <digest>'` and type the digest), then `clear-alert`.
 14. **Safe deployment** (after a session is flat): from `bot/`, `sh deploy/safe-deploy.sh` drains (no new sessions), insists on a fresh flat proof, deploys, then resumes. It refuses to deploy over an active or unresolved session. Planned deploys must use it; a plain `fly deploy` can kill a session mid-unwind.
-15. **One executor only.** Never run a second worker, a Codespace loop, `carry-drill` or a self-hosted runner against the same Testnet account: the engine needs the global Supabase lease (a second executor stays PAUSED), but `carry-drill`/`carry-book` do not use it. No GitHub workflow may run an order-capable command (a test enforces it).
+15. **One executor only.** Never run a second worker, a Codespace loop, `carry-drill` or a self-hosted runner against the same Testnet account. The engine needs the global Supabase lease (a second executor stays PAUSED). The legacy order-capable path (`unattended_drill.py --conformance`) now takes that SAME lease before every armed run and places nothing without it, but only in an image deployed from this code: the carry-drill machine deployed on 2026-11-05 predates that guard (see the section "Legacy apps: carry-drill and carry-book"). `carry-book` has no guard and stays stopped. The scheduled GitHub drill workflow is off unless the owner sets a repository variable (see that section).
 
 **One command per session (read-only).** `make testnet-ready` (knobs: `NOTIONAL=400 HOLD=0 SYMBOL=BTCUSDT`) picks the next unused `~/.ai-agent-control/ms_testnet_<N>` (from 5), runs preflight, plan and `assess` chained inside the 15-minute preflight window, prints the plan digest and the state dir, and stops. It has no order path: placing the order stays the separate command you type with the digest. A size whose cushioned spot leg would exceed the ceiling is refused at plan time (use e.g. 495).
 
