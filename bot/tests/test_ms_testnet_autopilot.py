@@ -1025,3 +1025,114 @@ def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
     assert b.acknowledge_halt() is True
     res, _ = _cycle_eng(w)
     assert res["result"] in ("DONE", "SKIPPED") and "ALLOCATION_ZERO" not in "".join(res["why"])
+
+
+# ---------------------------------------------------------------- the STALE EXECUTOR: a frozen process must be refused by the server before any entry order
+class SimServer:
+    """The server's lease record: one holder at a time, a fencing token that only grows, expiry on the SERVER clock."""
+
+    def __init__(self):
+        self.holder, self.token, self.now, self.expires = None, 0, 0.0, 0.0
+
+    def client(self, name):
+        return SimClient(self, name)
+
+
+class SimClient:
+    """Shaped like exec_evidence.LeaseClient; `held` answers from LOCAL memory (a deadline this process measured earlier), renew/acquire go to the server."""
+
+    def __init__(self, srv, name):
+        self.srv, self.name, self._tok, self.local_deadline = srv, name, None, None
+
+    @property
+    def held(self):
+        return self._tok is not None and self.local_deadline is not None and self.local_deadline > 0          # local belief only: frozen clocks never expire it
+
+    @property
+    def token(self):
+        return self._tok
+
+    def acquire(self):
+        s = self.srv
+        if s.holder not in (None, self.name) and s.expires > s.now:
+            return False
+        s.token += 1
+        s.holder, s.expires, self._tok, self.local_deadline = self.name, s.now + 30, s.token, 1.0
+        return True
+
+    def renew(self):
+        s = self.srv
+        if self._tok is None or s.holder != self.name or s.token != self._tok or s.expires <= s.now:
+            self._tok = None
+            return False
+        s.expires = s.now + 30
+        return True
+
+
+def _stale_world(w):
+    prepared(w)
+    srv = SimServer()
+    a, b = AP.RenewingLease(srv.client("A"), renew_every_s=1e9), AP.RenewingLease(srv.client("B"), renew_every_s=1e9)    # renew_every huge: the cheap check NEVER renews
+    assert a.ensure() is True and a.token == 1
+    srv.now = 100.0                                                       # process A is frozen; its lease expires on the server
+    assert b.ensure() is True and b.token == 2                            # process B legitimately takes over with a NEWER fencing token
+    return srv, a, b
+
+
+def test_a_frozen_process_still_believes_in_its_lease_but_the_strong_check_asks_the_server(w, tmp_path):
+    srv, a, b = _stale_world(w)
+    manifest = S._load_capability_manifest()[0]
+    assert a.held() is True                                               # the cheap local check is fooled: this is the bug the strong check exists for
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), a) is None
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), a, strong=True) == "LEASE_LOST"
+    assert a.reason == "renew_failed_pre_order" and a.token is None and a.held() is False      # and it stays lost: held() never re-wins
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), b, strong=True) is None  # the legitimate holder passes, and renewing keeps its token
+
+
+def test_a_woken_stale_executor_is_refused_before_a_single_order_is_sent(w, tmp_path):
+    srv, a, b = _stale_world(w)
+    w.fake.requests.clear()
+    res = run(w, tmp_path / "eng", lease=a)
+    assert res["result"] == "SKIPPED" and res["why"] == ["REVOKED_BEFORE_ORDER:LEASE_LOST"], res
+    assert not [r for r in w.fake.requests if r[0] == "POST"], "a stale executor reached the order endpoint"
+
+
+def test_an_unanswerable_lease_check_is_not_authority(w, tmp_path):
+    class Exploding:
+        token = 1
+
+        def held(self):
+            return True
+
+        def held_fresh(self):
+            raise RuntimeError("supabase unreachable")
+    manifest = S._load_capability_manifest()[0]
+    prepared(w)
+    assert AP.revocation_reason(w.clock.now(), manifest, str(tmp_path), Exploding(), strong=True) == "LEASE_CHECK_ERROR"
+    w.fake.requests.clear()
+    res = run(w, tmp_path / "eng2", lease=Exploding())
+    assert res["result"] == "SKIPPED" and res["why"] == ["REVOKED_BEFORE_ORDER:LEASE_CHECK_ERROR"] and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_a_lease_lost_between_the_start_of_execute_and_the_first_entry_order_places_nothing(w, tmp_path):
+    class FreshOnce:
+        """The server says yes for the pre-execute check and no from then on (another executor took over in between)."""
+        token = 1
+
+        def __init__(self):
+            self.fresh_calls = 0
+
+        def held(self):
+            return True                                                   # the cheap local belief never changes
+
+        def held_fresh(self):
+            self.fresh_calls += 1
+            return self.fresh_calls == 1
+    prepared(w)
+    lease = FreshOnce()
+    w.fake.requests.clear()
+    res = run(w, tmp_path / "eng3", lease=lease)
+    assert lease.fresh_calls >= 2, "the per-order check never asked the server"
+    entry_posts = [r for r in w.fake.requests if r[0] == "POST" and "/order/create" in str(r[1])]
+    assert not entry_posts, f"an entry order was sent without fresh authority: {entry_posts}"
+    assert res["orders"] == 0 if "orders" in res else True

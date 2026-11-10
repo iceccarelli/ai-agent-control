@@ -325,7 +325,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     lines.clear()
     if _STOP.is_set():                                               # a stop arrived before any order: nothing was placed, no entry was counted
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
-    why_now = revocation_reason(int(clock()), manifest, engine_root, lease)
+    why_now = revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     on_state("EXECUTING", "execute_started")
@@ -334,7 +334,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     def pre_order() -> Optional[str]:
         if _STOP.is_set():
             return "STOP_SIGNAL"
-        return revocation_reason(int(clock()), manifest, engine_root, lease)
+        return revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)      # before EVERY entry order: the server must say this holder still holds the lease
     rc = step("execute", "--confirm-plan-digest", digest, "--unattended", sl=watch_sleep, poc=pre_order)
     try:
         with open(os.path.join(d, "testnet_session.json"), encoding="utf-8") as fh:
@@ -355,7 +355,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
 
 
 # ---------------------------------------------------------------------------------------------------- authority can be REVOKED while a session is running
-def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str, lease: Any) -> Optional[str]:
+def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str, lease: Any, strong: bool = False) -> Optional[str]:
     """Why new authority is gone RIGHT NOW (None = still authorised): the grant vanished / expired / was tampered, the owner set STOP or an ALERT appeared, or the executor lease is not
     held. A DRAIN is not revocation (the active session finishes). Revocation never abandons a hedge: it engages the session's kill switch (cancel entries, reduce-only unwind, flat check)."""
     g, why = load_grant(now_ms, manifest)
@@ -365,8 +365,14 @@ def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str
     for m in ("STOP", "ALERT"):
         if st.has(m):
             return m
-    if lease is not None and not lease.held():
-        return "LEASE_LOST"
+    if lease is not None:
+        try:
+            fresh = getattr(lease, "held_fresh", None)
+            ok = bool(fresh() if (strong and fresh is not None) else lease.held())   # STRONG = the server's own answer (a renew), never this process's memory of a deadline
+        except Exception:                                            # an unanswerable authority check is not authority
+            return "LEASE_CHECK_ERROR"
+        if not ok:
+            return "LEASE_LOST"
     return None
 
 
@@ -547,6 +553,17 @@ class RenewingLease:
             if not self._l.renew():
                 self.reason = "renew_failed"
                 return False
+        return bool(self._l.held)
+
+    def held_fresh(self) -> bool:
+        """The STRONG check, used immediately before an entry order: a server-side renew. A process that was frozen past its expiry (a paused VM, a stopped container, a stalled monotonic
+        clock) still believes in its local deadline; the server, which owns the clock and the holder record, refuses it here. Never acquires. Any failure is NOT held."""
+        if not self._l.held:
+            return False
+        self._last = self._mono()
+        if not self._l.renew():
+            self.reason = "renew_failed_pre_order"
+            return False
         return bool(self._l.held)
 
     def ensure(self) -> bool:
