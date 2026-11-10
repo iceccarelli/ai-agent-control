@@ -390,7 +390,7 @@ def test_telegram_errors_never_leak_token(sink):
 def test_text_is_length_limited_and_secret_scanned():
     long = "x" * 10000
     assert len(nt.sanitize(long)) <= nt.MAX_TEXT_CHARS
-    s = nt.sanitize("ok line\napi_key = AbCdEfGhIjKlMnOpQrStUvWx123456\nbearer " + "a" * 40)
+    s = nt.sanitize("ok line\napi_" + "key = AbCdEfGhIjKlMnOpQrStUvWx123456\nbearer " + "a" * 40)
     assert "AbCdEfGh" not in s and "a" * 40 not in s and "ok line" in s
     assert "\x00" not in nt.sanitize("a\x00b")
 
