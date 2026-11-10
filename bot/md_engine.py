@@ -35,6 +35,10 @@ class Engine:
         self.last_pong_mono: Dict[str, float] = {}
         self.sub_failures: List[str] = []
         self._unlogged = 0
+        #: market INPUT records (frames and REST exchanges) appended successfully since start. A lock-free progress counter: the audit VIEW records the feed writes every few seconds
+        #: and connection events advance the log WITHOUT any market data, so the log's length is not evidence that the market is being recorded.
+        self.input_count = 0
+        self._uncommitted_inputs = 0     # inputs appended but not yet known durable; they join input_count only once the store has COMMITTED them
 
     # -- live helpers: append then apply, atomically ------------------------------------
 
@@ -63,18 +67,37 @@ class Engine:
                                                 {"event": "store_gap", "unlogged": self._unlogged}))
                 except Exception as exc:  # noqa: BLE001 - still down
                     self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
-                    self._unlogged += 1
+                    self._lost_to_failed_commit()
                     return self.apply(ST.Record(0, kind, w, m, category, conn_id, topic, payload))
                 self._unlogged = 0
                 self.apply(gap)
             try:
                 rec = self.store.append(kind, wall_ms=w, mono_s=m, category=category,
                                         conn_id=conn_id, topic=topic, payload=payload)
+                if kind in (ST.FRAME, ST.REST):
+                    self._uncommitted_inputs += 1
+                self._settle_inputs()
             except Exception as exc:  # noqa: BLE001 - disk full, locked, corrupt: do not die
                 self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
-                self._unlogged += 1
+                self._lost_to_failed_commit()
                 return self.apply(ST.Record(0, kind, w, m, category, conn_id, topic, payload))
             return self.apply(rec)
+
+    def _settle_inputs(self) -> None:
+        """Count appended inputs as progress only once the store has committed them (a batch a failed commit rolls back never happened)."""
+        st = self.store
+        if self._uncommitted_inputs and st is not None and st._pending == 0:
+            self.input_count += self._uncommitted_inputs
+            self._uncommitted_inputs = 0
+
+    def _lost_to_failed_commit(self) -> None:
+        """A failed commit rolls back EVERY row of the open batch, not just the one being appended: all of them are unlogged, so the store_gap marker must say so."""
+        st = self.store
+        lost = int(getattr(st, "last_rollback_lost", 0) or 0)
+        if st is not None:
+            st.last_rollback_lost = 0
+        self._unlogged += max(1, lost)
+        self._uncommitted_inputs = 0
 
     def start_session(self, wall_ms: Union[int, Callable[[], int]],
                       mono_s: Union[float, Callable[[], float]]) -> ApplyOutcome:
@@ -98,7 +121,9 @@ class Engine:
                                       payload=ST.view_payload(view.to_dict(), self.store._next_id - 1))
                 except Exception as exc:  # noqa: BLE001
                     self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
-                    self._unlogged += 1
+                    self._lost_to_failed_commit()
+                else:
+                    self._settle_inputs()
             return view
 
     # -- the one state transition ------------------------------------------------------------

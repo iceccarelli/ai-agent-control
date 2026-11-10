@@ -179,6 +179,12 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
     recorder = record.get("recorder")
     if isinstance(recorder, dict):
         line["recorder_state"] = recorder.get("state")
+        for key in ("age_s", "growth_age_s", "heartbeat_errors"):
+            if isinstance(recorder.get(key), (int, float)):
+                line["recorder_" + key] = recorder[key]
+        for key in ("recorder_restarts", "recorder_watchdog_kills", "recorder_consecutive_failures"):          # already prefixed: the supervisor's own counters
+            if isinstance(recorder.get(key), (int, float)):
+                line[key] = recorder[key]
         for key in ("records", "free_mb", "capacity_rows", "max_fillable_usd", "chain_n"):
             if isinstance(recorder.get(key), (int, float)):
                 line["recorder_" + key] = recorder[key]
@@ -207,6 +213,35 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
 #: A recorder status file older than this is a recorder that has stopped reporting
 #: (it writes every 30 s); five minutes is ten missed beats.
 RECORDER_STALE_S = 300.0
+#: A recorder whose HEARTBEAT is fresh but whose log has not grown for this long is alive and not persisting (a dead feed, a wedged writer, a full volume). BTCUSDT's books update many
+#: times a second, so five minutes without one new record is not a quiet market.
+RECORDER_NO_GROWTH_S = 300.0
+
+
+def _supervisor_counters(status_path: str) -> Dict[str, Any]:
+    """The supervisor's own restart counters (numbers only), for the history line: a recorder that is RECORDING at every sample but keeps being restarted is a fault the state alone hides."""
+    sup = os.path.join(os.path.dirname(os.path.abspath(status_path)), "supervisor_status.json")
+    try:
+        with open(sup, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {k: d.get(k) for k in ("recorder_restarts", "recorder_watchdog_kills", "recorder_consecutive_failures") if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _supervisor_summary(status_path: str) -> str:
+    """What the supervisor (PID 1 of the runner) knows about the recorder, from ``supervisor_status.json`` in the recorder's own directory. Never raises."""
+    sup = os.path.join(os.path.dirname(os.path.abspath(status_path)), "supervisor_status.json")
+    try:
+        with open(sup, encoding="utf-8") as fh:
+            d = json.load(fh)
+        alive = "running" if d.get("recorder_pid") else "not running"
+        return (f"supervisor: recorder {alive}, restarts {d.get('recorder_restarts')}, consecutive failures {d.get('recorder_consecutive_failures')}, "
+                f"last exit {d.get('recorder_last_exit')}, watchdog kills {d.get('recorder_watchdog_kills', 0)}")
+    except FileNotFoundError:
+        return "no supervisor status file"
+    except Exception as exc:  # noqa: BLE001
+        return f"supervisor status unreadable ({type(exc).__name__})"
 
 
 def recorder_observation(path: Optional[str], *, now: Optional[float] = None
@@ -227,10 +262,21 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None
         store = st.get("store") or {}
         cap = st.get("capacity") or {}
         fault = store.get("fault")
+        progress = st.get("progress") or {}
+        growth_age = progress.get("growth_age_s")
         state = ("STALE" if age > RECORDER_STALE_S
                  else "FAULT" if fault or not feed.get("threads_alive", False)
+                 else "NOT_PERSISTING" if isinstance(growth_age, (int, float)) and growth_age > RECORDER_NO_GROWTH_S
                  else "RECORDING")
-        return {"state": state, "age_s": round(age, 1), "records": store.get("records"),
+        detail = None
+        if state == "STALE":
+            detail = (f"recorder_status.json is {age:.0f} s old (limit {RECORDER_STALE_S:.0f} s): the recorder has stopped reporting; "
+                      f"{_supervisor_summary(path)}")[:300]
+        elif state == "NOT_PERSISTING":
+            detail = (f"the recorder reports (heartbeat {age:.0f} s old) but its log has not grown for {growth_age:.0f} s "
+                      f"(limit {RECORDER_NO_GROWTH_S:.0f} s): nothing is being persisted; {_supervisor_summary(path)}")[:300]
+        return {"state": state, "age_s": round(age, 1), "detail": detail, "growth_age_s": growth_age,
+                "heartbeat_errors": (st.get("heartbeat") or {}).get("status_errors"), **_supervisor_counters(path), "records": store.get("records"),
                 "free_mb": None if store.get("free_bytes") is None else round(store["free_bytes"] / 1048576.0, 1),
                 "fault": fault, "capacity_rows": cap.get("rows"),
                 "max_fillable_usd": cap.get("max_displayed_fillable_notional_usd"),

@@ -111,3 +111,84 @@ Every work item must close with:
 - Remaining owner-only action stated as a precise command or dashboard operation.
 
 Do not return another broad architecture proposal, a dashboard, a speculative ML layer, a new worker, or a documentation-only PR unless it unblocks one of the ranked priorities. The shortest path to more money is the path with the best verified net edge and the least risk of losing capital—not the largest codebase.
+
+## 9. Execution log (one status system: this file)
+
+### Phase A: recorder staleness (branch `claude/money-phase-a-recorder`, base `70be57e`)
+
+**Root-cause classes found in the repository (offline, reproduced by `tests/test_recorder_liveness.py` and `tests/test_runner_supervisor.py`; none of them is yet proven to be what the Fly machine hit, see the read-only checks below):**
+
+| # | Fault | Effect on `recorder_status.json` | Fix |
+|---|---|---|---|
+| 1 | `Recorder.run` was one unguarded loop; an `OSError` writing the status (a full volume) or in `prune_capacity` ended the process | process dies, supervisor backoff (capped 300 s = the monitor's stale limit) leaves the file stale | heartbeat write is guarded and counted (`heartbeat.status_errors`); slow work isolated |
+| 2 | capacity capture and prune ran on the heartbeat thread | one slow capture froze the heartbeat: `STALE` while the feed was recording | capacity, prune and the row count now run on a maintenance thread |
+| 3 | every status write called `store.count()` (flush + `SELECT COUNT(*)` over every segment of a ~1.5 GB/day log) | seconds of scan and writer contention on a 1-vCPU machine, on the heartbeat path | heartbeat uses an O(1) lock-free `newest_id()`; the exact count is refreshed every 10 min off-thread |
+| 4 | a recorder alive but silent was never restarted (the supervisor only saw process exit) | stale for ever | supervisor watchdog: terminate and restart after 600 s without a rewrite, under the same capped backoff, counted in `recorder_watchdog_kills` |
+| 5 | no way to tell "alive and persisting" from "alive and not persisting" | a fresh heartbeat over a dead log looked `RECORDING` | status `progress.growth_age_s`; the monitor reports `NOT_PERSISTING` after 300 s without a new record (still alerts) |
+| 6 | `STALE` carried no detail and the age was dropped | the alert read "no detail recorded" | `STALE` / `NOT_PERSISTING` now say the age and what the supervisor reports (running or not, restarts, last exit, watchdog kills); the history line keeps the age |
+
+Alert semantics are unchanged: three cycles not `RECORDING` still raise `recorder_down`; a stale status is never reported healthy and a data gap stays a gap.
+
+**Not proven (needs the Fly machine; read-only, valid in a container without `ps`):**
+
+```bash
+fly ssh console -a carry-drill -C "sh -c 'cat /data/market/supervisor_status.json; echo; cat /data/market/recorder_status.json | head -c 1800'"
+fly ssh console -a carry-drill -C "python3 -c \"import os;[print(p, open('/proc/'+p+'/cmdline').read().replace(chr(0),' ')) for p in sorted(os.listdir('/proc')) if p.isdigit()]\""
+fly ssh console -a carry-drill -C "sh -c 'df -h /data; du -sh /data/market /data/runs /data/shadow /data/monitor /data/mainnet 2>/dev/null; ls -la --time-style=full-iso /data/market | tail -12'"
+fly ssh console -a carry-drill -C "tail -n 6 /data/monitor/monitor.jsonl"
+fly logs -a carry-drill --no-tail | tail -80
+```
+
+How to read them: `supervisor_status.json` `recorder_pid` null with a growing `recorder_restarts` and a non-zero `recorder_last_exit` means a crash loop (look for `ENOSPC`/permission errors in the logs); a live pid with an old `recorder_status.json` means a hung recorder (fault 2 or 4); a fresh status with a flat `store.segments` listing means not persisting (fault 5); a full `/data` volume (the drill volume is 5 GB, the depth log retains 2 days) points at fault 1.
+
+**Deployed status: NOT deployed.** The Fly machine still runs the 2026-11-05 image. The fixes take effect only after the owner redeploys `carry-drill` from the merged source and the running machine is verified (see "Legacy apps" in `bot/RUNBOOKS.md`).
+
+### Phase B: read-only decision without execution authority (branch `claude/money-phase-b-readonly-eval`, base `70be57e`)
+
+- **Finding (verified in code):** `run_once(dry_run=True)`, which `evaluate` calls, loaded the capability file, the grant and the dedicated credentials BEFORE reading funding or computing the economics verdict, so the owner could not ask "should I trade?" without holding the authority to trade. The `evaluate` output also only described the session class, not a decision.
+- **Fix:** `evaluate_readonly` (the single implementation; `run_once(dry_run=True)` delegates to it before any authority check). It needs no grant, no capability and no lease, writes nothing, and returns one of `WAIT_FOR_DATA`, `SKIP_NO_OPPORTUNITY`, `REJECT_UNECONOMIC`, `INCONCLUSIVE`, `ELIGIBLE_FOR_OWNER_TESTNET_DECISION` with an `authority` snapshot and `authority_gaps`. Eligibility is explicitly not authority. Dedicated Testnet credentials remain required only to build the client and read the account's fee tier; without them the answer is `WAIT_FOR_DATA`.
+- **Unchanged (tested):** the order-capable cycle still refuses without the capability file and the grant, and no gate was weakened.
+- **Not yet done in this decision engine:** the full decision RECORD (data and code digests, candidate and specification digest, capital basis, worst credible loss) is only partly present in the evaluate output; making it a durable evidence event is the next Phase B item.
+
+### Operating contract (2026-11-10, owner directive)
+
+The binding rules are in `CLAUDE.md` section "Operating contract": one integration owner, ONE mission PR (this file's execution log is the single status system), no PR per phase, no stopping after a PR is opened, mandatory read-only subagents (recorder, research, execution, capital/accounting, red team), full self-testing on the exact head SHA, permitted self-merge only after every acceptance gate, continuous work through the backlog, money-first acceptance and no unauthorised production or trading action. PR #245 is the mission PR; #244 (empty) and #246 (carried in #245) were closed as superseded.
+
+### Integration round 2 (mission branch `claude/money-phase-a-recorder`, PR #245): independent review dispositions
+
+Five read-only reviews (recorder, quant research, execution, capital/accounting, red team) were run; each finding was checked in the code before acting. Dispositions:
+
+**Fixed and tested (each reproduced by a failing test first, or by an end-to-end run):**
+- Recorder `status()` waited on the engine lock through `feed.view()`; it now uses cached refusals (heartbeat test holds the lock).
+- `NOT_PERSISTING` could not fire with dead feeds because the feed writes an audit VIEW record every 5 s and CONN events: progress now counts committed market input (FRAME/REST) only.
+- A failed commit (ENOSPC) left `_next_id` ahead and the row in the open transaction: it now rolls back to the last durable id; `newest_id` is the committed id.
+- Disk budget: age-based retention keeps `retention_days + 1` segments (about 4.5 GB at 1.5 GB/day, never fitting a 5 GB volume with a 512 MB reserve): an emergency prune (superseded in round 3: now default-deny, see below) removes the oldest closed segment (checkpointed, counted in `emergency_prunes`) when the reserve is breached. The 1.5 GB/day figure is from the repository's docs, NOT measured here; the owner's `du` output decides the retention setting.
+- Watchdog kills no longer reset the supervisor backoff; a slow start writes a heartbeat first; failed status writes are logged to stderr and leave no temp file; restart/kill counters reach the history line and raise a `recorder_restarting` alert even when every sample says RECORDING.
+- A stray `bot/recorder_status.json` (written by my first, broken supervisor test) was committed in error: removed and ignored.
+- `evaluate` exit codes distinguish a decision (0: eligible, reject, skip) from a failure to decide (3: wait for data, inconclusive); the output carries `data_scope: TESTNET_DATA_NOT_MAINNET_EXPECTANCY`.
+- Control-centre identities (reproduced on a filled run with slippage, adverse selection and funding): the producer's `realised_gross_usd` contained the funding line (consumer then added it again) and the checks ignored modelled slippage; the ledger's liquidation-value unrealised was compared with the portfolio's mark-to-market. Producer and consumer now share one definition (see RUNBOOKS "Identity"); `exit_adjustment_usd` is stated explicitly.
+- Capital book: the session is parked with a conservative placeholder BEFORE execution (a crash after orders is still settled: loss debited, gain never credited); a different unsettled session is never overwritten; a transfer declared before a session parked is not subtracted from it; only a verified credited gain breaks a losing streak; `capital --ack-drawdown` is the owner's explicit resume after a drawdown stop; constants are pinned against the Testnet manifest limits.
+
+**Checked in code and NOT confirmed (no change):**
+- "reconcile invents fills into the session net": the session ledger is fed only from the venue's execution rows (`feed_ledger`, provenance MEASURED); `recon:` fills affect the engine's group state only.
+- "closed orders are never read": `openOnly=1` returns open AND recent closed orders (executor docstring, Bybit semantics) and the per-order lookup also reads `/v5/order/history`.
+
+**Open, repository-side, not yet done (stated, not hidden):**
+- Funding is not read per session (`rec["net"]["funding_usd"]` is None): it needs the venue's `execType=Funding` rows booked with the verified sign convention against a real row, and the account transaction-log cross-check (the dedicated key's permission check currently refuses Wallet-class rights: an owner decision).
+- Per-leg execution measurements (reference bid/ask, order timestamps, cancel latency, slippage vs reference, effective fee) are not recorded, so maker-vs-taker cannot be evaluated on real fills; entry is always taker/taker.
+- Manual `ms_testnet_session.py execute` and several legacy tools (`drill.py --arm`, `close_testnet_short.py --arm`, `testnet_session.py`, ...) are order-capable without the shared lease; the scheduled drill workflow is off unless `CARRY_DRILL_ENABLED=true` (keep it unset).
+- The quantitative competition has no winner: only cash-and-carry and funding-dispersion have evaluators that can run, and both reach at most INSUFFICIENT_DATA on the committed corpus; cross-interval, basis, RV and microstructure candidates are specification-only. A fair common-data run needs the owner's 457-day backfill and the inventory output. Break-even funding per settlement (repo functions, taker/taker, 31.4 bps round trip, 0.259 bps/settlement in-sample mean): about 1.05 bps over 10 days, so the in-sample mean is far below the hurdle; an owned-spot overlay (11.4 bps round trip) needs about 0.38 bps over 10 days. These are modelled/venue-stated inputs, none measured.
+- Duplicated net formulas in `ms_pipeline.LocalLedgerAdapter` and `ms_replay.LocalLedger` (the `realised` field means gross in one and net in the other) should call `canonical_net` only.
+
+
+### Integration round 3 (same PR): final adversarial review dispositions (no CRITICAL finding)
+
+**Fixed and tested:**
+- HIGH: the emergency prune could delete the oldest closed day with no off-volume copy, converting a disk-pressure event into permanent loss of unrecoverable evidence. It is now DEFAULT-DENY: `MarketStore.emergency_prune(may_prune)` deletes only a day for which a predicate proves a verified copy (`md_seal.backed_up`: receipts chain verifies, receipt exists, the copy's sha256 equals the receipt, the receipt's last_chain equals the local day's), at most one day per minute, never when `--retention-days 0`. The recorder takes `--emergency-backup-dir` and `--emergency-receipts`; without them nothing is deleted and `store.emergency_prunes_denied` counts the refusals (a stalled recorder in FAULT is the lesser loss). `md_seal check` still passes after an emergency prune (test). `tools/md_seal.py` is now in the drill image.
+- MED: a failed commit rolls back the WHOLE open batch, but the engine counted one unlogged row and had already counted the batch as progress. The store reports the rows a rollback dropped (`last_rollback_lost`), the engine's `store_gap` marker counts all of them, and `input_count` advances only once the store has committed the rows.
+- MED: a deposit declared after the starting cash was read but before the session was parked was excluded from the delta (a phantom gain). `park(..., cash_read_ms=)` stamps the instant before the venue cash read and `settle` compares transfers against it; the opposite error (a late declaration of a deposit that was already in the cash) only understates the delta, i.e. debits conservatively.
+- MED: `evaluate --record-to` could write inside the checkout, `bot/state` or the owner's `~/.ai-agent-control` (realpath, symlinks included): refused. The outbox is closed in `finally`.
+- MED: a full volume stops the status rewrite, which made the supervisor watchdog (status mtime) kill a perfectly alive recorder in a loop. A failed status write now touches the existing file's mtime (metadata only); the CONTENT stays stale so the monitor (which reads `now_ms`) still raises STALE.
+- MED: a structural test pins that `acknowledge_halt` / `acknowledge_drawdown` are reachable only from the owner's `capital --ack-*` CLI branch, never from `loop` or `run_once`.
+
+**Noted, not changed:** the read-only `evaluate` builds the same authenticated client class as the executor (it needs no key to run its public reads, and its read-only path places no order); a public-only stub client would be a further hardening. A parked placeholder session reports `UNEXPLAINED_CASH` only when funding was read, which a placeholder never claims, so a crashed session settles as a loss or an unverified gain, never as a verified profit.

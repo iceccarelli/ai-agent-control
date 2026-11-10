@@ -24,6 +24,7 @@ import fcntl
 import hashlib
 import json
 import math
+import re
 import os
 import shutil
 import signal
@@ -234,10 +235,136 @@ def _noop_state(_state: str, _source: str) -> None:
     return None
 
 
+# ---------------------------------------------------------------------------------------------------- the read-only decision (needs NO execution authority)
+EVAL_DEFAULT_MAX_HOLD_S = 3300           # the grant default; only used to bound the hold when no grant exists
+DECISIONS = ("WAIT_FOR_DATA", "SKIP_NO_OPPORTUNITY", "REJECT_UNECONOMIC", "INCONCLUSIVE", "ELIGIBLE_FOR_OWNER_TESTNET_DECISION")
+
+
+def authority_snapshot(now_ms: int, env: Mapping[str, str]) -> Dict[str, Any]:
+    """What authority exists RIGHT NOW, described, never created and never required: reads the capability file and the grant file (both read-only), looks at credential PRESENCE only."""
+    out: Dict[str, Any] = {"capability": "ABSENT", "capability_problems": [], "grant": "ABSENT", "grant_problems": [], "credentials": TT.TestnetCredentials.presence(env),
+                           "lease": "NOT_CHECKED (a read-only evaluation never touches the executor lease)", "grant_view": None, "capability_symbols": None}
+    try:
+        manifest, st = S._load_capability_manifest()
+    except Exception as exc:                                         # noqa: BLE001
+        manifest, st = None, {"reasons": [type(exc).__name__]}
+    if manifest is None:
+        out["capability_problems"] = list(st.get("reasons", []))[:4]
+        return out
+    out["capability"], out["capability_symbols"] = "VALID", list(manifest.get("symbol_allowlist", []))
+    out["candidate_id"], out["spec_digest"] = manifest.get("candidate_id"), manifest.get("spec_digest")
+    g, why = load_grant(now_ms, manifest)
+    if g is None:
+        out["grant_problems"] = list(why)[:4]
+    else:
+        out["grant"], out["grant_view"] = "VALID", {k: g[k] for k in ("symbols", "max_notional_usd", "max_hold_s", "min_funding_bps", "allow_mechanics_sessions") if k in g}
+    return out
+
+
+def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, symbol: Optional[str] = None, notional_usd: Any = None,
+                      min_funding_bps: Any = None) -> Dict[str, Any]:
+    """The moment-of-decision economics, with NO execution authority: no grant, no capability, no lease, no state directory, no order, nothing written.
+
+    It reads the venue's public rows, books and funding, the signed fee-rate (when the dedicated credentials exist; otherwise the fee tier stays ASSUMED and the verdict can never be a
+    PROFIT_CANDIDATE), walks the books at the proposed size, runs the ONE economic model and says WHY. A grant or capability that happens to exist only supplies defaults (symbol, size,
+    the owner's funding floor); their absence changes nothing about the answer. ELIGIBLE_FOR_OWNER_TESTNET_DECISION is a statement about economics, not an authorisation: executing still
+    needs the owner's capability, grant, executor lease, risk approval and venue-flat proof (listed under ``authority_gaps``)."""
+    clock = clock or (lambda: int(time.time() * 1000))
+    now = int(clock())
+    auth = authority_snapshot(now, env)
+    gv = auth["grant_view"] or {}
+    sym = symbol or (gv.get("symbols") or [None])[0] or (auth["capability_symbols"] or [None])[0] or "BTCUSDT"
+    gaps = [g for g, ok in (("CAPABILITY_FILE", auth["capability"] == "VALID"), ("UNATTENDED_GRANT", auth["grant"] == "VALID"),
+                            ("DEDICATED_TESTNET_CREDENTIALS", auth["credentials"]["dedicated_key_present"] and auth["credentials"]["dedicated_secret_present"])) if not ok]
+    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
+
+    def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
+        res = _res("EVALUATED", why, decision=decision, **{**base, **kw})
+        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD)
+        return res
+    if not re.fullmatch(r"[A-Z0-9]{3,20}", str(sym)):
+        return done("WAIT_FOR_DATA", ["SYMBOL_INVALID"])
+    try:
+        notional = (D(str(notional_usd)) if notional_usd is not None else (D(str(gv["max_notional_usd"])) if "max_notional_usd" in gv
+                                                                           else D(str(AD.AGGREGATE_CEILING_USD)) * CC.INITIAL_FRACTION)).quantize(D("0.01"))     # one canonical spelling: 200 == 200.0
+        floor = float(min_funding_bps) if min_funding_bps is not None else float(gv.get("min_funding_bps", 0.0))
+    except (ValueError, ArithmeticError, TypeError):
+        return done("WAIT_FOR_DATA", ["EVALUATION_PARAMETERS_INVALID"])
+    if not (0 < notional <= D(str(AD.AGGREGATE_CEILING_USD))) or not (math.isfinite(floor) and floor >= 0):
+        return done("WAIT_FOR_DATA", ["EVALUATION_PARAMETERS_OUT_OF_RANGE"], notional_usd=str(notional))
+    base.update(notional_usd=str(notional), owner_funding_floor_bps=floor)
+    if not (auth["credentials"]["dedicated_key_present"] and auth["credentials"]["dedicated_secret_present"]):
+        return done("WAIT_FOR_DATA", ["NO_DEDICATED_CREDENTIALS_FOR_THE_PUBLIC_CLIENT: the Testnet client needs them to be built; they are used here only for public reads and the signed fee-rate READ"])
+    try:
+        rate, nxt = fetch_funding(env, inner, clock, sym)
+    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, KeyError, IndexError, ValueError, TypeError) as exc:
+        return done("WAIT_FOR_DATA", [f"FUNDING_READ_FAILED:{type(exc).__name__}"])
+    pseudo = {"min_funding_bps": floor, "max_hold_s": int(gv.get("max_hold_s", EVAL_DEFAULT_MAX_HOLD_S)), "allow_mechanics_sessions": False}
+    go, hold_s, reason = funding_decision(rate, nxt, now, pseudo)
+    secs = (int(nxt) - now) / 1000.0
+    base.update(funding_bps=rate * 1e4, seconds_to_settlement=round(secs, 1), funding_check=reason)
+    if secs < MIN_SECONDS_TO_SETTLEMENT or int(math.ceil(secs)) + EXIT_MARGIN_S > pseudo["max_hold_s"]:
+        return done("SKIP_NO_OPPORTUNITY", [reason])                  # no hold across a settlement is possible now: there is nothing to price
+    hold_for_edge = hold_s or int(math.ceil(secs)) + EXIT_MARGIN_S
+    try:
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()))
+        verdict = EG.evaluate_edge(inp)
+    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
+        return done("WAIT_FOR_DATA", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
+    edge = verdict.as_dict()
+    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms))
+    if verdict.session_class == EG.PROFIT_CANDIDATE and go:
+        return done("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", [reason, "ECONOMICS_CLEAR_THE_HURDLE: eligibility is not authority; see authority_gaps"], session_class="PROFIT_SEEKING")
+    if verdict.session_class == EG.REJECTED:
+        return done("REJECT_UNECONOMIC", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
+    if verdict.session_class == EG.PROFIT_CANDIDATE:                  # economics clear, the owner's own funding floor does not
+        return done("SKIP_NO_OPPORTUNITY", [reason], session_class=None)
+    return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
+
+
+def _decision_dir_refusal(directory: str) -> Optional[str]:
+    """A decision record is evidence, never state: refuse a directory that is (or is inside) the repository, the bot's state directory or the owner's engine/authority root (realpath, so a
+    symlink cannot smuggle it in). Writing evidence files next to a grant or capability would also muddy what the owner's file-integrity checks see."""
+    real = os.path.realpath(directory)
+    home = os.path.expanduser("~")
+    forbidden = [os.path.dirname(BOT), os.path.join(BOT, "state"), os.path.join(home, ".ai-agent-control")]
+    for f in forbidden:
+        fr = os.path.realpath(f)
+        if real == fr or real.startswith(fr + os.sep):
+            return "DIRECTORY_INSIDE_" + os.path.basename(f.rstrip(os.sep)).upper().replace("-", "_")
+    return None
+
+
+def record_decision(directory: str, record: Mapping[str, Any], at_ms: int) -> str:
+    """Append a decision record to the durable outbox under its own id. STORED / DUPLICATE / REFUSED:<why>. A decision record is evidence, never authority; the outbox refuses a payload that
+    looks like a secret, and the same decision id with different content is a conflict, never an overwrite. The directory must be OUTSIDE the repository, bot/state and the engine root."""
+    import exec_evidence as XE
+    bad = _decision_dir_refusal(directory)
+    if bad is not None:
+        return "REFUSED:" + bad
+    ob = None
+    try:
+        ob = XE.Outbox(directory)
+        before = ob.pending
+        ob.append("DECISION", {"stage": "DECISION_RECORDED", **record}, session_id=None, event_id=EL.event_id("decision", "DECISION", str(record["decision_id"]), 0),
+                  occurred_at_ms=int(record.get("observed_ms") or at_ms))             # the OBSERVATION time, so the same decision stored twice is byte-identical (a duplicate, never a conflict)
+        return "STORED" if ob.pending > before else "DUPLICATE"
+    except Exception as exc:                                                    # noqa: BLE001
+        return f"REFUSED:{type(exc).__name__}"
+    finally:
+        if ob is not None:
+            try:
+                ob.close()
+            except Exception:                                                   # noqa: BLE001
+                pass
+
+
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
              out: Callable[[str], None] = print, state_root: Optional[str] = None, engine_root: Optional[str] = None, lease: Any = None,
              on_state: Callable[[str, str], None] = _noop_state, on_event: Callable[..., None] = _noop_event, dry_run: bool = False, **_ignored: Any) -> Dict[str, Any]:
     clock = clock or (lambda: int(time.time() * 1000))
+    if dry_run:                                                       # the owner's read-only `evaluate`: economics only, BEFORE any authority check (it needs none and must never create any)
+        return evaluate_readonly(env, inner=inner, clock=clock, symbol=_ignored.get("symbol"), notional_usd=_ignored.get("notional_usd"), min_funding_bps=_ignored.get("min_funding_bps"))
     sleep = sleep or time.sleep
     now = int(clock())
     on_state("DATA_CHECK", "cycle_start")
@@ -268,15 +395,18 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     session_class, why_not = classify_session(verdict, D(str(rate)), g)
-    if dry_run:                                                       # the owner's read-only `evaluate`: the verdict and the class, never a session
-        return _res("EVALUATED", why_not, funding_bps=rate * 1e4, hold_s=hold_s, session_class=session_class, edge=verdict.as_dict())
+    drec = EL.decision_record({"decision": "SESSION_" + str(session_class), "symbol": sym, "notional_usd": str(g["max_notional_usd"]), "owner_funding_floor_bps": g["min_funding_bps"],
+                               "funding_bps": rate * 1e4, "hold_s": hold_s, "why": why_not, "edge": verdict.as_dict(), "inputs_digest": inp.digest(), "observed_ms": inp.now_ms,
+                               "authority": {"candidate_id": manifest.get("candidate_id"), "spec_digest": manifest.get("spec_digest")}}, code_sha=env.get("GIT_SHA"),
+                              margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD)
+    did = drec["decision_id"]                                         # the SAME record shape the read-only evaluation produces: a session is traceable to the decision that preceded it
     if session_class is None:
-        return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict())
+        return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict(), decision_id=did)
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
     try:
-        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event)
+        return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event), "decision_id": did}
     finally:
         _ACTIVE["dir"] = None
 
@@ -304,6 +434,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
 
     if _STOP.is_set():
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
+    cash_read_ms = int(time.time() * 1000)                           # BEFORE the venue cash read inside preflight: a transfer declared after this instant is not provably in the starting cash
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
     pf = ES.read_json(os.path.join(d, "preflight.json")) or {}
@@ -358,6 +489,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
+    if not book.park(os.path.basename(d), usdt_now, None, False, False, cash_read_ms=cash_read_ms):          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
+        return _res("SKIPPED", ["CAPITAL_PENDING_UNSETTLED_OR_CASH_UNKNOWN"], state_dir=d)
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
 
@@ -377,7 +510,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     net = rec.get("net") or {}
     fees, price, fund = (CC._d(net.get(k)) for k in ("fees_usd", "price_pnl_usd", "funding_usd"))
     known = None if (fees is None or price is None) else price - fees + (fund or D(0))
-    book.park(os.path.basename(d), usdt_now, known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT flat cash read, never from fill arithmetic alone
+    book.update_pending(os.path.basename(d), known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT cash read, never from fill arithmetic alone
     summary["allocation"] = alloc.as_dict()
     for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT")):
         emit(evt)
@@ -833,7 +966,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             if res.get("edge"):
                 tel.event("OPPORTUNITY_EVAL", {"result": res["result"], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")), "edge": evidence_edge(res["edge"]),
                                                "why": list(res.get("why", []))[:6]}, sid)
-            tel.event("DECISION", {"result": res["result"], "why": list(res.get("why", []))[:6], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")),
+            tel.event("DECISION", {"decision_id": res.get("decision_id"), "result": res["result"], "why": list(res.get("why", []))[:6], "session_class": res.get("session_class"), "funding_bps": _r4(res.get("funding_bps")),
                                    "flat_verified": res.get("flat_verified"), "realised_costs": evidence_net(res.get("net")), "revoked_reason": res.get("revoked_reason")}, sid)
         except Exception:                                            # noqa: BLE001
             pass
@@ -988,9 +1121,14 @@ def _parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
     cp.add_argument("--root", default=DEFAULT_ROOT)
     cp.add_argument("--ack-halt", action="store_true")
+    cp.add_argument("--ack-drawdown", action="store_true", help="after YOU reviewed the losses that hit the drawdown stop: resume from the current verified basis (a new drawdown peak)")
     cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
     cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
-    sub.add_parser("evaluate", help="READ-ONLY: what the economics gate says right now (never starts a session; the only order path is `loop`)")
+    ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
+    ev.add_argument("--symbol", help="default: the grant's / capability's first symbol, else BTCUSDT")
+    ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40% of the ceiling)")
+    ev.add_argument("--min-funding-bps", help="the owner's extra funding floor; default: the grant's, else none (the economics gate derives the real requirement)")
+    ev.add_argument("--record-to", help="OPT-IN: append the decision record (no authority, no order) to the durable evidence outbox in this directory (outside git); the same decision is never stored twice")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
     for name, helptext in (("status", "print the grant, engine state, markers and last result (no network)"), ("deploy-check", "exit 0 only if a deployment is safe now (fresh DRAINED proof, no active session, no ALERT)")):
@@ -1029,6 +1167,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         cbk = CC.CapitalBook(a.root)
         if a.ack_halt:
             print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        if a.ack_drawdown:
+            print("drawdown acknowledged" if cbk.acknowledge_drawdown() else "no drawdown to acknowledge")
         if a.reserve_fraction is not None:
             print("reserve set" if cbk.set_reserve_fraction(a.reserve_fraction) else "refused: reserve must be between 0 and 0.9")
         if a.declare_transfer:
@@ -1036,9 +1176,12 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "evaluate":
-        res = run_once(e, dry_run=True)
+        res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps)
+        if a.record_to and isinstance(res.get("decision_record"), dict):
+            res["recorded"] = record_decision(a.record_to, res["decision_record"], clock())
         print(json.dumps(res, indent=2, sort_keys=True, default=str))
-        return 0 if res["result"] in ("EVALUATED", "SKIPPED") else 3
+        # exit contract (a wrapper or cron can tell a DECISION from a failure to decide): 0 = a decisive answer (eligible / reject / skip), 3 = could not decide (wait for data / inconclusive) or any other result
+        return 0 if res.get("decision") in ("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", "REJECT_UNECONOMIC", "SKIP_NO_OPPORTUNITY") else 3
     if a.cmd == "drain":
         return cmd_drain(a.root, clock, a.wait)
     if a.cmd == "deploy-check":

@@ -1231,3 +1231,24 @@ def test_open_legs_are_valued_at_the_exit_side_of_the_book_less_the_taker_exit_f
     assert p["net"] == pytest.approx(base["net"] + perp + spot)
     assert p["realised"] + p["unrealised"] == pytest.approx(p["net"])
     assert led.symbol_pnl("XUSDT")["net"] == pytest.approx(p["net"])
+
+
+def test_every_control_centre_accounting_identity_passes_on_a_filled_run_with_slippage_and_adverse_selection(happy):
+    """REPRODUCED (review, then here): the control centre's gross_minus_fees ignored slippage and adverse selection, and ledger_components added the funding the producer had already put inside
+    realised_gross_usd and omitted slippage: two FAILs on a run whose numbers are correct. The consumer and the producer must share ONE net definition."""
+    series, pr = happy
+    assert pr.result.pnl["adverse_selection"] > 0 and art(pr, "replay_report.json")["slippage_usd"] > 0 and art(pr, "ledger_pnl.json")["funding_usd"] != 0
+    acc = cc_state(pr)["accounting"]
+    states = {c["id"]: c["state"] for c in acc["checks"]}
+    assert "gross_minus_fees" in states and "ledger_components" in states
+    assert not [k for k, v in states.items() if v == "FAIL"], states
+    assert states["gross_minus_fees"] == "PASS" and states["ledger_components"] == "PASS", states
+    assert acc["integrity"] == "PASS"
+
+
+def test_the_ledger_gross_is_the_price_result_alone_so_funding_is_counted_once(happy):
+    series, pr = happy
+    lp = art(pr, "ledger_pnl.json")
+    slip = lp["taker_slippage_usd"] + lp["adverse_selection_usd"]
+    # realised gross = realised price result at mid; net = gross + funding - fees - modelled slippage; funding is a separate line and is never inside the gross
+    assert lp["realised_gross_usd"] + lp["funding_usd"] - lp["fees_usd"] - slip == pytest.approx(lp["realised_net_usd"], rel=1e-9, abs=1e-6)

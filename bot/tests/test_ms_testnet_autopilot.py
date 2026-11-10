@@ -1222,3 +1222,198 @@ def test_the_loop_routes_lifecycle_events_into_the_real_outbox_with_deterministi
     with pytest.raises(XE.EventConflict):                                                                                  # the same id for a DIFFERENT fact is refused (and quarantined), never overwritten
         tel.event("PLAN", {"stage": "PLAN_CREATED", "source": "LOCAL", "notional_usd": "999.0000"}, sid, event_id=eid)
     assert tel.pending() == 1
+
+
+# ---------------------------------------------------------------- Phase B: the read-only decision needs NO execution authority
+def _tree(root):
+    out = {}
+    for dp, _d, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(dp, f)
+            out[p] = (os.stat(p).st_size, os.stat(p).st_mtime_ns)
+    return out
+
+
+def _evaluate(w, **kw):
+    return AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), dry_run=True, **kw)
+
+
+def _measured_world(w, funding="0.0080"):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = funding, 600_000
+
+
+def test_evaluate_needs_no_grant_no_capability_and_no_lease_and_writes_nothing(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)                                    # NO capability file, NO grant
+    _measured_world(w)
+    assert not os.path.exists(w.cap_path) and not os.path.exists(AP.grant_path())
+    before = _tree(str(tmp_path))
+    w.fake.requests.clear()
+    res = _evaluate(w, notional_usd="200")
+    assert res["result"] == "EVALUATED" and res["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION", res
+    assert res["authority"]["grant"] == "ABSENT" and res["authority"]["capability"] == "ABSENT" and res["read_only"] is True
+    assert {"CAPABILITY_FILE", "UNATTENDED_GRANT", "EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"} <= set(res["authority_gaps"])        # eligibility is NOT authority
+    assert "eligibility is not authority" in " ".join(res["why"]) and res["edge"]["session_class"] == "PROFIT_CANDIDATE"
+    assert not [r for r in w.fake.requests if r[0] == "POST"], "a read-only evaluation placed an order"
+    assert _tree(str(tmp_path)) == before, "a read-only evaluation wrote something"
+
+
+def test_the_decision_classes_are_unambiguous_and_economics_decide_them(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w, funding="0.0001")                                             # 1 bp: far below the cost chain
+    assert _evaluate(w, notional_usd="200")["decision"] == "REJECT_UNECONOMIC"
+    _measured_world(w)
+    w.fake.fee_rates = None                                                          # the key cannot read its own fee tier: ASSUMED, so never a PASS even at 80 bps
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and any("ASSUMED_INPUTS_CANNOT_PASS" in x for x in res["why"])
+    _measured_world(w)
+    res = _evaluate(w, notional_usd="200", min_funding_bps="100")                    # the owner's own floor is above this funding: economics clear, the floor does not
+    assert res["decision"] == "SKIP_NO_OPPORTUNITY" and res["edge"]["session_class"] == "PROFIT_CANDIDATE"
+    w.fake.funding_in_ms = 30_000                                                    # a settlement 30 s away cannot be held across
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "SKIP_NO_OPPORTUNITY" and "edge" not in res and res["funding_check"].startswith("SETTLEMENT_TOO_CLOSE")
+
+
+def test_missing_credentials_or_bad_parameters_are_wait_for_data_and_send_nothing(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    w.fake.requests.clear()
+    res = AP.run_once({}, inner=w.fake, clock=w.clock.now, dry_run=True)
+    assert res["decision"] == "WAIT_FOR_DATA" and "NO_DEDICATED_CREDENTIALS" in res["why"][0] and not w.fake.requests
+    for kw, why in (({"notional_usd": "501"}, "EVALUATION_PARAMETERS_OUT_OF_RANGE"), ({"notional_usd": "0"}, "EVALUATION_PARAMETERS_OUT_OF_RANGE"), ({"notional_usd": "x"}, "EVALUATION_PARAMETERS_INVALID"),
+                    ({"min_funding_bps": "-1"}, "EVALUATION_PARAMETERS_OUT_OF_RANGE"), ({"symbol": "btc usdt"}, "SYMBOL_INVALID")):
+        r = _evaluate(w, **kw)
+        assert r["decision"] == "WAIT_FOR_DATA" and r["why"] == [why], (kw, r)
+    assert not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_a_grant_changes_the_defaults_never_the_economics(tmp_path, monkeypatch):
+    a = World(tmp_path / "a", monkeypatch, grant=False)
+    _measured_world(a)
+    ra = _evaluate(a, notional_usd="200")                                            # evaluated BEFORE any capability or grant exists (the patched paths are process-wide)
+    b = World(tmp_path / "b", monkeypatch)
+    _measured_world(b)
+    write_grant(b, max_notional_usd=200.0, min_funding_bps=0.5)
+    rb = _evaluate(b)                                                                # defaults come from the grant: BTCUSDT, $200, floor 0.5 bp
+    assert rb["authority"]["grant"] == "VALID" and rb["notional_usd"] == "200.00" and rb["owner_funding_floor_bps"] == 0.5
+    assert ra["decision"] == rb["decision"] and ra["edge"]["digest"] == rb["edge"]["digest"], "the same inputs must give the same economic answer with or without authority"
+    assert "UNATTENDED_GRANT" in ra["authority_gaps"] and "UNATTENDED_GRANT" not in rb["authority_gaps"]
+
+
+def test_the_order_capable_cycle_still_requires_every_authority_gate(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    w.fake.requests.clear()
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"))
+    assert res["result"] == "REFUSED" and any("OWNER_CAPABILITY_FILE" in x for x in res["why"]) and not [r for r in w.fake.requests if r[0] == "POST"]
+    w.write_capability()
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"))
+    assert res["result"] == "REFUSED" and "GRANT_MISSING" in res["why"] and not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_the_evaluate_command_exposes_symbol_notional_and_floor_and_nothing_that_grants_authority():
+    a = AP._parser().parse_args(["evaluate", "--symbol", "ETHUSDT", "--notional-usd", "150", "--min-funding-bps", "3"])
+    assert (a.cmd, a.symbol, a.notional_usd, a.min_funding_bps) == ("evaluate", "ETHUSDT", "150", "3")
+    evaluate = next(sp for sp in AP._parser()._subparsers._group_actions[0].choices.values() if sp.prog.endswith("evaluate"))
+    assert not [o for act in evaluate._actions for o in act.option_strings if any(w in o for w in ("grant", "capability", "lease", "confirm", "execute", "order"))]
+
+
+def test_a_crash_between_execute_and_the_end_of_the_session_leaves_the_cash_pending_for_settlement(w, tmp_path, monkeypatch):
+    """REPRODUCED by review: the capital book was only parked after execute returned; a crash after orders left nothing to settle and the loss was invisible."""
+    _profit_world(w)
+    real_main = S.main
+
+    def dying(argv, **kw):
+        if "execute" in argv:
+            raise RuntimeError("process killed after orders were placed")
+        return real_main(argv, **kw)
+    monkeypatch.setattr(AP.S, "main", dying)
+    eng = str(w.tmp / "eng_crash")
+    with pytest.raises(RuntimeError):
+        AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=eng)
+    p = CC.CapitalBook(eng).load()["pending"]
+    assert p is not None and p["flat_verified"] is False and p["ledger_net_known_usd"] is None, "no conservative placeholder was parked before execution"
+    r = CC.CapitalBook(eng).settle("1")                                        # the venue's cash is thousands lower than this: a LOSS, booked in full
+    assert r["status"] == "SETTLED" and CC.CapitalBook(eng).load()["loss_streak"] == 1
+
+
+# ---------------------------------------------------------------- the durable, reproducible decision record
+def test_every_evaluation_carries_a_decision_record_whose_id_is_reproducible_from_its_inputs(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    r1 = _evaluate(w, notional_usd="200")
+    r2 = _evaluate(w, notional_usd="200")
+    rec1, rec2 = r1["decision_record"], r2["decision_record"]
+    assert rec1["decision_id"].startswith("dec_") and rec1 == rec2, "the same market inputs, size and code must give the same record"
+    assert rec1["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and rec1["fee_tier"] == "MEASURED" and rec1["inputs_ref"] and rec1["edge"]["edge_ref"] and rec1["data_scope"].startswith("TESTNET_DATA")
+    assert rec1["capital_required_usd"] == "232.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
+    assert "inputs_digest" in r1 and len(r1["inputs_digest"]) == 64                                  # the full digest stays in the local result; the record carries a 16-hex reference
+
+
+def test_a_different_market_state_size_fee_tier_or_code_can_never_share_a_decision_id(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    base = _evaluate(w, notional_usd="200")["decision_record"]["decision_id"]
+    assert _evaluate(w, notional_usd="150")["decision_record"]["decision_id"] != base                  # size
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0003", "0.0006")}
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # fee tier
+    _measured_world(w, funding="0.0090")
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # funding observation
+    _measured_world(w)
+    w.clock.sleep(5)
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # a later observation
+    _measured_world(w)
+    w.env = {**w.env, "GIT_SHA": "a" * 40}
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != base                  # code revision
+
+
+def test_the_decision_record_passes_the_evidence_guard_and_is_stored_once_on_explicit_opt_in(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    rec = _evaluate(w, notional_usd="200")["decision_record"]
+    XE.make_event("DECISION", {"stage": "DECISION_RECORDED", **rec}, session_id=None, occurred_at_ms=rec["observed_ms"], event_id=EL.event_id("decision", "DECISION", rec["decision_id"], 0))   # the REAL secret guard
+    d = str(tmp_path / "ob")
+    assert not os.path.exists(d), "evaluate wrote an outbox without the opt-in flag"
+    assert AP.record_decision(d, rec, w.clock.now()) == "STORED"
+    assert AP.record_decision(d, rec, w.clock.now() + 99_000) == "DUPLICATE"                          # the same decision, even much later: byte-identical, never a second record
+    assert XE.Outbox(d).pending == 1
+    assert AP.record_decision(d, {**rec, "decision": "REJECT_UNECONOMIC"}, w.clock.now()).startswith("REFUSED")      # the same id with a different fact is a conflict, never an overwrite
+
+
+def test_every_decision_class_yields_a_valid_record(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    for setup, expect in ((lambda: _measured_world(w, funding="0.0001"), "REJECT_UNECONOMIC"), (lambda: (_measured_world(w), setattr(w.fake, "fee_rates", None)), "INCONCLUSIVE"),
+                          (lambda: (_measured_world(w), setattr(w.fake, "funding_in_ms", 30_000)), "SKIP_NO_OPPORTUNITY")):
+        setup()
+        res = _evaluate(w, notional_usd="200")
+        rec = res["decision_record"]
+        assert rec["decision"] == expect and rec["decision_id"].startswith("dec_")
+        XE.make_event("DECISION", {"stage": "DECISION_RECORDED", **rec}, session_id=None, occurred_at_ms=rec["observed_ms"] or w.clock.now(), event_id=EL.event_id("decision", "DECISION", rec["decision_id"], 0))
+    r = AP.run_once({}, inner=w.fake, clock=w.clock.now, dry_run=True)                               # WAIT_FOR_DATA (no credentials): a record without inputs, still deterministic and valid
+    assert r["decision"] == "WAIT_FOR_DATA" and r["decision_record"]["inputs_ref"] is None and r["decision_record"]["decision_id"].startswith("dec_")
+
+
+def test_the_order_capable_cycle_carries_the_same_decision_id_shape_into_its_result_and_event(w, tmp_path):
+    _profit_world(w)
+    res, _eng = _cycle_eng(w)
+    assert res["result"] == "DONE" and str(res["decision_id"]).startswith("dec_"), res
+    w.clock.sleep(1800)
+    res2, _ = _cycle_eng(w)
+    assert str(res2.get("decision_id", "dec_")).startswith("dec_") and res2["decision_id"] != res["decision_id"]          # a later observation is a different decision
+
+
+def test_a_decision_record_is_refused_inside_the_repository_the_state_dir_or_the_engine_root(tmp_path, monkeypatch):
+    """Red-team MED: --record-to could point at the checkout, bot/state or the owner's authority directory; evidence must never be written beside a grant or capability."""
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    rec = _evaluate(w, notional_usd="200")["decision_record"]
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for bad in (os.path.join(AP.BOT, "evidence_out"), os.path.join(AP.BOT, "state", "x"), os.path.dirname(AP.BOT), str(tmp_path / "home" / ".ai-agent-control" / "ev")):
+        existed = os.path.exists(bad)
+        r = AP.record_decision(bad, rec, w.clock.now())
+        assert r.startswith("REFUSED:DIRECTORY_INSIDE_"), (bad, r)
+        assert os.path.exists(bad) == existed, bad                                   # a refusal creates nothing
+    link = tmp_path / "innocent"
+    os.symlink(AP.BOT, str(link))
+    assert AP.record_decision(str(link / "ev2"), rec, w.clock.now()).startswith("REFUSED:DIRECTORY_INSIDE_")        # a symlink does not smuggle it in
+    assert AP.record_decision(str(tmp_path / "fine"), rec, w.clock.now()) == "STORED"

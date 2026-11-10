@@ -58,6 +58,17 @@ DAY_MS = 86_400_000
 
 def _atomic_write(path: str, obj: Any) -> None:
     tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        _atomic_write_inner(path, tmp, obj)
+    except BaseException:
+        try:
+            os.remove(tmp)                                    # a failed write must not leave a litter of temp files on a volume that is already full
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_inner(path: str, tmp: str, obj: Any) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, sort_keys=True, default=str)
         fh.flush()
@@ -92,6 +103,15 @@ class Recorder:
         self.chain_head: Optional[Dict[str, Any]] = None      # {"file", "n", "head"} of the newest row
         self._resealed = 0
         self._repairs = 0
+        # liveness bookkeeping (all lock-free reads/writes of small values; a heartbeat must never wait on the engine, the store or the disk scan)
+        self.status_errors, self.last_status_error = 0, ""
+        self.maintenance_errors, self.last_maintenance_error, self.maintenance_ok_ms = 0, "", None
+        self._entry_refusals: Optional[List[str]] = None      # cached by the maintenance thread: status() must not take the engine lock
+        self._entry_refusals_ms: Optional[int] = None
+        self._count_cache: Optional[int] = None
+        self._count_ms: Optional[int] = None
+        self._last_id: Optional[int] = None
+        self._last_growth_ms = self.started_ms
         os.makedirs(self.dir, exist_ok=True)
 
     # -- capacity ----------------------------------------------------------------------------------------
@@ -111,6 +131,13 @@ class Recorder:
             out[f"{key}_seq"] = None if bk is None else getattr(bk, "seq", None)
         return out
 
+    def _rejection_total(self) -> Optional[int]:
+        """A lock-free read of a dict the feed threads mutate: copy first, and never let a racing resize cost a capacity row."""
+        try:
+            return sum(int(v) for v in list((self.engine.state.rejections or {}).values()))
+        except Exception:  # noqa: BLE001
+            return None
+
     def _health(self) -> Dict[str, Any]:
         fs = self.feed.status()
         streams = fs.get("streams") or {}
@@ -125,7 +152,7 @@ class Recorder:
                 "linear_connected": (streams.get(E.LINEAR) or {}).get("connected"),
                 "spot_connected": (streams.get(E.SPOT) or {}).get("connected"),
                 "rest_errors": rest.get("errors"), "rest_bootstrapped": rest.get("bootstrapped"),
-                "book_rejections": sum(int(v) for v in (self.engine.state.rejections or {}).values()),
+                "book_rejections": self._rejection_total(),
                 "store_fault": self.engine.state.store_fault,
                 "free_bytes": free, "min_free_bytes": self.min_free_bytes}
 
@@ -139,6 +166,7 @@ class Recorder:
             # the view's own verdict is recorded with the curve: a curve taken from a view the
             # entry gate would refuse is still data, but it must say so
             row["entry_refusals"] = list(view.refusals(S.ENTRY))
+            self._entry_refusals, self._entry_refusals_ms = list(row["entry_refusals"]), now
             path = self._capacity_path(now)
             try:
                 n, head = EC.append(path, row)
@@ -185,20 +213,20 @@ class Recorder:
             free = store.free_bytes()
         except Exception:  # noqa: BLE001
             free = None
-        view_refusals: Optional[List[str]] = None
-        try:
-            view_refusals = list(self.feed.view().refusals(S.ENTRY))
-        except Exception:  # noqa: BLE001
-            pass
+        view_refusals = self._entry_refusals      # from the last capacity capture: reading the view here would wait on the engine lock the writer holds, and a heartbeat must never wait on the writer
         return {
             "schema": SCHEMA, "pid": os.getpid(), "environment": self.environment,
             "symbol": self.engine.state.symbol, "started_ms": self.started_ms, "now_ms": now,
             "uptime_s": round((now - self.started_ms) / 1000.0, 1),
             "feed": self.feed.status(),
-            "store": {"records": store.count(), "segments": len(store.segments()),
+            "heartbeat": {"status_errors": self.status_errors, "last_status_error": self.last_status_error, "maintenance_errors": self.maintenance_errors,
+                          "last_maintenance_error": self.last_maintenance_error, "maintenance_ok_ms": self.maintenance_ok_ms},
+            "progress": self._progress(now),
+            "store": {"records": self._count_cache, "records_counted_ms": self._count_ms, "segments": len(store.segments()),
                       "free_bytes": free, "min_free_bytes": self.min_free_bytes,
                       "retention_days": self.retention_days,
                       "capacity_retention_days": self.capacity_retention_days,
+                      "emergency_prunes": getattr(store, "emergency_prunes", 0), "emergency_prunes_denied": getattr(store, "emergency_prunes_denied", 0),
                       "fault": self.engine.state.store_fault},
             "entry_refusals": view_refusals,
             "capacity": {"rows": self.capacity_rows, "errors": self.capacity_errors,
@@ -208,13 +236,54 @@ class Recorder:
                          "repairs_while_running": self._repairs},
         }
 
+    def _progress(self, now_ms: int) -> Dict[str, Any]:
+        """Is the log GROWING? The newest record id is an O(1) lock-free read; the age of its last change is what separates a recorder that is alive and persisting from one whose heartbeat
+        is fresh while nothing is being written (a dead feed, a wedged writer, a full volume). ``growth_age_s`` counts from the recorder's start until the first record lands."""
+        try:
+            rid: Optional[int] = self.engine.store.newest_id()                  # newest DURABLE record (informational: VIEW and CONN records advance it with no market data)
+            inputs: Optional[int] = int(self.engine.input_count)                # market INPUT records (frames, REST) appended and committed: what growth is measured on
+        except Exception:  # noqa: BLE001 - an old store/engine without the counters reports nothing rather than a false alarm
+            rid = inputs = None
+        if inputs is not None and inputs != self._last_id:
+            self._last_id, self._last_growth_ms = inputs, now_ms
+        return {"newest_record_id": rid, "market_inputs": inputs, "last_growth_ms": self._last_growth_ms,
+                "growth_age_s": round(max(0, now_ms - self._last_growth_ms) / 1000.0, 1) if inputs is not None else None}
+
+    def refresh_count(self) -> None:
+        """The exact row count scans every segment: it runs on the MAINTENANCE thread, rarely, never on the heartbeat."""
+        try:
+            self._count_cache = int(self.engine.store.count())
+            self._count_ms = self.wall_ms()
+        except Exception as exc:  # noqa: BLE001
+            self._maintenance_failed("count", exc)
+
+    def _maintenance_failed(self, what: str, exc: BaseException) -> None:
+        self.maintenance_errors += 1
+        self.last_maintenance_error = f"{what}: {type(exc).__name__}: {exc}"[:200]
+
     def write_status(self) -> Dict[str, Any]:
         st = self.status()
         _atomic_write(os.path.join(self.dir, STATUS_FILE), st)
         return st
 
+    def write_status_guarded(self) -> Optional[Dict[str, Any]]:
+        """The heartbeat: a failed write (a full volume, a permissions fault) is COUNTED and reported in the next status that does get written, never raised into the run loop."""
+        try:
+            return self.write_status()
+        except Exception as exc:  # noqa: BLE001 - the heartbeat must outlive the fault it reports
+            self.status_errors += 1
+            self.last_status_error = f"{type(exc).__name__}: {exc}"[:200]
+            if self.status_errors == 1 or self.status_errors % 10 == 0:
+                print(f"market_recorder: status write failed ({self.status_errors}x): {self.last_status_error}", file=sys.stderr, flush=True)   # visible in `fly logs` even when the file cannot be written
+            try:
+                os.utime(os.path.join(self.dir, STATUS_FILE))       # a METADATA-only touch works on a full volume: the process is alive, so the supervisor's watchdog (mtime) must not kill it for a disk fault; the monitor reads the file's own now_ms, so it still reports STALE
+            except OSError:
+                pass
+            return None
+
     # -- lifecycle ---------------------------------------------------------------------------------------
     def start(self) -> None:
+        self.write_status_guarded()          # a heartbeat BEFORE the (possibly slow) chain repair and feed start: a slow start is not a silent one
         # a crash between a row and its chain entry leaves an unchained tail: seal it visibly
         try:
             # every capacity file, not just today's: a crash near midnight leaves YESTERDAY's head behind
@@ -227,7 +296,7 @@ class Recorder:
         except Exception:  # noqa: BLE001 - evidence repair must not stop collection
             pass
         self.feed.start()
-        self.write_status()
+        self.write_status_guarded()
 
     def stop(self) -> None:
         try:
@@ -238,23 +307,43 @@ class Recorder:
             finally:
                 self.engine.store.close()
 
-    def run(self, stop: threading.Event, *, status_every_s: float = 30.0,
-            capacity_every_s: float = 300.0, prune_every_s: float = 3600.0) -> None:
-        """Block until `stop` is set."""
-        next_status = next_capacity = next_prune = self.mono()
+    def _maintenance(self, stop: threading.Event, capacity_every_s: float, prune_every_s: float, count_every_s: float) -> None:
+        """Capacity capture, pruning and the row count, on their OWN thread: any of them may be slow (an engine-lock wait, a chain repair, a directory scan, a count over a large log) and none
+        of them may delay the status heartbeat. Every task is isolated: one failing task is counted and the others still run."""
+        now = self.mono()
+        next_capacity, next_prune, next_count = now, now, now
         while not stop.is_set():
             now = self.mono()
-            if now >= next_capacity:
-                next_capacity = now + capacity_every_s
-                self.capture_capacity()
-            if now >= next_prune:
-                next_prune = now + prune_every_s
-                self.prune_capacity()
+            for name, due, every, fn in (("capacity", next_capacity, capacity_every_s, self.capture_capacity), ("prune", next_prune, prune_every_s, self.prune_capacity),
+                                         ("count", next_count, count_every_s, self.refresh_count)):
+                if now >= due:
+                    if name == "capacity":
+                        next_capacity = now + every
+                    elif name == "prune":
+                        next_prune = now + every
+                    else:
+                        next_count = now + every
+                    try:
+                        fn()
+                        self.maintenance_ok_ms = self.wall_ms()              # a task COMPLETED (refresh_count records its own failure and returns)
+                    except Exception as exc:  # noqa: BLE001
+                        self._maintenance_failed(name, exc)
+            stop.wait(max(0.01, min(1.0, capacity_every_s, prune_every_s, count_every_s)))
+
+    def run(self, stop: threading.Event, *, status_every_s: float = 30.0,
+            capacity_every_s: float = 300.0, prune_every_s: float = 3600.0, count_every_s: float = 600.0) -> None:
+        """Block until `stop` is set. This thread is only the HEARTBEAT (a guarded status write every ``status_every_s``); the slow work runs on a maintenance thread."""
+        worker = threading.Thread(target=self._maintenance, args=(stop, capacity_every_s, prune_every_s, count_every_s), name="recorder-maintenance", daemon=True)
+        worker.start()
+        next_status = self.mono()
+        while not stop.is_set():
+            now = self.mono()
             if now >= next_status:
                 next_status = now + status_every_s
-                self.write_status()
-            stop.wait(1.0)
-        self.write_status()
+                self.write_status_guarded()
+            stop.wait(min(1.0, max(0.01, status_every_s)))
+        worker.join(5.0)
+        self.write_status_guarded()
 
 
 def build(directory: str, *, environment: str = "mainnet", symbol: str = "BTCUSDT",
@@ -285,6 +374,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="UTC days of the (large) depth log to keep")
     ap.add_argument("--capacity-retention-days", type=int, default=365,
                     help="UTC days of the (small) capacity curve files to keep; 0 = keep all")
+    ap.add_argument("--emergency-backup-dir", default=None, help="off-volume backup directory; with --emergency-receipts it lets a full volume free its oldest BACKED-UP day (default: never delete an unbacked day)")
+    ap.add_argument("--emergency-receipts", default=None, help="md_seal backup receipts file matching --emergency-backup-dir")
     ap.add_argument("--status-every", type=float, default=30.0)
     ap.add_argument("--capacity-every", type=float, default=300.0)
     ap.add_argument("--no-rest", action="store_true")
@@ -302,6 +393,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rec = build(a.dir, environment=a.environment, symbol=a.symbol, min_free_mb=a.min_free_mb,
                 retention_days=a.retention_days, capacity_retention_days=a.capacity_retention_days, use_rest=not a.no_rest,
                 proxy_url=a.proxy_url, ca_file=a.ca_file)
+    if a.emergency_backup_dir and a.emergency_receipts:
+        import md_seal as SEAL      # noqa: E402 - only needed when an owner named a verified backup
+        rec.feed.emergency_may_prune = lambda name: SEAL.backed_up(a.dir, name, a.emergency_receipts, a.emergency_backup_dir)
     rec.start()
     try:
         rec.run(stop, status_every_s=a.status_every, capacity_every_s=a.capacity_every)

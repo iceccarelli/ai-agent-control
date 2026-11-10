@@ -194,22 +194,42 @@ class CapitalBook:
             b = self.load()
             if any(t["event_id"] == event_id for t in b["transfers_pending"] + b["transfers_applied"]):
                 return False
-            b["transfers_pending"] = list(b["transfers_pending"]) + [{"event_id": event_id, "amount_usd": str(a)}]
+            b["transfers_pending"] = list(b["transfers_pending"]) + [{"event_id": event_id, "amount_usd": str(a), "declared_ms": int(time.time() * 1000)}]
             self._save(b)
         return True
 
     # ---- a session is parked until the NEXT cash read says what the cash really did (a session that ended NOT flat is parked as well: its losses count, its gains never do)
-    def park(self, session_id: str, usdt_before: Any, ledger_net_known: Any, funding_was_read: bool, flat_verified: bool) -> None:
+    def park(self, session_id: str, usdt_before: Any, ledger_net_known: Any, funding_was_read: bool, flat_verified: bool, cash_read_ms: Optional[int] = None) -> bool:
+        """Park a session for settlement. True = parked (or already parked / already settled: idempotent); False = REFUSED: a different session is still unsettled (its cash result must be booked
+        first, never overwritten) or there is no trustworthy starting cash."""
         if _d(usdt_before) is None:
-            return                                                    # no trustworthy starting cash: nothing can be settled later (the engine's NOT_FLAT/ALERT handling still applies)
+            return False                                              # no trustworthy starting cash: nothing can be settled later (the engine's NOT_FLAT/ALERT handling still applies)
         with self._locked():
             b = self.load()
             if any(h.get("session_id") == session_id for h in b["history"]) or (b["pending"] or {}).get("session_id") == session_id:
-                return
+                return True
+            if b["pending"]:
+                return False
             kn = _d(ledger_net_known)
             b["pending"] = {"session_id": session_id, "usdt_before": str(_d(usdt_before)), "ledger_net_known_usd": None if kn is None else str(kn), "funding_was_read": bool(funding_was_read),
-                            "flat_verified": bool(flat_verified)}
+                            "flat_verified": bool(flat_verified), "parked_ms": int(time.time() * 1000),
+                            "cash_read_ms": int(cash_read_ms) if cash_read_ms is not None else int(time.time() * 1000)}
             self._save(b)
+            return True
+
+    def update_pending(self, session_id: str, ledger_net_known: Any, funding_was_read: bool, flat_verified: bool) -> bool:
+        """After the session ends: replace the conservative placeholder parked BEFORE execution (not flat, nothing known) with what the session actually established. A crash before this call
+        leaves the placeholder, so the next settlement still debits the loss and never credits a gain."""
+        with self._locked():
+            b = self.load()
+            p = b.get("pending")
+            if not p or p.get("session_id") != session_id:
+                return False
+            kn = _d(ledger_net_known)
+            p.update({"ledger_net_known_usd": None if kn is None else str(kn), "funding_was_read": bool(funding_was_read), "flat_verified": bool(flat_verified)})
+            b["pending"] = p
+            self._save(b)
+            return True
 
     def settle(self, usdt_now: Any) -> Dict[str, Any]:
         """Called with the first cash read after a parked session. Returns {status, delta, credited, ...}; NOTHING pending -> NO_PENDING."""
@@ -224,7 +244,10 @@ class CapitalBook:
                 return {"status": "NO_PENDING"}
             if now is None:
                 return {"status": "CASH_UNKNOWN"}                       # stays pending: nothing is credited on a cash read that failed
-            transfers = sum((D(t["amount_usd"]) for t in b["transfers_pending"]), D(0))
+            parked_ms = int(p.get("cash_read_ms") or p.get("parked_ms") or 0)       # the instant the starting cash was READ (a deposit declared between that read and the park is not in it)
+            # a transfer declared BEFORE the starting cash was read was already inside it: it is not part of this session's delta (recorded as applied, with its reason)
+            counted = [t for t in b["transfers_pending"] if int(t.get("declared_ms") or 0) >= parked_ms]
+            transfers = sum((D(t["amount_usd"]) for t in counted), D(0))
             before = D(p["usdt_before"])
             delta = now - before - transfers                            # cash that moved BECAUSE OF TRADING (declared deposits/withdrawals removed)
             known = _d(p.get("ledger_net_known_usd"))
@@ -257,13 +280,16 @@ class CapitalBook:
             bs = self.basis(b)
             if bs is not None and (_d(b.get("peak_basis_usd")) is None or bs > D(b["peak_basis_usd"])):
                 b["peak_basis_usd"] = str(bs)
-            b["loss_streak"] = int(b.get("loss_streak", 0)) + 1 if credited < 0 else 0
+            if credited < 0:
+                b["loss_streak"] = int(b.get("loss_streak", 0)) + 1
+            elif credited > 0:
+                b["loss_streak"] = 0                                    # only a VERIFIED credited gain breaks a losing streak: an unverified gain or a quiet session does not
             if b["loss_streak"] >= LOSS_STREAK_STOP:
                 b["halted"] = True
             entry = {"session_id": p["session_id"], "delta_usd": str(delta), "transfers_removed_usd": str(transfers), "credited_usd": str(credited), "unverified_excess_usd": str(excess),
                      "status": status, "usdt_before": p["usdt_before"], "usdt_after": str(now), "flat_verified": bool(flat)}
             b["history"] = (list(b["history"]) + [entry])[-HISTORY_MAX:]
-            b["transfers_applied"] = (list(b["transfers_applied"]) + list(b["transfers_pending"]))[-HISTORY_MAX:]
+            b["transfers_applied"] = (list(b["transfers_applied"]) + [{**t, "applied_to": p["session_id"], "counted": t in counted} for t in b["transfers_pending"]])[-HISTORY_MAX:]
             b["transfers_pending"] = []
             b["pending"] = None
             self._save(b)
@@ -275,6 +301,19 @@ class CapitalBook:
             if not b.get("halted"):
                 return False
             b["halted"], b["loss_streak"] = False, 0
+            self._save(b)
+            return True
+
+    def acknowledge_drawdown(self) -> bool:
+        """The owner's explicit decision, after reviewing the losses, to resume from the CURRENT verified basis: the drawdown is measured from a new peak. Nothing is credited; the
+        verified result and the history are untouched. False when there is no drawdown to acknowledge."""
+        with self._locked():
+            b = self.load()
+            bs, pk = self.basis(b), _d(b.get("peak_basis_usd"))
+            if bs is None or pk is None or pk <= bs:
+                return False
+            b["peak_basis_usd"] = str(bs)
+            b.setdefault("drawdown_acknowledged", []).append({"from_peak_usd": str(pk), "to_basis_usd": str(bs), "at_ms": int(time.time() * 1000)})
             self._save(b)
             return True
 

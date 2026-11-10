@@ -33,8 +33,8 @@ import threading
 import time
 import zlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterator, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Iterator, List, Optional, Tuple
 
 FRAME = "frame"        # a raw WebSocket text frame
 CONN = "conn"          # a connection event: {"event": connected|disconnected|invalidate, ...}
@@ -188,6 +188,11 @@ class MarketStore:
         if environment is not None:
             self._take_writer_lock()           # exactly one writer per directory
         self._next_id, self._prev_chain = self._scan_tail()
+        self._committed_next, self._committed_chain = self._next_id, self._prev_chain       # the last state that is DURABLE: a failed commit rolls back to it
+        self.emergency_prunes = 0
+        self.emergency_prunes_denied = 0
+        self.last_rollback_lost = 0                              # read-and-reset by the engine: how many rows a failed commit dropped
+        self._last_emergency: Optional[float] = None
         segs = self.segments()
         if segs:
             self._latest_day = segs[-1][3:11]
@@ -331,6 +336,43 @@ class MarketStore:
             raise StoreError(f"free space on the market-data volume is below the "
                              f"{self.min_free_bytes}-byte reserve; not writing")
 
+    def low_space(self) -> bool:
+        """True when the volume is below the reserve (a failed look counts as low: never assume there is room)."""
+        if not self.min_free_bytes:
+            return False
+        try:
+            return self.free_bytes() < self.min_free_bytes
+        except OSError:
+            return True
+
+    def emergency_prune(self, may_prune: Optional[Callable[[str], bool]] = None, *, min_interval_s: float = 60.0) -> List[str]:
+        """Free space when the reserve is breached: remove the OLDEST closed segment (never the newest, never the one being written, only when at least two closed segments exist), with the
+        usual ``pruned.jsonl`` checkpoint so the retained log still verifies. DEFAULT-DENY: without ``may_prune`` (a predicate that proves THIS segment has a verified off-volume copy) nothing
+        is deleted and the refusal is counted in ``emergency_prunes_denied`` — a deleted unbacked day is unrecoverable evidence, and a stalled recorder is the lesser loss. At most one
+        segment per ``min_interval_s``. Never invents or rewrites data."""
+        self.flush()
+        closed = [n for n in self.segments()[:-1] if n[3:11] != self._day]
+        if len(closed) < 2:
+            return []
+        now = time.monotonic()
+        if self._last_emergency is not None and now - self._last_emergency < min_interval_s:
+            return []
+        victim = closed[0]
+        try:
+            ok = bool(may_prune(victim)) if may_prune is not None else False
+        except Exception:  # noqa: BLE001 - a predicate that cannot answer is a no
+            ok = False
+        if not ok:
+            self.emergency_prunes_denied += 1
+            return []
+        oldest_day = datetime.strptime(victim[3:11], "%Y%m%d").replace(tzinfo=timezone.utc)
+        removed = self.prune_segments_before((oldest_day + timedelta(days=1)).strftime("%Y%m%d"))
+        if removed:
+            self.emergency_prunes += len(removed)
+            self._last_emergency = now
+            self._free_checked_at = 0.0                          # look at the space again on the very next write
+        return removed
+
     def apply_retention(self, now_ms: int, retention_days: int) -> List[str]:
         """Prune whole closed segments older than `retention_days` UTC days (0 = keep
         everything). The chain checkpoint is written by `prune_segments_before`, so
@@ -347,8 +389,21 @@ class MarketStore:
         return self.prune_segments_before(cutoff)
 
     def _commit_locked(self) -> None:
+        """Commit the open batch. A FAILED commit (a full volume, an I/O error) rolls the transaction back and restores the id and chain to the last DURABLE state, so a later successful
+        commit can never persist rows the engine already reported as unlogged, and ids stay contiguous. The batch is lost (the engine's ``store_gap`` marker invalidates the books)."""
         if self._conn is not None and self._pending:
-            self._conn.commit()
+            try:
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.last_rollback_lost = max(self.last_rollback_lost, self._pending)     # rows (incl. the one being appended) that were NEVER durable
+                self._next_id, self._prev_chain, self._pending = self._committed_next, self._committed_chain, 0
+                self._last_commit = time.monotonic()
+                raise
+        self._committed_next, self._committed_chain = self._next_id, self._prev_chain
         self._pending = 0
         self._last_commit = time.monotonic()
 
@@ -389,6 +444,11 @@ class MarketStore:
                                  bytes(row[8]).hex())
             finally:
                 conn.close()
+
+    def newest_id(self) -> int:
+        """The id of the newest record that is DURABLE (committed; 0 = none), read WITHOUT the writer lock and without touching the disk: a liveness/progress counter for a heartbeat that must
+        never wait on the writer or scan the log (``count()`` flushes and scans every segment)."""
+        return int(self._committed_next) - 1
 
     def count(self) -> int:
         self.flush()

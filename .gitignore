@@ -22,3 +22,7 @@ bot/runs/
 bot/artifacts/testnet_session_evidence*.jsonl
 *.sqlite
 *.sqlite3
+
+# a stray runtime status file must never be committed
+bot/recorder_status.json
+bot/supervisor_status.json

@@ -19,6 +19,7 @@ Stages (the intended chain; each event carries its own ``stage``):
 from __future__ import annotations
 
 import hashlib
+import json
 from decimal import Decimal as D
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -127,6 +128,41 @@ def capital_book(report: Mapping[str, Any]) -> Event:
     p.update({"lifecycles_settled": report.get("lifecycles_settled"), "wins": report.get("wins"), "losses": report.get("losses"), "profit_factor": report.get("profit_factor"),
               "loss_streak": report.get("loss_streak"), "halted": bool(report.get("halted"))})
     return ("DAILY_PNL", "CAPITAL_BOOK", p)
+
+
+def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None, margin_per_usd: Optional[Any] = None, loss_cap_usd: Optional[Any] = None) -> Dict[str, Any]:
+    """The REPRODUCIBLE record of one moment-of-decision evaluation (pure). ``decision_id`` is a hash of everything that determined the answer: the digest of the market INPUTS (books,
+    instrument rows, funding observation, fee tiers), the verdict digest, the decision, the size, the owner's floor, the candidate and the code revision. The same inputs and code give the same
+    id and the same decision; a different market state, fee tier, size or code can never share one. Full digests stay in the local result; the evidence payload carries 16-hex references.
+    ``capital_required_usd`` is notional x the cash margin per USD of the hedged pair; ``loss_cap_usd`` is the POLICY per-session loss ceiling, not a modelled loss."""
+    edge = result.get("edge") if isinstance(result.get("edge"), Mapping) else None
+    auth = result.get("authority") if isinstance(result.get("authority"), Mapping) else {}
+    cand = {"candidate_id": auth.get("candidate_id"), "spec_ref": ref16(auth.get("spec_digest"))} if auth.get("candidate_id") else None
+    core = {"inputs": result.get("inputs_digest"), "edge": None if edge is None else edge.get("digest"), "decision": result.get("decision"), "symbol": result.get("symbol"),
+            "notional": result.get("notional_usd"), "floor": result.get("owner_funding_floor_bps"), "candidate": cand, "code": code_sha}
+    did = "dec_" + hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
+    assumed = [str(a) for a in (edge or {}).get("assumed_inputs", [])]
+    notional = result.get("notional_usd")
+    rec: Dict[str, Any] = {
+        "decision_id": did, "decision": result.get("decision"), "reasons": [str(x)[:120] for x in list(result.get("why", []))[:6]], "symbol": result.get("symbol"),
+        "notional_usd": num(notional, 2), "owner_funding_floor_bps": num(result.get("owner_funding_floor_bps")), "funding_bps": num(result.get("funding_bps")),
+        "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "hold_s": result.get("hold_s"), "candidate": cand, "code_sha": code_sha,
+        "inputs_ref": ref16(result.get("inputs_digest")), "observed_ms": result.get("observed_ms"), "data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY", "source": "LOCAL",
+        "authority_gaps": [str(g)[:40] for g in list(result.get("authority_gaps", []))[:10]]}
+    if edge is not None:
+        rec["edge"] = {"session_class": edge.get("session_class"), "net_edge_bps": num(edge.get("net_edge_bps")), "expected_funding_bps": num(edge.get("expected_funding_bps")),
+                       "required_funding_bps": num(edge.get("required_funding_bps")), "expected_net_usd": num(edge.get("expected_net_usd")),
+                       "costs_bps": {str(k)[:30]: num(v) for k, v in dict(edge.get("costs_bps", {})).items()}, "assumed_inputs": assumed[:10],
+                       "settlements_in_hold": edge.get("settlements_in_hold"), "edge_ref": ref16(edge.get("digest"))}
+        rec["fee_tier"] = "ASSUMED" if any("fee" in a.lower() for a in assumed) else "MEASURED"
+    if notional is not None and margin_per_usd is not None:
+        try:
+            rec["capital_required_usd"] = num(D(str(notional)) * D(str(margin_per_usd)), 2)
+        except Exception:                                                       # noqa: BLE001
+            rec["capital_required_usd"] = None
+    if loss_cap_usd is not None:
+        rec["worst_credible_loss_usd"] = {"value": num(loss_cap_usd, 2), "basis": "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL"}
+    return rec
 
 
 def session_events(rec: Mapping[str, Any], result: str) -> List[Event]:
