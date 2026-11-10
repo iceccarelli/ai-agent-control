@@ -15,6 +15,7 @@ for _p in (HERE, os.path.dirname(HERE), os.path.join(os.path.dirname(HERE), "too
 import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
+import ms_capital as CC  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
 
@@ -970,3 +971,57 @@ def test_the_same_state_transition_does_not_bump_the_state_seq_but_a_change_does
     b = st.transition("PAUSED", "again")
     c = st.transition("ALERT", "now")
     assert a["seq"] == b["seq"] and c["seq"] == a["seq"] + 1
+
+
+# ---------------------------------------------------------------- capital allocation and realised-only compounding wired into the session path
+def _profit_world(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+
+
+def _cycle_eng(w):
+    eng = str(w.tmp / "eng")
+    return AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=eng), eng
+
+
+def test_the_session_is_sized_by_the_allocator_not_the_grants_full_maximum_and_is_parked_for_settlement(w):
+    _profit_world(w)
+    res, eng = _cycle_eng(w)
+    assert res["result"] == "DONE" and res["flat_verified"] is True, res
+    plan = json.load(open(os.path.join(res["state_dir"], "plan.json")))
+    assert float(plan["notional_usd"]) <= 200.0 + 1e-6 < 400.0                                        # grant max is 400: day one deploys 40% of the $500 ceiling
+    assert res["allocation"]["binding_limit"] == "COMPOUNDED_SIZE"
+    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    assert ev["allocation"]["notional_usd"] == "200.00" and ev["capital_settlement"]["status"] == "NO_PENDING"
+    book = CC.CapitalBook(eng).load()
+    assert book["start_cash_usd"] is not None and book["pending"]["session_id"] == os.path.basename(res["state_dir"]) and book["realised_usd"] == "0"   # parked, NOT credited yet
+
+
+def test_cash_the_ledger_cannot_explain_raises_an_alert_and_places_nothing(w):
+    _profit_world(w)
+    eng = str(w.tmp / "eng")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("1")
+    b.park("prev_session", "1", "0.50", True, True)                                                   # the venue's cash is thousands of dollars away from this
+    w.fake.requests.clear()
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "REFUSED" and res["why"] == ["ACCOUNT_CASH_UNEXPLAINED"] and not [r for r in w.fake.requests if r[0] == "POST"]
+    assert AP.ES.EngineState(eng, w.clock.now).has("ALERT")
+    assert CC.CapitalBook(eng).load()["realised_usd"] == "0"                                          # and nothing unexplained was credited
+
+
+def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
+    _profit_world(w)
+    eng = str(w.tmp / "eng")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("10000")
+    bk = b.load()
+    bk["halted"], bk["loss_streak"] = True, 4
+    b._save(bk)
+    w.fake.requests.clear()
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "SKIPPED" and res["why"][0].startswith("ALLOCATION_ZERO") and not [r for r in w.fake.requests if r[0] == "POST"]
+    assert b.acknowledge_halt() is True
+    res, _ = _cycle_eng(w)
+    assert res["result"] in ("DONE", "SKIPPED") and "ALLOCATION_ZERO" not in "".join(res["why"])

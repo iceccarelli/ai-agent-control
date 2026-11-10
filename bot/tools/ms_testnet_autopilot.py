@@ -41,6 +41,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import ms_capital as CC  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
@@ -287,9 +288,22 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
+    pf = ES.read_json(os.path.join(d, "preflight.json")) or {}
+    book = CC.CapitalBook(engine_root)
+    usdt_now = pf.get("usdt")
+    book.ensure_baseline(usdt_now)
+    settled = book.settle(usdt_now)                                   # what the venue's cash REALLY did since the last verified-flat session (losses in full; gains only as far as explained)
+    if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
+        return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
+    cb = book.load()
+    alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
+                        loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
-                                                          "edge": verdict.as_dict()})
-    if step("plan", "--symbol", sym, "--notional-usd", str(g["max_notional_usd"]), "--hold-seconds", str(hold_s)) != 0:
+                                                          "edge": verdict.as_dict(), "allocation": alloc.as_dict(), "capital_settlement": settled})
+    if alloc.notional <= 0:                                           # the allocator can only say LESS than the owner's limits; zero is a decision to stay idle
+        return _res("SKIPPED", ["ALLOCATION_ZERO:" + alloc.binding], state_dir=d, allocation=alloc.as_dict())
+    if step("plan", "--symbol", sym, "--notional-usd", str(alloc.notional), "--hold-seconds", str(hold_s)) != 0:
         return _res("SKIPPED", ["PLAN_REFUSED"], state_dir=d, detail=lines[-3:])
     try:
         with open(os.path.join(d, "plan.json"), encoding="utf-8") as fh:
@@ -330,6 +344,11 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     summary = {"state_dir": d, "plan_digest": digest, "hold_s": hold_s, "funding_bps": rate * 1e4, "flat_verified": rec.get("flat_verified"), "orders": len(rec.get("orders", [])),
                "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:], "session_class": session_class, "edge": verdict.as_dict(), "revoked_reason": watch["reason"]}
     on_state("RECONCILING", "session_ended")
+    net = rec.get("net") or {}
+    fees, price, fund = (CC._d(net.get(k)) for k in ("fees_usd", "price_pnl_usd", "funding_usd"))
+    known = None if (fees is None or price is None) else price - fees + (fund or D(0))
+    book.park(os.path.basename(d), usdt_now, known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT flat cash read, never from fill arithmetic alone
+    summary["allocation"] = alloc.as_dict()
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
@@ -906,6 +925,9 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--days", type=int, default=7, help=f"validity, <= {MAX_GRANT_DAYS}")
     g.add_argument("--allow-mechanics-sessions", action="store_true", help="ALSO allow bounded TESTNET_MECHANICS sessions (fake-money lifecycle/fee/fill measurement, expected net NEGATIVE, never "
                    "an opportunity) when the economics gate says the trade does not pay; without it only a PROFIT_CANDIDATE session can run")
+    cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
+    cp.add_argument("--root", default=DEFAULT_ROOT)
+    cp.add_argument("--ack-halt", action="store_true")
     sub.add_parser("evaluate", help="READ-ONLY: what the economics gate says right now (never starts a session; the only order path is `loop`)")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
@@ -940,6 +962,12 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "grant_problems": why, "engine": {k: v for k, v in eng.load().items() if k != "history"},
                           "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json"))},
                          indent=2, sort_keys=True, default=str))
+        return 0
+    if a.cmd == "capital":
+        cbk = CC.CapitalBook(a.root)
+        if a.ack_halt:
+            print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True)
