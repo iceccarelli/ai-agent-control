@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import signal
 import stat
 import sys
@@ -40,6 +41,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
 
 import bybit_connection as bc  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
+import ms_engine_state as ES  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_executor as TE  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
@@ -217,11 +219,17 @@ def _res(result: str, why: Sequence[str] = (), **kw: Any) -> Dict[str, Any]:
     return {"result": result, "why": list(why), **kw}
 
 
+def _noop_state(_state: str, _source: str) -> None:
+    return None
+
+
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
-             out: Callable[[str], None] = print, state_root: Optional[str] = None) -> Dict[str, Any]:
+             out: Callable[[str], None] = print, state_root: Optional[str] = None, engine_root: Optional[str] = None, lease: Any = None,
+             on_state: Callable[[str, str], None] = _noop_state, **_ignored: Any) -> Dict[str, Any]:
     clock = clock or (lambda: int(time.time() * 1000))
     sleep = sleep or time.sleep
     now = int(clock())
+    on_state("DATA_CHECK", "cycle_start")
     manifest, st = S._load_capability_manifest()
     if manifest is None:
         return _res("REFUSED", ["OWNER_CAPABILITY_FILE:" + ",".join(st.get("reasons", []))])
@@ -242,6 +250,7 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     go, hold_s, reason = funding_decision(rate, nxt, now, g)
     if not go:
         return _res("SKIPPED", [reason], funding_bps=rate * 1e4)
+    on_state("RESEARCHING", "edge_gate")
     try:                                                              # the ECONOMICS gate: expected NET edge on the one economic model, from the venue's own rows, books and fee tier
         inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()))
         verdict = EG.evaluate_edge(inp)
@@ -254,17 +263,18 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
     try:
-        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict)
+        return _run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state)
     finally:
         _ACTIVE["dir"] = None
 
 
 def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], d: str, sym: str, g: Mapping[str, Any], hold_s: int,
-                 rate: float, session_class: str, verdict: EG.EdgeVerdict) -> Dict[str, Any]:
+                 rate: float, session_class: str, verdict: EG.EdgeVerdict, manifest: Mapping[str, Any], engine_root: str, lease: Any,
+                 on_state: Callable[[str, str], None]) -> Dict[str, Any]:
     lines: List[str] = []
 
-    def step(*argv: str) -> int:
-        return S.main(["--state-dir", d, *argv], env=env, inner_transport=inner, clock_ms=clock, sleep=sleep, input_fn=lambda _p: "", out=lines.append)
+    def step(*argv: str, sl: Optional[Callable[[float], None]] = None) -> int:
+        return S.main(["--state-dir", d, *argv], env=env, inner_transport=inner, clock_ms=clock, sleep=sl or sleep, input_fn=lambda _p: "", out=lines.append)
 
     if _STOP.is_set():
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
@@ -279,6 +289,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
             digest = json.load(fh)["plan_digest"]
     except (OSError, ValueError, KeyError):
         return _res("ERROR", ["PLAN_UNREADABLE"], state_dir=d)
+    on_state("PLAN_PROPOSED", "plan_written")
     lines.clear()
     if step("assess") != 0:
         return _res("SKIPPED", ["ASSESS_FAILED"], state_dir=d, detail=lines[-3:])
@@ -289,56 +300,330 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("SKIPPED", ["ASSESS_UNREADABLE"], state_dir=d)
     if bad:
         return _res("SKIPPED", ["ASSESS_NOT_APPROVED:" + ",".join(bad)], state_dir=d)
+    on_state("RISK_APPROVED", "assess_approved")
     lines.clear()
     if _STOP.is_set():                                               # a stop arrived before any order: nothing was placed, no entry was counted
         return _res("SKIPPED", ["STOP_REQUESTED"], state_dir=d)
-    rc = step("execute", "--confirm-plan-digest", digest, "--unattended")
+    on_state("EXECUTING", "execute_started")
+    watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
+    rc = step("execute", "--confirm-plan-digest", digest, "--unattended", sl=watch_sleep)
     try:
         with open(os.path.join(d, "testnet_session.json"), encoding="utf-8") as fh:
             rec = json.load(fh)
     except (OSError, ValueError):
         rec = {}
     summary = {"state_dir": d, "plan_digest": digest, "hold_s": hold_s, "funding_bps": rate * 1e4, "flat_verified": rec.get("flat_verified"), "orders": len(rec.get("orders", [])),
-               "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:], "session_class": session_class, "edge": verdict.as_dict()}
+               "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:], "session_class": session_class, "edge": verdict.as_dict(), "revoked_reason": watch["reason"]}
+    on_state("RECONCILING", "session_ended")
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
 
 
-# ---------------------------------------------------------------------------------------------------- the supervised loop
+# ---------------------------------------------------------------------------------------------------- authority can be REVOKED while a session is running
+def revocation_reason(now_ms: int, manifest: Mapping[str, Any], engine_root: str, lease: Any) -> Optional[str]:
+    """Why new authority is gone RIGHT NOW (None = still authorised): the grant vanished / expired / was tampered, the owner set STOP or an ALERT appeared, or the executor lease is not
+    held. A DRAIN is not revocation (the active session finishes). Revocation never abandons a hedge: it engages the session's kill switch (cancel entries, reduce-only unwind, flat check)."""
+    g, why = load_grant(now_ms, manifest)
+    if g is None:
+        return "GRANT:" + (why[0] if why else "INVALID")
+    st = ES.EngineState(engine_root, lambda: now_ms)
+    for m in ("STOP", "ALERT"):
+        if st.has(m):
+            return m
+    if lease is not None and not lease.held():
+        return "LEASE_LOST"
+    return None
+
+
+def _watching_sleep(sleep: Callable[[float], None], state_dir: str, clock: Callable[[], int], manifest: Mapping[str, Any], engine_root: str, lease: Any
+                    ) -> Tuple[Callable[[float], None], Dict[str, Optional[str]]]:
+    """Wraps the session's own sleep: every poll of the running session first re-checks the authority, so a revocation is seen within one poll (about a second), not once per session."""
+    box: Dict[str, Optional[str]] = {"reason": None}
+
+    def watch(seconds: float) -> None:
+        if box["reason"] is None:
+            why = revocation_reason(int(clock()), manifest, engine_root, lease)
+            if why is not None:
+                box["reason"] = why
+                try:
+                    AD.engage_kill_switch(os.path.join(state_dir, "MS_KILL"), "revoked:" + why)
+                except OSError:
+                    pass
+                ES.write_json_atomic(os.path.join(state_dir, "revocation.json"), {"reason": why, "at_ms": int(clock())})
+        sleep(seconds)
+    return watch, box
+
+
+# ---------------------------------------------------------------------------------------------------- recovery: a restart is NOT permission to trade
+def session_dirs(state_root: str) -> List[str]:
+    try:
+        return sorted(os.path.join(state_root, n) for n in os.listdir(state_root) if n.startswith("ms_auto_") and os.path.isdir(os.path.join(state_root, n)))
+    except OSError:
+        return []
+
+
+def venue_flat_proof(ex: Any, symbol: str, baseline: Optional[float], entry_qty: Optional[float]) -> Tuple[bool, List[str], bool]:
+    """(flat, reasons, venue_read_complete). FLAT is the venue's OWN complete position read: the perp is zero, the spot balance equals the session baseline within dust, and no order is
+    open (ours or foreign). An incomplete read is not 'flat': it is unknown."""
+    v = ex.venue_state()
+    pos = v.get("positions")
+    if not v.get("complete") or pos is None:
+        return False, ["VENUE_READ_INCOMPLETE"], False
+    why: List[str] = []
+    if abs(pos.get(f"linear:{symbol}", 0.0)) >= 1e-12:
+        why.append(f"PERP_POSITION_OPEN:{pos.get(f'linear:{symbol}')}")
+    if baseline is not None:
+        dust = max(float(ex.filters("spot", symbol).qty_step), 0.002 * float(entry_qty or 0.0))
+        delta = S._minus(pos.get(f"spot:{symbol}", 0.0), baseline)
+        if abs(delta) > dust:
+            why.append(f"SPOT_DELTA_OPEN:{delta}")
+    if v.get("foreign_open_orders") or [o for o in v.get("orders", {}).values() if o.get("status") in ("New", "PartiallyFilled")]:
+        why.append("OPEN_ORDERS")
+    return (not why), why, True
+
+
+def recover(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, state_root: Optional[str] = None, symbol: Optional[str] = None, **_k: Any
+            ) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """(ok, reasons, info). ok = the venue PROVES the account flat relative to the last session's baseline and no order is open. An unresolved prior session whose venue state is flat is
+    recorded (recovery.json: accounting must be reconciled) and allowed; anything open, incomplete or unreadable is not ok (the caller pauses or raises an ALERT)."""
+    clock = clock or (lambda: int(time.time() * 1000))
+    root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
+    manifest, st = S._load_capability_manifest()
+    sym = symbol or ((manifest or {}).get("symbol_allowlist") or [None])[0]
+    if manifest is None or sym is None:
+        return False, ["OWNER_CAPABILITY_FILE:" + ",".join(st.get("reasons", []))], {"venue_read_complete": False}
+    last = (session_dirs(root) or [None])[-1]
+    baseline = entry_qty = None
+    unresolved = False
+    if last:
+        lim = ES.read_json(os.path.join(last, "run_limits.json")) or {}
+        b = (lim.get("baseline") or {}).get(f"spot:{sym}")
+        baseline = float(b) if isinstance(b, (int, float)) and not isinstance(b, bool) else None
+        plan = ES.read_json(os.path.join(last, "plan.json")) or {}
+        try:
+            entry_qty = float(plan["group"]["legs"][0]["qty"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            entry_qty = None
+        rec = ES.read_json(os.path.join(last, "testnet_session.json")) or {}
+        journal = os.path.join(last, "journal.jsonl")
+        started = os.path.exists(os.path.join(last, "journal")) or os.path.exists(journal) or bool(rec.get("orders"))
+        unresolved = bool(started and rec.get("flat_verified") is not True)
+    try:
+        flat, why, complete = venue_flat_proof(_executor(env, inner, clock, sym), sym, baseline, entry_qty)
+    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, TT.TestnetCredentialsMissing, KeyError, ValueError, TypeError) as exc:
+        return False, [f"VENUE_UNREADABLE:{type(exc).__name__}"], {"venue_read_complete": False, "last_session": last, "unresolved": unresolved}
+    info = {"venue_read_complete": complete, "last_session": last, "unresolved": unresolved, "reconciled_ms": int(clock())}
+    if not flat:
+        return False, why, info
+    if unresolved and last:
+        ES.write_json_atomic(os.path.join(last, "recovery.json"), {"resolved_by": "VENUE_FLAT_PROOF", "at_ms": int(clock()), "accounting_must_be_reconciled": True})
+    return True, [], info
+
+
+# ---------------------------------------------------------------------------------------------------- telemetry hooks (the evidence outbox and the lease plug in here)
+class NullTelemetry:
+    """The default: nothing is sent anywhere. The Fly worker injects a real one (durable outbox -> Supabase) in ``main``; the loop never depends on it for SAFETY."""
+
+    def heartbeat(self, hb: Mapping[str, Any]) -> None:
+        return None
+
+    def event(self, kind: str, payload: Mapping[str, Any], session_id: Optional[str] = None) -> None:
+        return None
+
+    def pending(self) -> int:
+        return 0
+
+
+def build_heartbeat(env: Mapping[str, str], st: Mapping[str, Any], root: str, clock: Callable[[], int], seen: Mapping[str, Optional[int]], pending: int, lease_token: Optional[int],
+                    session_id: Optional[str], run_id: str) -> Dict[str, Any]:
+    try:
+        free = int(shutil.disk_usage(root).free)
+    except OSError:
+        free = -1
+    return {"worker_id": env.get("FLY_MACHINE_ID") or "local", "app": env.get("FLY_APP_NAME") or "local", "machine_id": env.get("FLY_MACHINE_ID") or "local",
+            "region": env.get("FLY_REGION") or "local", "code_revision": env.get("GIT_SHA") or "unknown", "runtime_version": sys.version.split()[0], "run_id": run_id,
+            "mode": "TESTNET_AUTOPILOT", "state": st["state"], "session_id": session_id, "last_bybit_read_ms": seen.get("bybit"), "last_market_data_ms": seen.get("market"),
+            "last_reconcile_ms": seen.get("reconcile"), "last_supabase_sync_ms": seen.get("sync"), "outbox_pending": int(pending), "disk_free_bytes": free, "lease_token": lease_token,
+            "seq": int(st.get("seq", 0)), "at_ms": int(clock())}
+
+
+# ---------------------------------------------------------------------------------------------------- the supervised loop: a state machine that does not exit on a marker
+IDLE_POLL_S = 30
+DRAINED_FRESH_MS = 300_000
+OWNER_AUTHORITY_REFUSALS = ("GRANT_", "OWNER_CAPABILITY_FILE", "DEDICATED_TESTNET_CREDENTIALS_MISSING")
+
+
 def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[..., Dict[str, Any]] = run_once, clock: Optional[Callable[[], int]] = None,
-         sleep: Optional[Callable[[float], None]] = None, out: Callable[[str], None] = print, max_iterations: Optional[int] = None, **kw: Any) -> int:
-    """Repeat ``once`` until STOP exists, a NOT_FLAT / REFUSED result (a human must look: ALERT file, exit 3), or three errors in a row. One loop per root (lock file)."""
+         sleep: Optional[Callable[[float], None]] = None, out: Callable[[str], None] = print, max_iterations: Optional[int] = None, telemetry: Optional[Any] = None,
+         lease: Any = None, recover_fn: Callable[..., Tuple[bool, List[str], Dict[str, Any]]] = recover, **kw: Any) -> int:
+    """The unattended engine. It NEVER exits because of a marker or a refusal (so an always-on restart policy cannot loop): ALERT, PAUSED, STOP, DRAIN are STATES it reports while it idles.
+    It exits only on a stop SIGNAL (SIGTERM/SIGHUP/SIGINT: the active session is asked to unwind first) or ``max_iterations`` (tests). A restart is not permission to trade: before any
+    session it must PROVE the account flat from the venue (``recover``); a non-flat venue is an ALERT; an unreadable one is PAUSED and retried. One loop per root (lock file); an
+    optional global executor ``lease`` must be held (fail closed) before any session starts."""
     clock = clock or (lambda: int(time.time() * 1000))
     sleep = sleep or (lambda s: _STOP.wait(s))                       # a stop signal wakes the wait at once
+    tel = telemetry or NullTelemetry()
     os.makedirs(root, mode=0o700, exist_ok=True)
-    if os.path.exists(os.path.join(root, "ALERT")):                  # a human must look first: after a restart (Fly restarts a failed machine) the loop must NOT carry on
-        out(f"ALERT present in {root}: not starting. Read it, fix the cause, remove the ALERT file, then start again")
-        return 0
     lock = open(os.path.join(root, "lock"), "a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         out("another autopilot loop holds this root's lock")
         return 4
-    errors, n = 0, 0
+    eng = ES.EngineState(root, clock)
+    prev = eng.previous_state()
+    run_id = f"run_{int(clock())}"
+    seen: Dict[str, Optional[int]] = {"bybit": None, "market": None, "reconcile": None, "sync": None}
+    session: Dict[str, Optional[str]] = {"id": None}
+
+    def go(state: str, source: str, **extra: Any) -> Dict[str, Any]:
+        session["id"] = os.path.basename(_ACTIVE["dir"]) if _ACTIVE.get("dir") else None
+        st = eng.transition(state, source, **extra)
+        try:
+            tel.heartbeat(build_heartbeat(env, st, root, clock, seen, tel.pending(), getattr(lease, "token", None), session["id"], run_id))
+            tel.event("SESSION_STATE", {"state": state, "source": source, **extra}, session["id"])
+        except Exception:                                            # noqa: BLE001 - telemetry must never affect safety or availability
+            pass
+        return st
+
+    def idle(state: str, source: str, **extra: Any) -> None:
+        go(state, source, **extra)
+        sleep(IDLE_POLL_S)
+
+    go("INITIALISING", f"loop_start(prev={prev})")
+    recovered = False
+    errors, refused, n = 0, 0, 0
     while max_iterations is None or n < max_iterations:
         n += 1
-        if _STOP.is_set() or os.path.exists(os.path.join(root, "STOP")):
-            out("stop requested: stopping")
+        if _STOP.is_set():
+            go("STOPPED", "signal")
+            out("stop signal: stopped")
             return 0
-        res = once(env, clock=clock, sleep=sleep, out=out, **kw)
+        if eng.has("ALERT"):
+            idle("UNRECONCILED" if eng.load()["state"] == "UNRECONCILED" else "ALERT", "marker", detail=eng.read("ALERT"))        # the more specific cause stays visible across a restart
+            continue
+        if eng.has("STOP"):
+            idle("STOPPED", "marker")
+            continue
+        if eng.has("PAUSED"):
+            idle("PAUSED", "marker", detail=eng.read("PAUSED"))
+            continue
+        if lease is not None and not lease.held():
+            idle("PAUSED", "lease_not_held")
+            continue
+        if not recovered:
+            go("RECOVERING", f"startup_check(prev={prev})")
+            ok, why, info = recover_fn(env, clock=clock, **{k: v for k, v in kw.items() if k in ("inner", "state_root", "symbol")})
+            if info.get("venue_read_complete"):
+                seen["bybit"] = seen["reconcile"] = int(info.get("reconciled_ms") or clock())
+            if not ok:
+                if info.get("venue_read_complete"):                  # the venue answered and is NOT flat: a human must look (exact commands in the runbook)
+                    eng.set("ALERT", {"code": "UNRECONCILED_AT_RECOVERY", "why": why, "info": info})
+                    go("UNRECONCILED", "recovery_not_flat", why=why)
+                else:                                                # unreadable / no capability yet: paused, retried automatically
+                    idle("PAUSED", "recovery_unreadable", why=why)
+                continue
+            recovered = True
+        if eng.has("DRAIN"):
+            d = eng.read("DRAINED")
+            if not (isinstance(d, dict) and int(clock()) - int(d.get("at_ms", 0)) < DRAINED_FRESH_MS):
+                eng.set("DRAINED", {"venue_flat_proof": True, "at_ms": int(clock())})
+            idle("DRAINING", "drain_requested")
+            continue
+        res = once(env, clock=clock, sleep=sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src), **kw)
         res["at_ms"] = int(clock())
-        S._write_json(os.path.join(root, "last_result.json"), res)
-        out(json.dumps({k: res.get(k) for k in ("result", "why", "state_dir", "flat_verified", "funding_bps")}, sort_keys=True, default=str))
-        if res["result"] in ("NOT_FLAT", "REFUSED"):
-            S._write_json(os.path.join(root, "ALERT"), res)
-            return 3
-        errors = errors + 1 if res["result"] == "ERROR" else 0
-        if errors >= MAX_CONSECUTIVE_ERRORS:
-            S._write_json(os.path.join(root, "ALERT"), res)
-            return 3
-        sleep(COOLDOWN_AFTER_SESSION_S if res["result"] == "DONE" else POLL_S)
+        ES.write_json_atomic(os.path.join(root, "last_result.json"), res)
+        out(json.dumps({k: res.get(k) for k in ("result", "why", "state_dir", "flat_verified", "funding_bps", "session_class")}, sort_keys=True, default=str))
+        try:
+            tel.event("DECISION", {k: res.get(k) for k in ("result", "why", "session_class", "funding_bps", "edge", "flat_verified", "net", "revoked_reason")}, session["id"])
+        except Exception:                                            # noqa: BLE001
+            pass
+        seen["market"] = int(clock()) if res["result"] != "ERROR" else seen["market"]
+        r = res["result"]
+        errors = errors + 1 if r == "ERROR" else 0
+        refused = refused + 1 if r == "REFUSED" else 0
+        if r == "NOT_FLAT":
+            eng.set("ALERT", {"code": "NOT_FLAT", "result": res})
+            go("UNRECONCILED", "session_not_flat")
+            recovered = False                                        # the next recovery must prove flat again
+            continue
+        if r in ("DONE",):
+            seen["reconcile"] = int(clock())
+            go("FLAT", "session_done")
+            if res.get("revoked_reason"):
+                go("PAUSED", f"revoked:{res['revoked_reason']}")
+            sleep(COOLDOWN_AFTER_SESSION_S)
+            continue
+        if r == "REFUSED":
+            owner_side = any(any(w.startswith(p) for p in OWNER_AUTHORITY_REFUSALS) for w in res.get("why", []))
+            if not owner_side and refused >= MAX_CONSECUTIVE_ERRORS:
+                eng.set("ALERT", {"code": "REPEATED_UNEXPECTED_REFUSAL", "result": res})
+                continue
+            idle("PAUSED", "refused:" + ",".join(res.get("why", []))[:120])    # authority missing/expired: no marker, resumes by itself when the owner installs it
+            continue
+        if r == "ERROR" and errors >= MAX_CONSECUTIVE_ERRORS:
+            eng.set("ALERT", {"code": "REPEATED_ERRORS", "result": res})
+            continue
+        idle("WAITING_FOR_OPPORTUNITY", "skipped:" + ",".join(res.get("why", []))[:120]) if r == "SKIPPED" else idle("DATA_CHECK", "error:" + ",".join(res.get("why", []))[:120])
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------- owner commands on the machine (drain, resume, clear-alert, deploy-check)
+def cmd_drain(root: str, clock: Callable[[], int], wait_s: int = 0, sleep: Callable[[float], None] = time.sleep, out: Callable[[str], None] = print) -> int:
+    """Ask the loop for a safe deployment: no new sessions, the active one finishes, then DRAINED is written once the venue is proven flat. ``wait_s`` > 0 blocks until DRAINED."""
+    eng = ES.EngineState(root, clock)
+    eng.set("DRAIN", {"requested": True})
+    out("DRAIN requested: no new session will start; the active one finishes or unwinds")
+    deadline = int(clock()) + wait_s * 1000
+    while wait_s > 0 and int(clock()) < deadline:
+        d = eng.read("DRAINED")
+        if isinstance(d, dict) and int(d.get("at_ms", 0)) >= int(eng.read("DRAIN").get("at_ms", 0)):
+            out("DRAINED: the venue is flat and no session is active; deploying is safe now")
+            return 0
+        sleep(5)
+    return 0 if wait_s == 0 else 1
+
+
+def deploy_ready(root: str, clock: Callable[[], int]) -> Tuple[bool, str]:
+    eng = ES.EngineState(root, clock)
+    stt = eng.load()["state"]
+    if stt in ES.IN_SESSION:
+        return False, f"a session is active (state {stt}): drain first"
+    d = eng.read("DRAINED")
+    if not (isinstance(d, dict) and int(clock()) - int(d.get("at_ms", 0)) < DRAINED_FRESH_MS):
+        return False, "no fresh DRAINED proof: run `drain --wait` and let it finish"
+    if eng.has("ALERT"):
+        return False, "an ALERT is open: resolve it first (a deploy would not clear it)"
+    return True, "OK_TO_DEPLOY"
+
+
+def cmd_resume(root: str, clock: Callable[[], int], reason: str, out: Callable[[str], None] = print) -> int:
+    eng = ES.EngineState(root, clock)
+    if eng.has("ALERT"):
+        out("an ALERT is open: use clear-alert (it proves the venue flat first)")
+        return 2
+    cleared = [m for m in ("PAUSED", "STOP", "DRAIN", "DRAINED") if eng.clear(m, reason)]
+    out(f"cleared: {cleared or 'nothing'}")
+    return 0
+
+
+def cmd_clear_alert(env: Mapping[str, str], root: str, clock: Callable[[], int], reason: str, *, recover_fn: Callable[..., Tuple[bool, List[str], Dict[str, Any]]] = recover,
+                    out: Callable[[str], None] = print, **kw: Any) -> int:
+    """An ALERT is cleared by a human AFTER the venue proves flat: this runs the recovery check and refuses when it cannot."""
+    eng = ES.EngineState(root, clock)
+    if not eng.has("ALERT"):
+        out("no ALERT")
+        return 0
+    if not reason.strip():
+        out("refused: a reason (what you examined and fixed) is required")
+        return 2
+    ok, why, _info = recover_fn(env, clock=clock, **kw)
+    if not ok:
+        out("refused: the venue is not proven flat: " + ", ".join(why))
+        return 2
+    eng.clear("ALERT", reason)
+    out("ALERT cleared (logged in marker_log.jsonl); the loop resumes by itself")
     return 0
 
 
@@ -398,20 +683,32 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--max-sessions", type=int, default=2, help="sessions per UTC day (<= the manifest's entries cap)")
     g.add_argument("--max-notional-usd", type=float, default=400.0)
     g.add_argument("--max-hold-s", type=int, default=1500, help=f"hold per session, <= {MAX_HOLD_S}; a settlement farther away than this is skipped")
-    g.add_argument("--min-funding-bps", type=float, default=5.0, help="only trade when the funding rate pays at least this many bps per settlement")
+    g.add_argument("--min-funding-bps", type=float, default=5.0, help="an extra FLOOR on the funding rate; the economics gate derives the real requirement and this can never lower it")
     g.add_argument("--days", type=int, default=7, help=f"validity, <= {MAX_GRANT_DAYS}")
     g.add_argument("--allow-mechanics-sessions", action="store_true", help="ALSO allow bounded TESTNET_MECHANICS sessions (fake-money lifecycle/fee/fill measurement, expected net NEGATIVE, never "
                    "an opportunity) when the economics gate says the trade does not pay; without it only a PROFIT_CANDIDATE session can run")
     sub.add_parser("once", help="one cycle")
-    lp = sub.add_parser("loop", help="repeat until STOP, a NOT_FLAT/REFUSED result, or repeated errors")
+    lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
     lp.add_argument("--root", default=DEFAULT_ROOT)
-    sub.add_parser("status", help="print the grant's bounds and the last result (no network)")
+    for name, helptext in (("status", "print the grant, engine state, markers and last result (no network)"), ("deploy-check", "exit 0 only if a deployment is safe now (fresh DRAINED proof, no active session, no ALERT)")):
+        p2 = sub.add_parser(name, help=helptext)
+        p2.add_argument("--root", default=DEFAULT_ROOT)
+    dr = sub.add_parser("drain", help="ask the loop for a safe deployment: no new sessions, the active one finishes, then the venue is proven flat")
+    dr.add_argument("--root", default=DEFAULT_ROOT)
+    dr.add_argument("--wait", type=int, default=0, help="block up to this many seconds until DRAINED")
+    rs = sub.add_parser("resume", help="clear PAUSED / STOP / DRAIN (never an ALERT)")
+    rs.add_argument("--root", default=DEFAULT_ROOT)
+    rs.add_argument("--reason", required=True)
+    ca = sub.add_parser("clear-alert", help="clear an ALERT after you examined it; refused unless the venue is proven flat")
+    ca.add_argument("--root", default=DEFAULT_ROOT)
+    ca.add_argument("--reason", required=True, help="what you examined and fixed")
     return ap
 
 
 def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int:
     a = _parser().parse_args(list(argv) if argv is not None else None)
     e = dict(env)
+    clock = lambda: int(time.time() * 1000)                         # noqa: E731
     if a.cmd == "grant":
         if not sys.stdin.isatty():
             print("refused: the grant needs an interactive terminal (you type the reference yourself)")
@@ -419,13 +716,26 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         return cmd_grant(a)
     if a.cmd == "status":
         manifest, _st = S._load_capability_manifest()
-        g, why = load_grant(int(time.time() * 1000), manifest or {}, None) if manifest else (None, ["NO_CAPABILITY"])
-        print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "why": why}, indent=2, sort_keys=True))
+        g, why = load_grant(clock(), manifest or {}, None) if manifest else (None, ["NO_CAPABILITY"])
+        eng = ES.EngineState(a.root, clock)
+        print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "grant_problems": why, "engine": {k: v for k, v in eng.load().items() if k != "history"},
+                          "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json"))},
+                         indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "once":
         res = run_once(e)
         print(json.dumps(res, indent=2, sort_keys=True, default=str))
         return 0 if res["result"] in ("DONE", "SKIPPED") else 3
+    if a.cmd == "drain":
+        return cmd_drain(a.root, clock, a.wait)
+    if a.cmd == "deploy-check":
+        ok, msg = deploy_ready(a.root, clock)
+        print(msg)
+        return 0 if ok else 1
+    if a.cmd == "resume":
+        return cmd_resume(a.root, clock, a.reason)
+    if a.cmd == "clear-alert":
+        return cmd_clear_alert(e, a.root, clock, a.reason)
     install_signal_handlers()
     return loop(e, root=a.root)
 

@@ -196,20 +196,6 @@ def test_a_cycle_stops_at_the_daily_cap(w):
 
 
 # ---------------------------------------------------------------- the loop
-def test_the_loop_honours_stop_alerts_on_not_flat_and_allows_one_loop_per_root(tmp_path):
-    root = str(tmp_path / "ap")
-    os.makedirs(root)
-    open(os.path.join(root, "STOP"), "w").close()
-    calls = []
-    assert AP.loop({}, root=root, once=lambda *a, **k: calls.append(1) or {"result": "DONE"}, out=lambda _m: None) == 0 and calls == []
-    os.remove(os.path.join(root, "STOP"))
-    assert AP.loop({}, root=root, once=lambda *a, **k: {"result": "NOT_FLAT", "why": []}, out=lambda _m: None) == 3
-    assert os.path.exists(os.path.join(root, "ALERT"))
-    os.remove(os.path.join(root, "ALERT"))
-    seq = iter([{"result": "ERROR", "why": ["x"]}] * 3)
-    assert AP.loop({}, root=root, once=lambda *a, **k: next(seq), sleep=lambda _s: None, out=lambda _m: None) == 3                # three errors in a row stop it
-    done = iter([{"result": "SKIPPED", "why": []}] * 2)
-    assert AP.loop({}, root=root, once=lambda *a, **k: next(done), sleep=lambda _s: None, out=lambda _m: None, max_iterations=2) == 0
 
 
 def test_the_owner_grant_command_needs_the_capability_file_a_typed_reference_and_refuses_to_overwrite(w):
@@ -282,13 +268,6 @@ def test_a_stop_before_the_order_places_nothing_and_counts_no_entry(w, stop_stat
     assert res["result"] == "SKIPPED" and res["why"] == ["STOP_REQUESTED"] and not [r for r in w.fake.requests if r[0] == "POST"] and S.entries_today(w.clock.now()) == 0
 
 
-def test_the_loop_does_not_start_while_an_alert_exists_so_a_fly_restart_cannot_skip_the_human(tmp_path, stop_state):
-    root = tmp_path / "ap"
-    root.mkdir()
-    (root / "ALERT").write_text("{}")
-    calls = []
-    msgs = []
-    assert AP.loop({}, root=str(root), once=lambda *a, **k: calls.append(1) or {"result": "DONE"}, out=msgs.append) == 0 and calls == [] and "ALERT present" in msgs[0]
 
 
 # ---------------------------------------------------------------- the ECONOMICS gate: a funding rate is not a profit
@@ -362,3 +341,260 @@ def test_the_grant_command_records_the_mechanics_choice_explicitly(w):
     a = argparse.Namespace(symbols=["BTCUSDT"], max_sessions=2, max_notional_usd=400.0, max_hold_s=1500, min_funding_bps=5.0, days=7, allow_mechanics_sessions=True)
     assert AP.cmd_grant(a, input_fn=lambda _p: "owner", now_ms=w.clock.now(), out=lambda _m: None) == 0
     assert AP.load_grant(w.clock.now(), S._load_capability_manifest()[0])[0]["allow_mechanics_sessions"] is True
+
+
+# ================================================================ the lifecycle: persistent states, recovery, revocation, drain
+import ms_engine_state as ES  # noqa: E402
+
+
+def run_loop(w, root, once, *, n=1, recover_fn=None, telemetry=None, lease=None, **kw):
+    out = []
+    kwargs = dict(root=str(root), once=once, clock=w.clock.now, sleep=lambda _s: None, out=out.append, max_iterations=n, telemetry=telemetry, lease=lease, inner=w.fake,
+                  state_root=str(w.tmp / "auto"))
+    if recover_fn is not None:
+        kwargs["recover_fn"] = recover_fn
+    kwargs.update(kw)
+    rc = AP.loop(w.env, **kwargs)
+    return rc, out
+
+
+OK_RECOVERY = lambda *a, **k: (True, [], {"venue_read_complete": True, "reconciled_ms": 1})          # noqa: E731
+NEVER = lambda *a, **k: (_ for _ in ()).throw(AssertionError("once() must not be called"))          # noqa: E731
+
+
+def state_of(root, clock):
+    return ES.EngineState(str(root), clock).load()["state"]
+
+
+def test_engine_state_records_a_source_and_timestamp_for_every_transition_and_refuses_unknown_states(tmp_path):
+    t = {"now": 1000}
+    st = ES.EngineState(str(tmp_path / "r"), lambda: t["now"])
+    st.transition("RECOVERING", "startup")
+    t["now"] = 2000
+    cur = st.transition("WAITING_FOR_OPPORTUNITY", "recovery_ok")
+    assert [h["state"] for h in cur["history"]] == ["RECOVERING", "WAITING_FOR_OPPORTUNITY"] and cur["history"][1] == {"state": "WAITING_FOR_OPPORTUNITY", "at_ms": 2000, "source": "recovery_ok"}
+    with pytest.raises(ValueError):
+        st.transition("HEALTHY", "x")
+    assert os.stat(st.path).st_mode & 0o777 == 0o600
+
+
+def test_a_stop_marker_keeps_the_process_alive_as_STOPPED_and_starts_nothing(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    ES.EngineState(str(root), w.clock.now).set("STOP", {"by": "owner"})
+    rc, _ = run_loop(w, root, NEVER, n=3, recover_fn=OK_RECOVERY)
+    assert rc == 0 and state_of(root, w.clock.now) == "STOPPED"
+
+
+def test_an_alert_survives_a_restart_and_blocks_trading_until_a_human_clears_it(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    ES.EngineState(str(root), w.clock.now).set("ALERT", {"code": "NOT_FLAT"})
+    for _ in range(2):                                                                  # two "restarts": a fresh loop each time
+        rc, _ = run_loop(w, root, NEVER, n=2, recover_fn=OK_RECOVERY)
+        assert rc == 0 and state_of(root, w.clock.now) == "ALERT" and os.path.exists(root / "ALERT")
+
+
+def test_a_paused_marker_pauses_and_the_resume_command_clears_it_but_never_an_alert(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    eng = ES.EngineState(str(root), w.clock.now)
+    eng.set("PAUSED", {"why": "x"})
+    run_loop(w, root, NEVER, n=1, recover_fn=OK_RECOVERY)
+    assert state_of(root, w.clock.now) == "PAUSED"
+    assert AP.cmd_resume(str(root), w.clock.now, "examined", out=lambda _m: None) == 0 and not eng.has("PAUSED")
+    eng.set("ALERT", {"code": "x"})
+    assert AP.cmd_resume(str(root), w.clock.now, "try", out=lambda _m: None) == 2 and eng.has("ALERT")
+
+
+def test_a_restart_cannot_trade_before_the_venue_proves_flat(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    w.fake.inject_position("BTCUSDT", -0.005)                                           # the previous process died with a short open
+    calls = []
+    rc, _ = run_loop(w, root, lambda *a, **k: calls.append(1) or {"result": "SKIPPED", "why": []}, n=3)
+    st = ES.EngineState(str(root), w.clock.now)
+    assert calls == [] and st.has("ALERT") and st.load()["state"] == "UNRECONCILED"
+    assert any("PERP_POSITION_OPEN" in str(x) for x in st.read("ALERT")["why"])
+
+
+def test_an_unreadable_venue_pauses_without_an_alert_and_is_retried(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    unreadable = lambda *a, **k: (False, ["VENUE_UNREADABLE:ExecutorError"], {"venue_read_complete": False})          # noqa: E731
+    run_loop(w, root, NEVER, n=2, recover_fn=unreadable)
+    st = ES.EngineState(str(root), w.clock.now)
+    assert st.load()["state"] == "PAUSED" and not st.has("ALERT")
+
+
+def test_a_flat_venue_after_an_unresolved_prior_session_is_recorded_and_allowed(w, tmp_path, stop_state):
+    write_grant(w, min_funding_bps=0.5)
+    prior = w.tmp / "auto" / "ms_auto_20261110T000000"
+    os.makedirs(prior)
+    open(prior / "journal", "w").write("x\n")                                           # a session started and never reached flat_verified
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert ok and why == [] and info["unresolved"] is True
+    assert json.load(open(prior / "recovery.json"))["accounting_must_be_reconciled"] is True
+
+
+def test_recovery_refuses_when_the_spot_balance_differs_from_the_sessions_baseline(w, tmp_path):
+    prior = w.tmp / "auto" / "ms_auto_20261110T000000"
+    os.makedirs(prior)
+    json.dump({"baseline": {"spot:BTCUSDT": 0.0}}, open(prior / "run_limits.json", "w"))
+    w.fake.wallet["BTC"] = __import__("decimal").Decimal("0.5")                          # a spot leg is still held
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert not ok and info["venue_read_complete"] and any(x.startswith("SPOT_DELTA_OPEN") for x in why)
+
+
+def test_clear_alert_is_refused_unless_the_venue_is_proven_flat_and_a_reason_is_given(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    eng = ES.EngineState(str(root), w.clock.now)
+    eng.set("ALERT", {"code": "NOT_FLAT"})
+    kw = dict(inner=w.fake, state_root=str(w.tmp / "auto"))
+    assert AP.cmd_clear_alert(w.env, str(root), w.clock.now, "  ", out=lambda _m: None, **kw) == 2 and eng.has("ALERT")
+    w.fake.inject_position("BTCUSDT", -0.005)
+    assert AP.cmd_clear_alert(w.env, str(root), w.clock.now, "looked", out=lambda _m: None, **kw) == 2 and eng.has("ALERT")
+    w.fake.inject_position("BTCUSDT", 0)
+    assert AP.cmd_clear_alert(w.env, str(root), w.clock.now, "closed the short by hand and verified flat", out=lambda _m: None, **kw) == 0 and not eng.has("ALERT")
+    log = [json.loads(x) for x in open(root / "marker_log.jsonl")]
+    assert log[-1]["action"] == "CLEARED" and "verified flat" in log[-1]["payload"]["reason"]
+
+
+def test_results_map_to_states_and_a_session_that_is_not_flat_raises_an_alert(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    run_loop(w, root, lambda *a, **k: {"result": "NOT_FLAT", "why": [], "state_dir": "x"}, n=1, recover_fn=OK_RECOVERY)
+    st = ES.EngineState(str(root), w.clock.now)
+    assert st.has("ALERT") and st.load()["state"] == "UNRECONCILED" and st.read("ALERT")["code"] == "NOT_FLAT"
+    root2 = tmp_path / "ap2"
+    run_loop(w, root2, lambda *a, **k: {"result": "SKIPPED", "why": ["FUNDING_BELOW_THRESHOLD"]}, n=1, recover_fn=OK_RECOVERY)
+    assert state_of(root2, w.clock.now) == "WAITING_FOR_OPPORTUNITY"
+    root3 = tmp_path / "ap3"
+    run_loop(w, root3, lambda *a, **k: {"result": "DONE", "why": [], "flat_verified": True}, n=1, recover_fn=OK_RECOVERY)
+    assert state_of(root3, w.clock.now) == "FLAT"
+
+
+def test_missing_owner_authority_pauses_by_itself_and_repeated_unexpected_refusals_raise_an_alert(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    run_loop(w, root, lambda *a, **k: {"result": "REFUSED", "why": ["GRANT_MISSING"]}, n=5, recover_fn=OK_RECOVERY)
+    st = ES.EngineState(str(root), w.clock.now)
+    assert st.load()["state"] == "PAUSED" and not st.has("ALERT")                       # owner-side: resumes by itself when the grant is installed
+    root2 = tmp_path / "ap2"
+    run_loop(w, root2, lambda *a, **k: {"result": "REFUSED", "why": ["EXECUTE_REFUSED"]}, n=4, recover_fn=OK_RECOVERY)
+    assert ES.EngineState(str(root2), w.clock.now).has("ALERT")
+
+
+def test_three_errors_in_a_row_raise_an_alert_and_the_loop_keeps_reporting_instead_of_exiting(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    rc, _ = run_loop(w, root, lambda *a, **k: {"result": "ERROR", "why": ["FUNDING_READ_FAILED"]}, n=6, recover_fn=OK_RECOVERY)
+    st = ES.EngineState(str(root), w.clock.now)
+    assert rc == 0 and st.has("ALERT") and st.read("ALERT")["code"] == "REPEATED_ERRORS" and st.load()["state"] == "ALERT"
+
+
+def test_drain_writes_a_fresh_proof_only_after_the_venue_is_flat_and_deploy_check_refuses_otherwise(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+    ok, msg = AP.deploy_ready(str(root), w.clock.now)
+    assert not ok and "DRAINED" in msg
+    AP.cmd_drain(str(root), w.clock.now, 0, out=lambda _m: None)
+    run_loop(w, root, NEVER, n=2, recover_fn=OK_RECOVERY)
+    assert state_of(root, w.clock.now) == "DRAINING" and AP.deploy_ready(str(root), w.clock.now) == (True, "OK_TO_DEPLOY")
+    w.clock.t += AP.DRAINED_FRESH_MS + 1                                                # the proof goes stale
+    assert AP.deploy_ready(str(root), w.clock.now)[0] is False
+    ES.EngineState(str(root), w.clock.now).set("ALERT", {"code": "x"})
+    ES.EngineState(str(root), w.clock.now).set("DRAINED", {"venue_flat_proof": True})
+    assert "ALERT" in AP.deploy_ready(str(root), w.clock.now)[1]
+
+
+def test_deploy_check_refuses_while_a_session_is_active(w, tmp_path):
+    root = tmp_path / "ap"
+    ES.EngineState(str(root), w.clock.now).transition("EXECUTING", "test")
+    ES.EngineState(str(root), w.clock.now).set("DRAINED", {"venue_flat_proof": True})
+    ok, msg = AP.deploy_ready(str(root), w.clock.now)
+    assert not ok and "session is active" in msg
+
+
+def test_a_failed_telemetry_sink_never_breaks_the_loop_and_every_heartbeat_has_the_contract_fields(w, tmp_path, stop_state):
+    root = tmp_path / "ap"
+
+    class Rec(AP.NullTelemetry):
+        def __init__(self):
+            self.hbs = []
+
+        def heartbeat(self, hb):
+            self.hbs.append(hb)
+
+    class Broken(AP.NullTelemetry):
+        def heartbeat(self, hb):
+            raise RuntimeError("supabase down")
+
+        def event(self, *a, **k):
+            raise RuntimeError("supabase down")
+    rec = Rec()
+    run_loop(w, root, lambda *a, **k: {"result": "SKIPPED", "why": ["X"]}, n=2, recover_fn=OK_RECOVERY, telemetry=rec)
+    need = {"worker_id", "app", "machine_id", "region", "code_revision", "runtime_version", "run_id", "mode", "state", "session_id", "last_bybit_read_ms", "last_market_data_ms",
+            "last_reconcile_ms", "last_supabase_sync_ms", "outbox_pending", "disk_free_bytes", "lease_token", "seq", "at_ms"}
+    assert rec.hbs and all(need <= set(h) for h in rec.hbs) and {h["state"] for h in rec.hbs} <= set(ES.STATES)
+    rc, _ = run_loop(w, tmp_path / "ap2", lambda *a, **k: {"result": "SKIPPED", "why": ["X"]}, n=2, recover_fn=OK_RECOVERY, telemetry=Broken())
+    assert rc == 0
+
+
+def test_a_lease_that_is_not_held_pauses_the_loop_and_starts_no_session(w, tmp_path, stop_state):
+    class NoLease:
+        token = None
+
+        def held(self):
+            return False
+    root = tmp_path / "ap"
+    run_loop(w, root, NEVER, n=2, recover_fn=OK_RECOVERY, lease=NoLease())
+    assert state_of(root, w.clock.now) == "PAUSED"
+
+
+# ---------------------------------------------------------------- revocation during a session: never abandon a hedge, never a naked leg
+def revoke_cycle(w, root, trigger, **grant_over):
+    """A full hold session on the fake; ``trigger(n)`` runs inside the session's own sleep (n-th call) to revoke authority mid-session."""
+    write_grant(w, **{"min_funding_bps": 0.5, "allow_mechanics_sessions": True, **grant_over})
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0008", 600_000
+    calls = {"n": 0}
+    real = w.clock.sleep
+
+    def sleep(s):
+        calls["n"] += 1
+        trigger(calls["n"])
+        real(s)
+    return AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(root), lease=getattr(w, "lease", None))
+
+
+def test_deleting_the_grant_during_a_session_unwinds_and_verifies_flat(w, tmp_path):
+    root = tmp_path / "ap"
+    res = revoke_cycle(w, root, lambda n: os.remove(AP.grant_path()) if n == 3 and os.path.exists(AP.grant_path()) else None)
+    assert res["revoked_reason"].startswith("GRANT:") and res["flat_verified"] is True and res["result"] == "DONE"
+    assert os.path.exists(os.path.join(res["state_dir"], "MS_KILL")) and json.load(open(os.path.join(res["state_dir"], "revocation.json")))["reason"].startswith("GRANT:")
+    assert all(p["size"] == 0 for p in w.fake.positions.values())                       # no naked leg
+
+
+def test_a_stop_marker_set_during_a_session_unwinds_and_verifies_flat(w, tmp_path):
+    root = tmp_path / "ap"
+    res = revoke_cycle(w, root, lambda n: ES.EngineState(str(root), w.clock.now).set("STOP", {"by": "owner"}) if n == 3 else None)
+    assert res["revoked_reason"] == "STOP" and res["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_losing_the_executor_lease_during_a_session_unwinds_and_verifies_flat(w, tmp_path):
+    class Lease:
+        token = 7
+
+        def __init__(self):
+            self.ok = True
+
+        def held(self):
+            return self.ok
+    w.lease = Lease()
+    root = tmp_path / "ap"
+    res = revoke_cycle(w, root, lambda n: setattr(w.lease, "ok", False) if n == 3 else None)
+    assert res["revoked_reason"] == "LEASE_LOST" and res["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_an_expiring_grant_during_a_session_is_a_revocation(w, tmp_path):
+    root = tmp_path / "ap"
+    res = revoke_cycle(w, root, lambda n: None, expires_ms=w.clock.now() + 400_000)       # valid at the plan and the execute gate, gone 6.7 minutes into a 12 minute hold
+    assert res["revoked_reason"] == "GRANT:GRANT_EXPIRED" and res["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_a_session_nobody_revokes_runs_to_the_end_with_no_revocation(w, tmp_path):
+    root = tmp_path / "ap"
+    res = revoke_cycle(w, root, lambda n: None)
+    assert res["result"] == "DONE" and res["revoked_reason"] is None and not os.path.exists(os.path.join(res["state_dir"], "revocation.json"))
