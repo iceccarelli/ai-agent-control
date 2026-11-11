@@ -125,6 +125,10 @@ the bot's state, as the authority.
   `fly volumes extend <id> -s <GB>`) or lower `--recorder-retention-days` in the image CMD. The recorder never deletes a day that has no
   verified off-volume copy to free space: `emergency_prunes_denied` in `recorder_status.json` counts the refusals. To let a full volume free its oldest BACKED-UP day,
   run `md_seal.py seal` + `backup` and start the recorder with `--emergency-backup-dir DIR --emergency-receipts R.jsonl` (owner decision).
+- **EARLY WARNING (alert `recorder_disk_low`):** the last 3 monitor cycles that report `free_mb` found the volume within about 1 GiB of the 512 MB reserve. The recorder is still RECORDING, but once the reserve is hit it stops writing and does NOT
+  recover by itself (age retention is bounded by the newest segment on disk, a refused write never opens the next day's segment, and the emergency prune is default-deny). Act now, read-only first:
+  `fly volumes list -a carry-drill`, `fly ssh console -a carry-drill -C "df -h /data"`, `fly ssh console -a carry-drill -C "sh -c 'du -sh /data/*'"`. The size model (about 1.1 measured / 1.5 documented GB per day; retention 2 needs
+  about 4.2 / 5.6 GB at 1.1 / 1.5 GB/day and 8 GB at 2.25; retention 1 needs about 3.0 / 3.9 / 5.6 GB) is in `docs/MONEY_MISSION.md`.
 - **Never:** delete files under `/data/market` by hand; the log is hash-chained and prunes itself by day.
 
 ## Backups

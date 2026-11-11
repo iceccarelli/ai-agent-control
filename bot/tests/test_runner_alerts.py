@@ -483,3 +483,41 @@ def test_one_or_two_bad_cycles_or_a_recovered_recorder_do_not_alert():
 def test_a_history_with_no_recorder_field_never_raises_recorder_down():
     alerts = RA.evaluate(text(row(180), row(120), row(60)), NOW)
     assert "recorder_down" not in _keys(alerts)
+
+
+# -- the recorder's volume: early warning before the write reserve --------------------------------------------
+
+def _free_rows(*mbs):
+    n = len(mbs)
+    return [row((n - i) * 60, recorder_state="RECORDING", free_mb=mb) for i, mb in enumerate(mbs)]
+
+
+def test_a_volume_that_stays_within_one_day_of_the_write_reserve_warns_before_the_recorder_stops():
+    alerts = RA.evaluate(text(*_free_rows(5000, 1400, 1300, 1200)), NOW)
+    assert "recorder_disk_low" in _keys(alerts) and "recorder_down" not in _keys(alerts)          # still RECORDING: this is the notice, not the failure
+    msg = next(a for a in alerts if a.key == "recorder_disk_low")
+    assert msg.severity == RA.WARNING and "1200 MB" in msg.text and "does NOT recover by itself" in msg.text and "fly volumes list" in msg.text
+
+
+def test_a_briefly_low_or_comfortable_volume_does_not_warn():
+    for mbs in ((5000, 4000, 3000, 2500), (1400, 1300, 3500), (1400, 1300), (3000, 1400, 1300, 3500)):    # comfortable / recovered by the retention prune / too few rows
+        assert "recorder_disk_low" not in _keys(RA.evaluate(text(*_free_rows(*mbs)), NOW)), mbs
+
+
+def test_below_the_reserve_the_warning_says_below():
+    msg = next(a for a in RA.evaluate(text(*_free_rows(400, 300, 200)), NOW) if a.key == "recorder_disk_low")
+    assert "BELOW the 512 MB write reserve" in msg.text
+
+
+def test_rows_without_a_numeric_free_space_never_raise_the_disk_warning():
+    rows = [row(180, recorder_state="RECORDING", free_mb=None), row(120, recorder_state="RECORDING", free_mb="low"), row(60, recorder_state="RECORDING", free_mb=True)]
+    assert "recorder_disk_low" not in _keys(RA.evaluate(text(*rows), NOW))
+
+
+def test_the_alert_reserve_is_the_recorders_own_default_reserve():
+    """The warning is defined relative to the reserve the recorder actually enforces (``build(min_free_mb=512)``): if that default moves, this alert's arithmetic must move with it."""
+    import inspect
+    import market_recorder
+    default = inspect.signature(market_recorder.build).parameters["min_free_mb"].default
+    assert default == RA.RECORDER_RESERVE_MB == 512
+    assert RA.RECORDER_FREE_WARN_MB == RA.RECORDER_RESERVE_MB + 1024
