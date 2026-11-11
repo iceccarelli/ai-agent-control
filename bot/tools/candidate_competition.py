@@ -174,6 +174,7 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
         fam_out[k] = {"verdict": f["verdict"], "status": f.get("status"), "is_carry": f["is_carry"], "rows": f.get("independent_holding_rows"), "oos_mean_net_bps_per_row": oos,
                       "descriptive_best_in_sample_net_bps": desc, "descriptive_label": "IN_SAMPLE_DESCRIPTIVE_NOT_A_TEST" if desc is not None else None,
                       "p_adjusted": f.get("p_adjusted"), "n_variants_counted": f.get("n_variants_counted"), "survivorship": f.get("survivorship"), "reason": f.get("reason"),
+                      "rejected_early": f.get("reject_early") is not None, "oos_independent_observations": f.get("oos_independent_observations"),
                       "oos_beta_to_market": (f.get("oos_book_analytics") or {}).get("beta_to_market"),
                       "oos_max_drawdown_bps": (f.get("oos_book_analytics") or {}).get("max_drawdown_bps")}
         if oos is not None and (best is None or oos > best):

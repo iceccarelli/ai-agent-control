@@ -432,7 +432,7 @@ def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_
     EXECUTION_READY PROSPECTIVE + executable on a qualified venue (never a RESEARCH_ONLY candidate).
     OWNER_PROFIT_EVIDENCED  owner-signed evidence verified by the owner's ledger. This tool cannot read or create it: never reached here (a caller-supplied dict is ignored).
 
-    ``survivorship`` None = not applicable (single instrument). ``highest_supportable_verdict`` never exceeds INSUFFICIENT_DATA: REJECTED only when an adequately sized evaluation lost."""
+    ``survivorship`` None = not applicable (single instrument). ``highest_supportable_verdict`` never exceeds INSUFFICIENT_DATA: REJECTED when an adequately sized evaluation lost, or earlier when the out-of-sample net is significantly negative (``early_rejection``: reject-only)."""
     L: Dict[str, Dict[str, Any]] = {}
     ev = evaluation if isinstance(evaluation, Mapping) else None
 
@@ -1010,7 +1010,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     """Walk-forward evaluation of 'short the perps with the highest trailing funding'. EVERY variant tried in the call is a member of the multiple-testing family:
     formation windows x hold lengths x top-k x cost scenarios (``variants_tried``; the count is ``n_variants_counted``). Variants that share the primary ``hold_days`` share
     one time grid and may be SELECTED (on the TRAIN rows only); a different hold length has a different row grid, so it is COUNTED but never selectable. Returns a verdict
-    capped at INSUFFICIENT_DATA (REJECTED when an adequately sized out-of-sample is non-positive). The trailing same-window observation is reported separately and labelled;
+    capped at INSUFFICIENT_DATA (REJECTED when an adequately sized out-of-sample is non-positive, or earlier by the reject-only ``early_rejection`` rule). The trailing same-window observation is reported separately and labelled;
     it is not an expectation.
 
     ``universe_info`` is the ``info`` from ``load_history_root``: it supplies ``survivorship`` (absent = SURVIVORS_ONLY). ``multiple_testing_scope`` is PER_PROCESS for the
@@ -1134,13 +1134,20 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    early = early_rejection(st)
+    early_applied = False
+    if verdict == "INSUFFICIENT_DATA" and early:
+        verdict, early_applied = "REJECTED", True         # reject-only: a significantly negative net cannot clear its costs, whatever the sample size
     if out["terminal_exit_unpriced"] or unkeyed:
-        verdict = "INSUFFICIENT_DATA"                   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
+        verdict, early_applied = "INSUFFICIENT_DATA", False   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
+    out["reject_early"] = early if early_applied else None
+    out["reject_early_suppressed_by_cap"] = bool(early and not early_applied and verdict != "REJECTED")
     out.update({"status": "WALK_FORWARD_DONE", "evidence_class": "FULL_SPAN_WALK_FORWARD_NOT_PROFIT_EVIDENCE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
                 "correction": "holm", "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean,
                 "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"], "p_adjusted": adj, "selected_per_fold": chosen,
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
-                "reason": "directional total = funding + short price leg - perp round trip; PERP_ONLY legs are never carry. A pass would still need prospective evidence"})
+                "reason": "directional total = funding + short price leg - perp round trip; PERP_ONLY legs are never carry. A pass would still need prospective evidence"
+                          + ((" | REJECTED_EARLY: " + early["rule"]) if early_applied else "")})
     return out
 
 
@@ -1394,6 +1401,37 @@ FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
                          "cost_position_class": "perp_only_unhedged", "risk_model": "outright short-perp price exposure (beta to the market is ~ -1) plus funding; a squeeze can exceed funding by orders of magnitude",
                          "price_leg": "measured per leg from marks", "name_rule": "NEVER called carry"},
 }
+
+
+#: PRE-REGISTERED early-rejection rule (constants fixed here, not tuned to any result). A family whose out-of-sample NET mean is negative and significantly so cannot clear its costs; waiting for 50
+#: independent observations before saying so only delays the owner's decision. It can only REJECT: promotion keeps its floor (SV.MIN_OBSERVATIONS) and every other gate. THREE independent conditions must all
+#: hold: (1) at least 12 independent observations by the ESS floor, (2) a lower-tail p <= 0.01 from the ESS-adjusted t, and (3) the WIDEST of the bootstrap / ESS-t / batch-means 90% intervals
+#: (RH.significance ``ci``) lies wholly below zero. The ESS is estimated from the same short series, so (2) alone is anti-conservative at n of 24-40 under serial dependence (the independent review measured
+#: 3-6% false rejection at alpha 0.025 and ESS >= 8); with (1)-(3) the simulated false-rejection rate under a ZERO true edge is about 0.2-2.5% for n 24-60 and rho 0-0.6 (500 trials per cell, so +-0.7 pp),
+#: per look: repeated re-runs on a growing capture accumulate. Power is deliberately modest: about 70% at a mean of -1 sd at n=24 (90% at n=40) and 27% at -0.5 sd; a borderline loser stays INSUFFICIENT_DATA.
+REJECT_EARLY_MIN_INDEPENDENT = 12
+REJECT_EARLY_ALPHA = 0.01
+
+
+def early_rejection(st: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The early-rejection evidence from ``RH.significance`` output (computed WITH its ``ci``), or None. Fails closed: a missing, non-finite or malformed input is never a rejection."""
+    try:
+        mean, t, p1 = float(st.get("mean")), float(st.get("t")), float(st.get("p_one_sided"))
+        ind = int(st.get("independent_observations") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(mean) and math.isfinite(t) and math.isfinite(p1)) or ind < REJECT_EARLY_MIN_INDEPENDENT or not (mean < 0):
+        return None
+    p_lower = 1.0 - p1
+    if not (p_lower <= REJECT_EARLY_ALPHA):                                 # also False for NaN
+        return None
+    ci = st.get("ci")
+    hi = ci.get("hi") if isinstance(ci, Mapping) and ci.get("status") == "OK" else None
+    if not (isinstance(hi, (int, float)) and math.isfinite(float(hi)) and float(hi) < 0):
+        return None                                                          # no usable second method, or it does not exclude zero: no claim
+    return {"rule": (f">= {REJECT_EARLY_MIN_INDEPENDENT} independent OOS observations, negative mean, lower-tail p <= {REJECT_EARLY_ALPHA} (ESS-adjusted) AND the widest 90% interval wholly below zero; "
+                     "per look, taker cost scenario only (the modelled maker scenario is never selected), reject-only: never promotes"),
+            "independent_observations": ind, "mean_bps": mean, "t": t, "p_lower": p_lower, "alpha": REJECT_EARLY_ALPHA, "ci_hi_bps": float(hi)}
 
 
 def family_costs(kind: str) -> Dict[str, Dict[str, Any]]:
@@ -1715,15 +1753,22 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    early = early_rejection(st)
+    early_applied = False
+    if verdict == "INSUFFICIENT_DATA" and early:
+        verdict, early_applied = "REJECTED", True         # reject-only: a significantly negative net cannot clear its costs, whatever the sample size
     if unpriced or unkeyed:
-        verdict = "INSUFFICIENT_DATA"
+        verdict, early_applied = "INSUFFICIENT_DATA", False   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
     oos_rows = [by_t(pick)[common_sorted[i]] for pick, i in test_idx]
+    out["reject_early"] = early if early_applied else None
+    out["reject_early_suppressed_by_cap"] = bool(early and not early_applied and verdict != "REJECTED")
     out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(results), "correction": "holm",
                 "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean, "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"],
                 "p_adjusted": adj, "selected_per_fold": chosen, "oos_book_analytics": book_analytics(oos_rows),
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
-                "reason": ("carry: funding - spot+perp round trip (basis residual UNMEASURED)" if kind == FAMILY_CARRY else
-                           "perp-only book: funding earned/paid + measured price legs - perp round trips; NOT carry")})
+                "reason": (("carry: funding - spot+perp round trip (basis residual UNMEASURED)" if kind == FAMILY_CARRY else
+                           "perp-only book: funding earned/paid + measured price legs - perp round trips; NOT carry")
+                          + ((" | REJECTED_EARLY: " + early["rule"]) if early_applied else ""))})
     return out
 
 
