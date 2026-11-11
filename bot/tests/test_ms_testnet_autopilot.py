@@ -1659,3 +1659,65 @@ def test_the_owner_marker_is_recognised_even_when_the_kill_file_already_holds_an
     assert AP.owner_unwind_alert(str(d), eng, clock) is False
     (d / S.FILES["owner_unwind"]).write_text(S.OWNER_UNWIND_KILL_REASON)
     assert AP.owner_unwind_alert(str(d), eng, clock) is True and ES.EngineState(eng, clock).has("ALERT")
+
+
+# ---------------------------------------------------------------- the settlement is re-checked when the first entry leaves (a slow session must not enter after the print)
+def _slow_world_before_settlement(w, monkeypatch, settle_in_s, round_trip_s):
+    t0 = w.clock.now()
+    t_settle = t0 + settle_in_s * 1000
+    w.fake.funding_rate = "0.0020"                                                         # 20 bps: clears the owner's floor
+    monkeypatch.setattr(type(w.fake), "funding_in_ms", property(lambda s: t_settle - s.now_ms(), lambda s, v: None), raising=False)     # an ABSOLUTE settlement time, not a sliding one
+    orig = w.fake.request
+    slow_paths = {"/v5/account/wallet-balance", "/v5/position/list", "/v5/order/realtime", "/v5/execution/list", "/v5/order/create", "/v5/position/set-leverage", "/v5/market/time"}
+
+    def slow(method, url, **k):
+        if url.split("?")[0].split("bybit.com")[-1] in slow_paths:
+            w.clock.t += round_trip_s * 1000                                                 # a slow venue round trip on the session's own reads
+        return orig(method, url, **k)
+    w.fake.request = slow
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
+    return t_settle
+
+
+def _cycle_with_create_times(w, tmp_path, t_settle):
+    creates = []
+    orig = w.fake.request
+
+    def spy(method, url, **k):
+        if "/v5/order/create" in url:
+            creates.append((t_settle - w.clock.now()) / 1000.0)                                   # seconds to the settlement when the order request leaves
+        return orig(method, url, **k)
+    w.fake.request = spy
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(tmp_path / "ap"))
+    return res, creates
+
+
+@pytest.mark.parametrize("settle_in_s", [126, 130])
+def test_a_session_slowed_past_the_margin_sends_nothing_and_is_a_skip_with_its_reason(w, tmp_path, monkeypatch, settle_in_s):
+    t_settle = _slow_world_before_settlement(w, monkeypatch, settle_in_s=settle_in_s, round_trip_s=3)
+    res, creates = _cycle_with_create_times(w, tmp_path, t_settle)
+    assert not creates and not [e for e in w.fake.execs if e.get("execType", "Trade") == "Trade"], "an entry left too close to (or after) the settlement: all fees, no funding"
+    assert res["result"] == "SKIPPED" and res["why"] and res["why"][0].startswith("SETTLEMENT_TOO_CLOSE_AT_ORDER") and res["orders"] == 0 and res["flat_verified"] is True
+    log = os.path.join(str(tmp_path / "ap"), "exec_quality_log.jsonl")
+    assert not os.path.exists(log) or not open(log).read().strip()                                  # a session that sent nothing is not a measured-cost sample
+
+
+@pytest.mark.parametrize("settle_in_s", [136, 140])
+def test_the_first_entry_is_gated_at_the_margin_but_the_hedge_leg_is_not(w, tmp_path, monkeypatch, settle_in_s):
+    """The perp (first leg) leaves with at least 20 s to spare; the spot hedge follows seconds later, at 140 s it is AFTER the print, and it must still be sent: refusing it would open a perp
+    and burn a round trip unwinding it."""
+    t_settle = _slow_world_before_settlement(w, monkeypatch, settle_in_s=settle_in_s, round_trip_s=3)
+    res, creates = _cycle_with_create_times(w, tmp_path, t_settle)
+    assert res["result"] == "DONE" and res["flat_verified"] is True and res["orders"] == 4        # perp + spot entry, two exits
+    assert creates[0] >= 15.0                                                                      # the first leg went with time to spare (the check ran ~5 s earlier in this slowed world)
+    if settle_in_s == 140:
+        assert creates[1] < 0                                                                      # the hedge leg left AFTER the settlement and was not time-gated
+
+
+def test_a_session_with_time_to_spare_still_enters_across_the_settlement(w, tmp_path, monkeypatch):
+    _slow_world_before_settlement(w, monkeypatch, settle_in_s=300, round_trip_s=1)
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(tmp_path / "ap"))
+    assert res["result"] == "DONE" and res["flat_verified"] is True and res["orders"] > 0               # positive control: the guard does not stop a session with time left
+    log = os.path.join(str(tmp_path / "ap"), "exec_quality_log.jsonl")
+    assert os.path.exists(log) and open(log).read().strip()                                          # a session that sent orders is a feedback sample

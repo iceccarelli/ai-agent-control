@@ -468,3 +468,29 @@ def test_a_full_volume_does_not_make_the_supervisor_watchdog_kill_a_live_recorde
     monkeypatch.undo()
     assert time.time() - os.stat(path).st_mtime < 60, "mtime must show the process is alive"
     assert open(path).read() == before, "the content must stay stale: a status that could not be written is not a fresh status"
+
+
+def test_the_disk_warning_fires_from_the_real_history_writer_not_just_from_hand_built_rows(tmp_path):
+    """END TO END (the first version read the wrong key and was inert in production): a status file whose volume is within about 1 GiB of the 512 MiB reserve goes through the REAL
+    ``recorder_observation`` and ``_history_line`` and the REAL alert rules."""
+    import runner_alerts as RA
+
+    def status(free_mib, now=1_700_000_000.0):
+        st = {"now_ms": int(now * 1000), "feed": {"threads_alive": True}, "store": {"records": 5, "free_bytes": int(free_mib * 1048576), "fault": None}, "capacity": {"rows": 3},
+              "progress": {"newest_record_id": 10, "growth_age_s": 1.0}}
+        path = tmp_path / "recorder_status.json"
+        path.write_text(json.dumps(st))
+        return str(path), now
+    base = time.mktime(time.strptime("2026-11-10T00:00:00", "%Y-%m-%dT%H:%M:%S"))
+    for free, expect in ((700, True), (4000, False)):
+        hist = tmp_path / "monitor.jsonl"
+        if hist.exists():
+            hist.unlink()
+        p, now = status(free)
+        for k in range(4):
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(base + 60 * k))
+            assert RM._history_line(str(tmp_path), {"at": at, "outcome": "OK", "reasons": [], "recorder": RM.recorder_observation(p, now=now), "decision": {}}) is True
+        line = json.loads(hist.read_text().splitlines()[-1])
+        assert line["recorder_free_mb"] == pytest.approx(float(free)) and "free_mb" not in line       # the key the alert must read
+        keys = [a.key for a in RA.evaluate(hist.read_text(), base + 300)]
+        assert ("recorder_disk_low" in keys) is expect, (free, keys)

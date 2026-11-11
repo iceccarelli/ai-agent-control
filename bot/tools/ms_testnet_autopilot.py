@@ -60,6 +60,7 @@ MAX_GRANT_BYTES = 65_536
 MAX_HOLD_S = 3300                       # the session's lifecycle is one hour: hold + 60 s entry wait + 180 s exit wait must fit
 EXIT_MARGIN_S = 120                     # the hedge is held this long PAST the settlement
 MIN_SECONDS_TO_SETTLEMENT = 90          # entry (up to 60 s) must complete before the settlement
+SETTLEMENT_ENTRY_MARGIN_S = 20          # RE-CHECKED when the first entry order is about to leave: a session slowed by its own reads must not open the position after the print (all fees, no funding)
 POLL_S = 120                            # a cheap public read between cycles
 COOLDOWN_AFTER_SESSION_S = 1800
 MAX_CONSECUTIVE_ERRORS = 3
@@ -451,14 +452,15 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     except OSError:
         pass                                                           # evidence only: never a reason to refuse or to trade
     try:
-        return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event), "decision_id": did}
+        return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, int(nxt), on_state, on_event),
+                "decision_id": did}
     finally:
         _ACTIVE["dir"] = None
         owner_unwind_alert(d, engine_root or DEFAULT_ROOT, clock)       # also when the session raised before its own check: the owner's emergency must stop the loop whatever happened after it
 
 
 def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], d: str, sym: str, g: Mapping[str, Any], hold_s: int,
-                 rate: float, session_class: str, verdict: EG.EdgeVerdict, manifest: Mapping[str, Any], engine_root: str, lease: Any,
+                 rate: float, session_class: str, verdict: EG.EdgeVerdict, manifest: Mapping[str, Any], engine_root: str, lease: Any, next_settlement_ms: int,
                  on_state: Callable[[str, str], None], on_event: Callable[..., None] = _noop_event) -> Dict[str, Any]:
     lines: List[str] = []
     counts: Dict[Tuple[str, str], int] = {}
@@ -552,10 +554,22 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
 
+    first_entry = {"pending": True}
+    settlement_refusal: Dict[str, str] = {}
+
     def pre_order() -> Optional[str]:
         if _STOP.is_set():
             return "STOP_SIGNAL"
-        return revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)      # before EVERY entry order: the server must say this holder still holds the lease
+        why = revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)       # before EVERY entry order: the server must say this holder still holds the lease
+        if why is not None:
+            return why
+        if first_entry["pending"]:                                                              # the settlement was priced at decision time; reads, risk checks and a slow venue have used time since.
+            left = (int(next_settlement_ms) - int(clock())) / 1000.0                           # Checked LAST (after the lease round trip) so it is as close to the order as it can be.
+            if left < SETTLEMENT_ENTRY_MARGIN_S:
+                settlement_refusal["why"] = f"SETTLEMENT_TOO_CLOSE_AT_ORDER:{left:.0f}s"
+                return settlement_refusal["why"]
+            first_entry["pending"] = False                                                      # only the FIRST entry is gated on time: a perp already open is never left without its hedge
+        return None
     rc = step("execute", "--confirm-plan-digest", digest, "--unattended", sl=watch_sleep, poc=pre_order)
     try:
         with open(os.path.join(d, "testnet_session.json"), encoding="utf-8") as fh:
@@ -580,7 +594,9 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT"), quality if isinstance(quality, dict) else None,
                                 funding if isinstance(funding, dict) else None):
         emit(evt)
-    try:                                                              # research feedback: measured vs modelled, one chained row per session (evidence only; never affects safety)
+    try:                                                              # research feedback: measured vs modelled, one chained row per session that SENT an order (evidence only; never affects safety)
+        if not rec.get("orders"):
+            raise _NoFeedback()
         import evidence_chain as _EC
         dec = ES.read_json(os.path.join(d, "decision.json"))
         _EC.append(os.path.join(engine_root, "exec_quality_log.jsonl"),
@@ -591,7 +607,13 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         pass
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
+    if settlement_refusal and not rec.get("orders"):                  # the first entry was refused for time and nothing was sent: that is a SKIP with its reason, not a completed session
+        return _res("SKIPPED", [settlement_refusal["why"]], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
+
+
+class _NoFeedback(Exception):
+    """A session that sent no order has no measured cost to feed back: it must not count towards the 'about 30 sessions' the feedback report waits for."""
 
 
 def owner_unwind_alert(session_dir: str, engine_root: str, clock: Callable[[], int]) -> bool:

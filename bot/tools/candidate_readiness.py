@@ -1656,6 +1656,12 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
                 params_of[name] = {"kind": kind, "formation_days": F, "hold_days": hold_days, "top_k": k, "round_trip_bps": c["bps"], "min_listing_age_days": min_listing_age_days}
                 results[name] = run_family_variant(series, kind, slots=slots, formation_days=F, hold_days=hold_days, top_k=k, round_trip_bps=c["bps"],
                                                    min_listing_age_days=min_listing_age_days, max_staleness_ms=max_staleness_ms, memo=memo)
+    # FAIL CLOSED: only a variant whose cost provenance is KNOWN and not MODELLED can be selected. A MODELLED cost (maker: 100% fill, zero adverse selection, never measured) is counted in the
+    # multiple-testing family but never selected and never shown as the headline: train_only_best picks the cheapest variant on identical funding, so its modelled advantage would drive the figure.
+    def _prov_of(name: str) -> Optional[str]:
+        return (costs.get(name.rsplit("|C", 1)[-1]) or {}).get("prov")
+    unselectable = sorted(n for n in results if _prov_of(n) in (None, "MODELLED"))
+    out["selection_excludes_modelled_cost_variants"] = unselectable
     common = set(slots)
     for r in results.values():
         common &= {x["t"] for x in r["rows"]}
@@ -1678,18 +1684,28 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family_ledger": fam, "n_variants_counted": ledger.n_variants,
                     "reason": f"{n_rows} aligned {hold_days}-day holding rows; need >= {min_rows}. " + out["grid"]["statement"]
                               + f" This capture spans {out['grid']['window_days_available']} days (shortfall {out['grid']['shortfall_days']} days)",
-                    "descriptive_only": {"label": "IN_SAMPLE_DESCRIPTIVE_NOT_A_TEST", "book_analytics": {n: book_analytics([by_t(n)[t] for t in common_sorted]) for n in sorted(results)} if n_rows else {}}})
+                    "descriptive_only": {"label": "IN_SAMPLE_DESCRIPTIVE_NOT_A_TEST",
+                                         "book_analytics": {n: book_analytics([by_t(n)[t] for t in common_sorted]) for n in sorted(results) if n not in unselectable} if n_rows else {},
+                                         "book_analytics_modelled_scenarios": {n: book_analytics([by_t(n)[t] for t in common_sorted]) for n in unselectable} if n_rows else {},
+                                         "modelled_scenarios_note": "MODELLED-cost scenarios (never measured): shown apart, never the headline and never selectable"}})
         return out
     series_by = {n: [by_t(n)[t]["net_bps"] for t in common_sorted] for n in sorted(results)}
     for name, rets in series_by.items():
         if RH.series_digest(rets) not in ledger.returns_digests(name):          # same variant on the very same series = the same trial; new data or a new name counts
             ledger.record(name, params_of[name], rets, horizon=1)
+    # A MODELLED-cost variant (maker: 100% fill, zero adverse selection, never measured) is counted in the family but is NEVER selectable: train_only_best picks the highest training mean, which on
+    # identical funding is always the cheapest variant, so its modelled 7 bps would drive the out-of-sample figure the competition ranks.
+    selectable = {k: v for k, v in series_by.items() if k not in unselectable}
+    if not selectable:
+        out.update({"status": "NO_SELECTABLE_VARIANT", "verdict": "INSUFFICIENT_DATA", "family_ledger": fam, "n_variants_counted": ledger.n_variants,
+                    "reason": "every variant carries a MODELLED cost: none can be selected as a result"})
+        return out
     folds = RH.walk_forward_folds(n_rows, train_min=max(20, n_rows // 2), test_len=max(5, n_rows // 10), label_horizon=1, embargo=1)
     oos: List[float] = []
     chosen: List[str] = []
     test_idx: List[int] = []
     for f in folds:
-        pick = RH.train_only_best({k: [v[i] for i in f.train] for k, v in series_by.items()})
+        pick = RH.train_only_best({k: [v[i] for i in f.train] for k, v in selectable.items()})
         chosen.append(pick)
         oos.extend(series_by[pick][i] for i in f.test)
         test_idx.extend((pick, i) for i in f.test)                                           # type: ignore[arg-type]

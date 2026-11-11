@@ -22,6 +22,9 @@ WHAT IT ALERTS ON
   failed_streak MONITOR_FAILED on the last N cycles in a row (WARNING)
   recorder_down the last 3 cycles that report on the market recorder found it ABSENT, STALE,
                 UNREADABLE or in FAULT (WARNING: depth data is not accumulating)
+  recorder_disk_low the last 3 cycles that report free space found the recorder's volume within one day
+                (about 1 GiB) of its 512 MiB write reserve (WARNING: the recorder is about to stop writing and
+                cannot recover by itself)
   mainnet_stalled  the last 6 cycles that collect real-market data recorded none
                 (WARNING: the protocol's 30-day clock is not accumulating)
   shadow        the last forward-shadow step was FAULT or REFUSED (WARNING)
@@ -54,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -87,6 +91,12 @@ FAILED_STREAK = 2
 MAINNET_STALL_CYCLES = 6
 #: Cycles in a row, among those that report on the recorder, with it not RECORDING.
 RECORDER_DOWN_CYCLES = 3
+#: EARLY WARNING for the failure that stopped the live recorder: the market-data store refuses to write below a 512 MiB free-space reserve and cannot recover by itself (age retention is bounded by the
+#: newest segment on disk, a refused write never opens the next day's segment, the emergency prune is default-deny). The level is the reserve plus 1 GiB (about 0.7 day at the documented 1.5 GB/day):
+#: a volume sized at the documented MINIMUM for its retention has no such headroom and stays in alert for part of every day, by design; size it at least 1 GiB above the minimum (MONEY_MISSION.md).
+RECORDER_RESERVE_MB = 512
+RECORDER_FREE_WARN_MB = RECORDER_RESERVE_MB + 1024
+RECORDER_DISK_LOW_CYCLES = 3
 RESEND_S = 6 * 3600.0
 WATCHDOG_POLL_S = 60.0
 
@@ -285,6 +295,30 @@ def _recorder_down(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+def _free_mib(row: Mapping[str, object]) -> Optional[float]:
+    """The recorder volume's free space in MiB from a monitor history line, or None. The monitor writes it as ``recorder_free_mb`` (every recorder field is prefixed; see
+    ``runner_monitor._history_line``). A bool, a string, a non-finite or an absurdly large number is not a reading."""
+    v = row.get("recorder_free_mb")
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _recorder_disk_low(rows: Sequence[Mapping[str, object]], n: int):
+    """The last `n` rows that carry a usable free-space reading, when EVERY one is below the warning level; else None. Free space is a daily ramp (the oldest day is dropped when a new UTC day
+    opens), so the debounce only filters a momentary dip: a volume whose daily low sits under the warning level stays in alert for part of every day. It does not look at `recorder_state`
+    (a recorder that is already down raises `recorder_down` as well, which is useful: the second says why)."""
+    with_free = [r for r in rows if _free_mib(r) is not None]
+    tail = with_free[-n:]
+    if len(tail) == n and all(float(_free_mib(r)) < RECORDER_FREE_WARN_MB for r in tail):   # type: ignore[arg-type]
+        return tail
+    return None
+
+
 def distinct_rows(rows: Sequence[Mapping[str, object]]) -> List[Mapping[str, object]]:
     """`rows` with verbatim repeats removed, first occurrence kept, order kept.
 
@@ -403,6 +437,15 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
             "recorder_down", WARNING,
             f"the last {RECORDER_DOWN_CYCLES} cycles found the market recorder not recording "
             f"(state {last['recorder_state']}: {why}). Order-book depth is not accumulating."))
+    low = _recorder_disk_low(rows, RECORDER_DISK_LOW_CYCLES)
+    if low:
+        free = float(_free_mib(low[-1]))                       # type: ignore[arg-type]
+        below = free < RECORDER_RESERVE_MB
+        alerts.append(Alert(
+            "recorder_disk_low", WARNING,
+            f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {RECORDER_RESERVE_MB} MiB write reserve). "
+            "At the reserve the recorder stops writing and does NOT recover by itself. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
+            "--recorder-retention-days; see MONEY_MISSION.md (recorder size model) and RUNBOOKS section 14."))
     rising = _recorder_restarting(rows)
     if rising:
         a, b = rising
