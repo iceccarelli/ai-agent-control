@@ -223,6 +223,14 @@ def _no_test_opens_the_tracked_state_database():
 
 
 @pytest.fixture(autouse=True)
+def _private_executor_lock_per_test(tmp_path, monkeypatch):
+    """The legacy armed tools take a LOCAL account lock (``ms_executor_lock``) at a path ``MS_EXECUTOR_LOCK_PATH`` names, else under the owner's real ``~/.ai-agent-control``. No test may touch the
+    real one (nor contend with another test, or with a running autopilot on a developer's machine): every test gets its own."""
+    monkeypatch.setenv("MS_EXECUTOR_LOCK_PATH", str(tmp_path / "executor_lock" / "ms_executor.lock"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _drill_entry_ledger_per_test(request, tmp_path, monkeypatch):
     """The drill claims one armed entry per UTC day in a ledger file it is told to use, and refuses when none is named. Tests that arm a drill do not
     name one, so each gets a fresh temporary ledger (no test can consume another's day). A test of the real refusal marks itself
