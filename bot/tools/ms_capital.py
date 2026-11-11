@@ -173,7 +173,9 @@ class CapitalBook:
 
     def reserve_usd(self, b: Optional[Mapping[str, Any]] = None) -> D:
         b = b or self.load()
-        return (_d(b.get("gains_usd")) or D(0)) * (_d(b.get("reserve_fraction")) or DEFAULT_RESERVE_FRACTION)
+        frac = _d(b.get("reserve_fraction"))
+        frac = DEFAULT_RESERVE_FRACTION if frac is None else frac            # `or` would read the owner's explicit 0 as UNSET (Decimal 0 is falsy)
+        return (_d(b.get("gains_usd")) or D(0)) * frac
 
     def sizing_basis(self, b: Optional[Mapping[str, Any]] = None) -> Optional[Decimal]:
         """What the allocator may compound: the verified basis MINUS the reserve withheld from gains (losses are never softened)."""

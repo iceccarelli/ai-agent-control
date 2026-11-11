@@ -141,6 +141,19 @@ def test_the_reserve_is_withheld_from_the_sizing_basis_but_never_softens_a_loss(
     assert alloc(basis=b.sizing_basis(), start_cash=D(10000)).notional <= alloc(basis=b.basis(), start_cash=D(10000)).notional
 
 
+def test_a_reserve_fraction_the_owner_set_to_zero_is_zero_and_only_an_unset_one_is_the_default(tmp_path):
+    """`_d(x) or DEFAULT` treated the Decimal 0 as unset: the owner's explicit 0 silently became 25% (specialist E, F10)."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "40.00", True, True)
+    b.settle("10040")
+    assert b.reserve_usd() == D("10.00")                                                  # unset: the documented default
+    assert b.set_reserve_fraction("0")
+    assert b.reserve_usd() == D("0") and b.sizing_basis() == D("10040")                   # explicit zero: nothing withheld
+    assert b.set_reserve_fraction("0.9") and b.reserve_usd() == D("36.00")
+    assert b.set_reserve_fraction("0.0") and b.reserve_usd() == D("0")                     # every spelling of zero
+
+
 def test_a_declared_deposit_or_withdrawal_is_never_a_trading_result(tmp_path):
     b = book(tmp_path)
     b.ensure_baseline("10000")
