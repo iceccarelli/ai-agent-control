@@ -194,6 +194,7 @@ class TestnetExecutor:
         self._seen_exec: set = set()
         #: MEASUREMENTS per order link id (local clock): what we saw and when. Pure observation: nothing here feeds a decision, a gate or a retry.
         self.meas: Dict[str, Dict[str, Any]] = {}
+        self.wallet_samples: List[Tuple[int, str]] = []                # (local ms, USDT walletBalance) at every account read: lets a settlement be checked against the wallet's own delta
         self._quotes: Dict[Tuple[str, str], Dict[str, Any]] = {}      # (category, symbol) -> the latest ticker quote this executor read
 
     # ---------------------------------------------------------------- reads
@@ -488,10 +489,19 @@ class TestnetExecutor:
         if eid in self._seen_exec or any(x["fill_id"] == eid for x in out):
             return                                                     # duplicate execution event: dropped by execId
         typ, link = r.get("execType", "Trade"), r.get("orderLinkId") or ""
+        if typ != "Trade":                                              # funding, ADL, bust, settle...: SURFACED WHOLE (the settlement recogniser needs its time, mark and fee), never booked as our fill.
+            row = {"exec_id": eid, "type": typ, "symbol": r.get("symbol"), "fee": r.get("execFee") if r.get("execFee") not in (None, "") else None,     # a blank fee stays UNKNOWN, not 0
+                   "exec_time_ms": _ms(r.get("execTime")), "side": r.get("side"), "qty": r.get("execQty"), "price": r.get("execPrice"), "mark": r.get("markPrice"),
+                   "fee_ccy": r.get("feeCurrency"), "order_id": r.get("orderId"), "category": cat}     # parsed defensively: a malformed row here must NEVER fail the whole venue read
+            self._read_unattributed.append(row)
+            if not any(u["exec_id"] == eid for u in self.unattributed):
+                self.unattributed.append(row)
+            return
         qty, px, fee = _d(r["execQty"], "execQty"), _d(r["execPrice"], "execPrice"), _d(r.get("execFee") or "0", "execFee")
         side, sym = r["side"], r["symbol"]
-        if typ != "Trade" or not link:                                  # funding, ADL, bust, settle, or a trade under no client link id: SURFACED, never booked as our fill
-            row = {"exec_id": eid, "type": typ, "symbol": sym, "fee": str(fee)}
+        if not link:                                                    # a trade under no client link id: SURFACED, never booked as our fill
+            row = {"exec_id": eid, "type": typ, "symbol": sym, "fee": str(fee), "exec_time_ms": _ms(r.get("execTime")), "side": side, "qty": r.get("execQty"), "price": r.get("execPrice"),
+                   "mark": r.get("markPrice"), "fee_ccy": r.get("feeCurrency"), "order_id": r.get("orderId"), "category": cat}
             self._read_unattributed.append(row)
             if not any(u["exec_id"] == eid for u in self.unattributed):
                 self.unattributed.append(row)
@@ -508,6 +518,24 @@ class TestnetExecutor:
                     "liquidity": "MAKER" if r.get("isMaker") in (True, "true") else "TAKER", "ts_ms": int(r["execTime"]), "symbol": sym, "category": cat, "side": side,
                     "prov": "MEASURED", "fee_signed_usd": float(fee_signed), "fee_rate": r.get("feeRate") if r.get("feeRate") not in (None, "") else None,
                     "fee_ccy_venue": fee_ccy, "is_maker_reported": r.get("isMaker") is not None})
+
+    def funding_history(self, symbol: str, start_ms: int, end_ms: int) -> Optional[List[Dict[str, Any]]]:
+        """The public settlement history for ``symbol`` between two times: [{ts_ms, rate}] oldest first, or None when it cannot be read COMPLETELY (a read error, a malformed row, or a page that
+        may hold more rows than were returned). None means UNKNOWN to the caller; an empty list means the venue stated there was no settlement in the window."""
+        try:
+            res = self._get("/v5/market/funding/history", {"category": "linear", "symbol": symbol, "startTime": int(start_ms), "endTime": int(end_ms), "limit": 200}, signed=False)
+            lst = res.get("list")
+            if not isinstance(lst, list) or len(lst) >= 200:
+                return None
+            out = []
+            for r in lst:
+                ts, rate = _ms(r.get("fundingRateTimestamp")), r.get("fundingRate")
+                if ts is None or rate in (None, ""):
+                    return None
+                out.append({"ts_ms": ts, "rate": str(_d(rate, "fundingRate"))})
+            return sorted(out, key=lambda e: e["ts_ms"])
+        except (ExecutorError, KeyError, TypeError, ValueError):
+            return None
 
     # ---------------------------------------------------------------- account / market reads for the authority
     def account_state(self, baseline: Optional[Mapping[str, float]] = None, open_groups: int = 0) -> Dict[str, Any]:
@@ -526,6 +554,8 @@ class TestnetExecutor:
             view_pos[sym] = {"category": "linear", "notional_usd": float(size * m * (1 if side == "Buy" else -1)), "qty": float(size)}
         w = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, signed=True)
         eq, coins = parse_wallet(w)
+        if QUOTE in coins and len(self.wallet_samples) < 50_000:
+            self.wallet_samples.append((int(self.clock()), str(coins[QUOTE])))
         equity = float(eq)
         # THE LOSS MEASURE IS THE SESSION'S, NOT THE OWNER'S WHOLE ACCOUNT: spot the client held BEFORE the session (``baseline``) is valued at the wallet read's own implied price
         # (coin usdValue / walletBalance, the same basis as totalEquity) and taken out, so its price swings cancel exactly. Without this a $10 move in BTC on a 0.1 BTC holding

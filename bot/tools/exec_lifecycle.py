@@ -207,6 +207,28 @@ def execution_quality(doc: Optional[Mapping[str, Any]]) -> List[Event]:
     return out
 
 
-def session_events(rec: Mapping[str, Any], result: str, quality: Optional[Mapping[str, Any]] = None) -> List[Event]:
-    """Everything the venue and the ledger said about a finished session, in lifecycle order (``quality`` = the session's measured execution quality, when it was written)."""
-    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), *execution_quality(quality), session_reconciled(rec, result)]
+def funding_events(doc: Optional[Mapping[str, Any]]) -> List[Event]:
+    """Funding settlement recognition (``funding_settlement``) as evidence: kind FUNDING, one ``FUNDING_SETTLEMENT`` per settlement the hedge was held through (status, cash, the physical expectation,
+    the cash check, the venue row id as a 16-hex reference) and one ``FUNDING_RECOGNITION`` summary per symbol. ``source`` is VENUE: a booked amount is the venue's row agreeing with physics, a
+    quarantined or unknown one says so. The sign convention is UNVERIFIED and the payload says it. Nothing here is cash: realised results are settled from the wallet in the capital book."""
+    if not isinstance(doc, Mapping):
+        return []
+    out: List[Event] = []
+    for r in list(doc.get("recognitions") or [])[:4]:
+        if not isinstance(r, Mapping):
+            continue
+        for p in list(r.get("prints") or [])[:20]:
+            w = p.get("wallet") if isinstance(p.get("wallet"), Mapping) else {}
+            out.append(("FUNDING", "FUNDING_SETTLEMENT", {"source": "VENUE", "symbol": r.get("symbol"), "settlement_ms": p.get("ts_ms"), "rate": num(p.get("rate"), 8), "held_qty": num(p.get("signed_position_qty"), 6),
+                                                          "status": p.get("status"), "amount_usd": num(p.get("amount_usd"), 6), "expected_usd": num(p.get("expected_usd"), 6), "row_ref": ref16(p.get("row_id")),
+                                                          "cash_check": w.get("status"), "cash_check_delta_usd": num(w.get("delta_usd"), 6), "reason": str(p.get("reason") or "")[:160] or None}))
+        out.append(("FUNDING", "FUNDING_RECOGNITION", {"source": "VENUE", "symbol": r.get("symbol"), "sign_hypothesis": r.get("sign_hypothesis"), "prints_available": r.get("prints_available"),
+                                                        "window": r.get("window"), "all_resolved": r.get("all_prints_resolved"), "booked_usd": num(r.get("booked_usd"), 6),
+                                                        "flags": [str(f)[:80] for f in list(r.get("flags") or [])[:10]], "unmatched_rows": len(r.get("unmatched_rows") or []),
+                                                        "note": "funding is UNKNOWN unless booked; realised cash is settled from the wallet, not from this"}))
+    return out
+
+
+def session_events(rec: Mapping[str, Any], result: str, quality: Optional[Mapping[str, Any]] = None, funding: Optional[Mapping[str, Any]] = None) -> List[Event]:
+    """Everything the venue and the ledger said about a finished session, in lifecycle order (``quality`` = the session's measured execution quality, ``funding`` = its settlement recognition, when written)."""
+    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), *execution_quality(quality), *funding_events(funding), session_reconciled(rec, result)]

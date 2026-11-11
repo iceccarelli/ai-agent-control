@@ -36,6 +36,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
 
 import bybit_connection as bc  # noqa: E402
 import exec_quality as EQ  # noqa: E402
+import funding_settlement as FS  # noqa: E402
 import ms_accounting as AC  # noqa: E402
 import ms_authority as MA  # noqa: E402
 import ms_execution as EX  # noqa: E402
@@ -60,7 +61,7 @@ DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
 MAX_PLAN_AGE_MIN = 120
 EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 2
 FILES = {"record": "testnet_session.json", "plan": "plan.json", "preflight": "preflight.json", "journal": "engine_journal.jsonl", "kill": "MS_KILL",
-         "meas": "exec_measurements.json", "quality": "execution_quality.json", "decision": "decision.json"}
+         "meas": "exec_measurements.json", "quality": "execution_quality.json", "decision": "decision.json", "funding": "funding_settlement.json"}
 
 
 # ---------------------------------------------------------------------------------------------------- small helpers
@@ -835,6 +836,8 @@ class Run:
             meas: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in (prior or {}).items() if isinstance(v, dict)} if isinstance(prior, dict) else {}
             for link, v in self.ex.meas.items():
                 meas.setdefault(link, {}).update({k: x for k, x in v.items() if x is not None})
+            ws = {(int(t), str(v)) for t, v in (meas.get("__wallet__", {}).get("samples", []))} | {(int(t), str(v)) for t, v in self.ex.wallet_samples}
+            meas["__wallet__"] = {"samples": [[t, v] for t, v in sorted(ws)][-5000:]}
             _write_json(self.ctx.path("meas"), meas)
             dec = _read_json(self.ctx.path("decision"))
             decision_id = dec.get("decision_id") if isinstance(dec, dict) else None
@@ -863,6 +866,40 @@ class Run:
             self.ctx.out(f"execution quality not written ({type(exc).__name__}); trading is unaffected")
             return None
 
+    # ---- funding settlement recognition: what the held hedge was paid or charged, from the venue's own records (never from a model)
+    def recognise_funding(self, view: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """For each perp symbol of the group: the public settlement history, the venue's Funding rows and the wallet samples -> ``funding_settlement.recognise`` -> the ONE ledger. Funding is booked only
+        when the venue's rows agree with the physical expectation (and the wallet, when sampled); it is declared zero only when a complete public history shows no held settlement; otherwise it stays
+        UNKNOWN (None). The recognition (with every quarantined row) is written to ``funding_settlement.json``. A fault leaves funding UNKNOWN; it never blocks a flat check or an unwind."""
+        g = self.engine.groups.get(self.gid) if self.engine else None
+        if g is None:
+            return None
+        try:
+            now = int(self.ctx.clock())
+            prior = _read_json(self.ctx.path("meas"))
+            wallet = {(int(t), str(v)) for t, v in ((prior or {}).get("__wallet__", {}).get("samples", []) if isinstance(prior, dict) else [])} | {(int(t), str(v)) for t, v in self.ex.wallet_samples}
+            samples = sorted(wallet)
+            docs: List[Dict[str, Any]] = []
+            for sym in sorted({l.plan.symbol for l in g.legs.values() if l.plan.category == "linear"}):
+                mine = [x for x in view["executions"] if x["link_id"].startswith(self.gid + "-")]
+                perp = [{"ts_ms": x["ts_ms"], "side": x["side"], "qty": x["qty"], "price": x["price"]} for x in mine if x["category"] == "linear" and x["symbol"] == sym]
+                other = [x["ts_ms"] for x in mine if not (x["category"] == "linear" and x["symbol"] == sym)]
+                prints = self.ex.funding_history(sym, min(p["ts_ms"] for p in perp) - 1000, now) if perp else None
+                rows = [u for u in view.get("unattributed", []) if u.get("type") == "Funding" and u.get("symbol") == sym]
+                doc = FS.recognise(symbol=sym, perp_fills=perp, other_fill_ts=other, prints=prints, rows=rows, wallet_samples=samples, now_ms=now)
+                for a in doc["actions"]:
+                    if a["action"] == "record":
+                        self.ledger.record_funding(sym, int(a["ts_ms"]), a["amount_usd"], a["prov"])
+                    elif a["action"] == "declare_none":
+                        self.ledger.declare_no_funding(sym, a["reason"], a["prov"])
+                docs.append(doc)
+            out = {"schema": "funding_settlement_session.v1", "recognitions": docs, "at_ms": now}
+            _write_json(self.ctx.path("funding"), out)
+            return out
+        except Exception as exc:                                       # noqa: BLE001 - funding stays UNKNOWN; trading and flat verification are untouched
+            self.ctx.out(f"funding recognition failed ({type(exc).__name__}); funding stays UNKNOWN")
+            return None
+
     def snapshot_record(self, rec: Dict[str, Any], final: bool = False) -> Dict[str, Any]:
         view = self.ex.venue_state()
         rec["orders"] = _orders_for_record(view["orders"], self.gid)
@@ -878,6 +915,8 @@ class Run:
             rec["flat_verified"] = bool(flat)                          # None only before the final read; False when the read was incomplete or anything remains
             self.last_view = view
             self.feed_ledger()
+            if flat:
+                self.recognise_funding(view)                         # only once the position is closed: the held window is then complete
             self.reconcile_step(int(self.ctx.clock()))
             cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
             rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
