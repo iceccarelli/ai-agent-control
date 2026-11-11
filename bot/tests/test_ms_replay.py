@@ -513,3 +513,44 @@ def test_mutation_a_taker_that_ignores_book_age_is_caught(monkeypatch):
     monkeypatch.setattr(RP.World, "book", lambda self, sym, cat, t: real(self, sym, cat, t)[:2] + (0,))           # the transport sees every book as fresh
     with pytest.raises(AssertionError):
         test_a_taker_entry_against_a_six_hour_old_book_is_refused_and_a_fresh_book_fills()
+
+
+# ------------------------------------------------------------------------------------------------ an UNKNOWN price or fee is never zero in the replay ledger
+def _fill(i, side, qty, price, fee=0.1, prov="SIMULATED", symbol="XUSDT"):
+    return T.Fill(f"f{i}", "g", f"l{i}", symbol, side, qty, price, fee, "USDT", "TAKER", T0 + i, prov)
+
+
+def test_an_open_short_with_no_mark_is_valued_at_cost_not_at_zero():
+    """Valued at 0, a short's whole sale (here $1,000) was booked as profit (+$998.70 on a $1,000 pair in the capital audit): an unknown price is not zero."""
+    led = RP.LocalLedger()
+    led.record_fill(_fill(1, "Sell", 10.0, 100.0, fee=0.55))                  # short perp, never marked
+    p = led.pnl()
+    assert p["flags"] == ["MID_FALLBACK", "MARK_MISSING:XUSDT"] and p["valuation"] == "MID_FALLBACK"
+    assert p["unrealised"] == pytest.approx(-1000.0)                         # 10 x -100: valued at what it was sold for, no mark-to-market P&L
+    assert p["net"] == pytest.approx(-0.55)                                  # the fee is the only P&L: no phantom +$1,000
+    led.mark("XUSDT", T0 + 5, 100.0)                                         # a mark arrives: the flag goes, the valuation is the mark
+    q = led.pnl()
+    assert q["flags"] == ["MID_FALLBACK"] and q["net"] == pytest.approx(-0.55)
+
+
+def test_a_partially_closed_position_with_no_mark_keeps_its_realised_gain_at_average_cost():
+    led = RP.LocalLedger()
+    led.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=0.0, prov="MEASURED"))
+    led.record_fill(_fill(2, "Sell", 0.4, 110.0, fee=0.0, prov="MEASURED"))   # realised +4 on the 0.4 sold; 0.6 remain open and unmarked
+    p = led.pnl()
+    assert "MARK_MISSING:XUSDT" in p["flags"] and p["net"] == pytest.approx(4.0)             # the open 0.6 at its average cost 100 adds nothing
+    led.record_fill(_fill(3, "Sell", 1.0, 90.0, fee=0.0, prov="MEASURED"))   # flips short 0.4: the remainder was opened at 90
+    p2 = led.pnl()
+    assert p2["net"] == pytest.approx(4.0 + 0.6 * (90.0 - 100.0) + 0.0)                       # closes 0.6 at 90 (-6); the new 0.4 short is valued at its own 90 cost
+
+
+def test_an_unverified_zero_fee_is_flagged_but_a_measured_zero_fee_is_not():
+    led = RP.LocalLedger()
+    led.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=0.0, prov="SIMULATED"))
+    assert led.pnl()["fee_flags"] == ["ZERO_FEE_UNVERIFIED"]
+    meas = RP.LocalLedger()
+    meas.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=0.0, prov="MEASURED"))
+    assert meas.pnl()["fee_flags"] == []
+    priced = RP.LocalLedger()
+    priced.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=0.055, prov="SIMULATED"))
+    assert priced.pnl()["fee_flags"] == []

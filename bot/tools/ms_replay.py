@@ -160,22 +160,38 @@ class LocalLedger:
         cat = self._cat
         cash = 0.0
         pos: Dict[str, float] = {}
+        avg: Dict[str, float] = {}                                 # average entry price of the open quantity per key (average-cost accounting)
         fees = 0.0
+        zero_fee_unverified = False
         for f in self.fills:
             s = 1.0 if f.side == "Buy" else -1.0
             cash -= s * f.qty * f.price
             k = f.symbol if cat.get(f.fill_id, "linear") == "linear" else "SPOT:" + f.symbol
-            pos[k] = pos.get(k, 0.0) + s * f.qty
+            before = pos.get(k, 0.0)
+            after = before + s * f.qty
+            if abs(before) < 1e-12 or before * s > 0:              # opening or adding in the same direction: the average cost moves
+                avg[k] = (abs(before) * avg.get(k, f.price) + f.qty * f.price) / (abs(before) + f.qty)
+            elif before * after < 0:                               # the fill flipped the position: the remainder was opened at this price
+                avg[k] = f.price
+            pos[k] = after                                         # (a reduction keeps the average cost of what remains)
             fees += f.fee_usd
+            if f.fee_usd == 0 and f.prov != "MEASURED":
+                zero_fee_unverified = True                       # a free fill nobody measured is not a free fill (the canonical ledger books the fee as unknown)
         unreal_mtm = 0.0
         mid_fallback = False
+        missing_marks: List[str] = []
         for k, q in pos.items():
             if abs(q) < 1e-9:
                 continue
             bk = self.books.get(k)
             if bk is None:
                 mid_fallback = True
-                unreal_mtm += q * self.marks.get(k, 0.0)
+                m = self.marks.get(k)
+                if m is None:                                    # an UNKNOWN price is not zero: a short valued at 0 would book its whole sale as profit. Valued at cost (no mark-to-market P&L), and flagged
+                    missing_marks.append(k)
+                    unreal_mtm += q * avg.get(k, 0.0)
+                else:
+                    unreal_mtm += q * m
                 continue
             px = bk[0] if q > 0 else bk[1]
             unreal_mtm += q * px - abs(q) * px * self.exit_fee_bps["spot" if k.startswith("SPOT:") else "linear"] / 1e4
@@ -186,7 +202,9 @@ class LocalLedger:
         flat = all(abs(q) < 1e-9 for q in pos.values())
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": slippage, "adverse_selection": self.adverse, "taker_slippage": self.taker_slip,
                 "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": price_leg + funding - fees - slippage,
-                "unknown_funding_events": self.unknown_funding, "valuation": "MID_FALLBACK" if mid_fallback else "EXIT_SIDE", "flags": ["MID_FALLBACK"] if mid_fallback else []}
+                "unknown_funding_events": self.unknown_funding, "valuation": "MID_FALLBACK" if mid_fallback else "EXIT_SIDE",
+                "flags": (["MID_FALLBACK"] if mid_fallback else []) + [f"MARK_MISSING:{k}" for k in sorted(missing_marks)],
+                "fee_flags": ["ZERO_FEE_UNVERIFIED"] if zero_fee_unverified else []}
 
 
 # ------------------------------------------------------------------ the world: point-in-time lookups over the series
