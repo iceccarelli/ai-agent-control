@@ -15,6 +15,7 @@ for _p in (BOT, os.path.join(BOT, "tools"), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
@@ -45,7 +46,10 @@ class World:
                                     credential_env={"api_key": TT.KEY_ENV, "api_secret": TT.SECRET_ENV})
         if grant:
             self.write_capability()
-        self.env: Dict[str, str] = {TT.KEY_ENV: FAKE_KEY, TT.SECRET_ENV: FAKE_SECRET}
+        # the owner's STATED cost of capital (4%/yr, stated 2026-11-09, one day before the fixed test clock): the executor's gate never prices an unstated one as free, so a world whose tests expect a
+        # PROFIT_SEEKING session states it. Tests about the unstated case remove these three names (see test_ms_testnet_autopilot.py).
+        self.env: Dict[str, str] = {TT.KEY_ENV: FAKE_KEY, TT.SECRET_ENV: FAKE_SECRET,
+                                    EG.ENV_CASH_APR: "0.04", EG.ENV_CASH_SOURCE: "OWNER_STATED:test-fixture", EG.ENV_CASH_STATED_UTC: "2026-11-09"}
         self.typed: List[str] = []
         self.out: List[str] = []
 

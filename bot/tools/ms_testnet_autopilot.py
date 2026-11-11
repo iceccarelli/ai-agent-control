@@ -309,20 +309,22 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     if secs < MIN_SECONDS_TO_SETTLEMENT or int(math.ceil(secs)) + EXIT_MARGIN_S > pseudo["max_hold_s"]:
         return done("SKIP_NO_OPPORTUNITY", [reason])                  # no hold across a settlement is possible now: there is nothing to price
     hold_for_edge = hold_s or int(math.ceil(secs)) + EXIT_MARGIN_S
+    cash, _cash_state, cash_problems = EG.cash_alternative_from_env(env)       # the owner's STATED alternative return; absent or malformed = the cost of capital is UNKNOWN, never zero
     try:
-        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()), clock=clock)
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()), clock=clock, cash_alternative=cash)
         verdict = EG.evaluate_edge(inp)
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return done("WAIT_FOR_DATA", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     edge = verdict.as_dict()
-    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms), inputs=inp.summary(), next_settlement_ms=int(nxt))
+    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms), inputs=inp.summary(), next_settlement_ms=int(nxt),
+                cost_of_capital=EG.describe_cash_alternative(env, int(inp.now_ms)))
     if verdict.session_class == EG.PROFIT_CANDIDATE and go:
         return done("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", [reason, "ECONOMICS_CLEAR_THE_HURDLE: eligibility is not authority; see authority_gaps"], session_class="PROFIT_SEEKING")
     if verdict.session_class == EG.REJECTED:
         return done("REJECT_UNECONOMIC", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
     if verdict.session_class == EG.PROFIT_CANDIDATE:                  # economics clear, the owner's own funding floor does not
         return done("SKIP_NO_OPPORTUNITY", [reason], session_class=None)
-    return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
+    return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4] + [p for p in cash_problems if cash is None and p != "NO_CASH_ALTERNATIVE_STATED"][:1], session_class=None)
 
 
 def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) -> Dict[str, Any]:
@@ -430,7 +432,8 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
         return _res("SKIPPED", [reason], funding_bps=rate * 1e4)
     on_state("RESEARCHING", "edge_gate")
     try:                                                              # the ECONOMICS gate: expected NET edge on the one economic model, from the venue's own rows, books and fee tier
-        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()), clock=clock)
+        cash, _cash_state, _cash_problems = EG.cash_alternative_from_env(env)   # the owner's STATED alternative return; absent or malformed = UNKNOWN cost of capital, so never a PROFIT_SEEKING session
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()), clock=clock, cash_alternative=cash)
         verdict = EG.evaluate_edge(inp)
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
@@ -911,7 +914,8 @@ def evidence_edge(edge: Mapping[str, Any]) -> Dict[str, Any]:
     """The edge verdict as EVIDENCE: decimals rounded to 4 places, the digest shortened to a reference (full precision and the full digest stay in the local edge_verdict.json)."""
     return {"session_class": edge["session_class"], "reasons": list(edge["reasons"])[:6], "net_edge_bps": _r4(edge["net_edge_bps"]), "expected_funding_bps": _r4(edge["expected_funding_bps"]),
             "required_funding_bps": _r4(edge["required_funding_bps"]), "expected_net_usd": _r4(edge["expected_net_usd"]), "costs_bps": {k: _r4(v) for k, v in dict(edge["costs_bps"]).items()},
-            "assumed_inputs": list(edge["assumed_inputs"]), "settlements_in_hold": edge["settlements_in_hold"], "edge_ref": str(edge["digest"])[:16]}
+            "assumed_inputs": list(edge["assumed_inputs"]), "settlements_in_hold": edge["settlements_in_hold"], "edge_ref": str(edge["digest"])[:16],
+            "capital_basis": EL.capital_basis(edge.get("capital"))}
 
 
 def evidence_net(net: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1279,7 +1283,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         g, why = load_grant(clock(), manifest or {}, None) if manifest else (None, ["NO_CAPABILITY"])
         eng = ES.EngineState(a.root, clock)
         print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "grant_problems": why, "engine": {k: v for k, v in eng.load().items() if k != "history"},
-                          "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json"))},
+                          "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json")),
+                          "cost_of_capital": EG.describe_cash_alternative(e, clock())},
                          indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "capital":

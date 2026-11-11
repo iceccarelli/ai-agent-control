@@ -1446,6 +1446,117 @@ def test_the_decision_record_carries_every_field_the_owner_needs_and_the_scenari
     assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] == r["decision_id"] and "UNATTENDED_GRANT" in r["authority_gaps"]
 
 
+# ---------------------------------------------------------------- the owner's COST OF CAPITAL: stated in the environment, never defaulted (the old gate priced an unstated one as free)
+CASH_ENV = (EG.ENV_CASH_APR, EG.ENV_CASH_SOURCE, EG.ENV_CASH_STATED_UTC)
+
+
+def _no_cash(w, **replace):
+    for k in CASH_ENV:
+        w.env.pop(k, None)
+    w.env.update(replace)
+
+
+def test_an_unstated_cost_of_capital_makes_even_an_80_bps_print_inconclusive_in_the_read_only_decision(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)                                                                # 80 bps of funding, a MEASURED fee tier: only the cost of capital is missing
+    _no_cash(w)
+    w.fake.requests.clear()
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and res["edge"]["session_class"] == "INCONCLUSIVE", res["why"]
+    assert any(x.startswith("COST_OF_CAPITAL_UNKNOWN:") for x in res["why"]) and res["edge"]["net_edge_bps"] is None
+    assert res["cost_of_capital"]["state"] == "UNSTATED" and res["cost_of_capital"]["usable"] is False and res["cost_of_capital"]["apr"] is None
+    cb = res["decision_record"]["edge"]["capital_basis"]
+    assert cb["state"] == "UNSTATED" and cb["cash_alternative_apr"] is None and cb["opportunity_cost_bps"] is None and cb["committed_usd"] == "400.00"
+    assert res["decision_record"]["market_inputs"]["cost_of_capital_state"] == "UNSTATED"
+    assert not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_a_hopeless_edge_stays_rejected_when_the_cost_of_capital_is_unstated(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w, funding="0.0001")                                              # 1 bp: no cost of capital could rescue it
+    _no_cash(w)
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "REJECT_UNECONOMIC" and any("BEFORE_ANY_COST_OF_CAPITAL" in x for x in res["why"])
+
+
+def test_a_stated_cost_of_capital_is_charged_on_the_committed_capital_and_shown_in_the_decision_record(tmp_path, monkeypatch):
+    from decimal import Decimal as D
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and res["cost_of_capital"] == {
+        **res["cost_of_capital"], "state": "STATED", "usable": True, "apr": "0.04", "source": "OWNER_STATED:test-fixture", "provenance": "modelled"}
+    cb = res["decision_record"]["edge"]["capital_basis"]
+    assert (cb["state"], cb["cash_alternative_apr"], cb["cash_alternative_source"], cb["cash_alternative_provenance"], cb["multiple_of_notional"], cb["committed_usd"]) == (
+        "STATED", "0.040000", "OWNER_STATED:test-fixture", "modelled", "2.0000", "400.00")
+    hold_s = res["hold_s"]
+    expected_bps = D("0.04") * 2 * D(hold_s) / D(86_400) / D(365) * D(10_000)
+    assert abs(D(res["edge"]["costs_bps"]["opportunity_cost"]) - expected_bps) < D("1e-9") and expected_bps > 0           # a real, positive, hold-proportional charge
+
+
+@pytest.mark.parametrize("change,state,problem", [
+    ({EG.ENV_CASH_STATED_UTC: "2026-09-01"}, "STALE", "CASH_ALTERNATIVE_STALE"),                       # 70 days before the fixed test clock
+    ({EG.ENV_CASH_STATED_UTC: "2026-12-31"}, "FUTURE_DATED", "CASH_ALTERNATIVE_DATED_IN_THE_FUTURE"),
+    ({EG.ENV_CASH_APR: "4%"}, "INVALID", "CASH_ALTERNATIVE_RATE_INVALID"),
+    ({EG.ENV_CASH_APR: "4"}, "INVALID", "CASH_ALTERNATIVE_INVALID"),                                      # a unit slip (400%/yr) is refused, not obeyed
+])
+def test_a_stale_future_dated_or_malformed_statement_is_unknown_and_says_why(tmp_path, monkeypatch, change, state, problem):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    w.env.update(change)
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and res["cost_of_capital"]["state"] == state and res["cost_of_capital"]["usable"] is False
+    assert any(problem in x for x in res["cost_of_capital"]["problems"]) and res["edge"]["net_edge_bps"] is None
+
+
+def test_a_partial_statement_is_invalid_not_defaulted(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    del w.env[EG.ENV_CASH_STATED_UTC]
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and res["cost_of_capital"]["state"] == "INVALID" and any("INCOMPLETE" in x for x in res["why"])
+
+
+def test_the_order_capable_loop_places_no_profit_seeking_session_while_the_cost_of_capital_is_unstated(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000                                      # the same 80 bps that DID open a PROFIT_SEEKING session when the cost of capital was stated
+    _no_cash(w)
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and res["why"][0] == "EDGE_INCONCLUSIVE" and any(x.startswith("COST_OF_CAPITAL_UNKNOWN:") for x in res["why"])
+    assert not [r for r in w.fake.requests if r[0] == "POST"], "an order was placed on capital priced as free"
+
+
+def test_stating_the_cost_of_capital_is_what_opens_the_profit_seeking_session(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    res, _ = cycle(w)                                                                                  # the fixture's world states 4%/yr
+    assert res["result"] == "DONE" and res["session_class"] == "PROFIT_SEEKING"
+    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    assert ev["edge"]["capital"]["state"] == "STATED" and ev["edge"]["capital"]["cash_alternative_apr"] == "0.04" and ev["edge"]["capital"]["opportunity_cost_bps"] is not None      # the local verdict keeps full precision
+    shipped = AP.evidence_edge(ev["edge"])["capital_basis"]                                           # the evidence payload carries the rounded basis (the guard refuses long digit runs)
+    assert shipped["state"] == "STATED" and shipped["cash_alternative_apr"] == "0.040000" and shipped["cash_alternative_provenance"] == "modelled" and shipped["committed_usd"] is not None
+
+
+def test_the_status_command_tells_the_owner_the_state_of_the_cost_of_capital(w, tmp_path, capsys):
+    assert AP.main(["status", "--root", str(tmp_path / "ap")], env=w.env) == 0
+    stated = json.loads(capsys.readouterr().out)["cost_of_capital"]
+    assert stated["state"] == "STATED" and stated["usable"] is True and stated["apr"] == "0.04" and stated["names"] == list(CASH_ENV)
+    _no_cash(w)
+    assert AP.main(["status", "--root", str(tmp_path / "ap")], env=w.env) == 0
+    unstated = json.loads(capsys.readouterr().out)["cost_of_capital"]
+    assert unstated["state"] == "UNSTATED" and unstated["usable"] is False and unstated["apr"] is None and unstated["problems"] == ["NO_CASH_ALTERNATIVE_STATED"]
+
+
+def test_the_environment_the_image_and_the_fly_config_ship_never_states_a_cost_of_capital_for_the_owner():
+    """The owner states it; nothing in the repository's deployment files may default it (a default would be the old free-capital loophole again, one layer out)."""
+    bot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("Dockerfile.autopilot", "Dockerfile", "Dockerfile.drill", "Dockerfile.research", "fly.autopilot.toml", "fly.toml", "fly.drill.toml", "fly.research.toml"):
+        text = open(os.path.join(bot, name), encoding="utf-8").read()
+        assert not any(k in text for k in CASH_ENV), f"{name} ships a default cost of capital"
+
+
 def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_book_is_stated(tmp_path, monkeypatch):
     import ms_capital as CC
     ctx = AP._decision_context(str(tmp_path / "none"), 1.0)

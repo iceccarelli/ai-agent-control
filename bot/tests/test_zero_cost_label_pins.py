@@ -4,7 +4,8 @@ labelled 'modelled' or 'derived' passes as if it were a cost (``opportunity_cost
 WHAT THIS IS. A source-level TRIPWIRE with a reviewed ALLOW-LIST of every place in production code that constructs a ``Quantity`` whose value is a statically-known zero and whose provenance is not 'measured'
 or 'venue_stated' (or cannot be resolved statically). Each entry names the file, the enclosing function, the normalised call, and the REASON it is acceptable. A NEW site fails the test until someone
 reviews it and writes the reason down; an entry whose site disappeared fails the test until it is deleted (the list tracks reality); an extra identical site inside an allowed scope fails the count check.
-It changes no behaviour. The one entry that is NOT acceptable is marked KNOWN LOOPHOLE: it stays visible until the executor's capital cost is fixed, and its entry must then be deleted.
+It changes no behaviour. An entry that is NOT acceptable but not yet fixed is marked KNOWN LOOPHOLE so it stays visible (the executor gate's modelled-zero cost of capital was one; it is fixed and no
+loophole entry remains: ``test_no_known_loophole_is_left...``).
 
 WHAT IT CATCHES (each has a mutation test below that plants it in a temporary tree). Positional and keyword arguments, ``from economic_model import Quantity as Q``, module aliases (``EM.Quantity``),
 ``Q = Quantity`` aliases, named zero constants at module, class or function level (resolved through a scope-aware, single-binding analysis: a name counts as a constant only if EVERY binding of it is the same
@@ -362,9 +363,10 @@ ALLOWED = {
         "a RESULT, not a cost: 'the largest notional that still clears the floor is 0' when even the smallest order fails; its provenance is the weakest of the chain's known components",
     ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'derived', 'fraction')"):
         "STRUCTURAL zero: the spot leg is bought with USDT, not borrowed, so there is no borrow cost to charge",
-    ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')"):
-        "KNOWN LOOPHOLE, tracked for removal: the owner's opportunity cost of capital is not stated and is represented as a modelled ZERO, so an unset cost becomes free capital and a PROFIT_CANDIDATE can "
-        "pass (the research verdict already charges it against the cash series). To be replaced by an UNKNOWN capital cost (INCONCLUSIVE) or an owner-stated one: see MONEY_MISSION.md",
+    ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')"):
+        "REJECTION-ONLY PROBE: with the owner's cost of capital UNKNOWN the edge is re-priced with that one input floored at zero and labelled ASSUMED (the model refuses to PASS an assumed input). Its net is "
+        "compared with the hurdle to REJECT a hopeless edge and is never reported or used to pass: a cost of capital can only lower the net, so a miss at zero is a miss at any rate. Pinned by "
+        "test_ms_edge_gate.py::test_with_an_unknown_cost_of_capital_no_funding_level_can_make_a_profit_candidate",
 }
 
 
@@ -397,10 +399,12 @@ def test_zero_valued_quantities_without_an_observed_provenance_exist_only_where_
     assert all(isinstance(r, str) and len(r) >= 40 for r in ALLOWED.values()), "every allow-list entry needs a real reason"
 
 
-def test_the_known_loophole_is_the_only_entry_that_is_not_a_structural_zero_a_result_or_a_provenance_carrier():
-    """The allow-list is an exception list, so its size is a metric: exactly one entry is a known loophole, and when it is fixed this test fails until the entry is removed."""
-    loopholes = [k for k, why in ALLOWED.items() if why.startswith("KNOWN LOOPHOLE")]
-    assert loopholes == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')")]
+def test_no_known_loophole_is_left_and_the_one_rejection_probe_is_labelled_as_such():
+    """The allow-list is an exception list, so its composition is a metric. The executor gate's modelled-zero opportunity cost (an unset owner cost of capital priced as FREE) was removed: an unstated cost
+    of capital is UNKNOWN now (test_ms_edge_gate.py). No entry may be a KNOWN LOOPHOLE; the single REJECTION-ONLY probe is the assumed zero that can reject but never pass."""
+    assert [k for k, why in ALLOWED.items() if why.startswith("KNOWN LOOPHOLE")] == []
+    assert [k for k, why in ALLOWED.items() if why.startswith("REJECTION-ONLY PROBE")] == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')")]
+    assert not any(k[2].endswith("'modelled', 'fraction')") for k in ALLOWED), "a modelled zero cost is the loophole's exact shape"
 
 
 # ------------------------------------------------------------------------------------------------ mutation tests: every bypass the scanner claims to catch must be caught
@@ -517,16 +521,25 @@ def test_a_new_labelled_zero_planted_in_a_real_production_file_fails_the_pin(tmp
 def test_a_second_identical_zero_inside_an_already_allowed_scope_fails_the_count_check(tmp_path):
     root = _copy_real(tmp_path)
     gate = root / "tools" / "ms_edge_gate.py"
-    gate.write_text(gate.read_text() + "\n\ndef evaluate_edge():\n    return EM.Quantity(D(0), 'modelled', 'fraction')\n")
+    gate.write_text(gate.read_text() + "\n\ndef evaluate_edge():\n    return EM.Quantity(D(0), 'assumed', 'fraction')\n")
     _found, new, _stale, multi = review(str(root))
-    assert not new and multi == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')")], (new, multi)
+    assert not new and multi == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')")], (new, multi)
 
 
 def test_removing_an_allowed_zero_from_a_real_file_makes_its_entry_stale(tmp_path):
     root = _copy_real(tmp_path)
     gate = root / "tools" / "ms_edge_gate.py"
     text = gate.read_text()
-    assert "EM.Quantity(D(0), \"modelled\", \"fraction\")" in text or "EM.Quantity(D(0), 'modelled', 'fraction')" in text
-    gate.write_text(text.replace("EM.Quantity(D(0), \"modelled\", \"fraction\")", "EM.unknown(\"fraction\")").replace("EM.Quantity(D(0), 'modelled', 'fraction')", "EM.unknown('fraction')"))
+    assert "EM.Quantity(D(0), \"assumed\", \"fraction\")" in text or "EM.Quantity(D(0), 'assumed', 'fraction')" in text
+    gate.write_text(text.replace("EM.Quantity(D(0), \"assumed\", \"fraction\")", "EM.unknown(\"fraction\")").replace("EM.Quantity(D(0), 'assumed', 'fraction')", "EM.unknown('fraction')"))
     _found, _new, stale, _multi = review(str(root))
-    assert ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')") in stale
+    assert ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')") in stale
+
+
+def test_reintroducing_the_free_capital_loophole_in_the_real_gate_fails_the_pin(tmp_path):
+    """The exact original shape: an opportunity_cost_apr keyword given a modelled ZERO. It must be reported as a NEW site (there is no allow-list entry for it any more)."""
+    root = _copy_real(tmp_path)
+    gate = root / "tools" / "ms_edge_gate.py"
+    gate.write_text(gate.read_text() + "\n\ndef _regression():\n    return dict(opportunity_cost_apr=EM.Quantity(D(0), \"modelled\", \"fraction\"))\n")
+    _found, new, _stale, _multi = review(str(root))
+    assert [(k[1], k[2]) for k in new] == [("_regression", "EM.Quantity(D(0), 'modelled', 'fraction')")], new
