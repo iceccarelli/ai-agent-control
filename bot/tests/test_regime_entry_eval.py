@@ -314,7 +314,7 @@ def test_reg2_runs_through_the_cli_on_a_real_history_root(tmp_path, monkeypatch,
     monkeypatch.setattr(socket.socket, "connect", boom)
     root, uni, spot = TCR._hist(tmp_path)
     rc = RE.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", TCR.MARK_IV, "--ledger-dir", str(tmp_path / "L"), "--registration", "reg-2",
-                  "--json", str(tmp_path / "o.json")])
+                  "--json", str(tmp_path / "o.json"), "--unreserved-exploratory"])             # about the CLI contract; the reserved-holdout guard has its own file (test_history_holdout.py)
     assert rc == 0
     o = json.loads((tmp_path / "o.json").read_text())
     assert o["registration"]["registration_id"].endswith("@reg-2") and o["post_hoc"] is True and o["verdict"] == "INSUFFICIENT_DATA"

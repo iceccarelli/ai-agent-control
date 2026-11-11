@@ -88,7 +88,8 @@ def tampered(tmp_path_factory):
 def argv(w, art, cmd="run", **over):
     base = {"--history-root": w.root, "--universe-dir": w.uni, "--spot-dir": w.spot, "--mark-interval": TCR.MARK_IV, "--artifacts-dir": art, "--ledger-dir": w.ledger,
             "--start-ms": str(START), "--end-ms": str(END), "--candidate": CAND_PATH, "--execution-policy": "MAKER_FIRST", "--derive-risk-policy": True, "--mode": "REPLAY",
-            "--clock-ms": str(END), "--code-revision": REV, "--hold-days": "2"}
+            "--clock-ms": str(END), "--code-revision": REV, "--hold-days": "2",
+            "--unreserved-exploratory": True}            # these tests are about the CLI's other contracts; the reserved-holdout guard has its own file (test_history_holdout.py)
     for k, v in over.items():
         base["--" + k.replace("_", "-")] = v
     out = [cmd]

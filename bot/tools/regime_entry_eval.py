@@ -168,8 +168,9 @@ def regime_state(s: CR.SymbolSeries, t: int, p: Mapping[str, Any]) -> Tuple[Opti
 
 
 # ---------------------------------------------------------------- optional index series (basis residual)
-def load_index_series(root: str, interval: str, symbols: Sequence[str]) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[str, Any]]:
-    """The verified ``index-kline-<interval>`` closes keyed by OBSERVATION time (candle start + interval), or ({}, reason) when the dataset is absent / does not verify."""
+def load_index_series(root: str, interval: str, symbols: Sequence[str], *, cut_ms: Optional[int] = None) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[str, Any]]:
+    """The verified ``index-kline-<interval>`` closes keyed by OBSERVATION time (candle start + interval), or ({}, reason) when the dataset is absent / does not verify.
+    ``cut_ms`` (the reserved-holdout boundary, ``history_holdout``) drops every close observed at or after it: the basis measurement is a second read of the same window and must be cut too."""
     name = MH.dataset_dirname(MH.INDEX, interval)
     if not os.path.isdir(os.path.join(root, name)):
         return {}, {"status": "UNMEASURED", "reason": f"no {name} dataset under the history root (collect it with market_history run-plan --datasets all)"}
@@ -190,7 +191,8 @@ def load_index_series(root: str, interval: str, symbols: Sequence[str]) -> Tuple
                 ot = r.get("observation_time")
                 if not isinstance(ot, int) or isinstance(ot, bool) or (iv_ms and ot < r["ts"] + iv_ms):
                     raise RH.LookAheadError(f"{sym}: an index row claims its close is knowable before the candle ended")
-                pts.append((ot, float(r["v"]["close"])))
+                if cut_ms is None or ot < cut_ms:
+                    pts.append((ot, float(r["v"]["close"])))
             out[sym] = sorted(pts)
         except RH.LookAheadError:
             raise
@@ -387,13 +389,16 @@ def evaluate(series: Sequence[CR.SymbolSeries], *, ledger_path: str, universe_in
     return out
 
 
-def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, registration_name: str = "reg-1") -> Dict[str, Any]:
-    series, info = CR.load_history_root(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
-    index, idx_info = load_index_series(history_root, str(info["mark_interval"]), [s.symbol for s in series])
+def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, registration_name: str = "reg-1",
+                holdout_ledger: Optional[str] = None, unreserved_exploratory: bool = False) -> Dict[str, Any]:
+    import history_holdout as HH
+    series, info = HH.load(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_path=holdout_ledger,
+                           reader="regime_entry_eval", unreserved_exploratory=unreserved_exploratory)
+    index, idx_info = load_index_series(history_root, str(info["mark_interval"]), [s.symbol for s in series], cut_ms=info.get("holdout_cut_ms"))
     out = evaluate(series, ledger_path=ledger_path, universe_info=info, index=index, reg=registration(registration_name))
     out["basis_measurement"] = idx_info
     out["input"] = {k: info.get(k) for k in ("root", "mark_interval", "history_window", "history_coverage", "datasets", "universe", "survivorship", "hedge", "non_complete_symbols",
-                                             "symbols_loaded", "warnings")}
+                                             "symbols_loaded", "warnings", "holdout")}
     return out
 
 
@@ -407,6 +412,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--json", default=None, help="write the full report here")
     ap.add_argument("--registration", default="reg-1", choices=sorted(REGISTRATIONS), help="which frozen registration to run (each is one trial in the family ledger; an identical re-run is the same trial)")
     ap.add_argument("--print-registration", action="store_true", help="print the frozen registration and its digest, then exit")
+    ap.add_argument("--unreserved-exploratory", action="store_true",
+                    help="evaluate WITHOUT a reserved holdout: the whole window is read, the result is stamped NOT_A_HOLDOUT_STUDY and the dataset can never be reserved afterwards "
+                         "(default: refuse until `tools/history_holdout.py --reserve` has been run)")
     a = ap.parse_args(argv)
     if a.print_registration:
         print(json.dumps({"registration": registration(a.registration), "digest": registration_digest(registration(a.registration))}, indent=1, sort_keys=True))
@@ -414,8 +422,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not a.history_root or not a.universe_dir:
         ap.error("--history-root and --universe-dir are required (only --print-registration runs without them)")
     lpath = CR.default_ledger_path(FAMILY, a.history_root, a.ledger_dir)
+    import history_holdout as HH
     try:
-        out = run_on_root(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval, registration_name=a.registration)
+        out = run_on_root(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval, registration_name=a.registration,
+                          holdout_ledger=HH.ledger_for(os.path.dirname(os.path.abspath(lpath))), unreserved_exploratory=a.unreserved_exploratory)
     except RH.HarnessError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

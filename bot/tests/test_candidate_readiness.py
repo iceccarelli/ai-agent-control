@@ -377,7 +377,10 @@ def test_cli_history_root_requires_a_universe_and_runs_the_round_trip(tmp_path, 
         CR.main(["--history-root", root])
     with pytest.raises(SystemExit):
         CR.main(["--market-history", root])                                                                         # the old assumed layout is gone
-    assert CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV]) == 0
+    with pytest.raises(SystemExit):                                                                                 # no reserved holdout: refused (the guard has its own file, test_history_holdout.py)
+        CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV])
+    assert "HOLDOUT_NOT_RESERVED" in capsys.readouterr().err
+    assert CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV, "--unreserved-exploratory"]) == 0
     assert "ranked funding:" in capsys.readouterr().out
 
 

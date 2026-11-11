@@ -23,11 +23,12 @@ PORT  ?= 8787
 S     := $(PY) tools/ms_testnet_session.py --state-dir $(HOME)/.ai-agent-control/ms_testnet
 
 .PHONY: help setup check test-quick scope diagnose plan backfill collect-start collect-stop collect-status collect-log seal backup restore-check audit \
-        control-centre-start control-centre-stop pipeline regime-eval testnet-preflight testnet-plan testnet-status testnet-ready ops-resume
+        control-centre-start control-centre-stop pipeline regime-eval reserve-holdout holdout-status competition testnet-preflight testnet-plan testnet-status testnet-ready ops-resume
 
 help:
 	@echo "setup | check | test-quick | scope | diagnose | plan | backfill | collect-start|stop|status|log | seal | backup | restore-check | audit"
-	@echo "control-centre-start|stop | pipeline | testnet-preflight | testnet-plan | testnet-status      (no order target exists)"
+	@echo "reserve-holdout | holdout-status | competition | pipeline | regime-eval      (research on a history root: reserve-holdout FIRST, once)"
+	@echo "control-centre-start|stop | testnet-preflight | testnet-plan | testnet-status      (no order target exists)"
 
 setup:
 	cd $(BOT) && $(PY) -m pip install -q -r requirements.txt -c constraints.txt pytest
@@ -98,6 +99,24 @@ control-centre-start:
 
 control-centre-stop:
 	@rm -f $(OPS)/control-centre.enabled; test -f $(OPS)/cc.pid && kill $$(cat $(OPS)/cc.pid) 2>/dev/null; rm -f $(OPS)/cc.pid; echo stopped
+
+# --- RESERVE THE HOLDOUT BEFORE THE FIRST EVALUATION READ of a history root (once; idempotent; RUNBOOKS "Reserve the holdout first"). The last 30% of the funding window is cut out of every
+# evaluation below, and `competition`, `pipeline` and `regime-eval` REFUSE until this has run (all share $(DATA)/ledgers). holdout-status is read-only and prints the window arithmetic.
+reserve-holdout:
+	@test -n "$(EVALHIST)" || { echo "set HIST= (history data root)"; exit 2; }
+	@mkdir -p -m 700 $(DATA)/ledgers
+	cd $(BOT) && $(PY) tools/history_holdout.py --reserve --history-root $(EVALHIST) --mark-interval 240 --ledger-dir $(DATA)/ledgers
+
+holdout-status:
+	@test -n "$(EVALHIST)" || { echo "set HIST= (history data root)"; exit 2; }
+	cd $(BOT) && $(PY) tools/history_holdout.py --status --history-root $(EVALHIST) --mark-interval 240 --ledger-dir $(DATA)/ledgers
+
+# --- the candidate competition: offline, read-only, never a forced winner. Same ledger directory as every other research target, so the multiple-testing counts and the reserved holdout agree.
+competition:
+	@test -n "$(EVALHIST)" -a -n "$(UNI)" || { echo "set HIST= (history data root) and UNI="; exit 2; }
+	@test -n "$(SPOT)" || { echo "no spot snapshot under $(DATA)/spot-snap/spot-instruments; set SPOT=<snapshot dir> (market_history.py spot-instruments --out-root $(DATA)/spot-snap)"; exit 2; }
+	@mkdir -p -m 700 $(DATA)/ledgers
+	cd $(BOT) && $(PY) tools/candidate_competition.py --data-root $(EVALHIST) --universe-dir $(UNI) --spot-dir "$(SPOT)" --mark-interval 240 --ledger-dir $(DATA)/ledgers --json $(DATA)/competition.json
 
 # --- REPLAY research run on verified history (simulated transport only; TESTNET and live modes are refused by the CLI). Needs START/END (epoch ms) and a candidate.
 pipeline:

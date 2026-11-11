@@ -498,11 +498,17 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     except CC.BookUnreadable as exc:
         _alert_book_unreadable(engine_root, clock, d, exc)
         return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])      # (settle = what the venue's cash REALLY did since the last verified-flat session: losses in full, gains only as far as explained)
-    if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
-        emit(EL.capital_settled(settled))
-        ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
-        return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     cb = book.load()
+    review = cb.get("review_required")
+    if settled["status"] == "UNEXPLAINED_CASH" or review:             # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
+        if settled["status"] == "UNEXPLAINED_CASH":
+            emit(EL.capital_settled(settled))
+        review = review or {}
+        # The BOOK holds the stop (written in the settlement's own save); this marker is re-asserted from it on every session, so a kill between the save and the marker, or an owner who cleared
+        # the marker without `capital --ack-review`, cannot resume trading.
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": review.get("session_id") or settled.get("session_id"),
+                                                         "delta_usd": review.get("delta_usd") or settled.get("delta_usd")})
+        return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.sizing_basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
                         loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
@@ -1242,6 +1248,7 @@ def _parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
     cp.add_argument("--root", default=DEFAULT_ROOT)
     cp.add_argument("--ack-halt", action="store_true")
+    cp.add_argument("--ack-review", action="store_true", help="after YOU read the unexplained session's evidence (history[-1] and review_required in the book): let entries resume (it changes no money and no history; clearing the ALERT marker alone does not)")
     cp.add_argument("--ack-drawdown", action="store_true", help="after YOU reviewed the losses that hit the drawdown stop: resume from the current verified basis (a new drawdown peak)")
     cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
     cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
@@ -1296,6 +1303,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
             return 2
         if a.ack_halt:
             print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        if a.ack_review:
+            print("review acknowledged" if cbk.acknowledge_review() else "no review to acknowledge")
         if a.ack_drawdown:
             print("drawdown acknowledged" if cbk.acknowledge_drawdown() else "no drawdown to acknowledge")
         if a.reserve_fraction is not None:

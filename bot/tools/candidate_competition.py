@@ -51,14 +51,7 @@ DRAFT_RATIONALE = {
 
 
 def default_ledger_dir(data_root: Optional[str], ledger_dir: Optional[str]) -> str:
-    if ledger_dir:
-        return os.path.abspath(ledger_dir)
-    env = os.environ.get("CANDIDATE_LEDGER_DIR")
-    if env:
-        return os.path.abspath(env)
-    if data_root:
-        return os.path.join(os.path.dirname(os.path.realpath(data_root)), "candidate_ledgers")
-    return os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers")
+    return CR.ledger_dir_for(data_root, ledger_dir)                    # THE one rule: candidate_readiness, regime_entry_eval, history_holdout and this tool all resolve it here
 
 
 def _ledger(family: str, ldir: str) -> Tuple[Any, str]:
@@ -159,23 +152,27 @@ def btc_multiple_testing(econ: Optional[Mapping[str, Any]], ldir: str) -> Dict[s
 
 
 # ---------------------------------------------------------------- cross-sectional
-def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], ldir: str, *, spot_dir: Optional[str], mark_interval: Optional[str], history_root: Optional[str]) -> Dict[str, Any]:
-    """The cross-sectional evaluation or the loud reason it did not run. Never raises on missing/failed data."""
+def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], ldir: str, *, spot_dir: Optional[str], mark_interval: Optional[str], history_root: Optional[str],
+                        unreserved_exploratory: bool = False) -> Dict[str, Any]:
+    """The cross-sectional evaluation or the loud reason it did not run. Never raises on missing/failed data. The load is CUT at the reserved-holdout boundary and refused (HOLDOUT_NOT_RESERVED,
+    with the exact command) when nothing is reserved in ``ldir``, unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY and recorded)."""
     root = history_root or data_root
     if not universe_dir:
         return {"status": "UNIVERSE_DIR_REQUIRED", "reason": "UNIVERSE_DIR_REQUIRED: the cross-sectional path takes an explicit verified universe_capture directory (--universe-dir); nothing was evaluated"}
     if not root:
         return {"status": "NO_HISTORY_ROOT", "reason": "no --data-root (market_history root) given: nothing to evaluate"}
+    import history_holdout as HH
     try:
-        out = CR.evaluate_cross_sectional(root, universe_dir=universe_dir, ledger_path=_path("cross_sectional_funding", ldir), spot_dir=spot_dir, mark_interval=mark_interval)
+        out = CR.evaluate_cross_sectional(root, universe_dir=universe_dir, ledger_path=_path("cross_sectional_funding", ldir), spot_dir=spot_dir, mark_interval=mark_interval,
+                                          holdout_ledger=HH.ledger_for(ldir), unreserved_exploratory=unreserved_exploratory, reader="candidate_competition")
     except RH.HarnessError as exc:
-        return {"status": "REFUSED", "reason": str(exc)[:300]}
+        return {"status": "REFUSED", "reason": str(exc)[:600]}
     return {"status": "EVALUATED", "evaluation": out}
 
 
 def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     if res["status"] != "EVALUATED":
-        return {"verdict": "UNTESTED", "net_edge": None, "reasons": [res["reason"]], "families": {}, "evaluation": None}
+        return {"verdict": "UNTESTED", "net_edge": None, "reasons": [res["reason"]], "families": {}, "evaluation": None, "survivorship": None, "holdout": None}
     ev = res["evaluation"]
     fams = ev["families"]
     reasons: List[str] = []
@@ -205,8 +202,11 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
         reasons.append("HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS: " + str(rf["history_coverage"]["symbols_in_history"]) + " of " + str(rf["history_coverage"]["universe_eligible_symbols"]) + " eligible symbols")
     if ev.get("survivorship") == CR.SURVIVORS_ONLY:
         reasons.append("SURVIVORS_ONLY: no survivorship-free claim")
+    ho = (ev.get("input") or {}).get("holdout") if isinstance(ev.get("input"), Mapping) else None
+    if isinstance(ho, Mapping) and ho.get("status") != "RESERVED":
+        reasons.insert(0, f"HOLDOUT {ho.get('status')}: {ho.get('label')}")           # an exploratory read must be the first thing a reader of this row sees
     verdict = "REJECTED" if verdicts and all(v == "REJECTED" for v in verdicts) else "INSUFFICIENT_DATA"
-    return {"verdict": verdict, "net_edge": best, "reasons": reasons, "families": fam_out, "evaluation": ev}
+    return {"verdict": verdict, "net_edge": best, "reasons": reasons, "families": fam_out, "evaluation": ev, "survivorship": ev.get("survivorship"), "holdout": dict(ho) if isinstance(ho, Mapping) else None}
 
 
 # ---------------------------------------------------------------- the competition
@@ -221,11 +221,11 @@ def _tier(row: Mapping[str, Any]) -> int:
 
 
 def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[str] = None, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
-                    ledger_dir: Optional[str] = None, history_root: Optional[str] = None, with_economics: bool = True) -> Dict[str, Any]:
+                    ledger_dir: Optional[str] = None, history_root: Optional[str] = None, with_economics: bool = True, unreserved_exploratory: bool = False) -> Dict[str, Any]:
     """Run the competition. Deterministic for fixed inputs (no clock). The ledger is persistent by default (``default_ledger_dir``)."""
     ldir = default_ledger_dir(data_root or history_root, ledger_dir)
     base = CR.build_report(data_root=data_root or history_root, universe_dir=universe_dir, with_economics=with_economics)
-    xs = _xs_summary(run_cross_sectional(data_root, universe_dir, ldir, spot_dir=spot_dir, mark_interval=mark_interval, history_root=history_root))
+    xs = _xs_summary(run_cross_sectional(data_root, universe_dir, ldir, spot_dir=spot_dir, mark_interval=mark_interval, history_root=history_root, unreserved_exploratory=unreserved_exploratory))
     evals = {"cross_sectional_funding": xs["evaluation"]["families"].get("PERP_FUNDING_SPREAD")} if xs["evaluation"] else None
     if evals and evals["cross_sectional_funding"] is not None:
         base = CR.build_report(data_root=data_root or history_root, universe_dir=universe_dir, with_economics=with_economics, evaluations=evals)
@@ -280,6 +280,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
             net_basis = ("OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: best family's out-of-sample mean net bps per 7-day row (perp-only families are NOT carry)" if net is not None else
                          "UNKNOWN: not evaluated, or too few holding rows for a test (descriptive in-sample figures are in families[])")
             extra["families"] = xs["families"]
+            extra["survivorship"] = xs["survivorship"]          # the table must show it: a survivors-only cross-section flatters every net edge it prints
+            extra["holdout"] = xs["holdout"]
             mt = {**mt, "per_family": {k: v["n_variants_counted"] for k, v in xs["families"].items()}}
             if xs["families"]:
                 mt["n_variants_counted"] = sum(v["n_variants_counted"] or 0 for v in xs["families"].values())
@@ -326,12 +328,13 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
 
 
 def render_table(rep: Mapping[str, Any]) -> str:
-    cols = ("rank", "candidate", "origin", "verdict", "level", "net_edge_bps", "data", "PIT", "exec", "mt_n", "top_reason")
+    cols = ("rank", "candidate", "origin", "verdict", "level", "net_edge_bps", "data", "PIT", "survivorship", "holdout", "exec", "mt_n", "top_reason")
     lines = ["\t".join(cols)]
     for r in rep["results"]:
         ne = r["net_edge"]["value_bps"]
         lines.append("\t".join(str(x) for x in (r["rank"] if r["rank"] is not None else "-", r["name"], r["origin"], r["verdict"], r["readiness_level"], "n/a" if ne is None else f"{ne:.1f}",
-                                                r["data_readiness"]["value"], r["point_in_time"], r["executable_on_qualified_venue"]["value"], r["multiple_testing"]["n_variants_counted"],
+                                                r["data_readiness"]["value"], r["point_in_time"], r.get("survivorship") or "-", (r.get("holdout") or {}).get("status") or "-",
+                                                r["executable_on_qualified_venue"]["value"], r["multiple_testing"]["n_variants_counted"],
                                                 (r["rejection_reasons"][0][:70] if r["rejection_reasons"] else ""))))
     lines.append("")
     lines.append(rep["winner_statement"])
@@ -351,8 +354,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--mark-interval", default=None)
     ap.add_argument("--ledger-dir", default=None, help="persistent multiple-testing ledgers (default: $CANDIDATE_LEDGER_DIR, <parent of data root>/candidate_ledgers, or ~/.cache)")
     ap.add_argument("--json", default="", help="write the machine-readable result here")
+    ap.add_argument("--unreserved-exploratory", action="store_true",
+                    help="evaluate the cross-sectional rows WITHOUT a reserved holdout: the whole window is read, the result is stamped NOT_A_HOLDOUT_STUDY and the dataset can never be reserved "
+                         "afterwards (default: refuse until `tools/history_holdout.py --reserve` has been run)")
     a = ap.parse_args(argv)
-    rep = run_competition(data_root=a.data_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval, ledger_dir=a.ledger_dir, history_root=a.history_root)
+    rep = run_competition(data_root=a.data_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval, ledger_dir=a.ledger_dir, history_root=a.history_root,
+                          unreserved_exploratory=a.unreserved_exploratory)
     print(render_table(rep))
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:

@@ -140,7 +140,7 @@ class CapitalBook:
     def _fresh(self) -> Dict[str, Any]:
         return {"schema": BOOK_SCHEMA, "start_cash_usd": None, "realised_usd": "0", "gains_usd": "0", "losses_usd": "0", "peak_basis_usd": None, "loss_streak": 0, "halted": False,
                 "pending": None, "history": [], "unverified_excess_usd": "0", "reserve_fraction": str(DEFAULT_RESERVE_FRACTION), "transfers_pending": [], "transfers_applied": [],
-                "last_cash_usdt": None, "last_cash_ms": None}
+                "last_cash_usdt": None, "last_cash_ms": None, "review_required": None}
 
     def load(self) -> Dict[str, Any]:
         """The book, a fresh one ONLY when no file exists. A file that is present but unreadable, malformed or of another schema is NOT a fresh book: silently starting over would reset the baseline,
@@ -314,6 +314,11 @@ class CapitalBook:
             entry = {"session_id": p["session_id"], "delta_usd": str(delta), "transfers_removed_usd": str(transfers), "credited_usd": str(credited), "unverified_excess_usd": str(excess),
                      "status": status, "usdt_before": p["usdt_before"], "usdt_after": str(now), "flat_verified": bool(flat)}
             b["history"] = (list(b["history"]) + [entry])[-HISTORY_MAX:]
+            if status == "UNEXPLAINED_CASH" and not b.get("review_required"):
+                # The stop is part of THIS save. The autopilot used to write its ALERT marker in a separate file afterwards; a process killed between the two left a book that had moved on and no
+                # marker, and the next session traded on cash it had already called unexplained. The book is the source of truth: every session reads this and re-asserts the ALERT.
+                b["review_required"] = {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": p["session_id"], "delta_usd": str(delta), "known_usd": None if known is None else str(known),
+                                        "set_ms": int(time.time() * 1000)}
             b["transfers_applied"] = (list(b["transfers_applied"]) + [{**t, "applied_to": p["session_id"], "counted": t in counted} for t in b["transfers_pending"]])[-HISTORY_MAX:]
             b["transfers_pending"] = []
             b["pending"] = None
@@ -326,6 +331,18 @@ class CapitalBook:
             if not b.get("halted"):
                 return False
             b["halted"], b["loss_streak"] = False, 0
+            self._save(b)
+            return True
+
+    def acknowledge_review(self) -> bool:
+        """The owner's explicit decision, after reading the unexplained session's evidence in the book, to let entries resume. It changes no money and no history; False when there is no
+        review open. Clearing the ALERT marker alone never does this: the autopilot re-asserts the marker from the book."""
+        with self._locked():
+            b = self.load()
+            if not b.get("review_required"):
+                return False
+            b["review_required"] = None
+            b.setdefault("review_acknowledged", []).append({"at_ms": int(time.time() * 1000)})
             self._save(b)
             return True
 
@@ -352,5 +369,5 @@ class CapitalBook:
                 "verified_losses_usd": b["losses_usd"], "basis_usd": None if bs is None else str(bs), "reserve_fraction": b["reserve_fraction"], "reserve_usd": str(self.reserve_usd(b)),
                 "sizing_basis_usd": None if sb is None else str(sb), "unverified_excess_usd": b["unverified_excess_usd"], "transfers_pending": b["transfers_pending"],
                 "lifecycles_settled": len(b["history"]), "wins": len(wins), "losses": len(losses), "profit_factor": None if gl == 0 else str((gp / gl).quantize(D("0.01"))),
-                "max_drawdown_now_usd": None if self.drawdown(b) is None else str(self.drawdown(b)), "loss_streak": b["loss_streak"], "halted": b["halted"], "pending": b["pending"],
+                "max_drawdown_now_usd": None if self.drawdown(b) is None else str(self.drawdown(b)), "loss_streak": b["loss_streak"], "halted": b["halted"], "review_required": b.get("review_required"), "pending": b["pending"],
                 "label": "TESTNET SIMULATION: fake money; verified realised cash only; not real-world performance"}

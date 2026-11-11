@@ -1123,7 +1123,8 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     out["trailing_observation"] = _trailing(series, formation_days_grid[-1] if formation_days_grid else 7)
     if n_rows < min_rows:
         for name in out["variants_tried"]:
-            ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping holding rows (< {min_rows})")
+            if not ledger.knows(name):                      # an identical re-run is the same trial, not a new one (evaluate_family and regime_entry_eval already say so)
+                ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping holding rows (< {min_rows})")
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "evidence_class": "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE", "family": fam, "n_variants_counted": ledger.n_variants,
                     "n_variants_tried_in_call": len(out["variants_tried"]),
                     "required_span": grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows, span_days=(t1 - t0) / MS_DAY),
@@ -1134,11 +1135,13 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
         return out
     cut = {k: v[:n_rows] for k, v in per.items()}
     for name, rets in cut.items():
-        ledger.record(name, params_of[name], rets, horizon=1)
+        if RH.series_digest(rets) not in ledger.returns_digests(name):          # same variant on the very same series = the same trial; new data or a new name counts
+            ledger.record(name, params_of[name], rets, horizon=1)
     for name, (rets, h) in counted_only.items():
         if len(rets) >= 2:
-            ledger.record(name, params_of[name], rets, horizon=1)
-        else:
+            if RH.series_digest(rets) not in ledger.returns_digests(name):
+                ledger.record(name, params_of[name], rets, horizon=1)
+        elif not ledger.knows(name):
             ledger.record_rejected(name, params_of[name], "fewer than two holding rows for this hold length")
     folds = RH.walk_forward_folds(n_rows, train_min=max(20, n_rows // 2), test_len=max(5, n_rows // 10), label_horizon=1, embargo=1)
     oos: List[float] = []
@@ -1267,7 +1270,8 @@ def _survivorship_info(uinfo: Mapping[str, Any]) -> Tuple[str, str]:
 
 
 def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, window: Optional[Tuple[int, int]] = None,
-                      include_statuses: Sequence[str] = ('Trading', 'Closed'), quote_coins: Optional[Sequence[str]] = ('USDT',), classifier: Optional[Any] = None) -> Tuple[List[SymbolSeries], Dict[str, Any]]:
+                      include_statuses: Sequence[str] = ('Trading', 'Closed'), quote_coins: Optional[Sequence[str]] = ('USDT',), classifier: Optional[Any] = None,
+                      cut_ms: Optional[int] = None) -> Tuple[List[SymbolSeries], Dict[str, Any]]:
     """Series from a market_history root written by ``tools/market_history.py``: ``<root>/funding``, ``<root>/mark-kline-<interval>`` (rows.jsonl per symbol), plus a verified
     universe_capture directory (launch / delivery / fundingInterval_min) and optionally a spot-instruments snapshot (hedgeability).
 
@@ -1279,7 +1283,11 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     excluded and LISTED in ``info['excluded']``; other non-COMPLETE symbol statuses are kept and reported in ``info['non_complete_symbols']``. Gaps are never filled.
 
     THE FUNNEL. Which symbols are loaded is decided by ``backfill_plan.funnel`` (the same function ``plan``, ``diagnose`` and the audit call), not here: this function loads EXACTLY ``funnel.loadable``
-    and embeds the funnel report as ``info['funnel']``. ``window`` = the (from_ms, to_ms) the history must cover (default: the window the funding manifest itself requested)."""
+    and embeds the funnel report as ``info['funnel']``. ``window`` = the (from_ms, to_ms) the history must cover (default: the window the funding manifest itself requested).
+
+    ``cut_ms`` is the RESERVED-HOLDOUT boundary (``history_holdout``): the study window ends there and no funding print or mark close observed at or after it is built into a series
+    (the funnel is judged on the cut window too, so which symbols are loaded cannot depend on the reserved rows). Only ``history_holdout`` passes it; an evaluator must go through
+    ``history_holdout.load`` (a test enforces that nothing else calls this function)."""
     from decimal import Decimal, InvalidOperation
     if not isinstance(universe_dir, str) or not universe_dir:
         raise RH.HarnessError("universe_dir is required: instrument attributes do not live in the history manifests")
@@ -1293,6 +1301,15 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     fman, fdir = _verified_dataset(root, MH.FUNDING)
     mman, mdir = _verified_dataset(root, mark_name)
     import backfill_plan as BP            # lazy: backfill_plan imports this module lazily too
+    if cut_ms is not None:
+        if isinstance(cut_ms, bool) or not isinstance(cut_ms, int) or cut_ms <= 0:
+            raise RH.HarnessError(f"cut_ms must be a positive epoch-millisecond integer, got {cut_ms!r}")
+        base_window = window if window is not None else BP.window_of_funding_manifest(os.path.abspath(root))
+        if base_window is None:
+            raise RH.HarnessError("HOLDOUT_CUT_NEEDS_A_WINDOW: the funding dataset records no requested window to cut")
+        if cut_ms <= int(base_window[0]):
+            raise RH.HarnessError(f"HOLDOUT_CUT_BEFORE_WINDOW_START: the cut {cut_ms} is not after the window start {int(base_window[0])}: nothing would be left to evaluate")
+        window = (int(base_window[0]), min(int(base_window[1]), int(cut_ms)))
     try:
         fn = BP.funnel(universe_dir, root, window=window, window_source=BP.WINDOW_FROM_EXPLICIT if window is not None else BP.WINDOW_FROM_FUNDING_MANIFEST, include_statuses=include_statuses,
                        quote_coins=quote_coins, required_datasets=(MH.FUNDING, MH.MARK), intervals={MH.MARK: mark_iv}, report_datasets=(MH.FUNDING, MH.MARK), classifier=classifier,
@@ -1337,8 +1354,8 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                 ot = r.get("observation_time")
                 if not isinstance(ot, int) or isinstance(ot, bool) or ot < r["ts"] + (iv_ms if isinstance(iv_ms, int) and iv_ms > 0 else 1):
                     raise RH.LookAheadError(f"{sym}: a mark row claims its close is knowable before the candle ended (observation_time {ot!r}, candle start {r['ts']}, interval {iv_ms!r})")
-            fund = sorted((r["observation_time"], float(Decimal(r["v"]["fundingRate"]) * 10000)) for r in frows)
-            mark = sorted((r["observation_time"], float(Decimal(r["v"]["close"]))) for r in mrows)
+            fund = sorted((r["observation_time"], float(Decimal(r["v"]["fundingRate"]) * 10000)) for r in frows if cut_ms is None or r["observation_time"] < cut_ms)
+            mark = sorted((r["observation_time"], float(Decimal(r["v"]["close"]))) for r in mrows if cut_ms is None or r["observation_time"] < cut_ms)
         except RH.HarnessError:
             raise
         except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
@@ -1395,7 +1412,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                             "not_complete_over_window": sorted(set(fn.loadable) - set(fn.complete)), "closed_in_universe_not_in_series": closed_info, "point_in_time_claim": False,
                             "point_in_time_note": "this loader builds series from capture snapshots; it makes no point-in-time claim (use PointInTimeUniverse.from_capture_dirs for that). " + PIT_LABEL_NOTE,
                             "time_basis": "marks and funding are keyed by observation_time (replay mode: receipt time is not stored per row)",
-                            "interval_mismatch_symbols": mismatch,
+                            "interval_mismatch_symbols": mismatch, "holdout_cut_ms": cut_ms,
                             "non_complete_symbols": non_complete, "excluded": excluded, "symbols_loaded": len(series), "warnings": warnings})
     info.verdict = UniverseVerdict(survivorship, len(closed_missing), tuple(closed_missing[:NAMES_CAP]), _UNIVERSE_SEAL)
     if hedge_info is not None:
@@ -1714,6 +1731,13 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
     if not series:
         out.update({"verdict": "UNTESTED", "status": "NO_SERIES", "reason": "no series given"})
         return out
+    if spec["is_carry"] and all(s.spot_listed is None for s in series):
+        # The carry family's universe is "symbols with a confirmed Bybit spot pair". With no hedgeability fact for ANY symbol (no --spot-dir, or a snapshot none of whose pairs
+        # resolved) that universe is empty, so nothing could have been tried: counting six rejected variants would only make the later real run harder to pass.
+        out.update({"verdict": "UNTESTED", "status": "HEDGEABILITY_UNKNOWN_FOR_EVERY_SYMBOL",
+                    "reason": "no symbol has a hedgeability fact: no spot snapshot was supplied (--spot-dir) or none of its pairs resolved, so the carry universe is empty and nothing was tried "
+                              "(nothing was written to the multiple-testing ledger)"})
+        return out
     t0 = min(min((ts for ts, _ in s.funding), default=10 ** 18) for s in series)
     t1 = max(max((ts for ts, _ in s.funding), default=0) for s in series)
     fmax = max(formation_days_grid)
@@ -1818,11 +1842,24 @@ def _require_universe_dir(universe_dir: Any) -> str:
     return universe_dir
 
 
+def ledger_dir_for(data_root: Optional[str], ledger_dir: Optional[str] = None) -> str:
+    """THE rule for where a research ledger directory is (pure: nothing is created): ``ledger_dir``, else $CANDIDATE_LEDGER_DIR, else ``<parent of data_root>/candidate_ledgers``, else
+    ``~/.cache/ai-agent-control/candidate_ledgers``. Every research CLI resolves its ledgers through this one function: two tools that each re-derive the rule drift apart, and a
+    family counted in two directories is two families (the multiple-testing count then understates the trials, and a holdout reserved in one directory is invisible from the other)."""
+    if ledger_dir:
+        return os.path.abspath(ledger_dir)
+    env = os.environ.get("CANDIDATE_LEDGER_DIR")
+    if env:
+        return os.path.abspath(env)
+    if data_root:
+        return os.path.join(os.path.dirname(os.path.realpath(data_root)), "candidate_ledgers")
+    return os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers")
+
+
 def default_ledger_path(family: str, data_root: str, ledger_dir: Optional[str] = None) -> str:
-    """The persistent multiple-testing ledger of ``family``: ``ledger_dir`` (or $CANDIDATE_LEDGER_DIR, or ``<parent of data_root>/candidate_ledgers``) / ``<family>.jsonl``.
+    """The persistent multiple-testing ledger of ``family``: ``ledger_dir_for(...)`` / ``<family>.jsonl``.
     It is deliberately OUTSIDE the data root (evidence directories stay byte-for-byte what the verifier hashed) and never under bot/state."""
-    base = ledger_dir or os.environ.get("CANDIDATE_LEDGER_DIR") or os.path.join(os.path.dirname(os.path.realpath(data_root)), "candidate_ledgers")
-    path = os.path.join(os.path.abspath(base), RH.normalise_family(family) + ".jsonl")
+    path = os.path.join(ledger_dir_for(data_root, ledger_dir), RH.normalise_family(family) + ".jsonl")
     if os.path.realpath(path).startswith(os.path.join(BOT, "state") + os.sep):
         raise RH.HarnessError("the ledger may not live under bot/state")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1830,13 +1867,20 @@ def default_ledger_path(family: str, data_root: str, ledger_dir: Optional[str] =
 
 
 def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], ledger_path: Optional[str], spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
-                             spec: Optional[Mapping[str, Any]] = None, **kw: Any) -> Dict[str, Any]:
+                             spec: Optional[Mapping[str, Any]] = None, holdout_ledger: Optional[str] = None, unreserved_exploratory: bool = False, reader: str = "",
+                             **kw: Any) -> Dict[str, Any]:
     """Load a market_history root against its verified universe capture and run the ranked-funding walk-forward. The universe dir is REQUIRED (HarnessError UNIVERSE_DIR_REQUIRED) and
-    so is a persistent ``ledger_path``: a fresh process must not reset the multiple-testing family count (HarnessError otherwise)."""
+    so is a persistent ``ledger_path``: a fresh process must not reset the multiple-testing family count (HarnessError otherwise).
+
+    ``holdout_ledger`` is the reserved-holdout ledger (``history_holdout``): with it the load is CUT at the reserved boundary and refused (HOLDOUT_NOT_RESERVED, with the exact command)
+    when nothing is reserved, unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY and recorded). Without it (a library call) the whole window is read and
+    ``input['holdout']['status']`` says NOT_GUARDED; every research CLI passes its ledger."""
     _require_universe_dir(universe_dir)
     if not isinstance(ledger_path, str) or not ledger_path:
         raise RH.HarnessError("LEDGER_PATH_REQUIRED: a cross-sectional evaluation records its variants in a persistent ledger so the family count survives a restart")
-    series, info = load_history_root(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+    import history_holdout as HH            # lazy: history_holdout imports this module
+    series, info = HH.load(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_path=holdout_ledger,
+                           reader=reader or "candidate_readiness.evaluate_cross_sectional", unreserved_exploratory=unreserved_exploratory)
     out = {"input": info, **evaluate_ranked_funding(series, universe_info=info, ledger_path=ledger_path, spec=spec, **kw)}
     hw = info.get("history_window") or {}
     if out.get("evidence_class") == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE" and isinstance(out.get("required_span"), dict):
@@ -1898,7 +1942,7 @@ def dataset_report(*, data_root: Optional[str], universe_dir: Optional[str], spo
         rep.update({"status": "REFUSED", "reason": "no market_history datasets under the data root"})
     else:
         try:
-            series, info = load_history_root(data_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+            series, info = load_history_root(data_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)          # METADATA ONLY: symbol lists and coverage, never a return series
         except RH.HarnessError as exc:
             rep.update({"status": "REFUSED", "reason": str(exc)[:300]})
         else:
@@ -1950,6 +1994,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dataset-report", action="store_true", help="print the reproducible dataset report for --data-root/--history-root + --universe-dir and exit")
     ap.add_argument("--spot-dir", default=None, help="a spot-instruments snapshot dir (hedgeability; absent = unknown)")
     ap.add_argument("--mark-interval", default=None, help="mark-kline interval (e.g. 240); needed when the root holds more than one")
+    ap.add_argument("--unreserved-exploratory", action="store_true",
+                    help="evaluate --history-root WITHOUT a reserved holdout: the whole window is read, the result is stamped NOT_A_HOLDOUT_STUDY and the dataset can never be reserved afterwards "
+                         "(default: refuse until `tools/history_holdout.py --reserve` has been run)")
     a = ap.parse_args(argv)
     if a.history_root and not a.universe_dir:
         ap.error("--history-root needs --universe-dir (UNIVERSE_DIR_REQUIRED)")
@@ -1962,7 +2009,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("UNIVERSE_DIR_REQUIRED: no --universe-dir passed; the cross-sectional rows are NOT evaluated and cannot reach RESEARCH_READY", file=sys.stderr)
     if a.history_root:
         try:
-            rep["ranked_funding"] = evaluate_cross_sectional(a.history_root, universe_dir=a.universe_dir, ledger_path=a.ledger or default_ledger_path("cross_sectional_funding", a.history_root), spot_dir=a.spot_dir, mark_interval=a.mark_interval)
+            import history_holdout as HH
+            lpath = a.ledger or default_ledger_path("cross_sectional_funding", a.history_root)
+            rep["ranked_funding"] = evaluate_cross_sectional(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval,
+                                                             holdout_ledger=HH.ledger_for(os.path.dirname(os.path.abspath(lpath))), unreserved_exploratory=a.unreserved_exploratory,
+                                                             reader="candidate_readiness.py --history-root")
         except RH.HarnessError as exc:
             ap.exit(2, f"refused: {exc}\n")
     print(render_table(rep))

@@ -129,7 +129,7 @@ def test_with_verified_data_and_a_universe_the_three_families_are_evaluated_and_
     _reset()
     root, uni, spot = _hist(tmp_path)
     ld = str(tmp_path / "led")
-    rep = CC_.run_competition(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_dir=ld)
+    rep = CC_.run_competition(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_dir=ld, unreserved_exploratory=True)         # this test is about the family plumbing: the holdout guard has its own file
     x = row(rep, "cross_sectional_funding")
     assert set(x["families"]) == set(CR.FAMILIES) and x["verdict"] == "INSUFFICIENT_DATA" and x["readiness_level"] in ("NONE", "DATA_READY")
     assert x["families"]["PERP_FUNDING_SPREAD"]["is_carry"] is False and x["families"]["SPOT_PERP_CARRY"]["is_carry"] is True
