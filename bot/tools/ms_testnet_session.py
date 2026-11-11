@@ -948,7 +948,7 @@ class Run:
                 # measurement. (2) The ledger itself flags a conflict in its inputs (a duplicate fill with different content, an orphan fill ...): its partial sums are not a net. (3) The measurement that
                 # would have told us (1) failed. Publishing any of them would turn "we could not tell" into a measured number (the capital book's `known` is None whenever either is None, so such a
                 # session can debit a loss but never credit a gain).
-                rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None}
+                rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None, **({"funding_usd": None} if integrity else {})}      # a flagged conflict taints the ledger's funding sum too (two prints for one settlement)
         elif rec["orders"] or rec["executions"]:
             self.execution_quality(view, False, None)
         return view

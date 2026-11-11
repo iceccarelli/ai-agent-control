@@ -166,26 +166,55 @@ def test_the_repair_refuses_to_drop_a_line_it_did_not_judge_and_changes_nothing(
     assert solo.drop_torn_tail(expected="b") == "b" and open(solo.path).read() == "a\n" and open(solo.path + ".torn").read() == "b\n"
 
 
-def test_the_torn_text_is_kept_before_the_journal_is_replaced_so_a_crash_between_loses_nothing(tmp_path, monkeypatch):
+def test_the_torn_text_is_kept_before_the_journal_is_cut_so_a_crash_between_loses_nothing(tmp_path, monkeypatch):
     X, st = _journal_file(tmp_path)
     lines = open(st.path).read().splitlines()
     with open(st.path, "w") as fh:
         fh.write("\n".join(lines[:2]) + "\n" + lines[2][:25])
     torn_state = open(st.path).read()
     seen = {}
-    real_replace = X.os.replace
 
-    def crash_at_replace(src, dst):
-        seen["torn_file_at_replace"] = open(st.path + ".torn").read() if os.path.exists(st.path + ".torn") else None
-        raise SimulatedCrash("killed between keeping the torn text and replacing the journal")
-    monkeypatch.setattr(X.os, "replace", crash_at_replace)
+    def crash_at_the_cut(path, size):
+        seen["torn_file_at_the_cut"] = open(st.path + ".torn").read() if os.path.exists(st.path + ".torn") else None
+        raise SimulatedCrash("killed between keeping the torn text and cutting the journal")
+    monkeypatch.setattr(X, "_truncate_file", crash_at_the_cut)
     with pytest.raises(SimulatedCrash):
         X.Journal(X.FileStore(st.path))
-    monkeypatch.setattr(X.os, "replace", real_replace)
-    assert seen["torn_file_at_replace"] == lines[2][:25] + "\n", "the evidence must be durable BEFORE the journal is replaced"
-    assert open(st.path).read() == torn_state, "a crash at the replace leaves the ORIGINAL journal, never a mixture"
+    monkeypatch.undo()
+    assert seen["torn_file_at_the_cut"] == lines[2][:25] + "\n", "the evidence must be durable BEFORE the journal is cut"
+    assert open(st.path).read() == torn_state, "a crash at the cut leaves the ORIGINAL journal, never a mixture"
+    assert not os.path.exists(st.path + ".repair"), "no second copy of the journal is ever written"
     again = X.Journal(X.FileStore(st.path))                                              # and the next open repairs it
-    assert [e["type"] for e in again.entries] == ["STATE", "STATE", "ANOMALY"]
+    assert [e["type"] for e in again.entries] == ["STATE", "STATE", "ANOMALY"] and X.verify_chain(open(st.path).read().splitlines())[0]
+
+
+def test_a_repair_needs_no_free_space_beyond_the_kept_text_and_that_is_best_effort(tmp_path, capsys):
+    """Independent re-review, finding 6: the repair wrote the kept text AND a full copy of the journal, so on the full disk that tore the append the journal could not even be opened and the
+    owner's unwind was blocked. It now cuts in place; keeping the text is best effort and falls back to stderr."""
+    X, st = _journal_file(tmp_path)
+    lines = open(st.path).read().splitlines()
+    with open(st.path, "w") as fh:
+        fh.write("\n".join(lines[:2]) + "\n" + lines[2][:25])
+    os.makedirs(st.path + ".torn")                                                           # the evidence file cannot be opened for append (stands in for ENOSPC on it)
+    j = X.Journal(X.FileStore(st.path))
+    err = capsys.readouterr().err
+    assert [e["seq"] for e in j.entries[:2]] == [0, 1] and "JOURNAL_TORN_TEXT_NOT_KEPT" in err and lines[2][:25] in err, "the only copy of the text must be on stderr"
+    assert not os.path.exists(st.path + ".repair") and X.verify_chain(open(st.path).read().splitlines())[0]
+    assert open(st.path).read().startswith("\n".join(lines[:2]) + "\n"), "the two good lines are untouched"
+
+
+def test_a_journal_that_is_only_a_torn_line_opens_empty_and_journals_no_zero_time_anomaly(tmp_path, capsys):
+    """Re-review T1: a torn FIRST line made the repair's ANOMALY entry seq 0 with ts_ms 0, which the lifecycle read as a run that started in 1970 (a spurious LIFECYCLE_EXCEEDED)."""
+    X, st = _journal_file(tmp_path, n=1)
+    first = open(st.path).read().splitlines()[0]
+    with open(st.path, "w") as fh:
+        fh.write(first[:20])
+    j = X.Journal(X.FileStore(st.path))
+    err = capsys.readouterr().err
+    assert j.entries == [] and j.repaired_torn_tail["code"] == "TORN_TAIL_DROPPED" and "JOURNAL_TORN_TAIL_DROPPED" in err and "held nothing before the torn line" in err
+    assert open(st.path).read() == "" and open(st.path + ".torn").read() == first[:20] + "\n"
+    j.append("STATE", "g1", 5000, {"to": "FIRST_REAL_ENTRY"})
+    assert [e["seq"] for e in X.Journal(X.FileStore(st.path)).entries] == [0] and X.verify_chain(open(st.path).read().splitlines())[0]
 
 
 def test_a_full_disk_that_cannot_journal_the_anomaly_still_lets_the_owner_open_the_journal(tmp_path, monkeypatch, capsys):

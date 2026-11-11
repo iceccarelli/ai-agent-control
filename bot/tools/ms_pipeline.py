@@ -1039,9 +1039,13 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     else:
         parts = {"injected": "UNKNOWN"}
     series = _to_replay_series(raw_series, replay_cfg)
+    cut_ms = holdout_cut_of(info) if label == DATA_HISTORY else None
+    past = _window_past_boundary(replay_cfg.end_ms, cut_ms)
+    if past:
+        raise PipelineRefused(past)
     micro_info: Optional[Dict[str, Any]] = None
     if micro is not None:
-        series, micro_info = apply_micro(series, micro)
+        series, micro_info = apply_micro(series, micro, cut_ms=cut_ms)
         parts = {**parts, "collector": micro.data_digest()}
     symbols = [s.symbol for s in series]
     scope = str(info.get("survivorship", "SURVIVORS_ONLY"))
@@ -1320,9 +1324,13 @@ MICRO_LIMITS = ("NO_SPOT_ORDERBOOK_RECORDED: the spot / hedge leg is NOT measure
                 "QUEUE_POSITION_ESTIMATED_FROM_VISIBLE_SIZE_ONLY")
 
 
-def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any) -> Tuple[List[RP.ReplaySeries], Dict[str, Any]]:
+def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any, *, cut_ms: Optional[int] = None) -> Tuple[List[RP.ReplaySeries], Dict[str, Any]]:
     """Give each symbol the collector's MEASURED books (keyed by the collector's local receive time) and tape (only windows whose coverage the tape proves). Symbols without a recorded
-    book are EXCLUDED from a collector run (never traded on a synthetic book beside measured ones) and listed."""
+    book are EXCLUDED from a collector run (never traded on a synthetic book beside measured ones) and listed.
+
+    ``cut_ms`` is the reserved-holdout boundary when the history was loaded cut: the collector is a SECOND source of prices for the same calendar time, so every book snapshot and trade at or
+    after the boundary is dropped here (the independent re-review replayed a series cut at the boundary with collector books that continued past it and the exit was filled and valued from
+    the reserved period: a result stamped RESERVED that depended on reserved prices). The count dropped is reported."""
     import ms_microstructure as MM
     if not getattr(micro, "verified", False) or getattr(micro, "problems", ()):
         raise PipelineRefused("COLLECTOR_NOT_VERIFIED: an unverified collector dataset is never labelled MEASURED")
@@ -1330,17 +1338,37 @@ def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any) -> Tuple[List[RP.
         raise PipelineRefused("COLLECTOR_COHORT_FUNDING_SELECTED: a funding-selected cohort must not evaluate a funding edge")
     out: List[RP.ReplaySeries] = []
     without: List[str] = []
+    dropped = 0
     for x in series:
-        snaps = sorted((v for v in micro.snapshots(x.symbol) if v.valid), key=lambda v: (v.local_receive_ms, v.cycle))
+        every = sorted((v for v in micro.snapshots(x.symbol) if v.valid), key=lambda v: (v.local_receive_ms, v.cycle))
+        snaps = [v for v in every if cut_ms is None or v.local_receive_ms < cut_ms]
+        dropped += len(every) - len(snaps)
         if not snaps:
             without.append(x.symbol)
             continue
         books = tuple((v.local_receive_ms, v.bids, v.asks) for v in snaps)
-        ticks = tuple(sorted({(t[0], t[1], t[2]) for v in snaps if v.tape_complete for t in v.trades}))
+        ticks = tuple(sorted({(t[0], t[1], t[2]) for v in snaps if v.tape_complete for t in v.trades if cut_ms is None or t[0] < cut_ms}))
         out.append(dataclasses.replace(x, books=books, ticks=tuple(FM_Tick(a, b, c) for a, b, c in ticks)))
     if not out:
-        raise PipelineRefused("COLLECTOR_HAS_NO_BOOK_FOR_ANY_HISTORY_SYMBOL")
-    return out, {"symbols_with_micro": [x.symbol for x in out], "symbols_without_micro_excluded": sorted(without), "limits": list(MICRO_LIMITS), "cohort_id": micro.cohort_id}
+        raise PipelineRefused("COLLECTOR_HAS_NO_BOOK_FOR_ANY_HISTORY_SYMBOL" + ("" if cut_ms is None else " BEFORE THE RESERVED HOLDOUT BOUNDARY"))
+    return out, {"symbols_with_micro": [x.symbol for x in out], "symbols_without_micro_excluded": sorted(without), "limits": list(MICRO_LIMITS), "cohort_id": micro.cohort_id,
+                 "holdout_cut_ms": cut_ms, "book_snapshots_dropped_at_or_after_the_cut": dropped}
+
+
+def holdout_cut_of(info: Mapping[str, Any]) -> Optional[int]:
+    """The reserved boundary (epoch ms) the history was loaded CUT at, or None (no reservation in force for this load)."""
+    h = info.get("holdout") if isinstance(info.get("holdout"), Mapping) else {}
+    cut = h.get("cut_ms")
+    return int(cut) if h.get("status") == "RESERVED" and isinstance(cut, int) and not isinstance(cut, bool) else None
+
+
+def _window_past_boundary(end_ms: int, cut_ms: Optional[int]) -> Optional[str]:
+    """The refusal text when a replay window reaches into the reserved region (None when it does not). The series are cut, but a window that ends after the boundary is a window about data that was
+    never read: positions would be exited and valued on whatever the other sources hold for that period."""
+    if cut_ms is None or int(end_ms) <= int(cut_ms):
+        return None
+    return (f"WINDOW_PAST_THE_HOLDOUT_BOUNDARY: the window ends {int(end_ms)} but the reserved holdout begins {int(cut_ms)}: a run stamped RESERVED may not extend into the reserved region; "
+            f"use --end-ms {int(cut_ms)} or earlier")
 
 
 def validate_inputs(ns: argparse.Namespace) -> Validated:
@@ -1428,6 +1456,9 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
     parts = dict(loaded.parts)
     if coll_digest:
         parts["collector"] = coll_digest
+    past = _window_past_boundary(end, holdout_cut_of(loaded.info))
+    if past:
+        raise CliRefused("WINDOW_PAST_THE_HOLDOUT_BOUNDARY", past)
     first, last = _series_span(loaded.series)
     if first is None or end < first or start > last:
         raise CliRefused("WINDOW_OUTSIDE_DATA", f"the window [{start}, {end}] does not overlap the verified history [{first}, {last}]: nothing could be tested")

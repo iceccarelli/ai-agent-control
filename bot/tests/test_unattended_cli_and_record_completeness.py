@@ -118,6 +118,40 @@ def test_a_session_that_ends_not_flat_publishes_its_fees_but_no_price_leg(tmp_pa
     assert rec["net"]["fees_usd"] is not None, "the fees of the fills that did happen are measured and stay published"
 
 
+def test_a_conflicted_funding_figure_is_not_published_but_a_mere_valuation_flag_does_not_hide_it(tmp_path, monkeypatch):
+    """Independent re-review, finding 12: fees and the price leg were nulled on an integrity flag but ``funding_usd`` stayed: two funding prints for one settlement give FUNDING_CONFLICT,
+    ``net_complete`` False and a funding sum (the first print booked) that is not a measurement."""
+    real = S.AC.Ledger.canonical_net
+
+    def with_flags(*flags):
+        def patched(self, *a, **k):
+            out = real(self, *a, **k)
+            out["funding"] = 1.25
+            out["flags"] = list(out.get("flags", [])) + list(flags)
+            return out
+        return patched
+    monkeypatch.setattr(S.AC.Ledger, "canonical_net", with_flags("FUNDING_CONFLICT:BTCUSDT:1500"))
+    world = World(tmp_path, monkeypatch)
+    d = _ready(world)
+    assert world.run("execute", "--confirm-plan-digest", d, typed=d) == 0, world.text()[-300:]
+    net = world.record()["net"]
+    assert net["funding_usd"] is None and net["fees_usd"] is None and net["price_pnl_usd"] is None, net
+    monkeypatch.setattr(S.AC.Ledger, "canonical_net", with_flags("MID_FALLBACK"))                      # a valuation convention is not an integrity conflict
+    world2 = World(tmp_path / "second", monkeypatch)
+    d2 = _ready(world2)
+    assert world2.run("execute", "--confirm-plan-digest", d2, typed=d2) == 0, world2.text()[-300:]
+    assert world2.record()["net"]["funding_usd"] == 1.25, "a flag that is not an integrity conflict must not hide a measured funding figure"
+    # unlisted executions null the fees and the price leg (a lower bound is not a measurement) but say nothing about the funding the venue paid
+    monkeypatch.setattr(S.AC.Ledger, "canonical_net", with_flags())
+    world3 = World(tmp_path / "third", monkeypatch)
+    for i in range(1, 9):
+        world3.fake.hidden_execs.add("E%06d" % i)
+    d3 = _ready(world3)
+    assert world3.run("execute", "--confirm-plan-digest", d3, typed=d3) == 0, world3.text()[-300:]
+    n3 = world3.record()["net"]
+    assert n3["fees_usd"] is None and n3["price_pnl_usd"] is None and n3["funding_usd"] == 1.25, "incomplete executions are not a funding conflict"
+
+
 def test_a_session_with_a_clean_ledger_keeps_its_measured_net(tmp_path, monkeypatch):
     world = World(tmp_path, monkeypatch)
     d = _ready(world)

@@ -262,8 +262,8 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
     cash_q = EM.Quantity(cash.apr, cash.provenance, "fraction") if (cash is not None and cash_state == "STATED") else EM.unknown("fraction")
     opportunity_cost_apr = cash_q * EM.Quantity(capital_multiple, "derived", "ratio")
     zero_reasons = {"borrow_apr": "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW"}
-    if cash_state == "STATED" and cash is not None and cash.apr == 0:
-        zero_reasons["opportunity_cost_apr"] = "OWNER_STATED_ZERO_COST_OF_CAPITAL"            # capital priced as free BY THE OWNER'S STATEMENT: the only way a zero cost of capital may pass
+    if cash_state == "STATED" and cash is not None and cash.apr < MATERIAL_CASH_ALTERNATIVE_APR:
+        zero_reasons["opportunity_cost_apr"] = "OWNER_STATED_ZERO_COST_OF_CAPITAL"            # capital priced as free BY THE OWNER'S STATEMENT (an explicit 0 or an immaterial rate, disclosed below): the only way a zero cost of capital may pass
     if abs(D(1) - hedge_ratio) < EM.ECONOMIC_ZERO and spot_tier.source != "assumed":              # the model's own test for a whole hedge (so the declaration and the rule cannot disagree)
         zero_reasons["hedge_ratio"] = "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL"        # the account's spot taker fee is exactly 0: no base coin is withheld, the perp short IS a whole hedge (an assumed tier never gets this)
     scn = EM.Scenario(

@@ -148,8 +148,9 @@ def qsum(items: Sequence[Quantity], unit: str = "") -> Quantity:
 # --------------------------------------------------------------------------------------------------------------------------
 # A zero cost is a CLAIM: it must be a measurement, or zero BY CONSTRUCTION for a reason on a closed list
 # --------------------------------------------------------------------------------------------------------------------------
-#: A cost input below this is a zero whatever its spelling (0, '0E-8', 1e-30, D(1) - D(1), -0, replace(), **dict).
-ECONOMIC_ZERO = Decimal("1e-12")
+#: A cost input below this is a zero whatever its spelling (0, '0E-8', 1e-30, D(1) - D(1), -0, replace(), **dict) AND whatever its size under it: no real cost input, in bps or as an annual fraction, is
+#: smaller than a billionth, so a 'modelled' 1E-11 is a zero spelled as a number (the independent re-review passed 1E-11 for impact, basis, borrow and opportunity cost under the old 1e-12 bound).
+ECONOMIC_ZERO = Decimal("1e-9")
 
 #: The ONLY reasons an input may be exactly zero (or, for the hedge ratio, exactly one) without being a measurement, each BOUND to the one scenario input it speaks about. A reason is a claim about ONE
 #: input: the same words declared against another input justify nothing (an owner-stated zero COST OF CAPITAL cannot excuse a zero market impact; a review reproduced exactly that). A zero that is not
@@ -721,10 +722,28 @@ def _is_whole_hedge(scn: Scenario) -> bool:
     return scn.hedge_ratio.known and abs(Decimal(1) - scn.hedge_ratio.value) < ECONOMIC_ZERO
 
 
+def _spot_buy_leg_pays_no_base_fee(scn: Scenario) -> bool:
+    """The FACT behind ``ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL``: the scenario really has a spot BUY leg whose fee is taken in the base coin and whose fee rate (the leg's role) is exactly zero.
+    The other two reasons are plan-level facts (cash-funded spot, an owner's statement) that a scenario cannot show, so they are bound to their input and nothing more."""
+    for leg in scn.legs:
+        tier = leg.fee_tier
+        if leg.instrument.category == "spot" and leg.side == "buy" and leg.fee_in_base and tier is not None and (tier.maker if leg.role == "maker" else tier.taker) == 0:
+            return True
+    return False
+
+
+_REASON_FACTS = {"ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL": _spot_buy_leg_pays_no_base_fee}
+
+
 def _zero_is_justified(scn: Scenario, name: str) -> bool:
-    """True only when ``scn.zero_reasons`` names, for THIS input, a reason on the closed list that is BOUND to this input (``STRUCTURAL_ZERO_INPUTS``). Never raises on a malformed reason."""
+    """True only when ``scn.zero_reasons`` names, for THIS input, a reason on the closed list that is BOUND to this input (``STRUCTURAL_ZERO_INPUTS``), and, where the scenario can show the fact the
+    reason states (``_REASON_FACTS``), the fact holds (a reason is not a password: the independent re-review declared the zero-fee reason on a scenario with no spot leg). Never raises on a
+    malformed reason."""
     reason = scn.zero_reasons.get(name)
-    return isinstance(reason, str) and name in STRUCTURAL_ZERO_INPUTS.get(reason, frozenset())
+    if not (isinstance(reason, str) and name in STRUCTURAL_ZERO_INPUTS.get(reason, frozenset())):
+        return False
+    fact = _REASON_FACTS.get(reason)
+    return fact is None or bool(fact(scn))
 
 
 def _unjustified_zeros(scn: Scenario, maker_legs: int) -> Tuple[str, ...]:

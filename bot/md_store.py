@@ -226,11 +226,33 @@ class MarketStore:
         return {"meta", "log"} <= tables
 
     def _abandoned(self, name: str) -> bool:
-        """An unfinished CREATION can only be the NEWEST segment (the recorder died while making the day it was about to write). An uninitialised segment with a successor is not an abandoned
-        creation: it is a closed day whose file lost its content, so its records are gone and every reader must say so, loudly, instead of counting around the hole (an independent review zeroed a middle
-        segment and ``count()`` quietly returned 15 records instead of 20)."""
+        """True for an uninitialised segment that held NO record: an unfinished CREATION (the recorder died while making the day it was about to write). That is certain for the NEWEST segment. An
+        uninitialised segment with a successor is either that creation followed by later days after a restart (the file simply stayed behind) or a closed day whose file lost its content; the hash chain
+        tells them apart, because it is global: if a segment had held records, the next segment's ``chain_start`` would be the chain AFTER them. When the chain continues across the file (the nearest
+        earlier record's chain is exactly the nearest later segment's ``chain_start``) nothing was ever in it and it is skipped like the newest one; when it does not, its records are LOST and every
+        reader must say so loudly instead of counting around the hole (an independent review zeroed a middle segment and ``count()`` quietly returned 15 records instead of 20, and a second one showed
+        that treating EVERY middle file as damage bricked the recorder's own ``refresh_count`` after a crash during creation followed by a day without data)."""
         segs = self.segments()
-        return bool(segs) and segs[-1] == name and not self._initialised(name)
+        if not segs or name not in segs or self._initialised(name):
+            return False
+        return segs[-1] == name or self._chain_continues_across(name, segs)
+
+    def _chain_continues_across(self, name: str, segs: List[str]) -> bool:
+        i = segs.index(name)
+        before: Optional[str] = None
+        for n in reversed(segs[:i]):                              # the nearest earlier segment that actually holds a record
+            if self._initialised(n):
+                last = self._segment_meta(n)[1]
+                if last:
+                    before = last
+                    break
+        if before is None:
+            pruned = self._pruned_manifest()                      # nothing earlier survives: the chain it must continue is the pruned tail, or genesis
+            before = pruned[-1]["last_chain"] if pruned else GENESIS
+        for n in segs[i + 1:]:
+            if self._initialised(n):
+                return self._segment_meta(n)[0] == before
+        return False
 
     def _scan_tail(self) -> Tuple[int, str]:
         segs = self.segments()
@@ -535,9 +557,10 @@ class MarketStore:
         for idx, name in enumerate(self.segments()):
             if not self._initialised(name):
                 if self._abandoned(name):
-                    problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record")
+                    problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record"
+                                    + ("" if name == self.segments()[-1] else "; the hash chain continues across it, so no record was lost (move it aside when convenient, RUNBOOKS section 14)"))
                 else:
-                    problems.append(f"{name}: EMPTY segment that is not the newest: its records are LOST (damage) unless it is an abandoned creation of an earlier day; readers refuse it. "
+                    problems.append(f"{name}: EMPTY segment that is not the newest and the hash chain does NOT continue across it: its records are LOST (damage); readers refuse it. "
                                     f"Check, then move it aside deliberately (RUNBOOKS section 14)")
                 continue
             start, _ = self._segment_meta(name)

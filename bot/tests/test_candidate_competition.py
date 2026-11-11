@@ -116,6 +116,16 @@ def test_the_strength_note_prints_the_criterion_that_actually_failed_and_never_a
             assert float(m.group(1)) > float(m.group(2)), "a printed inequality is false"
 
 
+def test_the_table_caveat_is_only_written_when_some_policy_is_rejected():
+    """Re-review finding 13: with no REJECTED policy the first reason read 'IN-SAMPLE; all 0 REJECTED policies meet the stat. rejection bar'."""
+    f = CC_._table_caveat
+    assert f([], []) is None, "no REJECTED policy: no caveat"
+    assert f(["unconditional_1_print_hold", "production_gated_sequence"], []) == "IN-SAMPLE; all 2 REJECTED policies meet the stat. rejection bar"
+    assert f(["unconditional_1_print_hold"], ["unconditional_51_print_hold"]) == "IN-SAMPLE; point-estimate only (NOT stat. rejected): 51p"
+    assert f([], ["unconditional_51_print_hold", "production_gated_sequence"]) == "IN-SAMPLE; point-estimate only (NOT stat. rejected): 51p, gated_seq"
+    assert all(len(x) <= 90 for x in (f(["a"] * 3, []), f([], ["unconditional_51_print_hold", "production_gated_sequence"]))), "the table prints 90 characters of it"
+
+
 def test_the_ranked_table_shows_the_point_estimate_only_caveat_first_for_the_btc_row(committed):
     rep, _ = committed
     b = row(rep, "cash_and_carry")

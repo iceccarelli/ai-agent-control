@@ -34,6 +34,8 @@ SPELLINGS = {
     "quantized_zero": lambda u: Q(D(0).quantize(D("0.01")), "modelled", u),
     "string_zero": lambda u: Q("0", "modelled", u),
     "tiny_1e-30": lambda u: Q(D("1E-30"), "modelled", u),
+    "tiny_1e-11": lambda u: Q(D("1E-11"), "modelled", u),                       # above the old 1e-12 bound: the independent re-review passed it for impact, basis, borrow and opportunity cost
+    "tiny_5e-10": lambda u: Q(D("5E-10"), "derived", u),
     "arithmetic_D1_minus_D1": lambda u: Q(D(1) - D(1), "modelled", u),
     "replace_of_a_measured_one": lambda u: dataclasses.replace(Q(D(1), "measured", u), value=D(0), provenance="modelled"),
     "replace_of_unknown": lambda u: dataclasses.replace(EM.unknown(u), value=D(0), provenance="derived"),
@@ -56,7 +58,7 @@ def test_a_bare_zero_cost_input_is_an_assumed_input_whatever_its_spelling(name, 
 def test_a_zero_that_is_a_measurement_or_a_nonzero_estimate_is_not_flagged(field, unit):
     """Controls (pass now and after): a MEASURED / venue_stated zero is an observation; a non-zero modelled number is an estimate with visible provenance."""
     comp = dict((f, c) for f, c, _u in INPUTS)[field]
-    for q in (Q(D(0), "measured", unit), Q(D(0), "venue_stated", unit), Q(D("0.0365") if unit == "fraction" else D("0.5"), "modelled", unit)):
+    for q in (Q(D(0), "measured", unit), Q(D(0), "venue_stated", unit), Q(D("0.0365") if unit == "fraction" else D("0.5"), "modelled", unit), Q(D("1E-8"), "modelled", unit)):
         res = EM.evaluate_chain(overlay(**{field: q}))
         assert comp not in res.assumed_inputs, (field, q)
 
@@ -212,7 +214,7 @@ def test_a_bare_zero_adverse_move_against_a_hedge_that_is_not_whole_is_an_assume
         return
     res = EM.evaluate_chain(overlay(**over))
     assert "adverse_move" in res.assumed_inputs, f"{name}: a zero move behind a 40% hedge error was accepted (assumed_inputs={res.assumed_inputs})"
-    assert res.components["hedge_error"].value == 0, "control: the zero really did erase the hedge error, which is why it must not pass bare"
+    assert abs(res.components["hedge_error"].value) < D("1E-9"), "control: the zero really did erase the hedge error, which is why it must not pass bare"
 
 
 def test_a_zero_adverse_move_that_is_measured_or_irrelevant_or_nonzero_is_not_flagged():
@@ -224,13 +226,31 @@ def test_a_zero_adverse_move_that_is_measured_or_irrelevant_or_nonzero_is_not_fl
 
 
 @pytest.mark.parametrize("prov", ["derived", "modelled", "assumed"])
-def test_a_whole_hedge_that_is_not_an_observation_is_an_assumed_input_unless_its_reason_is_declared(prov):
-    res = EM.evaluate_chain(overlay(hedge_ratio=Q(D(1), prov, "ratio")))
-    assert "hedge_ratio" in res.assumed_inputs
-    ok = EM.evaluate_chain(overlay(hedge_ratio=Q(D(1), prov, "ratio"), zero_reasons={"hedge_ratio": "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL"}))
-    assert ("hedge_ratio" in ok.assumed_inputs) == (prov == "assumed"), "an 'assumed' ratio stays assumed whatever reason is declared (the existing rule); the others are justified by the bound reason"
-    wrong = EM.evaluate_chain(overlay(hedge_ratio=Q(D(1), prov, "ratio"), zero_reasons={"hedge_ratio": "OWNER_STATED_ZERO_COST_OF_CAPITAL"}))
-    assert "hedge_ratio" in wrong.assumed_inputs
+def test_a_whole_hedge_that_is_not_an_observation_is_an_assumed_input_unless_its_reason_is_declared_and_true_of_the_legs(prov):
+    from test_economic_model import book, perp, spot, tier
+    whole = Q(D(1), prov, "ratio")
+    reason = {"hedge_ratio": "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL"}
+
+    def legs(*, side="buy", taker="0", maker="0", in_base=True, role="taker"):
+        return (EM.Leg("spot", spot(), side, book(), tier(taker=taker, maker=maker), role, fee_in_base=in_base), EM.Leg("perp", perp(), "sell", book(), tier()))
+    assert "hedge_ratio" in EM.evaluate_chain(overlay(hedge_ratio=whole)).assumed_inputs                                   # bare: a claim
+    assert "hedge_ratio" in EM.evaluate_chain(overlay(hedge_ratio=whole, zero_reasons=reason)).assumed_inputs, "declared on a scenario with NO spot leg: the reason's fact does not hold (re-review Z1)"
+    ok = EM.evaluate_chain(overlay(legs=legs(), hedge_ratio=whole, zero_reasons=reason))
+    assert ("hedge_ratio" in ok.assumed_inputs) == (prov == "assumed"), "an 'assumed' ratio stays assumed whatever reason is declared (the existing rule); the others are justified by the bound reason AND the fact"
+    for why, kw in (("a spot taker fee that is not zero", dict(taker="0.001")), ("a spot SELL leg", dict(side="sell")), ("a fee not taken in the base coin", dict(in_base=False))):
+        assert "hedge_ratio" in EM.evaluate_chain(overlay(legs=legs(**kw), hedge_ratio=whole, zero_reasons=reason)).assumed_inputs, why
+    assert "hedge_ratio" in EM.evaluate_chain(overlay(legs=legs(role="maker", maker="0.0002", taker="0"), hedge_ratio=whole, zero_reasons=reason)).assumed_inputs, "a maker leg is judged by its MAKER rate"
+    assert "hedge_ratio" not in EM.evaluate_chain(overlay(legs=legs(role="maker", maker="0", taker="0.001"), hedge_ratio=whole, zero_reasons=reason, maker_fill_probability=Q(D(1), "measured", "probability"))).assumed_inputs \
+        or prov == "assumed"
+    wrong = EM.evaluate_chain(overlay(legs=legs(), hedge_ratio=whole, zero_reasons={"hedge_ratio": "OWNER_STATED_ZERO_COST_OF_CAPITAL"}))
+    assert "hedge_ratio" in wrong.assumed_inputs, "a reason bound to another input justifies nothing"
+
+
+@pytest.mark.parametrize("ratio", ["0.99999999999", "0.9999999995", "1.0000000001"])
+def test_a_hedge_ratio_within_a_billionth_of_whole_is_a_whole_hedge_claim(ratio):
+    for prov in ("derived", "modelled"):
+        assert "hedge_ratio" in EM.evaluate_chain(overlay(hedge_ratio=Q(D(ratio), prov, "ratio"))).assumed_inputs, (ratio, prov)
+    assert "hedge_ratio" not in EM.evaluate_chain(overlay(hedge_ratio=Q(D("0.99999"), "derived", "ratio"))).assumed_inputs, "0.00001 short of whole is a real (if small) hedge error, an estimate with provenance"
 
 
 def test_a_hedge_that_is_measured_or_not_whole_is_not_flagged():

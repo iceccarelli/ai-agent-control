@@ -39,7 +39,7 @@ from test_candidate_readiness import MARK_IV, TMH, _hist, offline  # noqa: E402,
 
 DAY = 86_400_000
 H4 = TMH.H8 // 2
-VENUE = "api.bybit.com|linear"
+VENUE = "mainnet|linear"                                          # the manifest's request host mapped through bot/venues.py (api.bybit.com is the registered mainnet REST host)
 
 
 @pytest.fixture()
@@ -227,6 +227,41 @@ def test_a_symbol_whose_first_row_is_at_the_boundary_is_dropped_and_listed_never
     assert "ETHUSDT" in {s.symbol for s in everything}, "control: the uncut load does include it"
 
 
+def test_the_committed_btc_corpus_overlap_with_the_reserved_region_is_stated(world, tmp_path):
+    """Independent re-review, finding 3: the committed BTCUSDT corpus is read in sample on every competition run and lives outside the registry, yet it covers part of the reserved region for the
+    mainnet venue (136 of 198 days for a 660-day backfill ending 2026-11-10). The registry cannot cut it, so it SAYS it, with numbers."""
+    import datetime as dt
+    ms = lambda y, m, d: int(dt.datetime(y, m, d, tzinfo=dt.timezone.utc).timestamp() * 1000)          # noqa: E731
+    o = HH.corpus_overlap("mainnet|linear", ms(2026, 4, 26), ms(2026, 11, 10))
+    assert o and o["symbols"] == ["BTCUSDT"] and 135 < o["overlap_days"] < 138 and 0.67 < o["fraction_of_reserved_region"] < 0.71 and "ALREADY in sample" in o["consequence"], o
+    assert o["corpus_last"].startswith("2026-09-09")
+    assert HH.corpus_overlap("mainnet|linear", ms(2026, 9, 10), ms(2026, 11, 10)) is None, "a boundary after the corpus ends has no overlap"
+    assert HH.corpus_overlap("testnet|linear", ms(2026, 4, 26), ms(2026, 11, 10)) is None, "another venue's reserved region is not the corpus's"
+    assert HH.corpus_overlap("mainnet|linear", ms(2026, 4, 26), ms(2026, 11, 10), manifest_path=str(tmp_path / "absent.json")) is None, "an unreadable manifest states nothing rather than inventing a figure"
+    (tmp_path / "bad.json").write_text("{not json")
+    assert HH.corpus_overlap("mainnet|linear", ms(2026, 4, 26), ms(2026, 11, 10), manifest_path=str(tmp_path / "bad.json")) is None
+    # the world's own window starts after the corpus ends: the status carries the field (None) and the reserve row records it
+    r = _reserve(world)
+    assert "btc_corpus_overlap" in r
+    st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    assert "btc_corpus_overlap" in st
+
+
+def test_a_delisting_inside_the_reserved_region_is_hidden_from_the_explore_series(world):
+    """Independent re-review, finding 8: ``series[].delivery_ms`` carried a delisting instant from the reserved region. A delisting decides which explore holds are 'terminal' (priced at the last mark
+    or dropped as unpriced), so the explore result would depend on the reserved period. Hidden for a cut load, listed in the info, kept for a delisting before the boundary."""
+    _reserve(world)
+    series, info = _load(world)
+    old = next(x for x in series if x.symbol == "OLDUSDT")
+    assert old.delivery_ms is None and info["holdout_delivery_hidden"] == ["OLDUSDT"], "the explore series knows a delisting that happens in the reserved period"
+    assert all(x.delivery_ms is None for x in series if x.symbol != "OLDUSDT")
+    full, finfo = _load(world, ledger_path=HH.UNGUARDED)
+    real = next(x for x in full if x.symbol == "OLDUSDT").delivery_ms
+    assert isinstance(real, int) and real >= info["holdout_cut_ms"] and finfo.get("holdout_delivery_hidden") in (None, []), "control: the whole-window read sees the delivery"
+    before, binfo = CR.load_history_root(world["root"], universe_dir=world["uni"], spot_dir=world["spot"], mark_interval=MARK_IV, cut_ms=real + DAY)
+    assert next(x for x in before if x.symbol == "OLDUSDT").delivery_ms == real and binfo["holdout_delivery_hidden"] == [], "a delisting BEFORE the boundary is history and stays"
+
+
 def test_an_interval_change_inside_the_reserved_region_does_not_reach_the_explore_series(tmp_path, offline):
     """The 8h -> 4h regime change a funding cap produces is a fact about the reserved region; the segments the series carries end at the boundary."""
     cut = HH.cut_for(TMH.START, TMH.END)
@@ -287,6 +322,22 @@ def test_the_exploratory_escape_hatch_is_idempotent_per_reader(world):
     assert len(_rows(world["reg"])) == 2
 
 
+def test_a_reservation_that_lands_while_an_unreserved_read_is_loading_refuses_with_the_true_reason(world, monkeypatch):
+    """Re-review finding 9 (S1): the refusal was correct but said 'no holdout is reserved' about a holdout that WAS reserved a moment earlier. The read is refused, nothing is returned, nothing is
+    recorded, and the message says what happened."""
+    real = CR.load_history_root
+
+    def racing(*a, **k):
+        out = real(*a, **k)
+        HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")      # another process reserves while this one loaded the whole window
+        return out
+    monkeypatch.setattr(CR, "load_history_root", racing)
+    with pytest.raises(RH.HarnessError, match="HOLDOUT_CHANGED_WHILE_LOADING") as e:
+        _load(world, unreserved_exploratory=True)
+    assert "no holdout is reserved" not in str(e.value) and "Nothing was returned and nothing was recorded" in str(e.value)
+    assert [r["kind"] for r in _rows(world["reg"])] == ["reserve"], "the refused read must not have been recorded"
+
+
 def test_the_escape_hatch_never_downgrades_an_existing_reservation(world):
     r = _reserve(world)
     series, info = _load(world, unreserved_exploratory=True)
@@ -320,8 +371,58 @@ def test_evaluations_that_left_ledger_rows_beside_the_data_block_a_reservation_u
     assert not os.path.exists(world["reg"])
     a, _b = _window(world)
     ok = _reserve(world, prior_reads_through_ms=a + DAY)
-    assert ok["prior_evaluations"] == [{"file": "cross_sectional_funding.jsonl", "rows": 1}]
+    assert ok["prior_evaluations"] == [{"dir": os.path.abspath(world["ldir"]), "file": "cross_sectional_funding.jsonl", "rows": 1}]
+    assert os.path.abspath(world["ldir"]) in ok["ledger_dirs_scanned"], "the row records WHERE it looked"
     assert [r["purpose"] if r["kind"] == "read" else "reserve" for r in _rows(world["reg"])] == ["PRIOR_STATED", "reserve"]
+
+
+def _earlier_row(directory, family="cross_sectional_funding"):
+    os.makedirs(directory, exist_ok=True)
+    RH.VariantLedger(family, path=os.path.join(directory, family + ".jsonl")).record_rejected("F3|H7|K1|Cbase", {"formation_days": 3}, "only 2 rows")
+
+
+def test_an_earlier_evaluation_in_ANY_ledger_directory_the_rule_can_resolve_to_blocks_the_reservation(world, tmp_path, monkeypatch):
+    """Independent re-review, finding 2: a ledger row in directory A made ``--reserve --ledger-dir A`` refuse, but the same call with a different ``--ledger-dir``, or with $CANDIDATE_LEDGER_DIR set,
+    succeeded and recorded ``prior_evaluations: []``. The realistic form: ``candidate_readiness.py --history-root R`` (no --ledger-dir) writes to <parent of R>/candidate_ledgers while
+    ``make reserve-holdout`` scanned $(DATA)/ledgers, so an earlier direct run was invisible."""
+    monkeypatch.delenv("CANDIDATE_LEDGER_DIR", raising=False)
+    parent_default = os.path.join(os.path.dirname(os.path.realpath(world["root"])), "candidate_ledgers")
+    elsewhere = str(tmp_path / "some_other_ledger_dir")
+    _earlier_row(parent_default)                                                          # the directory a direct `candidate_readiness.py --history-root R` run used
+    with pytest.raises(RH.HarnessError, match="PRIOR_EVALUATION_DETECTED") as e:
+        _reserve(world, ledger_dir=elsewhere)                                              # reserved through a DIFFERENT --ledger-dir
+    assert parent_default in str(e.value) and elsewhere in str(e.value), "the refusal names every directory it looked in"
+    assert not os.path.exists(world["reg"])
+    st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=elsewhere)
+    assert any(r["dir"] == parent_default for r in st["prior_evaluations"]) and parent_default in st["ledger_dirs_scanned"]
+    assert st["reservable"] is False and "PRIOR_EVALUATION_DETECTED" in st["not_reservable_because"], "status must not say 'reservable' while --reserve refuses (finding 9)"
+    shutil.rmtree(parent_default)
+    envdir = str(tmp_path / "env_ledgers")
+    _earlier_row(envdir, "funding_regime_conditioned_entry")
+    monkeypatch.setenv("CANDIDATE_LEDGER_DIR", envdir)                                      # ... or through the environment variable, with another explicit directory given
+    with pytest.raises(RH.HarnessError, match="PRIOR_EVALUATION_DETECTED"):
+        _reserve(world, ledger_dir=elsewhere)
+    monkeypatch.delenv("CANDIDATE_LEDGER_DIR")
+    shutil.rmtree(envdir)
+    clean = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=elsewhere)
+    assert clean["prior_evaluations"] == [] and clean["reservable"] is True and "not_reservable_because" not in clean, "control: with no earlier ledger anywhere the same call is reservable"
+    ok = _reserve(world, ledger_dir=elsewhere)
+    assert ok["kind"] == "reserve" and ok["prior_evaluations"] == [] and parent_default in ok["ledger_dirs_scanned"] and elsewhere in ok["ledger_dirs_scanned"]
+
+
+def test_the_candidate_ledger_dir_rule_has_one_owner_and_its_first_candidate_is_its_answer(tmp_path, monkeypatch):
+    monkeypatch.delenv("CANDIDATE_LEDGER_DIR", raising=False)
+    root = str(tmp_path / "data" / "md")
+    os.makedirs(root)
+    default = os.path.join(os.path.dirname(os.path.realpath(root)), "candidate_ledgers")
+    assert CR.ledger_dir_for(root) == CR.ledger_dir_candidates(root)[0] == default
+    assert CR.ledger_dir_for(root, "x") == CR.ledger_dir_candidates(root, "x")[0] == os.path.abspath("x") and default in CR.ledger_dir_candidates(root, "x")
+    monkeypatch.setenv("CANDIDATE_LEDGER_DIR", str(tmp_path / "env"))
+    assert CR.ledger_dir_for(root) == str(tmp_path / "env") and CR.ledger_dir_candidates(root)[:2] == [str(tmp_path / "env"), default]
+    monkeypatch.delenv("CANDIDATE_LEDGER_DIR")
+    cands = CR.ledger_dir_candidates(None)
+    assert cands == [os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers")] and CR.ledger_dir_for(None) == cands[0]
+    assert len(CR.ledger_dir_candidates(root, default)) == len(set(CR.ledger_dir_candidates(root, default))), "no directory is listed twice"
 
 
 def test_a_library_run_that_read_the_whole_window_blocks_a_later_reservation(world):
@@ -457,6 +558,74 @@ def test_a_rollback_to_an_older_consistent_state_is_visible_only_in_the_chain_he
     _series2, info2 = _load(world)                                                 # the rolled-back registry verifies and the holdout looks unspent
     assert info2["holdout"]["status"] == "RESERVED"
     assert info2["holdout"]["chain_head"]["n"] == 1 != head_after_final["n"] and info2["holdout"]["chain_head"]["head"] != head_after_final["head"]
+
+
+def test_a_boundary_over_data_that_does_not_exist_yet_is_refused_and_records_nothing(world, monkeypatch):
+    """Independent re-review, finding 4 (E8): funding that ended 120 days before the REQUEST's end still reserved 'the last 30%' and stamped every result RESERVED with zero rows withheld: a
+    prospective holdout presented as a present one. The reserved region must hold at least a day of data that exists."""
+    a, b = _window(world)
+    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 400 * DAY))                    # the request is far longer than what the datasets served
+    with pytest.raises(RH.HarnessError, match="RESERVED_REGION_HAS_NO_DATA") as e:
+        _reserve(world)
+    assert "actually served" in str(e.value) and "Nothing was recorded" in str(e.value)
+    with pytest.raises(RH.HarnessError, match="RESERVED_REGION_HAS_NO_DATA"):
+        _reserve(world, prior_reads_through_ms=a + DAY)                                     # an owner statement alongside must not leave a half-written registry
+    assert not os.path.exists(world["reg"]), "a refused reservation appended something"
+    st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    assert st["reservable"] is False and "RESERVED_REGION_HAS_NO_DATA" in st["not_reservable_because"]
+
+
+def test_the_arithmetic_counts_the_data_that_exists_not_the_window_that_was_requested(world, monkeypatch, tmp_path):
+    a, b = _window(world)
+    sa, sb = HH.served_window(world["root"])
+    assert HH.effective_window(world["root"], a, b) == (max(a, sa), min(b, sb)) and sa >= a and sb <= b
+    assert HH.effective_window(world["root"], a - 10 * DAY, b + 10 * DAY) == (sa, sb), "the request is clipped to what was served"
+    control = HH.reserve(str(tmp_path / "control.jsonl"), world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    assert round(control["reserved_days"], 3) == round((sb - control["from_ms"]) / DAY, 3) and control["explore_days"] == round((control["from_ms"] - max(a, sa)) / DAY, 3)
+    assert "data_ends_before_the_requested_end_days" not in control, "control: a collection that reaches its request's end has nothing to warn about"
+    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 40 * DAY))                     # a request that ends 40 days after the data does
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    requested_reserved = round(((b + 40 * DAY) - r["from_ms"]) / DAY, 3)
+    assert r["reserved_days"] == round((min(b + 40 * DAY, sb) - r["from_ms"]) / DAY, 3) < requested_reserved - 39, "the reserved days must be the data's, not the request's"
+    assert abs(r["data_ends_before_the_requested_end_days"] - 40) < 0.01
+    ser, info = _load(world)
+    h = info["holdout"]
+    assert h["reserved_days"] == r["reserved_days"] and abs(h["data_ends_before_the_requested_end_days"] - 40) < 0.01 and "ends" in h["warning"] and "days before the requested window end" in h["warning"]
+    st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    assert st["reserved_days"] == r["reserved_days"] and st["served_window_ms"] == [max(a, sa), sb] and st["requested_window_ms"] == [a, b + 40 * DAY]
+
+
+def test_the_venue_is_the_registered_venue_not_the_string_the_manifest_spells(tmp_path):
+    """Independent re-review, finding 7 (E2): forging ``request.host`` as ``API.BYBIT.COM`` (digest recomputed) passed verification and gave a venue the burn did not apply to. CLAUDE.md: venue
+    identity comes from bot/venues.py, never a string comparison."""
+    def root_with(name, host, cat="linear"):
+        d = tmp_path / name
+        (d / "funding").mkdir(parents=True)
+        (d / "funding" / "manifest.json").write_text(json.dumps({"request": {"host": host, "category": cat}}))
+        return str(d)
+    assert HH.venue_id(root_with("a", "api.bybit.com")) == "mainnet|linear"
+    assert HH.venue_id(root_with("b", "API.BYBIT.COM")) == "mainnet|linear" == HH.venue_id(root_with("c", "  api.bybit.com  ", "LINEAR"))
+    assert HH.venue_id(root_with("d", "api-testnet.bybit.com")) == "testnet|linear" != HH.venue_id(root_with("e", "api.bybit.com"))
+    assert HH.venue_id(root_with("f", "api-demo.bybit.com", "spot")) == "demo|spot"
+    for i, bad in enumerate(("api.bybit.eu", "evil.example.com", "api.bybit.com.evil.com", "", "   ", 7, None)):
+        with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
+            HH.venue_id(root_with(f"bad{i}", bad))
+    for i, cat in enumerate(("", "  ", None, 3)):
+        with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
+            HH.venue_id(root_with(f"cat{i}", "api.bybit.com", cat))
+    with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
+        HH.venue_id(str(tmp_path / "no_manifest_here"))
+
+
+def test_a_registry_chosen_by_the_environment_is_said_on_the_status_and_on_every_load_stamp(world, monkeypatch):
+    """Another registry file is a clean slate (E3: a second ``final_read`` through ``$HISTORY_HOLDOUT_LEDGER=<new>``). The floor stays a floor, but the override is stated, not inferred."""
+    _reserve(world)
+    st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    assert st["registry_source"] == "ENV:" + HH.REGISTRY_ENV and "REGISTRY_OVERRIDDEN_BY_ENV" in st["registry_warning"]
+    _s, info = _load(world)
+    assert info["holdout"]["registry_source"] == "ENV:" + HH.REGISTRY_ENV and "REGISTRY_OVERRIDDEN_BY_ENV" in info["holdout"]["registry_warning"]
+    monkeypatch.delenv(HH.REGISTRY_ENV)
+    assert HH.registry_source() == {"registry_source": "DEFAULT"} and HH.default_registry_path() == os.path.abspath(os.path.expanduser(HH.REGISTRY_DEFAULT))
 
 
 def test_the_status_report_is_read_only_and_states_the_arithmetic_and_the_burn(world):
@@ -658,6 +827,73 @@ def test_the_pipeline_identity_differs_between_a_cut_run_and_a_whole_window_run(
     assert cut_doc["data_digest"] != full_doc["data_digest"], "a cut run and a full-window run read different data: the identity must differ"
 
 
+def test_a_reserved_run_may_not_extend_past_the_boundary_through_the_cli(world, capsys):
+    """Independent re-review, finding 1: ``validate`` returned code 0 for ``--end-ms`` thirty days past the boundary with ``data_parts.holdout = RESERVED:<cut>``: a run stamped as keeping the reserved
+    region unread whose window reached into it. The window may now end at the boundary at the latest."""
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    cut = r["from_ms"]
+    DAYS = 86_400_000
+    for cmd in ("validate", "run"):
+        code, doc = TPC.cli(capsys, _pipeline_args(world, cmd, end_ms=cut + 30 * DAYS, clock_ms=cut + 30 * DAYS))
+        assert code == 2 and doc["error"]["code"] == "WINDOW_PAST_THE_HOLDOUT_BOUNDARY", (cmd, doc)
+        assert str(cut) in doc["error"]["message"] and f"--end-ms {cut}" in doc["error"]["message"]
+    code, doc = TPC.cli(capsys, _pipeline_args(world, "validate", end_ms=cut + 1, clock_ms=cut + 1))
+    assert code == 2 and doc["error"]["code"] == "WINDOW_PAST_THE_HOLDOUT_BOUNDARY", "one millisecond past the boundary is past it"
+    code, doc = TPC.cli(capsys, _pipeline_args(world, "validate", end_ms=cut, clock_ms=cut))
+    assert code == 0, f"a window that ends AT the boundary is allowed (the reserved region starts there): {doc}"
+    # an exploratory run on an unreserved root has no boundary to respect (and says so in its identity)
+    code, doc = TPC.cli(capsys, _pipeline_args(world, "validate", unreserved_exploratory=True, end_ms=cut + 30 * DAYS, clock_ms=cut + 30 * DAYS))
+    assert code == 2 and doc["error"]["code"] == "WINDOW_PAST_THE_HOLDOUT_BOUNDARY", "the escape hatch never downgrades an existing reservation, so the boundary still binds"
+
+
+def test_the_pipeline_library_refuses_a_reserved_window_past_the_boundary_and_attaches_no_collector_book_at_or_after_it(world):
+    """The same rule at the chokepoint every caller shares (``run``), and the collector's books and tape: a second source of prices for the same calendar time (finding 1: a replay over a series cut
+    at the boundary, with books that continued past it, filled and valued its exit from the reserved period; net -425 with calm post-cut books and +1570 when they crashed)."""
+    import ms_pipeline as MP
+    import ms_replay as RP
+    import types as _t
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    cut = r["from_ms"]
+    H1 = 3_600_000
+
+    def snap(t, px, cycle):
+        return _t.SimpleNamespace(valid=True, local_receive_ms=t, cycle=cycle, bids=((px - 0.05, 100.0),), asks=((px + 0.05, 100.0),), tape_complete=True, trades=((t - 1, px, 1.0), (t + 1, px, 1.0)))
+
+    snaps = [snap(cut - 3 * H1, 100.0, 1), snap(cut - H1, 100.0, 2), snap(cut - 1, 100.0, 6), snap(cut, 90.0, 3), snap(cut + H1, 90.0, 4), snap(cut + 33 * H1, 90.0, 5)]     # the snapshot at cut - 1 carries a trade stamped AT the boundary
+    micro = _t.SimpleNamespace(verified=True, problems=(), cohort_id="broad", snapshots=lambda sym: list(snaps), data_digest=lambda: "d" * 64, evaluates_funding_edge_ok=lambda: True)
+    import ms_microstructure as MM
+    orig = MM.evaluates_funding_edge_ok
+    MM.evaluates_funding_edge_ok = lambda m: True
+    try:
+        series = [RP.ReplaySeries("AAAUSDT", ((cut - 8 * H1, 1.0),), ((cut - 4 * H1, 100.0), (cut - H1, 100.0)), 480, "AAA")]
+        out_cut, info_cut = MP.apply_micro(series, micro, cut_ms=cut)
+        assert [b[0] for b in out_cut[0].books] == [cut - 3 * H1, cut - H1, cut - 1], "a book at or after the boundary reached the replay"
+        stamps = [getattr(t, "ts_ms", None) if getattr(t, "ts_ms", None) is not None else t[0] for t in out_cut[0].ticks]
+        assert stamps and max(stamps) < cut, f"a trade stamped at or after the boundary reached the replay: {stamps}"
+        assert info_cut["holdout_cut_ms"] == cut and info_cut["book_snapshots_dropped_at_or_after_the_cut"] == 3
+        out_all, info_all = MP.apply_micro(series, micro)
+        assert len(out_all[0].books) == 6 and info_all["holdout_cut_ms"] is None and info_all["book_snapshots_dropped_at_or_after_the_cut"] == 0, "control: with no boundary every book is attached"
+        assert max(getattr(t, "ts_ms", None) if getattr(t, "ts_ms", None) is not None else t[0] for t in out_all[0].ticks) >= cut, "control: the late trades exist when nothing is cut"
+        only_late = _t.SimpleNamespace(verified=True, problems=(), cohort_id="broad", snapshots=lambda sym: [snap(cut + H1, 90.0, 9)], data_digest=lambda: "d" * 64)
+        with pytest.raises(MP.PipelineRefused, match="BEFORE THE RESERVED HOLDOUT BOUNDARY"):
+            MP.apply_micro(series, only_late, cut_ms=cut)
+    finally:
+        MM.evaluates_funding_edge_ok = orig
+    assert MP._window_past_boundary(cut, cut) is None and MP._window_past_boundary(cut - 1, cut) is None and MP._window_past_boundary(cut + 1, cut).startswith("WINDOW_PAST_THE_HOLDOUT_BOUNDARY")
+    assert MP._window_past_boundary(10 ** 15, None) is None
+    loaded = MP.verify_inputs(world["root"], universe_dir=world["uni"], spot_dir=world["spot"], mark_interval=MARK_IV, holdout_ledger=world["reg"])
+    assert MP.holdout_cut_of(loaded.info) == cut
+    # the chokepoint itself: ``run`` refuses a window that ends after the boundary even when a caller skipped the CLI's validation
+    import ms_portfolio as PF
+    import test_ms_pipeline as TMP
+    DAYS = 86_400_000
+    late = RP.ReplayConfig(start_ms=cut - 40 * H1, end_ms=cut + DAYS, fill=TMP.FILL, hold_ms=2 * DAYS, decision_every_ms=8 * H1, spec_digest=TMP.DIGEST,
+                           portfolio=PF.PortfolioPolicy(max_wait_ms=3 * H1, style="MAKER_FIRST"))
+    with pytest.raises(MP.PipelineRefused, match="WINDOW_PAST_THE_HOLDOUT_BOUNDARY"):
+        MP.run(loaded, spec=TMP.SPEC, candidate_id=TMP.CAND, spec_digest=TMP.DIGEST, replay_cfg=late, artifacts_dir=str(world["tmp"] / "late_art"), competition_row=TMP.PROMOTED_ROW)
+    assert not os.path.exists(str(world["tmp"] / "late_art")), "a refused run writes nothing"
+
+
 def test_a_pipeline_given_no_registry_for_a_history_root_is_refused():
     import ms_pipeline as MP
     with pytest.raises(MP.PipelineRefused, match="HOLDOUT_LEDGER_REQUIRED"):
@@ -688,16 +924,24 @@ def _is_cr(node):
     return (isinstance(node, ast.Name) and node.id in ("CR", "candidate_readiness")) or (isinstance(node, ast.Attribute) and node.attr in ("CR", "candidate_readiness"))
 
 
+def _shipped_python():
+    """``(basename, path)`` of every shipped .py under bot/ (tests, caches, virtual environments and data are not shipped). A RECURSIVE walk: both tripwires used to read only bot/*.py and
+    bot/tools/*.py, so a new subdirectory was a hiding place (independent re-review, finding 10)."""
+    out = []
+    for root, dirs, files in os.walk(BOT):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("tests", "venv", "env", "site-packages", "node_modules", "__pycache__", "data", "lib"))
+        out.extend((name, os.path.join(root, name)) for name in sorted(files) if name.endswith(".py"))
+    return out
+
+
 def _references():
     """Every reference to the unguarded loader (by any spelling) and to candidate_readiness's private row reader. ``_rows`` is a common helper name, so only the references that can
     resolve to candidate_readiness's are counted: an attribute of CR / candidate_readiness, a bare name inside candidate_readiness.py itself, an import of it, a getattr string in a module
     that imports candidate_readiness."""
     out = []
-    for base in (BOT, os.path.join(BOT, "tools")):
-        for name in sorted(os.listdir(base)):
-            if not name.endswith(".py"):
-                continue
-            tree = ast.parse(open(os.path.join(base, name), encoding="utf-8").read())
+    for name, path in _shipped_python():
+        if True:
+            tree = ast.parse(open(path, encoding="utf-8").read())
             uses_cr = _imports_candidate_readiness(tree)
             parents = {ch: node for node in ast.walk(tree) for ch in ast.iter_child_nodes(node)}
             for node in ast.walk(tree):
@@ -738,14 +982,32 @@ def test_only_the_guard_and_the_metadata_functions_reach_the_history_rows():
     assert set(ALLOWED_REFERENCES) <= seen, f"the allow-list names a reference that no longer exists (delete the entry): {sorted(set(ALLOWED_REFERENCES) - seen)}"
 
 
+def _opt_out_references(tree):
+    """Line numbers of every CODE reference to the opt-out sentinel, by any spelling: a name, an attribute, a from-import (also with an alias), or the exact string handed to getattr. A mention
+    inside a longer string (a docstring, an error message) is not a reference."""
+    return sorted({node.lineno for node in ast.walk(tree)
+                   if (isinstance(node, ast.Name) and node.id == "UNGUARDED") or (isinstance(node, ast.Attribute) and node.attr == "UNGUARDED")
+                   or (isinstance(node, ast.alias) and node.name == "UNGUARDED") or (isinstance(node, ast.Constant) and node.value == "UNGUARDED")})
+
+
+def test_the_opt_out_detector_sees_every_spelling_and_ignores_prose():
+    planted = {
+        "name": "UNGUARDED",
+        "attribute": "import history_holdout as HH\nx = HH.UNGUARDED",
+        "from_import": "from history_holdout import UNGUARDED",
+        "aliased": "from history_holdout import UNGUARDED as _U\nuse(_U)",             # the spelling the previous tripwire missed (re-review, finding 10)
+        "getattr": "import history_holdout as HH\nx = getattr(HH, 'UNGUARDED')",
+        "dunder_import": "x = __import__('history_holdout').UNGUARDED",
+    }
+    for kind, src in planted.items():
+        assert _opt_out_references(ast.parse(src)), f"the detector missed the {kind} spelling"
+    prose = 'def f():\n    """pass history_holdout.UNGUARDED to read the whole window"""\n    raise ValueError("or the explicit history_holdout.UNGUARDED sentinel")'
+    assert _opt_out_references(ast.parse(prose)) == []
+
+
 def test_the_explicit_opt_out_never_appears_in_shipped_code():
-    """A CODE reference (a name or an attribute), not a mention in a docstring or an error message."""
-    offenders = []
-    for base in (BOT, os.path.join(BOT, "tools")):
-        for name in sorted(os.listdir(base)):
-            if not name.endswith(".py") or name == "history_holdout.py":
-                continue
-            for node in ast.walk(ast.parse(open(os.path.join(base, name), encoding="utf-8").read())):
-                if (isinstance(node, ast.Name) and node.id == "UNGUARDED") or (isinstance(node, ast.Attribute) and node.attr == "UNGUARDED"):
-                    offenders.append(f"{name}:{node.lineno}")
+    """A CODE reference (a name, an attribute, an import, a getattr string), not a mention in a docstring or an error message; every shipped file under bot/, recursively."""
+    files = [(n, p) for n, p in _shipped_python() if n != "history_holdout.py"]
+    assert len(files) > 100 and any(os.sep + "tools" + os.sep in p for _n, p in files), "the walker found no shipped code: the tripwire would pass vacuously"
+    offenders = [f"{os.path.relpath(p, BOT)}:{line}" for _n, p in files for line in _opt_out_references(ast.parse(open(p, encoding="utf-8").read()))]
     assert not offenders, f"UNGUARDED is for tests and embeddings: {offenders}"

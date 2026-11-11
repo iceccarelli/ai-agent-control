@@ -1343,6 +1343,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     excluded = [{"symbol": sy, "reason": why} for sy, why in sorted(fn.reasons_for_symbols_in_datasets().items())]
     series: List[SymbolSeries] = []
     cut_dropped: List[str] = []
+    delivery_hidden: List[str] = []                                         # symbols whose delisting instant lies in the reserved region (hidden from the explore series)
     for sym in fn.loadable:
         sts = {"funding": fman["symbols"][sym].get("status"), mark_name: mman["symbols"][sym].get("status")}
         if any(v != "COMPLETE" for v in sts.values()):
@@ -1386,9 +1387,15 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         if rec.get("status") in RH.ENDED_STATUSES and not (isinstance(d, int) and not isinstance(d, bool) and d > 0):
             raise RH.HarnessError(f"closed_without_delivery: {sym} is an ended contract with no delivery time (it would be immortal: stale exit price) but the lifecycle classifier let it through")
         launch = rec.get("launchTime")
+        delivery = d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None
+        if cut_ms is not None and delivery is not None and delivery >= int(cut_ms):
+            # A delisting inside the reserved region is a fact about the reserved period: it decides which explore holds are 'terminal' and so which are priced or dropped. The explore series
+            # must not know it (independent re-review: ``delivery_ms`` carried a delisting instant from the reserved region). Hidden, and listed.
+            delivery_hidden.append(sym)
+            delivery = None
         series.append(SymbolSeries(sym, iv if isinstance(iv, int) and not isinstance(iv, bool) and iv > 0 else None, fund, mark,
                                    launch if isinstance(launch, int) and not isinstance(launch, bool) and launch > 0 else 0,
-                                   d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None,
+                                   delivery, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None,
                                    funding_intervals=segs, key_basis=_KEY_BASIS_OBSERVED,
                                    mark_interval_ms=iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None))
     if [x.symbol for x in series] != [y for y in fn.loadable if y not in set(cut_dropped)]:
@@ -1429,7 +1436,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                             "not_complete_over_window": sorted(set(fn.loadable) - set(fn.complete)), "closed_in_universe_not_in_series": closed_info, "point_in_time_claim": False,
                             "point_in_time_note": "this loader builds series from capture snapshots; it makes no point-in-time claim (use PointInTimeUniverse.from_capture_dirs for that). " + PIT_LABEL_NOTE,
                             "time_basis": "marks and funding are keyed by observation_time (replay mode: receipt time is not stored per row)",
-                            "interval_mismatch_symbols": mismatch, "holdout_cut_ms": cut_ms, "holdout_dropped_no_rows_before_cut": cut_dropped,
+                            "interval_mismatch_symbols": mismatch, "holdout_cut_ms": cut_ms, "holdout_dropped_no_rows_before_cut": cut_dropped, "holdout_delivery_hidden": delivery_hidden,
                             "non_complete_symbols": non_complete, "excluded": excluded, "symbols_loaded": len(series), "warnings": warnings})
     info.verdict = UniverseVerdict(survivorship, len(closed_missing), tuple(closed_missing[:NAMES_CAP]), _UNIVERSE_SEAL)
     if hedge_info is not None:
@@ -1859,19 +1866,28 @@ def _require_universe_dir(universe_dir: Any) -> str:
     return universe_dir
 
 
-def ledger_dir_for(data_root: Optional[str], ledger_dir: Optional[str] = None) -> str:
-    """THE rule for where a research ledger directory is (pure: nothing is created): ``ledger_dir``, else $CANDIDATE_LEDGER_DIR, else ``<parent of data_root>/candidate_ledgers``, else
-    ``~/.cache/ai-agent-control/candidate_ledgers``. Every research CLI resolves its ledgers through this one function: two tools that each re-derive the rule drift apart, and a
-    family counted in two directories is two families (the multiple-testing count then understates the trials). ``--ledger FILE`` on candidate_readiness.py names one file and bypasses this
-    rule on purpose. The reserved-holdout registry does NOT live here: it is per user (``history_holdout.default_registry_path``), so no ledger directory can give a read a clean slate."""
+def ledger_dir_candidates(data_root: Optional[str], ledger_dir: Optional[str] = None) -> List[str]:
+    """Every directory the ledger-directory rule can resolve to, in precedence order, deduplicated and absolute: ``ledger_dir``, $CANDIDATE_LEDGER_DIR, ``<parent of data_root>/candidate_ledgers``
+    (only when a data root is given) and ``~/.cache/ai-agent-control/candidate_ledgers``. The FIRST is the rule's answer (``ledger_dir_for``); the whole list is where an evaluation of this data
+    could have left its ledgers, which is what the holdout reservation must look in (a run made with another ``--ledger-dir``, or with the variable set, is otherwise invisible to it)."""
+    out: List[str] = []
     if ledger_dir:
-        return os.path.abspath(ledger_dir)
+        out.append(os.path.abspath(ledger_dir))
     env = os.environ.get("CANDIDATE_LEDGER_DIR")
     if env:
-        return os.path.abspath(env)
+        out.append(os.path.abspath(env))
     if data_root:
-        return os.path.join(os.path.dirname(os.path.realpath(data_root)), "candidate_ledgers")
-    return os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers")
+        out.append(os.path.join(os.path.dirname(os.path.realpath(data_root)), "candidate_ledgers"))
+    out.append(os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers"))
+    return list(dict.fromkeys(out))
+
+
+def ledger_dir_for(data_root: Optional[str], ledger_dir: Optional[str] = None) -> str:
+    """THE rule for where a research ledger directory is (pure: nothing is created): ``ledger_dir``, else $CANDIDATE_LEDGER_DIR, else ``<parent of data_root>/candidate_ledgers``, else
+    ``~/.cache/ai-agent-control/candidate_ledgers`` (``ledger_dir_candidates``' first entry). Every research CLI resolves its ledgers through this one function: two tools that each re-derive the
+    rule drift apart, and a family counted in two directories is two families (the multiple-testing count then understates the trials). ``--ledger FILE`` on candidate_readiness.py names one file
+    and bypasses this rule on purpose. The reserved-holdout registry does NOT live here: it is per user (``history_holdout.default_registry_path``), so no ledger directory can give a read a clean slate."""
+    return ledger_dir_candidates(data_root, ledger_dir)[0]
 
 
 def default_ledger_path(family: str, data_root: str, ledger_dir: Optional[str] = None) -> str:

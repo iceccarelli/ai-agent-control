@@ -97,24 +97,31 @@ class FileStore:
             return [l.rstrip("\n") for l in fh if l.strip()]
 
     def drop_torn_tail(self, expected: Optional[str] = None) -> str:
-        """Set the LAST line aside (a torn append: killed or out of disk mid-write) so the next append starts on a clean line. The text is kept in ``<journal>.torn`` BEFORE the journal is replaced; the
-        replacement is a temp file + fsync + rename + directory fsync, so a crash here leaves either the old or the new journal, never a mixture.
+        """Set the LAST line aside (a torn append: killed or out of disk mid-write) so the next append starts on a clean line. The text is kept in ``<journal>.torn`` BEFORE the journal is cut, and
+        the cut is IN PLACE (a truncation at the start of that line): no second copy of the journal is written, because a torn append is very often a FULL DISK and a repair that needs space would
+        leave the owner's emergency unwind unable to open the journal (independent re-review, finding 6). A crash between the two steps leaves the original journal and the kept text, never a
+        mixture; keeping the text is best effort (when the disk refuses it, the text goes to stderr, the only copy, and the repair still proceeds).
         ``expected`` is the line the CALLER judged torn: the file is re-read here, and unless its last line is still exactly that line nothing is changed (ValueError). Under the single-writer lock that
         cannot differ; the emergency unwind's lock-broken branch runs WITHOUT it, where re-reading and dropping whatever is last could discard a good line another writer had just appended."""
         lines = self.read()
         if not lines or (expected is not None and lines[-1] != expected):
             raise ValueError("journal changed while its torn tail was being set aside: nothing was changed")
         dropped = lines[-1]
-        with open(self.path + ".torn", "a", encoding="utf-8") as fh:
-            fh.write(dropped + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp = self.path + ".repair"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write("".join(l + "\n" for l in lines[:-1]))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
+        with open(self.path, "rb") as rb:
+            data = rb.read()
+        tail = dropped.encode("utf-8")
+        at = data.rfind(tail)
+        if at < 0 or (at > 0 and data[at - 1:at] != b"\n") or data[at + len(tail):].strip(b"\r\n\t ") != b"":
+            raise ValueError("journal changed while its torn tail was being set aside: the last line could not be located, nothing was changed")
+        try:
+            with open(self.path + ".torn", "a", encoding="utf-8") as fh:
+                fh.write(dropped + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            print(f"JOURNAL_TORN_TEXT_NOT_KEPT: {type(exc).__name__}: the torn line could not be written to {os.path.basename(self.path)}.torn; it follows, and this is the only copy:", file=sys.stderr)
+            print(dropped, file=sys.stderr)
+        _truncate_file(self.path, at)
         try:
             fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
             try:
@@ -124,6 +131,14 @@ class FileStore:
         except OSError:
             pass
         return dropped
+
+
+def _truncate_file(path: str, size: int) -> None:
+    """Cut ``path`` to ``size`` bytes and make it durable (a seam the crash test replaces)."""
+    with open(path, "r+b") as fh:
+        fh.truncate(size)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def verify_chain(lines: Sequence[str]) -> Tuple[bool, str]:
@@ -172,8 +187,13 @@ class Journal:
         info = {"code": "TORN_TAIL_DROPPED", "dropped_chars": len(dropped), "dropped_sha16": hashlib.sha256(dropped.encode("utf-8")).hexdigest()[:16], "kept_in": kept}
         self.repaired_torn_tail = dict(info)
         print(f"JOURNAL_TORN_TAIL_DROPPED: a torn final journal line ({info['dropped_chars']} characters, sha256 {info['dropped_sha16']}) was set aside in {kept}; every earlier line verified", file=sys.stderr)
+        if not self.entries:
+            # the journal was ONLY the torn line: there is no durable entry to take a time from, and an entry stamped 0 would read to the lifecycle as a run that started in 1970 (a spurious
+            # LIFECYCLE_EXCEEDED, re-review T1). The printed line and the kept text are the evidence.
+            print(f"JOURNAL_TORN_TAIL_ANOMALY_NOT_JOURNALLED: the journal held nothing before the torn line; the line above and {kept} are the evidence", file=sys.stderr)
+            return
         try:
-            self.append("ANOMALY", "", int(self.entries[-1]["ts_ms"]) if self.entries else 0, info)
+            self.append("ANOMALY", "", int(self.entries[-1]["ts_ms"]), info)
         except OSError as exc:
             print(f"JOURNAL_TORN_TAIL_ANOMALY_NOT_JOURNALLED: {type(exc).__name__}: the line above and {kept} are the evidence", file=sys.stderr)
 

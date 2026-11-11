@@ -119,6 +119,17 @@ def btc_policies(econ: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _table_caveat(meeting: Sequence[str], not_meeting: Sequence[str]) -> Optional[str]:
+    """The short first reason of the BTC row (the ranked table prints only the first, 90 characters): which REJECTED policies are a point-estimate loss only. None when no policy is REJECTED:
+    'all 0 REJECTED policies meet the bar' is a vacuous sentence (independent re-review, finding 13)."""
+    short = lambda n: n.replace("unconditional_", "").replace("_print_hold", "p").replace("production_gated_sequence", "gated_seq")             # noqa: E731
+    if not_meeting:
+        return "IN-SAMPLE; point-estimate only (NOT stat. rejected): " + ", ".join(short(n) for n in not_meeting)
+    if meeting:
+        return f"IN-SAMPLE; all {len(meeting)} REJECTED policies meet the stat. rejection bar"
+    return None
+
+
 def _strength_note(rejected: bool, bar: Optional[Mapping[str, Any]]) -> str:
     """Say, in the note, whether a REJECTED policy meets the repo's early-rejection standard, and when it does NOT, WHICH criterion failed with its own number (a point-estimate loss that does not meet the
     standard is not a statistical rejection). The standard is the conjunction (candidate_readiness.early_rejection): >= REJECT_EARLY_MIN_INDEPENDENT independent observations, a negative mean, lower-tail
@@ -290,9 +301,9 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                                                                  "listed; registered holds are at most 17 days, longer holds (90/365 days) were never registered and this verdict does not cover them"}
             reasons.append(f"REJECTED is an IN-SAMPLE point-estimate verdict on registered holds of at most 17 days; policies meeting the repo's statistical rejection standard: {len(meeting)} of {len(meeting) + len(not_meeting)}"
                            + (f"; NOT statistically rejected: {', '.join(not_meeting)}" if not_meeting else "") + "; longer holds were never registered")
-            short = lambda n: n.replace("unconditional_", "").replace("_print_hold", "p").replace("production_gated_sequence", "gated_seq")             # noqa: E731
-            reasons.insert(0, ("IN-SAMPLE; point-estimate only (NOT stat. rejected): " + ", ".join(short(n) for n in not_meeting)) if not_meeting
-                           else f"IN-SAMPLE; all {len(meeting)} REJECTED policies meet the stat. rejection bar")                            # the ranked table prints reasons[0]: the caveat must be what a reader sees first
+            first = _table_caveat(meeting, not_meeting)
+            if first:                                           # the ranked table prints reasons[0]: the caveat must be what a reader sees first
+                reasons.insert(0, first)
         elif name == "cross_sectional_funding":
             verdict, reasons = xs["verdict"], xs["reasons"] + [x for x in reasons if "UNIVERSE_DIR_REQUIRED" in x]
             net = xs["net_edge"]
