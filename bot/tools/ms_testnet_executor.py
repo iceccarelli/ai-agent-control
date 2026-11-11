@@ -514,7 +514,7 @@ class TestnetExecutor:
             if not any(u["exec_id"] == eid for u in self.unattributed):
                 self.unattributed.append(row)
             return
-        fee_ccy = r.get("feeCurrency") or QUOTE
+        fee_ccy = str(r.get("feeCurrency") or QUOTE).strip().upper()      # the casing is not part of the meaning: compared as the quote and the base coin are written
         fee_signed = fee
         # Only two currencies can be applied: the quote (dollars as stated) and, on a SPOT fill, the symbol's own base coin (the received quantity is net of it; dollars at the fill price). A fee in ANYTHING
         # else (MNT, a third coin, USDC on a USDT contract) can be neither subtracted from this coin's quantity nor valued at this coin's price: it used to be treated as the base coin (a 0.18 MNT fee

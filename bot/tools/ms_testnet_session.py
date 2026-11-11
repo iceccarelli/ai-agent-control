@@ -549,6 +549,7 @@ class Run:
         self.venue_recon: Optional[Dict[str, Any]] = None
         self.hold_spot_exit = True                                     # sequence the spot exit AFTER the perp exit fill is confirmed on the venue read
         self.hold_spot_exit_s = 20.0
+        self.spot_exits_held = 0                                       # HELD answers so far: they are not venue rejections and do not count toward the exit halt, so each one is printed
 
     def _load_start(self) -> None:
         d = _read_json(os.path.join(self.ctx.dir, "run_limits.json"))
@@ -664,6 +665,13 @@ class Run:
         except Exception as exc:                                       # noqa: BLE001 - a diagnostic must never break the run
             self.ctx.out(f"REFUSAL-DIAGNOSTIC unavailable: {type(exc).__name__}")
 
+    def _engine_spot(self, symbol: str) -> float:
+        """What the engine's own fills say the group holds in spot (0.0 when it holds none or the figure is unreadable: the caller then holds the sale)."""
+        try:
+            return max(0.0, float((self.engine.positions() if self.engine else {}).get(f"spot:{symbol}", 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _await_perp_closed(self, req: EX.OrderRequest) -> Optional[EX.Ack]:
         """A spot sell is an exit only once the perp it hedges is closed (``ms_authority.spot_sell_keeps_hedge``), and on a real exchange the perp exit's FILL arrives after its
         ack: the authority would refuse the spot sell and five such rejections HALT the group. So the spot exit waits until a COMPLETE venue position read shows the perp flat.
@@ -677,11 +685,16 @@ class Run:
                 perp = pos.get(f"linear:{sym}", 0.0)
                 if abs(perp) < 1e-12:
                     return None                                             # the perp is closed
-                if perp < 0:                                                # a SHORT perp: a sale that leaves the group's spot (the account's balance MINUS the owner's own pre-session coin)
-                    spot_held = max(0.0, _minus(pos.get(f"spot:{sym}", 0.0), self.baseline.get(f"spot:{sym}", 0.0)))   # still covering that short is the excess of a partial hedge, not its exit
+                if perp < 0:                                                # a SHORT perp: a sale that leaves the group's spot still covering that short is the excess of a partial hedge, not its exit.
+                    # The group's spot is the SMALLER of two independent witnesses: the account's balance MINUS the owner's pre-session coin (the wallet: a deposit or faucet AFTER the baseline was
+                    # read inflates it, which let the sale leave while the whole short was open) and the engine's own book (what the group's fills made: 0 when it holds none, fail closed).
+                    spot_held = min(max(0.0, _minus(pos.get(f"spot:{sym}", 0.0), self.baseline.get(f"spot:{sym}", 0.0))), self._engine_spot(sym))
                     if spot_held - float(req.leg.qty) >= -perp - 1e-9:
                         return None                                         # (a perp LONG nobody planned is not a hedge: it still holds the sale until the perp is flat, as before)
             if int(self.ctx.clock()) >= deadline:
+                self.spot_exits_held += 1
+                self.ctx.out(f"SPOT EXIT HELD #{self.spot_exits_held} {req.link_id}: the perp is still short on the venue read and the sale would leave it uncovered; it is not a venue rejection and does "
+                             f"not count toward the exit halt (the exit window bounds it)")
                 return EX.Ack(req.link_id, "REJECTED", None, EX.HELD_REASON)                 # the engine's own constant: a HELD exit is not a venue rejection and never counts toward the halt
             self.ctx.sleep(0.5)
 
@@ -1113,21 +1126,31 @@ def _account_lock(ctx: Ctx, role: str) -> "XL.ExecutorLock":
 
 
 def close_out_unanswered_entries(ctx: Ctx, run: "Run") -> None:
-    """The unattended twin of the owner's ``reconcile --unwind`` close-out, for ENTRY legs only: a leg whose create got no answer twice, that the venue's COMPLETE read has no order for and that was sent at
-    least ``CLOSE_OUT_MIN_AGE_MS`` ago never existed there; marking it done lets the engine unwind the leg that did fill (reduce-only) instead of waiting for a human with a naked perp short."""
+    """The unattended twin of the owner's ``reconcile --unwind`` close-out, for ENTRY legs ONLY (an unanswered EXIT leg still needs the owner's unwind): a leg whose create got no answer twice, that the
+    venue has no trace of and that was sent at least ``CLOSE_OUT_MIN_AGE_MS`` ago never existed there; marking it done lets the engine unwind the leg that did fill (reduce-only) instead of leaving a
+    one-legged group behind. Every leg is judged on a venue read made FOR IT (an earlier close-out sends exits, so a view read before the loop can be tens of seconds stale), and 'no trace' means all three of:
+    a COMPLETE read that lists no order under the link, no execution under it, and the venue's own by-link lookup (which also sees CLOSED orders) answering 'no such order'. Any doubt, any unreadable
+    answer: the leg is left for the owner."""
     try:
-        view = run.ex.venue_state()
         g = run.engine.groups.get(run.gid) if run.engine else None
-        if g is None or not (view.get("complete") and view.get("positions") is not None):
+        if g is None:
             return
-        now_ms = int(ctx.clock())
         for link in run.unresolved_entries():
             leg_id = link[len(run.gid) + 1:]
             leg = g.legs.get(leg_id)
-            sent = getattr(leg, "sent_ms", None)
-            if link in view["orders"] or (sent is not None and now_ms - int(sent) < CLOSE_OUT_MIN_AGE_MS):
-                continue
-            ctx.out(f"ENTRY LEG {link}: no answer to its create and no order at the venue (complete read): closed out so the filled leg can unwind")
+            if leg is None or getattr(leg, "status", None) not in (EX.SENT, EX.UNKNOWN):
+                continue                                                # resolved meanwhile (a close-out lets the engine adopt another leg's fill)
+            view = run.ex.venue_state()
+            if not (view.get("complete") and view.get("positions") is not None):
+                return                                                  # an incomplete read proves nothing about ANY leg
+            sent, now_ms = getattr(leg, "sent_ms", None), int(ctx.clock())
+            if sent is not None and now_ms - int(sent) < CLOSE_OUT_MIN_AGE_MS:
+                continue                                                # a create that left a moment ago may still reach the venue
+            if link in view["orders"] or any(e.get("link_id") == link for e in view.get("executions", [])):
+                continue                                                # it exists at the venue (an order, or a fill the order list has rolled past): reconcile adopts it
+            if run.ex.lookup(leg.plan.category, leg.plan.symbol, link) is not None:
+                continue                                                # a CLOSED order the open + recent list no longer shows
+            ctx.out(f"ENTRY LEG {link}: no answer to its create and no trace at the venue (complete read, no execution, by-link lookup empty): closed out so the filled leg can unwind")
             run.engine.on_order_done(run.gid, leg_id, now_ms)
     except (TE.ExecutorError, bc.BybitAPIError):
         return

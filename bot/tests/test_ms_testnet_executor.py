@@ -295,6 +295,28 @@ def test_when_the_base_coin_cannot_be_read_no_fee_currency_but_the_quote_is_trus
     assert out[0]["fee_known"] is False and out[0]["fee_ccy_unsupported"] is True and out[0]["qty"] == pytest.approx(0.001) and out[0]["fee_usd"] == 0.0
 
 
+@pytest.mark.parametrize("ccy,side,known,qty_after,fee_usd", [
+    ("BTC", "Buy", True, 0.003996, 0.24),                 # the received coin: net quantity, dollars at the fill price
+    ("btc", "Buy", True, 0.003996, 0.24),                 # the venue's casing is not part of the meaning (review: the base was upper-cased but the fee currency was compared raw)
+    (" Btc ", "Buy", True, 0.003996, 0.24),
+    ("USDT", "Buy", True, 0.004, 0.004),                  # the quote: dollars as stated, the quantity untouched
+    ("usdt", "Buy", True, 0.004, 0.004),
+    ("BTC", "Sell", True, 0.004, 0.24),                   # a base-coin fee on a SELL is valued at the fill price, the sold quantity is what was sold
+    ("MNT", "Sell", False, 0.004, 0.0),                   # a third currency on a SELL is unknown too
+    ("MNT", "Buy", False, 0.004, 0.0),
+])
+def test_the_fee_currency_is_matched_case_insensitively_and_a_third_currency_is_unknown_on_either_side(w, ccy, side, known, qty_after, fee_usd):
+    run, ctx, rec = begin(w, submit=False)
+    fee = "0.000004" if ccy.strip().upper() == "BTC" else ("0.004" if ccy.strip().upper() == "USDT" else "0.18")
+    row = {"execId": "E900001", "orderLinkId": f"{run.gid}-s", "orderId": "O1", "symbol": "BTCUSDT", "side": side, "execQty": "0.004", "execPrice": "60000", "execFee": fee,
+           "feeCurrency": ccy, "isMaker": False, "execTime": str(w.clock.now()), "execType": "Trade"}
+    out = []
+    run.ex._take_exec(row, "spot", out)
+    x = out[0]
+    assert x["fee_known"] is known and x["qty"] == pytest.approx(qty_after) and x["fee_usd"] == pytest.approx(fee_usd), x
+    assert x["fee_ccy_unsupported"] is (not known)
+
+
 def test_the_base_coin_and_the_quote_fees_are_still_valued_exactly_as_before(w):
     run, ctx, rec = begin(w)
     drive(w, run, 2)
@@ -641,21 +663,36 @@ def test_a_spot_exit_whose_perp_never_closes_gives_up_after_the_hold_with_one_re
     assert [b for b in (json.loads(r[3]) for r in creates(w)) if b["category"] == "spot" and b["side"] == "Sell"] == []
 
 
-@pytest.mark.parametrize("perp,group_spot,baseline,sale,goes", [
-    ("-0.001", "0.004", "0",   "0.003", True),                  # the excess of a partial hedge: the spot still covers the perp short afterwards
-    ("-0.001", "0.004", "0.5", "0.003", True),                  # the same with a pre-session spot holding the group never bought
-    ("-0.001", "0.001", "0.5", "0.001", False),                 # the owner's OWN coin must not make the group's spot look like it covers the short
-    ("-0.001", "0.004", "0",   "0.004", False),                 # selling it all leaves the perp naked
-    ("-0.001", "0.004", "0",   "0.0031", False),                # one step too much
-    ("-0.001", "0.003", "0",   "0.002", True),                  # exactly covered afterwards (within the 1e-9 tolerance)
-    ("0",      "0.004", "0",   "0.004", True),                  # no perp left: nothing to keep hedged
-    ("0.001",  "0.004", "0",   "0.003", False),                 # a perp LONG nobody planned is not a hedge: the sale still waits for a flat perp, as before
+@pytest.mark.parametrize("perp,group_spot,baseline,sale,goes,engine_spot", [
+    ("-0.001", "0.004", "0",   "0.003", True,  None),                 # the excess of a partial hedge: the spot still covers the perp short afterwards
+    ("-0.001", "0.004", "0.5", "0.003", True,  None),                 # the same with a pre-session spot holding the group never bought
+    ("-0.001", "0.001", "0.5", "0.001", False, None),                 # the owner's OWN coin must not make the group's spot look like it covers the short
+    ("-0.001", "0.004", "0",   "0.004", False, None),                 # selling it all leaves the perp naked
+    ("-0.001", "0.004", "0",   "0.0031", False, None),                # one step too much
+    ("-0.001", "0.003", "0",   "0.002", True,  None),                 # exactly covered afterwards (within the 1e-9 tolerance)
+    ("0",      "0.004", "0",   "0.004", True,  None),                 # no perp left: nothing to keep hedged
+    ("0.001",  "0.004", "0",   "0.003", False, None),                 # a perp LONG nobody planned is not a hedge: the sale still waits for a flat perp, as before
+    # the wallet is not the only witness: the owner's own coin can GROW after the baseline was captured (a deposit, a faucet, a transfer), and then balance - baseline overstates the group's spot. The
+    # engine's own book (what the group's fills made) caps it: BOTH must cover the short.
+    ("-0.004", "0.024", "0",   "0.004", False, "0.004"),              # the wallet shows 0.02 BTC more than the baseline says: the full short is open, the sale waits (it used to leave at once)
+    ("-0.001", "0.024", "0",   "0.003", True,  "0.004"),              # the same drift with a genuine excess: the engine's 0.004 still covers the 0.001 short after selling 0.003
+    ("-0.001", "0.004", "0",   "0.003", False, "0.001"),              # the engine believes it holds only 0.001 (a fill it has not seen): the conservative reading holds the sale
+    ("-0.001", "0.004", "0",   "0.003", False, "none"),               # the engine has no spot position at all: fail closed
+    ("-0.001", "0.002", "0",   "0.002", False, "0.004"),              # the wallet shows LESS than the engine believes: the smaller of the two witnesses decides, in both directions
+    ("-0.001", "0.004", "0",   "0.003", False, "abc"),                # an unreadable engine figure: fail closed
+    ("-0.001", "0.004", "0",   "0.003", False, "no_engine"),          # no engine at all: fail closed
+    ("-0.001", "0",     "0",   "0.001", False, "0.004"),              # the wallet shows no spot at all (the venue row is absent or zero): nothing covers the short, whatever the engine believes
 ])
-def test_the_spot_exit_hold_lets_a_sale_through_only_while_the_group_spot_still_covers_the_perp_short(w, perp, group_spot, baseline, sale, goes):
+def test_the_spot_exit_hold_lets_a_sale_through_only_while_the_group_spot_still_covers_the_perp_short(w, monkeypatch, perp, group_spot, baseline, sale, goes, engine_spot):
     run, ctx, rec = begin(w, submit=False)
     w.fake.inject_position("BTCUSDT", perp)
     w.fake.wallet["BTC"] = D(group_spot) + D(baseline)
     run.baseline = {"spot:BTCUSDT": float(baseline)}
+    mine = {} if engine_spot in ("none", "no_engine") else {"spot:BTCUSDT": engine_spot or group_spot}
+    if engine_spot == "no_engine":
+        monkeypatch.setattr(run, "engine", None)
+    else:
+        monkeypatch.setattr(run.engine, "positions", lambda: dict(mine))
     leg = T.LegPlan("xspot", "BTCUSDT", "spot", "Sell", sale, "Market", None, False, False, "IOC")
     t0 = w.clock.now()
     ack = run._await_perp_closed(OrderRequest(run.gid, "c", "d", leg, f"{run.gid}-xspot"))
@@ -663,6 +700,26 @@ def test_the_spot_exit_hold_lets_a_sale_through_only_while_the_group_spot_still_
         assert ack is None and w.clock.now() - t0 < 5_000, f"the sale of {sale} was held although the spot still covers the short: {ack}"
     else:
         assert ack is not None and ack.status == "REJECTED" and ack.reason == EX_HELD_REASON and w.clock.now() - t0 >= 20_000, (ack, "the sale would have left the perp short uncovered")
+
+
+def test_a_deposit_of_the_owners_own_coin_after_the_baseline_never_lets_the_spot_sale_leave_before_the_perp_is_closed(w):
+    """REPRODUCED by the independent review: the owner's own BTC balance grew by 0.02 after the session's baseline was captured, the perp exit filled 2.5 s after its ack, and the new relaxation sold the
+    spot at t=0 with the whole perp short still open (the old hold waited for the flat perp, whatever the wallet said)."""
+    w.fake.fill_delay_ms = 2500
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    w.fake.wallet["BTC"] = w.fake.wallet.get("BTC", D(0)) + D("0.02")                       # the owner's deposit, AFTER the baseline was read
+    sent, orig = [], w.fake._create
+
+    def create(d):
+        sent.append((d["category"], d["side"], w.fake.positions["BTCUSDT"]["size"]))
+        return orig(d)
+    w.fake._create = create
+    run.engine.request_exit(run.gid, w.clock.now(), "T")
+    drive_full(w, run, 6)
+    sells = [x for x in sent if x[0] == "spot" and x[1] == "Sell"]
+    assert sells, f"the spot was never sold: {sent}"
+    assert all(size == 0 for _c, _s, size in sells), f"a spot sale left while the perp short was still open: {sent}"
 
 
 # ---- the unattended close-out of an ENTRY leg that never got an answer (the owner's unwind does the same by hand)
@@ -701,6 +758,87 @@ def test_an_entry_leg_the_venue_has_an_order_for_is_never_closed_out_however_old
     assert run.engine.groups[run.gid].legs["s"].status == "UNKNOWN" and "closed out" not in w.text(), "closing it out and unwinding would trade against an order that did execute"
 
 
+def test_an_entry_leg_whose_execution_is_listed_is_never_closed_out_even_when_its_order_is_not(w):
+    """Review: the absence proof was only 'not in the open + recently closed order list'. A fill under the link is existence too (the order list may have rolled over while the executions still show it)."""
+    run, ctx, sent = _a_run_whose_spot_entry_got_no_answer(w)
+    link = f"{run.gid}-s"
+    leg = next(l for l in run.group_plan.legs if l.leg_id == "s")
+    w.fake._create({"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit", "qty": leg.qty, "price": leg.price, "timeInForce": "IOC", "orderLinkId": link})
+    real = run.ex.venue_state
+
+    def venue_state(*a, **k):
+        v = dict(real(*a, **k))
+        assert any(e["link_id"] == link for e in v["executions"]), "the fixture must leave an execution under the leg's link"
+        return {**v, "orders": {k2: o for k2, o in v["orders"].items() if k2 != link}}                      # the order has rolled out of the list; the fill has not
+    run.ex.venue_state = venue_state
+    run.ex.lookup = lambda category, symbol, link_id: None                                                  # each witness must be sufficient ON ITS OWN: the by-link lookup is made blind here
+    w.clock.t = sent + 10 * S.CLOSE_OUT_MIN_AGE_MS
+    S.close_out_unanswered_entries(ctx, run)
+    assert run.engine.groups[run.gid].legs["s"].status == "UNKNOWN" and "closed out" not in w.text()
+
+
+@pytest.mark.parametrize("answer", ["an order", "unreadable"])
+def test_an_entry_leg_the_venues_own_by_link_lookup_knows_or_cannot_answer_for_is_never_closed_out(w, answer):
+    run, ctx, sent = _a_run_whose_spot_entry_got_no_answer(w)
+
+    def lookup(category, symbol, link):
+        if answer == "unreadable":
+            raise TE.ExecutorError("the lookup could not be read")
+        return {"orderLinkId": link, "orderStatus": "Filled", "orderId": "O777"}                              # a CLOSED order neither the open list nor the executions page still shows
+    run.ex.lookup = lookup
+    w.clock.t = sent + 10 * S.CLOSE_OUT_MIN_AGE_MS
+    S.close_out_unanswered_entries(ctx, run)
+    assert run.engine.groups[run.gid].legs["s"].status == "UNKNOWN" and "closed out" not in w.text()
+
+
+def test_each_unresolved_entry_leg_is_judged_on_a_view_read_for_it_not_on_one_read_before_the_loop():
+    """Review: ``view`` was read once before the loop, so a second leg was judged on a view that could be tens of seconds stale after the first close-out sent exits."""
+    import types
+    UNK = "UNKNOWN"
+    legs = {k: types.SimpleNamespace(sent_ms=0, status=UNK, plan=types.SimpleNamespace(category="spot", symbol="BTCUSDT")) for k in ("a", "b")}
+    closed, reads = [], []
+    engine = types.SimpleNamespace(groups={"g": types.SimpleNamespace(legs=legs)}, on_order_done=lambda gid, leg, ms: closed.append(leg))
+
+    def venue_state():
+        reads.append(1)
+        orders = {"g-b": {}} if len(reads) >= 2 else {}                                                     # leg b's order only becomes visible on the SECOND read
+        return {"complete": True, "positions": {}, "orders": orders, "executions": []}
+    run = types.SimpleNamespace(gid="g", engine=engine, ex=types.SimpleNamespace(venue_state=venue_state, lookup=lambda c, s, l: None), unresolved_entries=lambda: ["g-a", "g-b"])
+    ctx = types.SimpleNamespace(clock=lambda: 10 ** 12, out=lambda m: None)
+    S.close_out_unanswered_entries(ctx, run)
+    assert len(reads) == 2 and closed == ["a"], (len(reads), closed)
+
+
+def test_an_incomplete_read_for_any_leg_stops_the_whole_close_out():
+    import types
+    legs = {k: types.SimpleNamespace(sent_ms=0, status="UNKNOWN", plan=types.SimpleNamespace(category="spot", symbol="BTCUSDT")) for k in ("a", "b")}
+    closed, reads = [], []
+    engine = types.SimpleNamespace(groups={"g": types.SimpleNamespace(legs=legs)}, on_order_done=lambda gid, leg, ms: closed.append(leg))
+
+    def venue_state():
+        reads.append(1)
+        return {"complete": len(reads) >= 2, "positions": {}, "orders": {}, "executions": []}                 # the first read is incomplete, the second is fine
+    run = types.SimpleNamespace(gid="g", engine=engine, ex=types.SimpleNamespace(venue_state=venue_state, lookup=lambda c, s, l: None), unresolved_entries=lambda: ["g-a", "g-b"])
+    S.close_out_unanswered_entries(types.SimpleNamespace(clock=lambda: 10 ** 12, out=lambda m: None), run)
+    assert closed == [] and len(reads) == 1, "one unreliable read means nothing is closed out this time (the owner's unwind or the next call decides)"
+
+
+def test_a_leg_that_resolved_while_the_loop_ran_is_not_closed_out():
+    import types
+    legs = {"a": types.SimpleNamespace(sent_ms=0, status="UNKNOWN", plan=types.SimpleNamespace(category="spot", symbol="BTCUSDT")),
+            "b": types.SimpleNamespace(sent_ms=0, status="UNKNOWN", plan=types.SimpleNamespace(category="spot", symbol="BTCUSDT"))}
+    closed = []
+
+    def on_order_done(gid, leg, ms):
+        closed.append(leg)
+        legs["b"].status = "FILLED"                                                                            # closing a out lets the engine adopt b's fill
+    engine = types.SimpleNamespace(groups={"g": types.SimpleNamespace(legs=legs)}, on_order_done=on_order_done)
+    run = types.SimpleNamespace(gid="g", engine=engine, ex=types.SimpleNamespace(venue_state=lambda: {"complete": True, "positions": {}, "orders": {}, "executions": []}, lookup=lambda c, s, l: None),
+                                unresolved_entries=lambda: ["g-a", "g-b"])
+    S.close_out_unanswered_entries(types.SimpleNamespace(clock=lambda: 10 ** 12, out=lambda m: None), run)
+    assert closed == ["a"]
+
+
 @pytest.mark.parametrize("read", ["incomplete", "no_positions", "raises"])
 def test_an_entry_leg_is_never_closed_out_on_a_venue_read_that_is_not_complete(w, read):
     run, ctx, sent = _a_run_whose_spot_entry_got_no_answer(w)
@@ -715,6 +853,20 @@ def test_an_entry_leg_is_never_closed_out_on_a_venue_read_that_is_not_complete(w
     w.clock.t = sent + 10 * S.CLOSE_OUT_MIN_AGE_MS
     S.close_out_unanswered_entries(ctx, run)
     assert run.engine.groups[run.gid].legs["s"].status == "UNKNOWN" and "closed out" not in w.text(), "absence from an INCOMPLETE read proves nothing"
+
+
+def test_every_held_spot_exit_is_printed_with_a_running_count_so_a_hold_that_never_ends_is_not_silent(w):
+    """Review: a HELD answer no longer counts toward the exit halt (R3), so a hold that never resolved left only ACK rows in the journal. Each one is printed now, with the count and what it waits for;
+    the session's exit window still bounds the total (the end state of a hold that never resolves is NOT_FLAT and the owner's unwind, as before)."""
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    leg = T.LegPlan("xspot", "BTCUSDT", "spot", "Sell", "0.001", "Market", None, False, False, "IOC")
+    for n in (1, 2, 3):
+        ack = run._await_perp_closed(OrderRequest(run.gid, "c", "d", leg, f"{run.gid}-xspot{n}"))
+        assert ack.reason == EX_HELD_REASON
+        held = [l for l in w.out if l.startswith("SPOT EXIT HELD")]
+        assert len(held) == n and f"#{n}" in held[-1] and f"{run.gid}-xspot{n}" in held[-1] and "perp" in held[-1], held
+    assert run.spot_exits_held == 3
 
 
 def test_the_delayed_exit_sequence_end_to_end_through_the_session_tool(w):

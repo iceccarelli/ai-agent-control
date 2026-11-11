@@ -1219,14 +1219,33 @@ class OwnerGate:
     This is deliberate friction against an unattended or scripted caller, like the grant's typed reference: it is not a cryptographic proof of who typed."""
 
     def __init__(self, root: str, clock: Callable[[], int], *, isatty: Optional[Callable[[], bool]] = None, input_fn: Optional[Callable[[str], str]] = None, uid: Optional[int] = None,
-                 out: Callable[[str], None] = print, marker: str = "CAPITAL_BOOK") -> None:
+                 out: Callable[[str], None] = print, marker: str = "CAPITAL_BOOK", env: Optional[Mapping[str, str]] = None) -> None:
         self.eng = ES.EngineState(root, clock)
+        self.clock = clock
         self.isatty = isatty if isatty is not None else (lambda: sys.stdin.isatty())
         self.input_fn = input_fn if input_fn is not None else input
         self.uid = os.getuid() if uid is None else uid
         self.out, self.marker = out, marker
+        self.env = env or {}
         self._base: Dict[str, Any] = {}
         self._action = ""
+
+    def _how(self) -> Dict[str, Any]:
+        """What can be told apart afterwards between a person and a script that reads the printed line back through a pseudo-terminal: the parent process and whether the session came in over SSH."""
+        ppid = os.getppid()
+        try:
+            with open(f"/proc/{ppid}/cmdline", "rb") as fh:
+                parent = fh.read(300).replace(b"\0", b" ").decode("utf-8", "replace").strip() or None
+        except OSError:
+            parent = None
+        return {"ppid": ppid, "parent_cmd": parent, "ssh": bool(self.env.get("SSH_CONNECTION") or self.env.get("SSH_TTY"))}
+
+    def refuse_multiple(self, actions: Sequence[str]) -> int:
+        """Several owner actions in one command are refused whole: nothing is applied, so nothing is half-applied."""
+        self._base = {"action": "MULTIPLE", "actions": list(actions), "tty": bool(self.isatty()), "uid": self.uid, **self._how()}
+        self._best_effort("REFUSED_MULTIPLE")
+        self.out("refused: give one owner action per command (you asked for " + ", ".join(actions) + "); nothing was changed")
+        return 2
 
     def _audit(self, action: str, payload: Mapping[str, Any]) -> None:
         self.eng.audit(self.marker, action, dict(payload))
@@ -1234,7 +1253,7 @@ class OwnerGate:
     def confirm(self, action: str, facts: Mapping[str, Any], before: Mapping[str, Any]) -> Optional[int]:
         """None = confirmed, go ahead. An int = the exit code to return; NOTHING was changed."""
         tty, line = bool(self.isatty()), gate_line(action, facts)
-        self._action, self._base = action, {"action": action, "tty": tty, "uid": self.uid, "line": line, "before": dict(before)}
+        self._action, self._base = action, {"action": action, "tty": tty, "uid": self.uid, "line": line, "before": dict(before), **self._how()}
         if not tty:
             self._best_effort("REFUSED_NO_TTY")
             self.out(f"refused: {action} is owner-only: it needs an interactive terminal and the line it then shows you typed in (nothing was changed). Open an interactive session "
@@ -1243,7 +1262,14 @@ class OwnerGate:
         self.out(f"OWNER ACTION {action}: " + json.dumps(dict(facts), sort_keys=True, default=str))
         self.out("Type exactly the line below to confirm. It embeds the state as it is NOW: a line for an older state, or one nobody read, does not work.")
         self.out(line)
-        typed = self.input_fn("> ").strip()
+        asked_ms = int(self.clock())
+        try:
+            typed = self.input_fn("> ").strip()
+        except (EOFError, KeyboardInterrupt, OSError):
+            self._best_effort("REFUSED_NO_INPUT")
+            self.out("refused: no line was typed (end of input); nothing was changed")
+            return 2
+        self._base["elapsed_ms"] = int(self.clock()) - asked_ms          # prompt -> answer: a pasted line is fast, a script is faster, a person reading the facts is not
         if typed != line:
             self._best_effort("REFUSED_MISMATCH")
             self.out("refused: the typed line does not match the current state (nothing was changed)")
@@ -1410,10 +1436,13 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
              lambda: cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]), "transfer declared", "refused or already declared"),
         ]
         owner: Optional[OwnerGate] = None                                  # built only when an owner action is asked for: printing the book touches nothing
+        asked = [action for given, action, *_rest in steps if given]
+        if len(asked) > 1:
+            return OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, env=e).refuse_multiple(asked)
         for given, action, facts_of, apply, did, did_not in steps:
             if not given:
                 continue
-            owner = owner or OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid)
+            owner = owner or OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, env=e)
             before = _book_state(cbk)
             code = owner.confirm(action, facts_of(before), before)
             if code is not None:
@@ -1456,7 +1485,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
         if eng.has("ALERT") or not owner_stops:
             return cmd_resume(a.root, clock, a.reason)                      # the deploy's own DRAIN / DRAINED stay scriptable (safe-deploy.sh); an open ALERT is refused inside
         # PAUSED and STOP are the owner's OWN stops: clearing them needs the owner. A deploy that finds one still clears its own markers and leaves the stop where it is.
-        owner = OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, marker="OWNER_STOPS")
+        owner = OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, marker="OWNER_STOPS", env=e)
         code = owner.confirm("RESUME", {"markers": ",".join(owner_stops)}, {"markers": owner_stops, "reason": a.reason})
         if code is not None:
             cleared = [m for m in ("DRAIN", "DRAINED") if eng.clear(m, a.reason)]
@@ -1470,7 +1499,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
             return cmd_clear_alert(e, a.root, clock, a.reason)             # "no ALERT": nothing to clear
         alert = eng.read("ALERT")
         alert = alert if isinstance(alert, dict) else {}
-        owner = OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, marker="ALERT")
+        owner = OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, marker="ALERT", env=e)
         code = owner.confirm("CLEAR-ALERT", {"alert_code": alert.get("code") or "UNKNOWN", "alert_at_ms": alert.get("at_ms")}, {"alert": alert, "reason": a.reason})
         if code is not None:
             return code

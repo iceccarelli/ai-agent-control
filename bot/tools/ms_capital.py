@@ -87,11 +87,14 @@ class Allocation:
 
 
 def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, available_usdt: Any, basis: Optional[Decimal], start_cash: Optional[Decimal], loss_streak: int,
-             drawdown_usd: Optional[Decimal], profit_seeking: bool, halted: bool = False, leverage: int = 1, realised_usd: Optional[Decimal] = None) -> Allocation:
-    """The smallest of every limit; a missing input is a refusal, never a guess. ``realised_usd`` (the book's verified net result since it began) arms the lifetime stop no acknowledgement lifts."""
+             drawdown_usd: Optional[Decimal], profit_seeking: bool, realised_usd: Optional[Decimal], halted: bool = False, leverage: int = 1) -> Allocation:
+    """The smallest of every limit; a missing input is a refusal, never a guess. ``realised_usd`` (the book's verified net result since it began) arms the lifetime stop no acknowledgement lifts. It is a
+    REQUIRED keyword and an unknown figure is a refusal: the stop used to be skipped when the argument was left out or unreadable."""
     reasons: List[str] = []
     gm, ce, og, av = _d(grant_max_usd), _d(ceiling_usd), _d(open_gross_usd), _d(available_usdt)
-    if realised_usd is not None and realised_usd <= -LIFETIME_LOSS_STOP_USD:
+    if realised_usd is None:
+        reasons.append("REALISED_UNKNOWN")
+    elif realised_usd <= -LIFETIME_LOSS_STOP_USD:
         reasons.append("LIFETIME_LOSS_STOP")
     if halted:
         reasons.append("LOSS_STREAK_STOP_NOT_ACKNOWLEDGED")
@@ -356,9 +359,14 @@ class CapitalBook:
                     status = "UNEXPLAINED_CASH"
                 elif excess > tol:
                     status = "UNVERIFIED_EXCESS"
+            if (status == "UNEXPLAINED_CASH" or not flat) and credited > 0:   # unreconciled / not-flat profit never sizes anything; an unexplained or not-flat LOSS is still debited in full
+                excess, credited = excess + credited, D(0)
+                status = status if status == "UNEXPLAINED_CASH" else "NOT_FLAT_SESSION"
             if transfers < 0:
                 # A declared WITHDRAWAL is the owner's unverified claim and it moves the settled delta UP by its size. It may explain cash that fell; it may not (1) hide a loss the ledger measured, nor
-                # (2) lift a credit above the cash that actually rose. Both rules only ever make the book more conservative, and they bind only a withdrawal declared inside the session's own window.
+                # (2) lift a credit above the cash that actually rose, and (3) where the ledger measured nothing at all it cannot be told from a loss it could not see, so the book asks for the owner's
+                # review instead of settling quietly. The ledger-vs-cash comparison is the book's only independent check of the ledger and a declaration blinds it for its window: nothing is CREDITED on the
+                # strength of one. All three only ever make the book more conservative, and they bind only a declared withdrawal counted for this session.
                 if known is not None and known < 0 and delta > known and credited > known:
                     credited = known                                    # the measured loss is booked whole; the part of the cash change the book cannot place is the excess (visible, sizes nothing)
                     excess = delta - credited
@@ -369,9 +377,8 @@ class CapitalBook:
                     credited, excess = raw_rise, delta - raw_rise
                     if excess > tol and status == "SETTLED":
                         status = "UNVERIFIED_EXCESS"
-            if (status == "UNEXPLAINED_CASH" or not flat) and credited > 0:   # unreconciled / not-flat profit never sizes anything; an unexplained or not-flat LOSS is still debited in full
-                excess, credited = excess + credited, D(0)
-                status = status if status == "UNEXPLAINED_CASH" else "NOT_FLAT_SESSION"
+                if known is None and now < before and status == "SETTLED":
+                    status = "UNEXPLAINED_CASH"                         # the cash fell, the ledger has no net to compare it with, and a withdrawal is claimed to explain it: a review, nothing booked on a guess
             b["realised_usd"] = str((_d(b["realised_usd"]) or D(0)) + credited)
             if credited > 0:
                 b["gains_usd"] = str((_d(b["gains_usd"]) or D(0)) + credited)

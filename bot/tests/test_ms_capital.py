@@ -13,7 +13,7 @@ CEIL = 500
 
 
 def alloc(**kw):
-    base = dict(grant_max_usd=375, ceiling_usd=CEIL, open_gross_usd=0, available_usdt=10_000, basis=D(10_000), start_cash=D(10_000), loss_streak=0, drawdown_usd=D(0), profit_seeking=True)
+    base = dict(grant_max_usd=375, ceiling_usd=CEIL, open_gross_usd=0, available_usdt=10_000, basis=D(10_000), start_cash=D(10_000), loss_streak=0, drawdown_usd=D(0), profit_seeking=True, realised_usd=D(0))
     base.update(kw)
     return C.allocate(**base)
 
@@ -515,7 +515,8 @@ def test_a_declared_withdrawal_cannot_raise_a_credit_above_the_cash_that_actuall
 
 
 def test_a_withdrawal_the_owner_really_made_during_a_session_never_costs_more_than_the_known_loss_nor_credits_a_gain(tmp_path):
-    """The same cap and floor are conservative for a REAL withdrawal made in the window (rare: the runbook declares transfers before the next session starts, where they are not counted at all)."""
+    """The same cap and floor are conservative for a REAL withdrawal. That is the NORMAL case, not a rare one: a withdrawal you declare between two sessions is counted against the session that is still pending
+    (it was parked before you declared), so after every real withdrawal the previous session's gain shows as unverified excess instead of being credited (review finding 4)."""
     b = book(tmp_path)
     b.ensure_baseline("10000")
     assert b.park("s1", "10000", "-1.00", True, True)
@@ -693,3 +694,88 @@ def test_the_allocator_cannot_be_walked_past_a_stop_by_corrupting_the_realised_f
         json.dump(doc, fh)
     with pytest.raises(C.BookUnreadable):
         b.sizing_basis()
+
+
+def test_the_lifetime_stop_cannot_be_skipped_by_leaving_the_realised_figure_out_or_unreadable():
+    """Review finding: ``realised_usd`` used to default to None and None skipped the stop, so a caller that forgot the argument (or passed an unreadable figure) silently had no lifetime stop. It is a REQUIRED
+    argument now and an unknown figure is a refusal, like every other unknown input."""
+    import inspect
+    sig = inspect.signature(C.allocate)
+    assert sig.parameters["realised_usd"].default is inspect.Parameter.empty, "a required keyword: no default to fall back on"
+    base = dict(grant_max_usd=375, ceiling_usd=CEIL, open_gross_usd=0, available_usdt=10_000, basis=D(10_000), start_cash=D(10_000), loss_streak=0, drawdown_usd=D(0), profit_seeking=True)
+    with pytest.raises(TypeError):
+        C.allocate(**base)
+    a = C.allocate(**base, realised_usd=None)
+    assert a.notional == 0 and a.binding == "REALISED_UNKNOWN" and a.reasons[0] == "REALISED_UNKNOWN"
+    assert C.allocate(**base, realised_usd=D(0)).notional > 0
+
+
+def test_the_product_passes_the_realised_figure_to_the_allocator():
+    """Structural: the one product call site of ``ms_capital.allocate`` names ``realised_usd`` (a required keyword, so it cannot be dropped silently, and this pins what it is fed from)."""
+    import ast
+    src = open(os.path.join(BOT, "tools", "ms_testnet_autopilot.py"), encoding="utf-8").read()
+    calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "allocate" and getattr(n.func.value, "id", "") == "CC"]
+    assert len(calls) == 1, "one product call site of the capital allocator"
+    kw = {k.arg: ast.get_source_segment(src, k.value) for k in calls[0].keywords}
+    assert kw.get("realised_usd") == 'CC._d(cb["realised_usd"])', kw
+
+
+# ---- review round: edge cases of the declared-withdrawal rules
+def test_a_not_flat_session_keeps_its_not_flat_label_when_a_withdrawal_is_declared_in_its_window(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "0.50", True, False)                            # the ledger saw +0.50, but the session did NOT end verified flat
+    assert b.declare_transfer("wd", "-300")
+    r = b.settle("9700.50")
+    assert r["status"] == "NOT_FLAT_SESSION" and D(r["credited_usd"]) == 0 and D(r["unverified_excess_usd"]) == D("0.50"), r
+
+
+def test_a_declared_withdrawal_that_explains_a_cash_fall_the_ledger_could_not_measure_is_a_review_never_a_silent_settled(tmp_path):
+    """Review (MEDIUM-LOW): with the ledger's net UNKNOWN (a fee in a currency nobody could value, say) a declared withdrawal equal to the cash fall settled as SETTLED, credited 0, streak 0, no review. The
+    book cannot tell the withdrawal from a lost session it could not measure, so it asks for the owner's review (nothing is booked on a guess: a real withdrawal must not look like a trading loss)."""
+    b = book(tmp_path)
+    b.ensure_baseline("100")
+    assert b.park("s1", "100", None, False, True)
+    assert b.declare_transfer("wd", "-5")
+    r = b.settle("95")                                                           # the cash fell by exactly the declared 5
+    assert r["status"] == "UNEXPLAINED_CASH" and D(r["credited_usd"]) == 0 and (b.load()["review_required"] or {}).get("code") == "ACCOUNT_CASH_UNEXPLAINED", r
+    assert b.load()["loss_streak"] == 0 and D(b.load()["realised_usd"]) == 0, "nothing is booked on a guess"
+
+
+def test_with_the_ledger_net_unknown_a_withdrawal_declared_while_the_cash_rose_or_stayed_is_not_a_review(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("100")
+    assert b.park("s1", "100", None, False, True)
+    assert b.declare_transfer("wd", "-5")
+    r = b.settle("100")                                                          # the cash did not fall: nothing to explain away
+    assert r["status"] != "UNEXPLAINED_CASH" and not b.load()["review_required"], r
+
+
+def test_two_declared_withdrawals_act_as_their_sum_and_a_deposit_offsets_them(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-1.00", True, True)
+    assert b.declare_transfer("w1", "-3") and b.declare_transfer("w2", "-2")
+    r = b.settle("9994.00")                                                      # -1 trading - 5 withdrawn
+    assert D(r["credited_usd"]) == D("-1.00") and r["status"] == "SETTLED" and r["transfers_removed_usd"] == "-5", r
+    assert b.park("s2", "9994", "-1.00", True, True)
+    assert b.declare_transfer("w3", "-100") and b.declare_transfer("d1", "10")   # net -90: a NET withdrawal, so the loss floor binds
+    r = b.settle("9904.00")                                                      # the cash fell by 90: the ledger's -1.00 is NOT what the cash says (-90 + 90 = 0)
+    assert D(r["credited_usd"]) == D("-1.00") and r["status"] == "UNEXPLAINED_CASH", r
+    assert b.park("s3", "9904", "-1.00", True, True)
+    assert b.declare_transfer("w4", "-10") and b.declare_transfer("d2", "100")   # net +90: a deposit; the withdrawal rules do not apply
+    r = b.settle("9993.00")
+    assert D(r["credited_usd"]) == D("-1.00") and r["status"] == "SETTLED", r
+
+
+def test_the_unknown_net_review_is_not_raised_for_dust_nor_when_a_gain_is_already_unverified(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("100")
+    assert b.park("s1", "100", None, False, True)
+    assert b.declare_transfer("dust", "-0.01")
+    r = b.settle("100")                                                          # a one-cent withdrawal and an unchanged cash: dust, not a review
+    assert r["status"] != "UNEXPLAINED_CASH" and not b.load()["review_required"], r
+    assert b.park("s2", "100", None, False, True)
+    assert b.declare_transfer("big", "-20")
+    r = b.settle("95")                                                           # the cash fell 5 but 20 left: the book sees an unverified +15, which already sizes nothing
+    assert r["status"] == "UNVERIFIED_GAIN" and D(r["credited_usd"]) == 0 and not b.load()["review_required"], r

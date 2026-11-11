@@ -226,3 +226,82 @@ def test_a_real_process_with_stdin_closed_cannot_clear_the_stop(tmp_path):
     r = subprocess.run([sys.executable, os.path.join(BOT, "tools", "ms_testnet_autopilot.py"), "capital", "--root", root, "--ack-halt"], stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=BOT,
                        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)})
     assert r.returncode == 2 and CC.CapitalBook(root).load()["halted"] is True, (r.returncode, r.stdout[-300:], r.stderr[-300:])
+
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------ review round (the independent review of 3502ce9)
+def test_several_owner_actions_in_one_command_are_refused_and_nothing_is_applied(tmp_path, capsys):
+    """Review: with two flags the first was applied and the second refused, while the message said 'nothing was changed'. One owner action per command, so nothing is ever half-applied."""
+    root = str(tmp_path)
+    _halted_book(root)
+    before = CC.CapitalBook(root).load()
+    for tty in (False, True):
+        rc, out = _run(["capital", "--root", root, "--ack-halt", "--reserve-fraction", "0.5"], tty=tty, typed=_line_asked_for, capsys=capsys)
+        assert rc == 2 and "one owner action per command" in out and CC.CapitalBook(root).load() == before, out
+    assert [r["action"] for r in _log_rows(root)] == ["REFUSED_MULTIPLE", "REFUSED_MULTIPLE"]
+    assert _log_rows(root)[0]["payload"]["actions"] == ["ACK-HALT", "SET-RESERVE"]
+
+
+def test_end_of_input_at_the_prompt_is_a_refusal_with_a_trace_not_a_traceback(tmp_path, capsys):
+    root = str(tmp_path)
+    _halted_book(root)
+
+    def eof(_prompt):
+        raise EOFError
+    rc = AP.main(["capital", "--root", root, "--ack-halt"], env={}, isatty=lambda: True, input_fn=eof, uid=1)
+    out = capsys.readouterr().out
+    assert rc == 2 and "no line was typed" in out and "nothing was changed" in out and CC.CapitalBook(root).load()["halted"] is True
+    assert [r["action"] for r in _log_rows(root)] == ["REFUSED_NO_INPUT"]
+
+
+def test_the_intent_row_records_how_the_answer_arrived_not_only_that_it_did(tmp_path, capsys, monkeypatch):
+    """The gate cannot tell a person from a script that reads the printed line back through a pseudo-terminal. It records what can be told apart afterwards: the time between the prompt and the answer, the
+    parent process, and whether the session came in over SSH."""
+    root = str(tmp_path)
+    _halted_book(root)
+    ticks = iter(range(10 ** 6))
+    monkeypatch.setattr(AP.time, "time", lambda: 1_794_312_000.0 + next(ticks))                         # every clock read advances one second: the prompt-to-answer gap is whole seconds
+    rc, out = _run(["capital", "--root", root, "--ack-halt"], tty=True, typed=_line_asked_for, capsys=capsys, env={"SSH_CONNECTION": "10.0.0.1 5000 10.0.0.2 22"})
+    assert rc == 0, out
+    intent = [r for r in _log_rows(root) if r["action"] == "INTENT"][0]["payload"]
+    assert intent["ssh"] is True and intent["ppid"] == os.getppid() and (intent["parent_cmd"] is None or isinstance(intent["parent_cmd"], str))
+    assert isinstance(intent["elapsed_ms"], int) and intent["elapsed_ms"] >= 1000
+    _halted_book(str(tmp_path / "other"))
+    rc, out = _run(["capital", "--root", str(tmp_path / "other"), "--ack-halt"], tty=True, typed=_line_asked_for, capsys=capsys, env={})
+    assert [r for r in _log_rows(str(tmp_path / "other")) if r["action"] == "INTENT"][0]["payload"]["ssh"] is False
+
+
+def test_a_refusal_for_the_missing_terminal_also_records_the_parent_and_ssh(tmp_path, capsys):
+    root = str(tmp_path)
+    _halted_book(root)
+    rc, out = _run(["capital", "--root", root, "--ack-halt"], tty=False, capsys=capsys, env={"SSH_TTY": "/dev/pts/3"})
+    row = _log_rows(root)[0]["payload"]
+    assert rc == 2 and row["ssh"] is True and row["ppid"] == os.getppid() and "elapsed_ms" not in row
+
+
+def test_a_closing_audit_row_that_cannot_be_written_is_loud_and_the_exit_code_says_so(tmp_path, capsys, monkeypatch):
+    """The INTENT row is written before the action; if only the CLOSING row fails the action HAS happened, the message says so and the exit code is not 0."""
+    root = str(tmp_path)
+    _halted_book(root)
+    real = ES.EngineState.audit
+
+    def audit(self, name, action, payload):
+        if action in ("APPLIED", "NOOP"):
+            raise OSError(28, "No space left on device")
+        return real(self, name, action, payload)
+    monkeypatch.setattr(ES.EngineState, "audit", audit)
+    rc, out = _run(["capital", "--root", root, "--ack-halt"], tty=True, typed=_line_asked_for, capsys=capsys)
+    assert rc == 1 and "was applied but its closing audit row could not be written" in out and "INTENT row" in out, out
+    assert CC.CapitalBook(root).load()["halted"] is False
+    assert [r["action"] for r in _log_rows(root)] == ["INTENT"]
+
+
+def test_clear_alert_the_real_command_refusing_because_the_venue_is_not_flat_is_audited_as_not_applied(tmp_path, capsys, monkeypatch):
+    root = str(tmp_path)
+    eng = ES.EngineState(root, CLOCK)
+    eng.set("ALERT", {"code": "UNRECONCILED"})
+    real = AP.cmd_clear_alert
+    monkeypatch.setattr(AP, "cmd_clear_alert", lambda e, r, clock, reason, **kw: real(e, r, clock, reason, recover_fn=lambda *a, **k: (False, ["NOT_FLAT:linear:BTCUSDT"], {}), out=print))
+    rc, out = _run(["clear-alert", "--root", root, "--reason", "looked"], tty=True, typed=_line_asked_for, capsys=capsys)
+    assert rc == 2 and eng.has("ALERT") and "the venue is not proven flat" in out, out
+    rows = [r for r in _log_rows(root) if r["marker"] == "ALERT" and r["action"] != "SET"]                  # (the SET row is the alert itself)
+    assert [r["action"] for r in rows] == ["INTENT", "NOT_APPLIED"] and rows[-1]["payload"]["after"]["alert_open"] is True and rows[-1]["payload"]["after"]["rc"] == 2
