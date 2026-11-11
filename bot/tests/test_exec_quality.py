@@ -300,3 +300,33 @@ def test_the_session_record_schema_is_untouched(w):
     assert w.execute() == 0
     import ms_testnet_session as S
     assert S.record_refusals(w.record()) == [] and "execution_quality" not in w.record()
+
+
+# ------------------------------------------------------------------ research feedback: measured vs modelled
+def _row(style="TAKER", measured="22.0", modelled="20.0", expected="9.0", realised="8.0", done=True):
+    return {"style": style, "attempt_completed": done, "cost_complete": True, "total_execution_cost_bps_of_position_notional": measured, "total_execution_cost_usd": "0.2",
+            "position_notional_usd": "100", "modelled_cost_bps": modelled, "expected_funding_bps": expected, "realised_funding_bps": realised}
+
+
+def test_the_feedback_report_says_how_far_the_model_is_from_measurement_and_never_averages_a_handful():
+    rep = EQ.feedback_report([_row(measured="22"), _row(measured="26"), _row(measured="19")])
+    mv = rep["model_vs_measured"]
+    assert mv["sessions"] == 3 and mv["mean_measured_cost_bps"] == "22.3333" and mv["mean_modelled_cost_bps"] == "20.0000" and mv["mean_cost_surprise_bps"] == "2.3333"
+    assert mv["sessions_costlier_than_modelled"] == 2 and mv["status"] == "INSUFFICIENT_SAMPLE" and rep["policy"]["verdict"] == "INSUFFICIENT_SAMPLE"
+    f = rep["funding_vs_expected"]
+    assert f["mean_shortfall_bps"] == "-1.0000" and f["status"] == "INSUFFICIENT_SAMPLE"
+    big = EQ.feedback_report([_row(measured=str(20 + i % 5)) for i in range(30)], min_orders=30)
+    assert big["model_vs_measured"]["status"] == "ENOUGH"
+    empty = EQ.feedback_report([])
+    assert empty["model_vs_measured"]["mean_cost_surprise_bps"] is None and empty["sessions_logged"] == 0          # nothing is invented from no data
+
+
+def test_an_unknown_model_cost_or_unresolved_funding_is_unknown_in_the_row_never_zero():
+    q = {"group": {"style": "TAKER", "attempt_completed": True, "cost_complete": True, "position_notional_usd": "100", "total_execution_cost_usd": "0.2",
+                   "total_execution_cost_bps_of_position_notional": "20.0"}}
+    r = EQ.feedback_row(session="s", at_ms=1, decision_id="dec_1", quality=q, funding=None, edge={"costs_bps": {"a": "5", "b": None}, "expected_funding_bps": "9"}, flat_verified=True)
+    assert r["modelled_cost_bps"] is None and r["realised_funding_bps"] is None and r["funding_booked_usd"] is None and r["expected_funding_bps"] == "9.0000"
+    unresolved = {"recognitions": [{"all_prints_resolved": False, "booked_usd": None}]}
+    assert EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=unresolved, edge=None, flat_verified=True)["realised_funding_bps"] is None
+    booked = {"recognitions": [{"all_prints_resolved": True, "booked_usd": "0.9"}]}
+    assert EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=booked, edge=None, flat_verified=True)["realised_funding_bps"] == "90.0000"

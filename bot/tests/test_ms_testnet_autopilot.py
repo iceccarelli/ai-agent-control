@@ -1470,3 +1470,22 @@ def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_re
     res, _got = _collect(w, eng_name="eng_corrupt")
     assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
     assert (root / "capital.json").read_text() == "{corrupt" and not w.requests_to("/v5/order/create")
+
+
+def test_a_finished_session_appends_one_chained_feedback_row_and_the_quality_command_reports_it(w, capsys):
+    import evidence_chain as EC
+    _profit_world(w)
+    res, _got = _collect(w, eng_name="eng_fb")
+    assert res["result"] == "DONE", res
+    log = str(w.tmp / "eng_fb" / "exec_quality_log.jsonl")
+    rows = EC.rows_of(EC.read_lines(log)[0])
+    assert len(rows) == 1 and EC.verify(log)["ok"] and rows[0]["flat_verified"] is True and rows[0]["attempt_completed"] is True
+    assert rows[0]["total_execution_cost_bps_of_position_notional"] is not None and rows[0]["modelled_cost_bps"] is not None and rows[0]["decision_id"].startswith("dec_")
+    assert AP.main(["quality", "--root", str(w.tmp / "eng_fb")], env={}) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["sessions_logged"] == 1 and rep["log_chain_ok"] is True and rep["policy"]["verdict"] == "INSUFFICIENT_SAMPLE" and rep["model_vs_measured"]["sessions"] == 1
+    assert AP.main(["quality", "--root", str(w.tmp / "no_such_root")], env={}) == 0
+    assert json.loads(capsys.readouterr().out)["sessions_logged"] == 0                      # nothing logged: stated, not invented
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write('{"tampered": true}\n')                                                      # a broken chain is reported, not trusted
+    assert AP.main(["quality", "--root", str(w.tmp / "eng_fb")], env={}) == 1

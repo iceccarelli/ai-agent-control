@@ -254,3 +254,44 @@ def policy_summary(groups: Sequence[Mapping[str, Any]], *, min_orders: int = MIN
     return {"schema": "exec_quality.policy.v1", "policies": rows, "min_orders_per_policy": min_orders, "verdict": "COMPARABLE_SAMPLE" if enough else "INSUFFICIENT_SAMPLE",
             "claim": "measured execution cost on this sample only; Testnet fills are not Mainnet fills and an unfilled maker attempt is not a zero-cost one",
             "policies_with_data": styles}
+
+
+# ---------------------------------------------------------------------------------------------------- research feedback: measured vs modelled, session by session
+def feedback_row(*, session: str, at_ms: int, decision_id: Optional[str], quality: Optional[Mapping[str, Any]], funding: Optional[Mapping[str, Any]], edge: Optional[Mapping[str, Any]],
+                 flat_verified: Optional[bool]) -> Dict[str, Any]:
+    """One chained row per finished session: the MEASURED execution cost of the whole attempt beside the cost the economic model charged for it, and the funding the venue paid beside the funding
+    the model expected. Everything is a string / number / None (None = UNKNOWN); nothing is estimated here. ``modelled_cost_bps`` is the sum of the verdict's own cost lines (None when any is unknown);
+    ``expected_funding_bps`` is the verdict's post-haircut expectation over the hold; ``realised_funding_bps`` exists only when the settlement recognition booked every held settlement."""
+    g = dict((quality or {}).get("group") or {})
+    costs = dict((edge or {}).get("costs_bps") or {})
+    cv = [_d(v) for v in costs.values()]
+    modelled = None if (not costs or any(c is None for c in cv)) else sum(cv, D(0))
+    booked, notional = None, _d(g.get("position_notional_usd"))
+    for r in list((funding or {}).get("recognitions") or []):
+        if isinstance(r, Mapping) and r.get("all_prints_resolved") and r.get("booked_usd") is not None:
+            booked = (booked or D(0)) + (_d(r.get("booked_usd")) or D(0))
+    realised = (booked / notional * BPS) if (booked is not None and notional is not None and notional > 0) else None
+    return {"schema": "exec_quality.feedback.v1", "at_ms": int(at_ms), "session": str(session)[:80], "decision_id": decision_id, "style": g.get("style") or UNKNOWN,
+            "flat_verified": flat_verified is True, "attempt_completed": bool(g.get("attempt_completed")), "cost_complete": bool(g.get("cost_complete")),
+            "position_notional_usd": g.get("position_notional_usd"), "total_execution_cost_usd": g.get("total_execution_cost_usd"),
+            "total_execution_cost_bps_of_position_notional": g.get("total_execution_cost_bps_of_position_notional"), "unhedged_window_ms": g.get("unhedged_window_ms"),
+            "modelled_cost_bps": _s(modelled, 4), "expected_funding_bps": _s(_d((edge or {}).get("expected_funding_bps")), 4), "funding_booked_usd": _s(booked, 6),
+            "realised_funding_bps": _s(realised, 4)}
+
+
+def feedback_report(rows: Sequence[Mapping[str, Any]], *, min_orders: int = MIN_COMPARABLE_ORDERS) -> Dict[str, Any]:
+    """What the log of sessions says: the policy comparison (never a winner below the sample minimum), how far the cost model is from measurement (positive surprise = the model was too
+    optimistic about cost) and how realised funding compares with the expectation. Counts every row it uses; says INSUFFICIENT_SAMPLE instead of an average from a handful."""
+    done = [r for r in rows if r.get("attempt_completed") and r.get("cost_complete") and r.get("total_execution_cost_bps_of_position_notional") is not None and r.get("modelled_cost_bps") is not None]
+    sur = [_d(r["total_execution_cost_bps_of_position_notional"]) - _d(r["modelled_cost_bps"]) for r in done]
+    fund = [r for r in rows if r.get("realised_funding_bps") is not None and r.get("expected_funding_bps") is not None]
+    fs = [_d(r["realised_funding_bps"]) - _d(r["expected_funding_bps"]) for r in fund]
+    mean = lambda xs: _s((sum(xs, D(0)) / len(xs)) if xs else None, 4)        # noqa: E731
+    return {"schema": "exec_quality.report.v1", "sessions_logged": len(rows), "policy": policy_summary(rows, min_orders=min_orders),
+            "model_vs_measured": {"sessions": len(done), "mean_measured_cost_bps": mean([_d(r["total_execution_cost_bps_of_position_notional"]) for r in done]),
+                                  "mean_modelled_cost_bps": mean([_d(r["modelled_cost_bps"]) for r in done]), "mean_cost_surprise_bps": mean(sur),
+                                  "sessions_costlier_than_modelled": sum(1 for x in sur if x > 0), "status": "ENOUGH" if len(done) >= min_orders else "INSUFFICIENT_SAMPLE",
+                                  "reading": "positive surprise = the model under-charged execution cost; the first measurement of the assumed 0.4 bps spread / slippage term"},
+            "funding_vs_expected": {"sessions": len(fund), "mean_realised_bps": mean([_d(r["realised_funding_bps"]) for r in fund]), "mean_expected_bps": mean([_d(r["expected_funding_bps"]) for r in fund]),
+                                    "mean_shortfall_bps": mean(fs), "status": "ENOUGH" if len(fund) >= min_orders else "INSUFFICIENT_SAMPLE"},
+            "claim": "Testnet measurements describe this execution path, not Mainnet expectancy"}

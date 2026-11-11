@@ -43,6 +43,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
 
 import bybit_connection as bc  # noqa: E402
 import exec_lifecycle as EL  # noqa: E402
+import exec_quality as EQ  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
@@ -545,6 +546,15 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT"), quality if isinstance(quality, dict) else None,
                                 funding if isinstance(funding, dict) else None):
         emit(evt)
+    try:                                                              # research feedback: measured vs modelled, one chained row per session (evidence only; never affects safety)
+        import evidence_chain as _EC
+        dec = ES.read_json(os.path.join(d, "decision.json"))
+        _EC.append(os.path.join(engine_root, "exec_quality_log.jsonl"),
+                   EQ.feedback_row(session=os.path.basename(d), at_ms=int(clock()), decision_id=dec.get("decision_id") if isinstance(dec, dict) else None,
+                                   quality=quality if isinstance(quality, dict) else None, funding=funding if isinstance(funding, dict) else None, edge=verdict.as_dict(),
+                                   flat_verified=rec.get("flat_verified")))
+    except Exception:                                                  # noqa: BLE001
+        pass
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
@@ -1155,6 +1165,8 @@ def _parser() -> argparse.ArgumentParser:
     cp.add_argument("--ack-drawdown", action="store_true", help="after YOU reviewed the losses that hit the drawdown stop: resume from the current verified basis (a new drawdown peak)")
     cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
     cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
+    qp = sub.add_parser("quality", help="READ-ONLY: measured execution cost vs the model's, realised funding vs expected, and the policy comparison, from the chained session log (no venue access, nothing written)")
+    qp.add_argument("--root", default=DEFAULT_ROOT)
     ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
     ev.add_argument("--symbol", help="default: the grant's / capability's first symbol, else BTCUSDT")
     ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40% of the ceiling)")
@@ -1206,6 +1218,18 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
             print("transfer declared" if cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]) else "refused or already declared")
         print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
+    if a.cmd == "quality":
+        import evidence_chain as _EC
+        path = os.path.join(a.root, "exec_quality_log.jsonl")
+        try:
+            rows = [r for r in _EC.rows_of(_EC.read_lines(path)[0]) if isinstance(r, dict)] if os.path.exists(path) else []
+            ok = _EC.verify(path).get("ok", False) if os.path.exists(path) else True
+        except Exception:                                              # noqa: BLE001
+            rows, ok = [], False
+        rep = EQ.feedback_report(rows)
+        rep["log_chain_ok"] = bool(ok)
+        print(json.dumps(rep, indent=2, sort_keys=True, default=str))
+        return 0 if ok else 1
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps, engine_root=getattr(a, "root", None))
         if a.record_to and isinstance(res.get("decision_record"), dict):

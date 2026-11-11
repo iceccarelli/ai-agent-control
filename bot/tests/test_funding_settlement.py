@@ -15,6 +15,7 @@ sys.path[:0] = [HERE, BOT, os.path.join(BOT, "tools")]
 import exec_evidence as XE  # noqa: E402
 import exec_lifecycle as EL  # noqa: E402
 import funding_settlement as FS  # noqa: E402
+import runtime_capability as RC  # noqa: E402
 from ms_testnet_world import World, begin  # noqa: E402
 
 SYM = "BTCUSDT"
@@ -256,13 +257,11 @@ def test_the_executor_can_read_the_public_history_and_the_transaction_log_stays_
     assert run.ex.funding_history("BTCUSDT", 1_795_000_000_000, 1_796_000_000_000) == []                 # a complete empty answer is a statement: no settlement
     w.fake.funding_prints = None
     assert run.ex.funding_history("BTCUSDT", 1, 2) is None                                                # an error is UNKNOWN, not empty
-    # the capability pin: the transaction log is NOT readable by the executor role (a Wallet-class permission question that is the owner's), the public history and the execution list are
-    host = "api-testnet.bybit.com"
-    cap = run.client.transport.capability if hasattr(run.client.transport, "capability") else None
-    if cap is not None:
-        assert cap.check("GET", "/v5/account/transaction-log", True, host) is not None
-        assert cap.check("GET", "/v5/execution/list", True, host) is None
-        assert cap.check("GET", "/v5/market/funding/history", False, host) is None
+    # the capability pin (unconditional): the transaction log is NOT readable by the executor role (the Wallet-class permission question is the owner's); the public history and the execution list are
+    cap = RC.Capability.for_role(RC.TESTNET_EXECUTOR, venue="testnet", credential_class=RC.TESTNET_CREDENTIAL_CLASS, api_key="k" * 20, api_secret="s" * 20)
+    assert cap.check("GET", "/v5/account/transaction-log", True, cap.host) == "ENDPOINT_NOT_ALLOWED"
+    assert cap.check("GET", "/v5/execution/list", True, cap.host) is None
+    assert cap.check("GET", "/v5/market/funding/history", False, cap.host) is None
 
 
 def test_the_funding_evidence_events_pass_the_guard_state_the_unverified_convention_and_never_carry_a_venue_id(w):
