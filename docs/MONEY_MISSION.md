@@ -5,6 +5,23 @@
 **Snapshot main before the first handover update:** `e146212e040e3bf0eca9eafa643c286cc2ec411b`
 **Purpose:** give Claude Code a verified starting point and an economically ranked plan. Re-check all dated operational facts before acting.
 
+## 0. Current state (read this first; every dated claim is a snapshot: re-verify live state)
+
+**Written 2026-11-11 (UTC) at `main` = `3bd1712` (PR #252 merged).** The sections below are history and detail; the last section ("Money directive round (2026-11-11)") has the evidence behind each line here.
+
+| Question | State | Source |
+|---|---|---|
+| Code merged this round | #249 (verdict charges the cost of capital; wedged-exit, edge-gate clock, owner-unwind ALERT; unknown fee/quote stay unknown), #250 (settlement re-check at order time; `recorder_disk_low` alert; no selection by a modelled cost), #251 (reject-only early rule for the verdict ladder; replay ledger no longer values an unknown price at zero), #252 (bounded stalled-recorder recovery) | git, 2026-11-11 |
+| CI | all required checks green on the exact head of each of #249-#252 (the autopilot-image check is path-filtered and did not run on #252) and on main's carry-verify/security for the #249, #250 and #251 merges; main's run for the #252 merge was still in progress when this was written | GitHub, 2026-11-11 |
+| Economics | **NO WINNER.** BTC cash-and-carry is REJECTED against cash on the committed corpus (17-day overlay: +20.2 bps nominal, **-5.75 bps** excess over OKX USDT lending on 1.16x capital, block-CI90 [-9.3, -2.6]; acquire -22.99); the last-365-day funding (2.8%/yr) is below cash before any fee. Every other family is UNTESTED for lack of data. The executor's own profit gate needs about 53 bps in one print (corpus max 11.28): PROFIT_SEEKING is unreachable on BTC. Testnet is mechanics only | last section |
+| Deployed on Fly | **UNKNOWN.** The last owner-supplied image is 2026-11-05 and predates #243-#252; nothing merged here is running until the owner redeploys | owner-supplied, not re-read |
+| Live recorder | stalled at the write reserve: the carry-watch run of 2026-11-11T12:28Z measured 511 MiB free (run 43020528944), `recorder_down` and `recorder_disk_low` both fired; the live volume size is unrecorded (the only captured figure is 1 GB, 2026-10-25) | GitHub Actions log |
+| Authority | no capability, grant or Testnet credentials in this sandbox; owner-side UNKNOWN. No order-capable run, deploy, migration or Mainnet action was performed by an agent | sandbox, 2026-11-11 |
+
+**Owner-only, in this order** (exact commands in the last section): (1) read the recorder volume (`fly volumes list -a carry-drill`, `df -h /data`) and extend it or lower retention; a volume smaller than the retained days plus the reserve still stalls for good; back up any sealed day before the next UTC midnight; (2) redeploy `carry-drill` and the autopilot from merged source and verify (RUNBOOKS section 18 and "Legacy apps: carry-drill and carry-book"); (3) refresh the public funding history to today and read the account fee tier (read-only); (4) the capability/grant and the first held Testnet session across a real settlement (settles the Funding-row sign); (5) the point-in-time universe capture and funding/mark backfill, with the holdout certified before the first evaluation read.
+
+**Repository-side next, ranked:** the remaining structural cost-formula pins (a zero-valued quantity labelled modelled/derived/assumed is now pinned per file by `tests/test_zero_cost_label_pins.py`; the fee-literal allow-list is not) and a minimal canonical pricer (one capital line, unknown never zero); a read-only consumer of the measured-cost feedback once about 30 mechanics sessions exist; a bridge so the cash-vs-carry check runs on a refreshed `market_history` root instead of only the committed corpus; the autopilot-image workflow's path filter omits `bot/md_*.py` although `Dockerfile.autopilot` copies them (a change to those files did not trigger that check on #252). Do not build maker/PostOnly or microstructure work, a research worker, or dashboards before a candidate clears the capital-and-cash gate.
+
 ## 1. Commercial objective
 
 The only meaningful product outcome for this repository is a repeatable, scalable, positive **net** return on owner economic capital with survivable tail risk. Optimise the long-run expected net cash return, not gross funding, simulated P&L, notional turnover, trade count, code output, infrastructure count or the appearance of activity.
