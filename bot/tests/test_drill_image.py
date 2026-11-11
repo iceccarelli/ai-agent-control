@@ -143,3 +143,16 @@ def test_fly_config_properties():
     ms = int(re.search(r'kill_timeout = "(\d+)s"', code).group(1))
     assert ms >= 240
     assert 'dockerfile = "Dockerfile.drill"' in code
+
+
+def test_the_real_container_smoke_script_is_offline_and_arms_nothing():
+    """deploy/drill-image-smoke.sh runs in CI with the network available: every container it starts must be created with `--network none` (so nothing can reach Bybit or any service), and it must
+    never set a credential, an arming variable or a mainnet switch for a container. (Detecting those names in the image is the point of the script; setting them is never allowed.)"""
+    import re
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deploy", "drill-image-smoke.sh")
+    text = open(path, encoding="utf-8").read()
+    runs = [ln for ln in text.splitlines() if re.search(r"\bdocker run\b", ln) and not ln.lstrip().startswith("#")]
+    assert runs, "the smoke script starts no container"
+    assert all("--network none" in ln for ln in runs), [ln for ln in runs if "--network none" not in ln]
+    assert not re.search(r"-e\s+(LIVE_TRADING_ACK|USE_TESTNET=0|PAPER_TRADING=|BYBIT_(TESTNET_)?API_(KEY|SECRET))", text), "the smoke script must not set a credential or an arming variable"
+    assert "docker build -f Dockerfile.drill" in text and "set -eu" in text

@@ -38,9 +38,10 @@ IMAGES: Dict[str, Image] = {
     "Dockerfile": Image("carry-verify.yml", False, "fly.toml"),                    # job `production-image`; carry-verify has no path filter, it runs on every pull request
     "Dockerfile.autopilot": Image("autopilot-image.yml", True, "fly.autopilot.toml"),
     "Dockerfile.research": Image("research-image.yml", True, "fly.research.toml"),
-    "Dockerfile.drill": Image(None, False, "fly.drill.toml"),                      # KNOWN GAP: the recorder / monitor image has static import-closure tests but NO real-container workflow
+    "Dockerfile.drill": Image("drill-image.yml", True, "fly.drill.toml"),          # the recorder / monitor image: static closure tests AND a real-container workflow (offline, --network none)
 }
-KNOWN_GAPS = {"Dockerfile.drill": "the recorder/monitor image (Fly app carry-drill) is covered by static tests only (test_drill_image.py, test_image_manifest.py); no workflow builds and runs it"}
+#: images with NO real-container workflow, each with the reason. Empty today: add an entry (and the test below keeps it honest) only for an image that genuinely has none.
+KNOWN_GAPS: Dict[str, str] = {}
 
 
 def _read(path: str) -> str:

@@ -1,0 +1,43 @@
+# REAL container checks for the DRILL image (Dockerfile.drill: the recorder + monitor of the Fly app carry-drill): build it, run the real entrypoint, check the unprivileged user and the volume
+# ownership, that every long-running entry point imports with the pinned dependencies, that the recorder runs OFFLINE, writes its segment and status to the volume and stops cleanly on SIGTERM,
+# that the default command refuses to start without credentials, and that no credential or live switch is in the image and the testnet host cannot be changed by environment.
+# Offline and secret-free: every container runs with `--network none` (nothing can contact Bybit or any service) and no credential is used. It runs only when the image's inputs change (or on demand).
+# THE INPUTS ARE EVERYTHING THE DOCKERFILE COPIES (the top-level modules, signals/, the named tools, the deploy script, the dependency pins); the filter is deliberately WIDER than the exact COPY list and
+# bot/tests/test_image_validation_triggers.py recomputes the COPY list and fails if any shipped file is not matched by a pattern here. A merged PR does not change a running machine: this validates the
+# BUILT image; what runs on Fly is still the owner's redeploy and verification (bot/RUNBOOKS.md section 18).
+name: drill-image
+
+on:
+  pull_request:
+    paths:
+      - "bot/Dockerfile.drill"
+      - "bot/fly.drill.toml"
+      - "bot/.dockerignore"
+      - "bot/deploy/**"
+      - "bot/*.py"
+      - "bot/signals/**"
+      - "bot/tools/*.py"
+      - "bot/requirements.txt"
+      - "bot/constraints.txt"
+      - ".github/workflows/drill-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drill-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: drill image builds and runs (real container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - name: Real container checks
+        run: sh deploy/drill-image-smoke.sh carry-drill-ci
