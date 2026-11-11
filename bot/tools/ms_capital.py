@@ -23,12 +23,18 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 import time
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Mapping, Optional
 
-import ms_engine_state as ES
+BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BOT not in sys.path:
+    sys.path.insert(0, BOT)
+
+import economic_model as EM  # noqa: E402
+import ms_engine_state as ES  # noqa: E402
 
 D = Decimal
 INITIAL_FRACTION = D("0.4")            # day-one deployment: 40% of the ceiling, not all of it
@@ -36,7 +42,10 @@ MAX_FRACTION = D("0.8")                # even after gains the compounded size ne
 MAX_SCALE = D("2")                     # basis/start_cash is clamped here (and then by MAX_FRACTION)
 MIN_NOTIONAL_USD = D("20")
 MECHANICS_CAP_USD = D("100")           # a session that is not a profit candidate proves plumbing only: it does not need real size
-MARGIN_PER_USD = D("1.16")             # spot leg paid in full + ~15% perp margin + 1% buffer per USD of notional
+#: Cash a session COMMITS per USD of notional at the leverage the autopilot plans with (1): the spot leg paid in full + the perp initial margin (1/leverage) + the plan's 2% buffer = 2.04. It is the plan's
+#: OWN definition (``economic_model.hedged_pair_capital_usd``, which ``ms_testnet_session.build_plan`` enforces), not a constant someone typed: the old 1.16 (a research overlay assumption: BTC already
+#: held + ~15% perp margin) sized $200 on $232 of cash while the plan then demanded $408 and refused.
+MARGIN_PER_USD = EM.hedged_pair_capital_usd(1, 1).value
 LOSS_STREAK_HALF = 2                   # from this many consecutive realised losses the size is halved
 LOSS_STREAK_STOP = 4                   # ... and at this many entries stop until the owner acknowledges
 DRAWDOWN_STOP_USD = D("11.10")         # twice the Testnet loss ceiling: peak basis minus basis at or beyond this stops entries
@@ -70,7 +79,7 @@ class Allocation:
 
 
 def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, available_usdt: Any, basis: Optional[Decimal], start_cash: Optional[Decimal], loss_streak: int,
-             drawdown_usd: Optional[Decimal], profit_seeking: bool, halted: bool = False) -> Allocation:
+             drawdown_usd: Optional[Decimal], profit_seeking: bool, halted: bool = False, leverage: int = 1) -> Allocation:
     """The smallest of every limit; a missing input is a refusal, never a guess."""
     reasons: List[str] = []
     gm, ce, og, av = _d(grant_max_usd), _d(ceiling_usd), _d(open_gross_usd), _d(available_usdt)
@@ -93,7 +102,7 @@ def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, avail
     compounded = min(ce * INITIAL_FRACTION * scale, ce * MAX_FRACTION)
     if loss_streak >= LOSS_STREAK_HALF:
         compounded = compounded / 2
-    caps = {"GRANT_MAX": gm, "AGGREGATE_CEILING_LEFT": ce - og, "COMPOUNDED_SIZE": compounded, "MARGIN": av / MARGIN_PER_USD}
+    caps = {"GRANT_MAX": gm, "AGGREGATE_CEILING_LEFT": ce - og, "COMPOUNDED_SIZE": compounded, "MARGIN": av / EM.hedged_pair_capital_usd(1, max(1, int(leverage))).value}
     if not profit_seeking:
         caps["MECHANICS_ONLY"] = MECHANICS_CAP_USD
     binding = min(caps, key=lambda k: caps[k])
@@ -131,7 +140,7 @@ class CapitalBook:
     def _fresh(self) -> Dict[str, Any]:
         return {"schema": BOOK_SCHEMA, "start_cash_usd": None, "realised_usd": "0", "gains_usd": "0", "losses_usd": "0", "peak_basis_usd": None, "loss_streak": 0, "halted": False,
                 "pending": None, "history": [], "unverified_excess_usd": "0", "reserve_fraction": str(DEFAULT_RESERVE_FRACTION), "transfers_pending": [], "transfers_applied": [],
-                "last_cash_usdt": None, "last_cash_ms": None}
+                "last_cash_usdt": None, "last_cash_ms": None, "review_required": None}
 
     def load(self) -> Dict[str, Any]:
         """The book, a fresh one ONLY when no file exists. A file that is present but unreadable, malformed or of another schema is NOT a fresh book: silently starting over would reset the baseline,
@@ -173,7 +182,9 @@ class CapitalBook:
 
     def reserve_usd(self, b: Optional[Mapping[str, Any]] = None) -> D:
         b = b or self.load()
-        return (_d(b.get("gains_usd")) or D(0)) * (_d(b.get("reserve_fraction")) or DEFAULT_RESERVE_FRACTION)
+        frac = _d(b.get("reserve_fraction"))
+        frac = DEFAULT_RESERVE_FRACTION if frac is None else frac            # `or` would read the owner's explicit 0 as UNSET (Decimal 0 is falsy)
+        return (_d(b.get("gains_usd")) or D(0)) * frac
 
     def sizing_basis(self, b: Optional[Mapping[str, Any]] = None) -> Optional[Decimal]:
         """What the allocator may compound: the verified basis MINUS the reserve withheld from gains (losses are never softened)."""
@@ -267,13 +278,18 @@ class CapitalBook:
             status, credited, excess = "SETTLED", D(0), D(0)
             if delta < 0:
                 credited = delta                                        # a realised loss is always booked in full
-                if p.get("funding_was_read") and known is not None and abs(delta - known) > tol:
-                    status = "UNEXPLAINED_CASH"
+                if p.get("funding_was_read") and known is not None:
+                    credited = min(delta, known)                        # the ledger saw EVERY component (funding included): the loss it saw is booked whole even when an undeclared inflow made the cash fall by less
+                    if abs(delta - known) > tol:
+                        status = "UNEXPLAINED_CASH"
             elif known is None:
                 excess = delta                                          # nothing verifiable explains a gain: it does not size anything
                 status = "UNVERIFIED_GAIN" if delta > tol else "SETTLED"
             else:
-                credited = min(delta, max(known, D(0)))
+                if p.get("funding_was_read") and known < 0:
+                    credited = known                                    # the ledger saw EVERY component (funding included) and the session LOST: an undeclared inflow that lifted the cash does not erase it
+                else:
+                    credited = min(delta, max(known, D(0)))
                 excess = delta - credited
                 if p.get("funding_was_read") and abs(delta - known) > tol:
                     status = "UNEXPLAINED_CASH"
@@ -300,6 +316,11 @@ class CapitalBook:
             entry = {"session_id": p["session_id"], "delta_usd": str(delta), "transfers_removed_usd": str(transfers), "credited_usd": str(credited), "unverified_excess_usd": str(excess),
                      "status": status, "usdt_before": p["usdt_before"], "usdt_after": str(now), "flat_verified": bool(flat)}
             b["history"] = (list(b["history"]) + [entry])[-HISTORY_MAX:]
+            if status == "UNEXPLAINED_CASH" and not b.get("review_required"):
+                # The stop is part of THIS save. The autopilot used to write its ALERT marker in a separate file afterwards; a process killed between the two left a book that had moved on and no
+                # marker, and the next session traded on cash it had already called unexplained. The book is the source of truth: every session reads this and re-asserts the ALERT.
+                b["review_required"] = {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": p["session_id"], "delta_usd": str(delta), "known_usd": None if known is None else str(known),
+                                        "set_ms": int(time.time() * 1000)}
             b["transfers_applied"] = (list(b["transfers_applied"]) + [{**t, "applied_to": p["session_id"], "counted": t in counted} for t in b["transfers_pending"]])[-HISTORY_MAX:]
             b["transfers_pending"] = []
             b["pending"] = None
@@ -312,6 +333,18 @@ class CapitalBook:
             if not b.get("halted"):
                 return False
             b["halted"], b["loss_streak"] = False, 0
+            self._save(b)
+            return True
+
+    def acknowledge_review(self) -> bool:
+        """The owner's explicit decision, after reading the unexplained session's evidence in the book, to let entries resume. It changes no money and no history; False when there is no
+        review open. Clearing the ALERT marker alone never does this: the autopilot re-asserts the marker from the book."""
+        with self._locked():
+            b = self.load()
+            if not b.get("review_required"):
+                return False
+            b["review_required"] = None
+            b.setdefault("review_acknowledged", []).append({"at_ms": int(time.time() * 1000)})
             self._save(b)
             return True
 
@@ -338,5 +371,5 @@ class CapitalBook:
                 "verified_losses_usd": b["losses_usd"], "basis_usd": None if bs is None else str(bs), "reserve_fraction": b["reserve_fraction"], "reserve_usd": str(self.reserve_usd(b)),
                 "sizing_basis_usd": None if sb is None else str(sb), "unverified_excess_usd": b["unverified_excess_usd"], "transfers_pending": b["transfers_pending"],
                 "lifecycles_settled": len(b["history"]), "wins": len(wins), "losses": len(losses), "profit_factor": None if gl == 0 else str((gp / gl).quantize(D("0.01"))),
-                "max_drawdown_now_usd": None if self.drawdown(b) is None else str(self.drawdown(b)), "loss_streak": b["loss_streak"], "halted": b["halted"], "pending": b["pending"],
+                "max_drawdown_now_usd": None if self.drawdown(b) is None else str(self.drawdown(b)), "loss_streak": b["loss_streak"], "halted": b["halted"], "review_required": b.get("review_required"), "pending": b["pending"],
                 "label": "TESTNET SIMULATION: fake money; verified realised cash only; not real-world performance"}

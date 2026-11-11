@@ -4,7 +4,8 @@ labelled 'modelled' or 'derived' passes as if it were a cost (``opportunity_cost
 WHAT THIS IS. A source-level TRIPWIRE with a reviewed ALLOW-LIST of every place in production code that constructs a ``Quantity`` whose value is a statically-known zero and whose provenance is not 'measured'
 or 'venue_stated' (or cannot be resolved statically). Each entry names the file, the enclosing function, the normalised call, and the REASON it is acceptable. A NEW site fails the test until someone
 reviews it and writes the reason down; an entry whose site disappeared fails the test until it is deleted (the list tracks reality); an extra identical site inside an allowed scope fails the count check.
-It changes no behaviour. The one entry that is NOT acceptable is marked KNOWN LOOPHOLE: it stays visible until the executor's capital cost is fixed, and its entry must then be deleted.
+It changes no behaviour. An entry that is NOT acceptable but not yet fixed is marked KNOWN LOOPHOLE so it stays visible (the executor gate's modelled-zero cost of capital was one; it is fixed and no
+loophole entry remains: ``test_no_known_loophole_is_left...``).
 
 WHAT IT CATCHES (each has a mutation test below that plants it in a temporary tree). Positional and keyword arguments, ``from economic_model import Quantity as Q``, module aliases (``EM.Quantity``),
 ``Q = Quantity`` aliases, named zero constants at module, class or function level (resolved through a scope-aware, single-binding analysis: a name counts as a constant only if EVERY binding of it is the same
@@ -352,6 +353,9 @@ def scan(root: str) -> List[Site]:
 ALLOWED = {
     ("economic_model.py", "qsum", "Quantity(Decimal(0), 'derived', unit)"):
         "accumulator seed of a sum: 0 + q is q, and an unknown element makes the whole sum unknown (Quantity arithmetic); it is never reported on its own",
+    ("economic_model.py", "structural_zero", "Quantity(Decimal(0), 'derived', unit)"):
+        "the ONLY constructor of a JUSTIFIED zero: it refuses any reason outside the closed STRUCTURAL_ZERO_REASONS list, and the caller must ALSO declare the reason next to the input in "
+        "Scenario.zero_reasons, otherwise the runtime rule (_unjustified_zeros) counts the zero as ASSUMED and it can never PASS; pinned by tests/test_economic_zero_rule.py",
     ("economic_model.py", "_leg_costs", "Quantity(Decimal(0), p.provenance, 'bps')"):
         "a MAKER leg that does not cross has zero spread/slippage only as strongly as its stated fill probability: the provenance is the probability's (never upgraded to 'derived'); an unknown "
         "probability returns unknown(); no production caller builds a maker leg (the autopilot gate is taker-only), so this is exercised by the economic-model tests only",
@@ -360,11 +364,6 @@ ALLOWED = {
         "the scenario's own (possibly unknown) inputs are used instead",
     ("economic_model.py", "capacity_usd", "Quantity(Decimal(0), prov, 'usd')"):
         "a RESULT, not a cost: 'the largest notional that still clears the floor is 0' when even the smallest order fails; its provenance is the weakest of the chain's known components",
-    ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'derived', 'fraction')"):
-        "STRUCTURAL zero: the spot leg is bought with USDT, not borrowed, so there is no borrow cost to charge",
-    ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')"):
-        "KNOWN LOOPHOLE, tracked for removal: the owner's opportunity cost of capital is not stated and is represented as a modelled ZERO, so an unset cost becomes free capital and a PROFIT_CANDIDATE can "
-        "pass (the research verdict already charges it against the cash series). To be replaced by an UNKNOWN capital cost (INCONCLUSIVE) or an owner-stated one: see MONEY_MISSION.md",
 }
 
 
@@ -397,10 +396,14 @@ def test_zero_valued_quantities_without_an_observed_provenance_exist_only_where_
     assert all(isinstance(r, str) and len(r) >= 40 for r in ALLOWED.values()), "every allow-list entry needs a real reason"
 
 
-def test_the_known_loophole_is_the_only_entry_that_is_not_a_structural_zero_a_result_or_a_provenance_carrier():
-    """The allow-list is an exception list, so its size is a metric: exactly one entry is a known loophole, and when it is fixed this test fails until the entry is removed."""
-    loopholes = [k for k, why in ALLOWED.items() if why.startswith("KNOWN LOOPHOLE")]
-    assert loopholes == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')")]
+def test_no_known_loophole_is_left_and_the_executor_gate_holds_no_zero_literal_at_all():
+    """The allow-list is an exception list, so its composition is a metric. The executor gate's modelled-zero opportunity cost (an unset owner cost of capital priced as FREE) is gone: an unstated cost of
+    capital is UNKNOWN (test_ms_edge_gate.py), the borrow zero is a declared structural zero, the rejection bound comes from the model. Not one zero-valued Quantity is constructed in the gate; the
+    enforcement of the rule is the runtime check in economic_model (tests/test_economic_zero_rule.py), of which this scan is only the tripwire."""
+    assert [k for k, why in ALLOWED.items() if why.startswith("KNOWN LOOPHOLE") or why.startswith("REJECTION-ONLY PROBE")] == []
+    assert not [k for k in ALLOWED if k[0] == "tools/ms_edge_gate.py"], "the executor gate must not construct a zero-valued Quantity"
+    assert not any(k[2].endswith("'modelled', 'fraction')") for k in ALLOWED), "a modelled zero cost is the loophole's exact shape"
+    assert {k[0] for k in ALLOWED} == {"economic_model.py"}
 
 
 # ------------------------------------------------------------------------------------------------ mutation tests: every bypass the scanner claims to catch must be caught
@@ -516,17 +519,26 @@ def test_a_new_labelled_zero_planted_in_a_real_production_file_fails_the_pin(tmp
 
 def test_a_second_identical_zero_inside_an_already_allowed_scope_fails_the_count_check(tmp_path):
     root = _copy_real(tmp_path)
-    gate = root / "tools" / "ms_edge_gate.py"
-    gate.write_text(gate.read_text() + "\n\ndef evaluate_edge():\n    return EM.Quantity(D(0), 'modelled', 'fraction')\n")
+    em = root / "economic_model.py"
+    em.write_text(em.read_text() + "\n\ndef structural_zero(unit):\n    return Quantity(Decimal(0), 'derived', unit)\n")
     _found, new, _stale, multi = review(str(root))
-    assert not new and multi == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')")], (new, multi)
+    assert not new and multi == [("economic_model.py", "structural_zero", "Quantity(Decimal(0), 'derived', unit)")], (new, multi)
 
 
 def test_removing_an_allowed_zero_from_a_real_file_makes_its_entry_stale(tmp_path):
     root = _copy_real(tmp_path)
-    gate = root / "tools" / "ms_edge_gate.py"
-    text = gate.read_text()
-    assert "EM.Quantity(D(0), \"modelled\", \"fraction\")" in text or "EM.Quantity(D(0), 'modelled', 'fraction')" in text
-    gate.write_text(text.replace("EM.Quantity(D(0), \"modelled\", \"fraction\")", "EM.unknown(\"fraction\")").replace("EM.Quantity(D(0), 'modelled', 'fraction')", "EM.unknown('fraction')"))
+    em = root / "economic_model.py"
+    text = em.read_text()
+    assert 'total = Quantity(Decimal(0), "derived", unit)' in text
+    em.write_text(text.replace('total = Quantity(Decimal(0), "derived", unit)', "total = unknown(unit)"))
     _found, _new, stale, _multi = review(str(root))
-    assert ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'modelled', 'fraction')") in stale
+    assert ("economic_model.py", "qsum", "Quantity(Decimal(0), 'derived', unit)") in stale
+
+
+def test_reintroducing_the_free_capital_loophole_in_the_real_gate_fails_the_pin(tmp_path):
+    """The exact original shape: an opportunity_cost_apr keyword given a modelled ZERO. It must be reported as a NEW site (there is no allow-list entry for it any more)."""
+    root = _copy_real(tmp_path)
+    gate = root / "tools" / "ms_edge_gate.py"
+    gate.write_text(gate.read_text() + "\n\ndef _regression():\n    return dict(opportunity_cost_apr=EM.Quantity(D(0), \"modelled\", \"fraction\"))\n")
+    _found, new, _stale, _multi = review(str(root))
+    assert [(k[1], k[2]) for k in new] == [("_regression", "EM.Quantity(D(0), 'modelled', 'fraction')")], new

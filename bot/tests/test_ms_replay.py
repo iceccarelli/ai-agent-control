@@ -579,3 +579,44 @@ def test_the_report_carries_the_unknown_input_flags_so_a_consumer_cannot_miss_th
     r.pnl["flags"] = list(r.pnl.get("flags") or []) + ["MARK_MISSING:XUSDT"]
     r.pnl["fee_flags"] = ["ZERO_FEE_UNVERIFIED"]
     assert RP.build_report([r])["pnl"]["unknown_input_flags"] == ["MARK_MISSING:XUSDT", "ZERO_FEE_UNVERIFIED"]
+
+
+# ---------------------------------------------------------------- an incomplete net is a SUBTOTAL: never published as THE net, never ranked
+def test_a_complete_run_publishes_its_net_and_says_so():
+    r = go()
+    rep = RP.build_report([r])
+    assert rep["pnl"]["net_complete"] is True and rep["pnl"]["net_usd"] == rep["pnl"]["net_subtotal_usd"] and rep["pnl"]["net_usd"] is not None
+
+
+def test_default_score_never_ranks_an_incomplete_run(monkeypatch):
+    import types
+    monkeypatch.setattr(RP, "observations", lambda r: [object()])
+    c = types.SimpleNamespace(equity0=1000.0)
+    inc = types.SimpleNamespace(cfg=c, equity_curve=[(1, 1010.0)], pnl={"net": 50.0, "net_complete": False})
+    ok = types.SimpleNamespace(cfg=c, equity_curve=[(1, 1010.0)], pnl={"net": 50.0, "net_complete": True})
+    assert RP.default_score(inc) == float("-inf") and RP.default_score(ok) == pytest.approx(50.0)
+
+
+def test_the_report_withholds_the_net_of_an_incomplete_window_and_keeps_its_subtotal():
+    r = go()
+    inc = replace(r, pnl={**r.pnl, "net_complete": False, "fee_flags": ["ZERO_FEE_UNVERIFIED"]})
+    rep = RP.build_report([inc])
+    assert rep["pnl"]["net_complete"] is False and rep["pnl"]["net_usd"] is None and rep["pnl"]["net_subtotal_usd"] == pytest.approx(r.pnl["net"])
+    assert "ZERO_FEE_UNVERIFIED" in rep["pnl"]["unknown_input_flags"]
+
+
+def test_the_same_funding_print_twice_is_one_print_and_a_conflicting_second_one_makes_the_result_incomplete():
+    """The canonical ledger flags FUNDING_CONFLICT and refuses to call the net complete; the replay ledger must say the same (a mutant that dropped the flag survived every test)."""
+    led = RP.LocalLedger()
+    led.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=0.0, prov="MEASURED"))
+    led.mark("XUSDT", T0 + 5, 100.0)
+    led.record_funding("XUSDT", T0 + 10, 0.25, "MEASURED")
+    led.record_funding("XUSDT", T0 + 10, 0.25, "MEASURED")                    # the identical print again: ONE print
+    p = led.pnl()
+    assert p["funding"] == pytest.approx(0.25) and p["net_complete"] is True and not any(f.startswith("FUNDING_CONFLICT") for f in p["flags"])
+    led.record_funding("XUSDT", T0 + 10, 0.40, "MEASURED")                    # the same settlement with a DIFFERENT amount: the first stays booked, the result is incomplete
+    q = led.pnl()
+    assert q["funding"] == pytest.approx(0.25) and q["net_complete"] is False
+    assert f"FUNDING_CONFLICT:XUSDT:{T0 + 10}" in q["flags"] and q["net_subtotal"] == pytest.approx(q["net"])
+    led.record_funding("XUSDT", T0 + 20, 0.10, "MEASURED")                    # a different settlement is a new print and does not clear the conflict
+    assert led.pnl()["net_complete"] is False and led.pnl()["funding"] == pytest.approx(0.35)

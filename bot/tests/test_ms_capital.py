@@ -28,8 +28,11 @@ def test_the_grant_maximum_the_ceiling_left_and_margin_are_hard_caps():
     assert a.notional == D("120.00") and a.binding == "GRANT_MAX"
     a = alloc(open_gross_usd=450)
     assert a.notional == D("50.00") and a.binding == "AGGREGATE_CEILING_LEFT"
-    a = alloc(available_usdt=116)                                           # 116 / 1.16 = 100
+    a = alloc(available_usdt=204)                                           # 204 / 2.04 = 100: the plan commits spot + perp margin at leverage 1 + its 2% buffer per USD (was a 1.16 per-USD typed constant)
     assert a.notional == D("100.00") and a.binding == "MARGIN"
+    a = alloc(available_usdt=136, leverage=3)                               # the same function at leverage 3: (1 + 1/3) x 1.02 = 1.36 per USD
+    assert a.notional == D("100.00") and a.binding == "MARGIN"
+    assert alloc(available_usdt=232).notional < D("200")                    # $232 no longer sizes $200: the plan would demand $408 and refuse (the old allocator and the plan disagreed 1.16x vs 2.04x)
 
 
 def test_a_mechanics_session_is_capped_small():
@@ -139,6 +142,19 @@ def test_the_reserve_is_withheld_from_the_sizing_basis_but_never_softens_a_loss(
     assert b.set_reserve_fraction("0.5") and b.reserve_usd() == D("20.00")
     assert not b.set_reserve_fraction("0.95") and not b.set_reserve_fraction("-1") and not b.set_reserve_fraction("x")
     assert alloc(basis=b.sizing_basis(), start_cash=D(10000)).notional <= alloc(basis=b.basis(), start_cash=D(10000)).notional
+
+
+def test_a_reserve_fraction_the_owner_set_to_zero_is_zero_and_only_an_unset_one_is_the_default(tmp_path):
+    """`_d(x) or DEFAULT` treated the Decimal 0 as unset: the owner's explicit 0 silently became 25% (specialist E, F10)."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "40.00", True, True)
+    b.settle("10040")
+    assert b.reserve_usd() == D("10.00")                                                  # unset: the documented default
+    assert b.set_reserve_fraction("0")
+    assert b.reserve_usd() == D("0") and b.sizing_basis() == D("10040")                   # explicit zero: nothing withheld
+    assert b.set_reserve_fraction("0.9") and b.reserve_usd() == D("36.00")
+    assert b.set_reserve_fraction("0.0") and b.reserve_usd() == D("0")                     # every spelling of zero
 
 
 def test_a_declared_deposit_or_withdrawal_is_never_a_trading_result(tmp_path):
@@ -374,3 +390,93 @@ def test_a_schema_valid_book_stripped_of_its_stop_state_is_not_a_fresh_book(tmp_
             fh.write(_json.dumps(doc))
         with pytest.raises(C.BookUnreadable):
             b.load()
+
+
+def test_the_allocators_margin_per_usd_is_the_plans_own_capital_for_every_leverage():
+    """One definition: for any notional and leverage the allocator's margin cap and build_plan's cash need are the same economic_model function (no 1.16 constant to drift from it)."""
+    import economic_model as EM
+    assert C.MARGIN_PER_USD == EM.hedged_pair_capital_usd(1, 1).value == D("2.04")
+    for lev in (1, 2, 3, 5):
+        per_usd = EM.hedged_pair_capital_usd(1, lev).value
+        a = alloc(available_usdt=per_usd * 100, leverage=lev)
+        assert a.notional == D("100.00") and a.binding == "MARGIN", lev
+
+
+# ---------------------------------------------------------------- an undeclared inflow must not erase a loss the ledger saw WHOLE
+def test_a_loss_the_ledger_saw_whole_is_debited_even_when_an_undeclared_inflow_lifts_the_cash(tmp_path):
+    """Funding was READ, so the ledger's known net is every component: a loss of 0.40. A +100 USDT top-up that nobody declared lifts the wallet, which used to book NOTHING (credited 0, streak 0): the
+    loss-streak and drawdown stops were evadable by an unannounced faucet transfer. The cash is still UNEXPLAINED (an ALERT upstream); the known loss is booked."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-0.40", True, True)
+    r = b.settle("10100")
+    assert r["status"] == "UNEXPLAINED_CASH" and D(r["credited_usd"]) == D("-0.40")
+    assert D(r["unverified_excess_usd"]) == D("100.40")                                  # the whole unexplained inflow stays visible as excess, never sizes anything
+    assert b.load()["loss_streak"] == 1 and b.basis() == D("9999.60") and b.report()["verified_losses_usd"] == "-0.40"
+
+
+def test_with_funding_unread_a_cash_rise_is_not_read_as_an_inflow_that_hid_a_loss(tmp_path):
+    """Funding NOT read: the ledger's known net lacks the funding income, so a negative known with a rising wallet may simply be funding the book never saw. The book cannot tell the two apart, so it books
+    nothing (the existing, conservative behaviour: no gain credited, no phantom loss) and says UNVERIFIED_EXCESS. Stated limit, not a claim of detection."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-0.40", False, True)
+    r = b.settle("10000.60")
+    assert r["status"] == "UNVERIFIED_EXCESS" and D(r["credited_usd"]) == 0 and b.load()["loss_streak"] == 0
+
+
+def test_a_known_gain_and_a_plain_loss_are_booked_exactly_as_before(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "1.00", True, True)
+    assert b.settle("10001")["status"] == "SETTLED" and b.basis() == D("10001")
+    b.park("s2", "10001", "-2.00", True, True)
+    r = b.settle("9999")
+    assert D(r["credited_usd"]) == D("-2.00") and b.load()["loss_streak"] == 1
+
+
+# ---- a loss the ledger saw WHOLE is booked whole on both sides of zero (second independent review: the delta < 0 branch used to book only the cash's smaller fall)
+@pytest.mark.parametrize("inflow", ["0", "0.02", "1", "2.98", "3", "3.01", "10"])
+def test_a_known_loss_is_debited_whole_whatever_undeclared_inflow_lifted_the_cash(tmp_path, inflow):
+    """Ledger known -3.00 (funding read, flat). An undeclared inflow I makes the cash move by -3 + I: credited must be -3 for EVERY I (it used to be -3 + I while the cash still fell, and the
+    result was not even monotone: an inflow of 2.98 erased 2.98 of the loss, an inflow of 3.00 erased none). The unexplained cash is flagged and stops entries; the loss stays booked."""
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("100")
+    assert book.park("s1", "100", "-3.00", True, True)
+    r = book.settle(str(D("100") - D("3") + D(inflow)))
+    assert D(r["credited_usd"]) == D("-3.00"), r
+    tol = max(C.TOLERANCE_USD, D("3") * C.TOLERANCE_FRAC)
+    unexplained = abs(D(inflow)) > tol                                            # inside the tolerance the cash simply agrees with the ledger
+    assert r["status"] == ("UNEXPLAINED_CASH" if unexplained else "SETTLED")
+    assert (book.load()["review_required"] or {}).get("code") == ("ACCOUNT_CASH_UNEXPLAINED" if unexplained else None)
+    assert book.load()["loss_streak"] == 1 and D(book.load()["realised_usd"]) == D("-3.00")
+
+
+def test_a_cash_loss_bigger_than_the_ledger_knew_is_still_debited_in_full(tmp_path):
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("100")
+    assert book.park("s1", "100", "-3.00", True, True)
+    r = book.settle("95")                                                      # the cash fell by 5: the larger loss is the truth
+    assert D(r["credited_usd"]) == D("-5") and r["status"] == "UNEXPLAINED_CASH"
+
+
+def test_when_funding_was_not_read_the_cash_delta_alone_decides_a_loss(tmp_path):
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("100")
+    assert book.park("s1", "100", "-3.00", False, True)                         # funding unread: the ledger's -3.00 is a partial figure, not the whole truth
+    r = book.settle("99")
+    assert D(r["credited_usd"]) == D("-1") and r["status"] == "SETTLED"
+
+
+def test_a_dust_sized_booked_loss_still_counts_toward_the_loss_streak_a_conservative_rule_only_the_owner_may_change(tmp_path):
+    """Review finding 9 (LOW, KNOWN): the ledger saw a 2-cent loss with funding read while the cash rose 2 cents (rounding). The loss is booked in full and extends the streak, so four such sessions
+    halt entries. That is spurious but CONSERVATIVE, and the loss-streak stop is a risk limit: loosening it (a materiality floor on the streak) is the owner's policy decision (the same class as the
+    deferred dust/mechanics streak question), not a rounding fix to slip into a review round. Pinned so any change to it is deliberate and visible."""
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("1000")
+    for i in range(C.LOSS_STREAK_STOP):
+        assert book.park(f"s{i}", "1000", "-0.02", True, True)
+        r = book.settle("1000.02")
+        assert r["status"] == "SETTLED" and D(r["credited_usd"]) == D("-0.02"), r
+    rep = book.report()
+    assert rep["loss_streak"] == C.LOSS_STREAK_STOP and rep["halted"] is True and D(rep["verified_losses_usd"]) == D("-0.08")

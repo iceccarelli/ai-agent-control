@@ -145,6 +145,47 @@ def qsum(items: Sequence[Quantity], unit: str = "") -> Quantity:
     return total
 
 
+# --------------------------------------------------------------------------------------------------------------------------
+# A zero cost is a CLAIM: it must be a measurement, or zero BY CONSTRUCTION for a reason on a closed list
+# --------------------------------------------------------------------------------------------------------------------------
+#: A cost input below this is a zero whatever its spelling (0, '0E-8', 1e-30, D(1) - D(1), -0, replace(), **dict) AND whatever its size under it: no real cost input, in bps or as an annual fraction, is
+#: smaller than a billionth, so a 'modelled' 1E-11 is a zero spelled as a number (the independent re-review passed 1E-11 for impact, basis, borrow and opportunity cost under the old 1e-12 bound).
+ECONOMIC_ZERO = Decimal("1e-9")
+
+#: The ONLY reasons an input may be exactly zero (or, for the hedge ratio, exactly one) without being a measurement, each BOUND to the one scenario input it speaks about. A reason is a claim about ONE
+#: input: the same words declared against another input justify nothing (an owner-stated zero COST OF CAPITAL cannot excuse a zero market impact; a review reproduced exactly that). A zero that is not
+#: 'measured' / 'venue_stated' and not justified by a reason bound to ITS input is UNJUSTIFIED: it counts as an ASSUMED input and so can never PASS (``ChainResult.assumed_inputs``). A source scan can only
+#: be a tripwire for spellings it knows; this is value-based: every spelling of a value under ECONOMIC_ZERO is caught, while a larger number is an ESTIMATE the caller owns, with its provenance, that this rule cannot judge (the independent re-review passed 2E-9 for impact, basis, borrow and opportunity cost: above the bound, so a number).
+STRUCTURAL_ZERO_INPUTS: Mapping[str, frozenset] = {
+    "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW": frozenset({"borrow_apr"}),                  # the spot buy is paid from the USDT balance (the plan refuses a plan the cash cannot fund): there is no loan to pay interest on
+    "OWNER_STATED_ZERO_COST_OF_CAPITAL": frozenset({"opportunity_cost_apr"}),             # the owner explicitly stated 0%/yr: capital is free by decision, not by omission
+    "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL": frozenset({"hedge_ratio"}),          # a spot BUY whose taker fee is exactly 0 leaves no base-coin shortfall: the perp short is a whole hedge
+}
+STRUCTURAL_ZERO_REASONS = frozenset(STRUCTURAL_ZERO_INPUTS)
+
+
+def structural_zero(unit: str, reason: str) -> Quantity:
+    """A cost that is zero BY CONSTRUCTION. ``reason`` must be one of ``STRUCTURAL_ZERO_REASONS`` and must ALSO be declared next to the input in ``Scenario.zero_reasons``: this constructor alone
+    justifies nothing."""
+    if reason not in STRUCTURAL_ZERO_REASONS:
+        raise EconomicModelError(f"{reason!r} is not an accepted structural-zero reason")
+    return Quantity(Decimal(0), "derived", unit)
+
+
+#: The Testnet plan's own cash buffer (ms_testnet_session.build_plan refuses a plan whose cash need exceeds the USDT it read).
+PLAN_BUFFER_FRACTION = Decimal("0.02")
+
+
+def hedged_pair_capital_usd(notional_usd: Any, leverage: Any, *, buffer_fraction: Any = PLAN_BUFFER_FRACTION) -> Quantity:
+    """The cash a spot-buy + perp-short pair COMMITS at ``leverage``: the spot leg paid in full, plus the perp initial margin (notional / leverage), plus the plan's buffer. ONE definition, derived from the plan's
+    own inputs and never a constant per USD (a per-USD constant silently encodes one leverage): the plan's cash need, the allocator's margin cap, the decision record's ``capital_required_usd`` and the
+    cost of capital charged by the executor's gate all read it. (The research overlay's 1.16x is a DIFFERENT, assumed construction: BTC the owner already holds plus ~15% perp margin.)"""
+    n, lev, buf = to_decimal(notional_usd), to_decimal(leverage), to_decimal(buffer_fraction)
+    if n <= 0 or lev < 1 or buf < 0:
+        raise EconomicModelError("a capital basis needs notional > 0, leverage >= 1 and a buffer >= 0")
+    return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "derived", "usd")
+
+
 def at_least(q: Quantity, floor: Any) -> Optional[bool]:
     """Tri-state comparison: None when q is unknown (an unknown is neither above nor below)."""
     return None if not q.known else q.value >= to_decimal(floor)
@@ -571,6 +612,9 @@ class Scenario:
     margin_usd: Quantity = field(default_factory=lambda: unknown("usd"))
     # probability that ONE maker leg fills; required (explicit, with provenance) for any maker leg, else the maker leg's cost is UNKNOWN
     maker_fill_probability: Quantity = field(default_factory=lambda: unknown("probability"))
+    # input name -> a STRUCTURAL_ZERO_INPUTS reason BOUND to that input: the ONLY way a cost input that is exactly zero (or a hedge ratio that is exactly one) may be anything other than 'measured' /
+    # 'venue_stated' (see ``_unjustified_zeros``). A reason declared against an input it is not bound to justifies nothing.
+    zero_reasons: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -582,6 +626,7 @@ class ChainResult:
     capital_utilisation: Quantity          # notional / margin
     digest: str
     scenario_inputs: Mapping[str, Quantity] = field(default_factory=dict)      # the scenario's own non-cost inputs (gross edge, hedge ratio ...) with provenance
+    unjustified_zero_inputs: Tuple[str, ...] = ()                              # cost inputs that are a bare zero (and a hedge ratio that is a bare one) labelled derived / modelled / assumed with no structural reason bound to them: counted as ASSUMED
 
     @property
     def unknown_inputs(self) -> Tuple[str, ...]:
@@ -590,7 +635,7 @@ class ChainResult:
     @property
     def assumed_inputs(self) -> Tuple[str, ...]:
         """Every input whose number is an ASSUMPTION: cost components AND the scenario's gross edge / hedge ratio / maker probability. Any one blocks a PASS."""
-        names = {k for k, q in self.components.items() if q.provenance == "assumed"}
+        names = {k for k, q in self.components.items() if q.provenance == "assumed"} | set(self.unjustified_zero_inputs)
         names |= {k for k, q in self.scenario_inputs.items() if q.known and q.provenance == "assumed"}
         return tuple(sorted(names))
 
@@ -668,6 +713,59 @@ def _validate_scenario(scn: Scenario) -> None:
         raise EconomicModelError(f"the funding edge was built for hold_days={ge.hold_days} ({ge.n_settlements} settlements) but the scenario holds {hold}")
 
 
+_ZERO_CHECKED = {"impact_bps": "impact", "basis_cost_bps": "basis", "borrow_apr": "borrow", "opportunity_cost_apr": "opportunity_cost", "adverse_selection_bps": "adverse_selection",
+                 "adverse_move_bps": "adverse_move"}
+_NOT_OBSERVED = ("derived", "modelled", "assumed")
+
+
+def _is_whole_hedge(scn: Scenario) -> bool:
+    return scn.hedge_ratio.known and abs(Decimal(1) - scn.hedge_ratio.value) < ECONOMIC_ZERO
+
+
+def _spot_buy_leg_pays_no_base_fee(scn: Scenario) -> bool:
+    """The FACT behind ``ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL``: the scenario really has a spot BUY leg whose fee is taken in the base coin and whose fee rate (the leg's role) is exactly zero.
+    The other two reasons are plan-level facts (cash-funded spot, an owner's statement) that a scenario cannot show, so they are bound to their input and nothing more."""
+    for leg in scn.legs:
+        tier = leg.fee_tier
+        if leg.instrument.category == "spot" and leg.side == "buy" and leg.fee_in_base and tier is not None and (tier.maker if leg.role == "maker" else tier.taker) == 0:
+            return True
+    return False
+
+
+_REASON_FACTS = {"ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL": _spot_buy_leg_pays_no_base_fee}
+
+
+def _zero_is_justified(scn: Scenario, name: str) -> bool:
+    """True only when ``scn.zero_reasons`` names, for THIS input, a reason on the closed list that is BOUND to this input (``STRUCTURAL_ZERO_INPUTS``), and, where the scenario can show the fact the
+    reason states (``_REASON_FACTS``), the fact holds (a reason is not a password: the independent re-review declared the zero-fee reason on a scenario with no spot leg). Never raises on a
+    malformed reason."""
+    reason = scn.zero_reasons.get(name)
+    if not (isinstance(reason, str) and name in STRUCTURAL_ZERO_INPUTS.get(reason, frozenset())):
+        return False
+    fact = _REASON_FACTS.get(reason)
+    return fact is None or bool(fact(scn))
+
+
+def _unjustified_zeros(scn: Scenario, maker_legs: int) -> Tuple[str, ...]:
+    """Inputs that are a bare ZERO (the hedge ratio: a bare ONE) the model cannot vouch for: |value| below ECONOMIC_ZERO, a provenance that is not an observation (derived / modelled / assumed) and no
+    reason bound to that input in ``scn.zero_reasons``. Value-based, so it holds however the zero was spelled. A zero adverse-selection input is only checked when a maker leg actually uses it; a zero adverse
+    move is only checked while the hedge is not whole (the hedge error is |1 - hedge_ratio| x the move, so a whole hedge has nothing to move against); and a whole hedge is itself a claim: it must be
+    measured / venue_stated or carry its bound reason, because a hedge error of exactly zero is the cheapest cost to claim."""
+    out = []
+    whole = _is_whole_hedge(scn)
+    for name, comp in _ZERO_CHECKED.items():
+        if name == "adverse_selection_bps" and not maker_legs:
+            continue
+        if name == "adverse_move_bps" and whole:
+            continue
+        q = getattr(scn, name)
+        if q.known and abs(q.value) < ECONOMIC_ZERO and q.provenance in _NOT_OBSERVED and not _zero_is_justified(scn, name):
+            out.append(comp)
+    if whole and scn.hedge_ratio.provenance in _NOT_OBSERVED and not _zero_is_justified(scn, "hedge_ratio"):
+        out.append("hedge_ratio")
+    return tuple(sorted(out))
+
+
 def evaluate_chain(scn: Scenario) -> ChainResult:
     n = to_decimal(scn.notional_usd)
     if n <= 0 or not scn.legs:
@@ -714,7 +812,26 @@ def evaluate_chain(scn: Scenario) -> ChainResult:
     inputs = {"gross_edge": scn.gross_edge_bps, "hedge_ratio": scn.hedge_ratio, "adverse_move": scn.adverse_move_bps}
     if maker_legs:
         inputs["maker_fill_probability"] = p_fill
-    return ChainResult(comps, stages, executable, tuple(blockers), util, digest((scn,)), inputs)
+    return ChainResult(comps, stages, executable, tuple(blockers), util, digest((scn,)), inputs, _unjustified_zeros(scn, maker_legs))
+
+
+_NET_COST_COMPONENTS = ("fees", "spread", "slippage", "adverse_selection", "maker_fill", "impact", "basis", "borrow", "opportunity_cost", "hedge_error")
+
+
+def net_edge_upper_bound_bps(res: ChainResult, *, nonneg_unknown: Sequence[str] = ()) -> Optional[Decimal]:
+    """The CAPTURABLE net edge (bps of notional) if every UNKNOWN component named in ``nonneg_unknown`` were FREE. A cost is never below zero, so this is an UPPER bound on the true net edge: a verdict
+    that fails its hurdle even on this bound is REJECTED whatever the missing input would have been. None when the chain is not executable, the gross edge is unknown, or ANY other component is unknown.
+    It can only ever REJECT: a PASS needs every input known (``ChainResult.net_edge_bps``), and the bound is never reported as a net."""
+    if not res.executable or not res.stages["THEORETICAL"].known:
+        return None
+    total = res.stages["THEORETICAL"].value
+    for k in _NET_COST_COMPONENTS:
+        q = res.components[k]
+        if q.known:
+            total -= q.value
+        elif k not in nonneg_unknown:
+            return None
+    return total
 
 
 def round_trip_fee_bps(rates: Sequence[Quantity]) -> Quantity:

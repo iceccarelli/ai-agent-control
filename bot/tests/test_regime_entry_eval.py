@@ -17,6 +17,7 @@ for _p in (BOT, os.path.join(BOT, "tools"), os.path.join(BOT, "tests")):
         sys.path.insert(0, _p)
 
 import candidate_readiness as CR  # noqa: E402
+import history_holdout as HH  # noqa: E402
 import regime_entry_eval as RE  # noqa: E402
 import research_harness as RH  # noqa: E402
 
@@ -214,7 +215,7 @@ def test_it_runs_on_a_real_history_root_and_refuses_a_missing_universe(tmp_path,
         raise AssertionError("network touched")
     monkeypatch.setattr(socket.socket, "connect", boom)
     root, uni, spot = TCR._hist(tmp_path)
-    out = RE.run_on_root(root, universe_dir=uni, ledger_path=str(tmp_path / "led.jsonl"), spot_dir=spot, mark_interval=TCR.MARK_IV)
+    out = RE.run_on_root(root, universe_dir=uni, ledger_path=str(tmp_path / "led.jsonl"), spot_dir=spot, mark_interval=TCR.MARK_IV, holdout_ledger=HH.UNGUARDED)
     assert out["verdict"] == "INSUFFICIENT_DATA" and out["registration_digest"] == RE.registration_digest() and out["input"]["symbols_loaded"] == 4
     assert out["basis_measurement"]["status"] == "UNMEASURED"
     with pytest.raises(SystemExit) as ei:
@@ -314,7 +315,7 @@ def test_reg2_runs_through_the_cli_on_a_real_history_root(tmp_path, monkeypatch,
     monkeypatch.setattr(socket.socket, "connect", boom)
     root, uni, spot = TCR._hist(tmp_path)
     rc = RE.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", TCR.MARK_IV, "--ledger-dir", str(tmp_path / "L"), "--registration", "reg-2",
-                  "--json", str(tmp_path / "o.json")])
+                  "--json", str(tmp_path / "o.json"), "--unreserved-exploratory"])             # about the CLI contract; the reserved-holdout guard has its own file (test_history_holdout.py)
     assert rc == 0
     o = json.loads((tmp_path / "o.json").read_text())
     assert o["registration"]["registration_id"].endswith("@reg-2") and o["post_hoc"] is True and o["verdict"] == "INSUFFICIENT_DATA"

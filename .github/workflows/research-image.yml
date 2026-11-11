@@ -7,6 +7,7 @@ on:
     paths:
       - "bot/Dockerfile.research"
       - "bot/fly.research.toml"
+      - "bot/.dockerignore"
       - "bot/deploy/research-*"
       - "bot/tools/research_*.py"
       - "bot/tools/dataset_inventory.py"

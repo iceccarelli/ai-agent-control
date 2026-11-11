@@ -22,6 +22,7 @@ sys.path.insert(0, HERE)
 
 import candidate_readiness as CR  # noqa: E402
 import research_harness as RH  # noqa: E402
+import history_holdout as HH  # noqa: E402
 
 DAY = CR.MS_DAY
 
@@ -377,7 +378,10 @@ def test_cli_history_root_requires_a_universe_and_runs_the_round_trip(tmp_path, 
         CR.main(["--history-root", root])
     with pytest.raises(SystemExit):
         CR.main(["--market-history", root])                                                                         # the old assumed layout is gone
-    assert CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV]) == 0
+    with pytest.raises(SystemExit):                                                                                 # no reserved holdout: refused (the guard has its own file, test_history_holdout.py)
+        CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV])
+    assert "HOLDOUT_NOT_RESERVED" in capsys.readouterr().err
+    assert CR.main(["--history-root", root, "--universe-dir", uni, "--spot-dir", spot, "--mark-interval", MARK_IV, "--unreserved-exploratory"]) == 0
     assert "ranked funding:" in capsys.readouterr().out
 
 
@@ -874,9 +878,9 @@ def test_the_cross_sectional_path_refuses_without_a_universe_dir_and_says_so_lou
     assert any("UNIVERSE_DIR_REQUIRED" in x for x in row["readiness_reasons"])
     assert row["readiness"]["highest"] == "NONE"
     with pytest.raises(RH.HarnessError, match="UNIVERSE_DIR_REQUIRED"):
-        CR.evaluate_cross_sectional(root, universe_dir=None, ledger_path=str(tmp_path / "l.jsonl"))
+        CR.evaluate_cross_sectional(root, universe_dir=None, ledger_path=str(tmp_path / "l.jsonl"), holdout_ledger=HH.UNGUARDED)
     with pytest.raises(RH.HarnessError, match="UNIVERSE_DIR_REQUIRED"):
-        CR.evaluate_cross_sectional(root, universe_dir="", ledger_path=str(tmp_path / "l.jsonl"))
+        CR.evaluate_cross_sectional(root, universe_dir="", ledger_path=str(tmp_path / "l.jsonl"), holdout_ledger=HH.UNGUARDED)
 
 
 def test_repo_has_true_is_not_trusted_only_a_verified_manifest_counts(tmp_path, offline):
@@ -1152,7 +1156,7 @@ def test_a_terminal_exit_with_no_price_caps_the_verdict(tmp_path):
 
 def test_the_cross_sectional_entry_point_runs_all_three_families_on_the_real_writer_output(tmp_path, offline):
     root, uni, spot = _hist(tmp_path)
-    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), spot_dir=spot, mark_interval=MARK_IV)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), spot_dir=spot, mark_interval=MARK_IV, holdout_ledger=HH.UNGUARDED)
     assert set(out["families"]) == set(CR.FAMILIES)
     for k, f in out["families"].items():
         assert f["verdict"] in ("INSUFFICIENT_DATA", "UNTESTED") and f["family"] == k and f["grid"]["window_days_required"] == 7 + 30 + 420
@@ -1309,7 +1313,7 @@ def test_mutation_the_sibling_finding_removed_leaves_the_empty_list_silent():
 # ================================================================== one funnel / short diagnostics (worker B)
 def test_a_short_history_run_is_labelled_a_diagnostic_and_names_the_exact_required_span(tmp_path, offline):
     root, uni, _ = _hist(tmp_path, spot=False)
-    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), mark_interval=MARK_IV)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), mark_interval=MARK_IV, holdout_ledger=HH.UNGUARDED)
     assert out["status"] == "TOO_FEW_HOLDING_ROWS" and out["verdict"] == "INSUFFICIENT_DATA"
     assert out["evidence_class"] == "SHORT_DIAGNOSTIC_NOT_STRATEGY_EVIDENCE"
     assert out["required_span"]["window_days_required"] == 457 and out["history_shortfall"]["required_days"] == 457 and "457 days" in out["reason"]

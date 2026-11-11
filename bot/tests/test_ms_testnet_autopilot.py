@@ -60,10 +60,29 @@ def test_no_grant_means_no_unattended_execute_and_the_typed_path_is_untouched(w)
 def test_a_valid_grant_replaces_the_typed_digest_and_records_who_authorised_it(w):
     d = w.ready("BTCUSDT", 400.0)
     write_grant(w)
-    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="") == 0, w.text()
+    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: None) == 0, w.text()      # as the loop invokes it (it alone supplies the hook)
     assert w.record()["flat_verified"] is True and w.record()["confirmation"]["state"] == "CONFIRMED"
     prov = json.load(open(os.path.join(w.state_dir, "autopilot.json")))
     assert prov["mode"] == "UNATTENDED_STANDING_AUTHORISATION" and prov["plan_digest"] == d and prov["grant_reference"] == "owner test 2026-11-10"
+
+
+def test_unattended_execution_is_only_valid_under_the_autopilot_loop(w):
+    """The loop is the only caller that enforces the halts (ALERT, STOP, PAUSED, the capital book) and the single-writer lease, through the pre-order hook it alone can supply. `execute --unattended`
+    from a shell has no such hook, so a valid grant must not make it an order path that ignores every halt (specialist E, F1: reproduced with ALERT+STOP+PAUSED set and a 4-loss halt: 4 orders)."""
+    d = w.ready("BTCUSDT", 400.0)
+    write_grant(w)
+    text = refused_without_network(w, "execute", "--confirm-plan-digest", d, "--unattended")
+    assert "UNATTENDED_ONLY_VALID_UNDER_THE_AUTOPILOT_LOOP" in text
+    assert w.record().get("confirmation", {}).get("state") != "CONFIRMED" and not os.path.exists(os.path.join(w.state_dir, "autopilot.json"))
+    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: None) == 0, w.text()          # the loop's invocation (it passes its hook) is admitted
+
+
+def test_a_hook_that_refuses_the_entry_places_no_order_even_with_a_valid_grant(w):
+    d = w.ready("BTCUSDT", 400.0)
+    write_grant(w)
+    w.fake.requests.clear()
+    w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: "ENGINE_HALTED:TEST")
+    assert not [r for r in w.fake.requests if r[0] == "POST" and r[1] == "/v5/order/create"], "an entry order was sent although the pre-order hook refused it"
 
 
 def test_unattended_still_needs_the_plans_own_digest(w):
@@ -112,7 +131,7 @@ def test_the_plan_must_fit_the_grants_bounds(w):
 def test_the_grants_sessions_per_day_and_the_manifest_cap_both_hold(w):
     write_grant(w, max_sessions_per_day=1)
     d = w.ready("BTCUSDT", 400.0)
-    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="") == 0
+    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: None) == 0
     w.state_dir = os.path.join(os.path.dirname(w.state_dir), "state2")
     d = w.ready("BTCUSDT", 400.0)
     assert "GRANT_SESSIONS_PER_DAY_REACHED" in refused_without_network(w, "execute", "--confirm-plan-digest", d, "--unattended")
@@ -1346,7 +1365,7 @@ def test_every_evaluation_carries_a_decision_record_whose_id_is_reproducible_fro
     rec1, rec2 = r1["decision_record"], r2["decision_record"]
     assert rec1["decision_id"].startswith("dec_") and rec1 == rec2, "the same market inputs, size and code must give the same record"
     assert rec1["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and rec1["fee_tier"] == "MEASURED" and rec1["inputs_ref"] and rec1["edge"]["edge_ref"] and rec1["data_scope"].startswith("TESTNET_DATA")
-    assert rec1["capital_required_usd"] == "232.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
+    assert rec1["capital_required_usd"] == "408.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
     assert "inputs_digest" in r1 and len(r1["inputs_digest"]) == 64                                  # the full digest stays in the local result; the record carries a 16-hex reference
 
 
@@ -1446,6 +1465,117 @@ def test_the_decision_record_carries_every_field_the_owner_needs_and_the_scenari
     assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] == r["decision_id"] and "UNATTENDED_GRANT" in r["authority_gaps"]
 
 
+# ---------------------------------------------------------------- the owner's COST OF CAPITAL: stated in the environment, never defaulted (the old gate priced an unstated one as free)
+CASH_ENV = (EG.ENV_CASH_APR, EG.ENV_CASH_SOURCE, EG.ENV_CASH_STATED_UTC)
+
+
+def _no_cash(w, **replace):
+    for k in CASH_ENV:
+        w.env.pop(k, None)
+    w.env.update(replace)
+
+
+def test_an_unstated_cost_of_capital_makes_even_an_80_bps_print_inconclusive_in_the_read_only_decision(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)                                                                # 80 bps of funding, a MEASURED fee tier: only the cost of capital is missing
+    _no_cash(w)
+    w.fake.requests.clear()
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and res["edge"]["session_class"] == "INCONCLUSIVE", res["why"]
+    assert any(x.startswith("COST_OF_CAPITAL_UNKNOWN:") for x in res["why"]) and res["edge"]["net_edge_bps"] is None
+    assert res["cost_of_capital"]["state"] == "UNSTATED" and res["cost_of_capital"]["usable"] is False and res["cost_of_capital"]["apr"] is None
+    cb = res["decision_record"]["edge"]["capital_basis"]
+    assert cb["state"] == "UNSTATED" and cb["cash_alternative_apr"] is None and cb["opportunity_cost_bps"] is None and cb["committed_usd"] == "408.00"
+    assert res["decision_record"]["market_inputs"]["cost_of_capital_state"] == "UNSTATED"
+    assert not [r for r in w.fake.requests if r[0] == "POST"]
+
+
+def test_a_hopeless_edge_stays_rejected_when_the_cost_of_capital_is_unstated(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w, funding="0.0001")                                              # 1 bp: no cost of capital could rescue it
+    _no_cash(w)
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "REJECT_UNECONOMIC" and any("BEFORE_ANY_COST_OF_CAPITAL" in x for x in res["why"])
+
+
+def test_a_stated_cost_of_capital_is_charged_on_the_committed_capital_and_shown_in_the_decision_record(tmp_path, monkeypatch):
+    from decimal import Decimal as D
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and res["cost_of_capital"] == {
+        **res["cost_of_capital"], "state": "STATED", "usable": True, "apr": "0.04", "source": "OWNER_STATED:test-fixture", "provenance": "modelled"}
+    cb = res["decision_record"]["edge"]["capital_basis"]
+    assert (cb["state"], cb["cash_alternative_apr"], cb["cash_alternative_source"], cb["cash_alternative_provenance"], cb["multiple_of_notional"], cb["committed_usd"]) == (
+        "STATED", "0.040000", "OWNER_STATED:test-fixture", "modelled", "2.0400", "408.00")
+    hold_s = res["hold_s"]
+    expected_bps = D("0.04") * D("2.04") * D(hold_s) / D(86_400) / D(365) * D(10_000)
+    assert abs(D(res["edge"]["costs_bps"]["opportunity_cost"]) - expected_bps) < D("1e-9") and expected_bps > 0           # a real, positive, hold-proportional charge
+
+
+@pytest.mark.parametrize("change,state,problem", [
+    ({EG.ENV_CASH_STATED_UTC: "2026-09-01"}, "STALE", "CASH_ALTERNATIVE_STALE"),                       # 70 days before the fixed test clock
+    ({EG.ENV_CASH_STATED_UTC: "2026-12-31"}, "FUTURE_DATED", "CASH_ALTERNATIVE_DATED_IN_THE_FUTURE"),
+    ({EG.ENV_CASH_APR: "4%"}, "INVALID", "CASH_ALTERNATIVE_RATE_INVALID"),
+    ({EG.ENV_CASH_APR: "4"}, "INVALID", "CASH_ALTERNATIVE_INVALID"),                                      # a unit slip (400%/yr) is refused, not obeyed
+])
+def test_a_stale_future_dated_or_malformed_statement_is_unknown_and_says_why(tmp_path, monkeypatch, change, state, problem):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    w.env.update(change)
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and res["cost_of_capital"]["state"] == state and res["cost_of_capital"]["usable"] is False
+    assert any(problem in x for x in res["cost_of_capital"]["problems"]) and res["edge"]["net_edge_bps"] is None
+
+
+def test_a_partial_statement_is_invalid_not_defaulted(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    del w.env[EG.ENV_CASH_STATED_UTC]
+    res = _evaluate(w, notional_usd="200")
+    assert res["decision"] == "INCONCLUSIVE" and res["cost_of_capital"]["state"] == "INVALID" and any("INCOMPLETE" in x for x in res["why"])
+
+
+def test_the_order_capable_loop_places_no_profit_seeking_session_while_the_cost_of_capital_is_unstated(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000                                      # the same 80 bps that DID open a PROFIT_SEEKING session when the cost of capital was stated
+    _no_cash(w)
+    res, _ = cycle(w)
+    assert res["result"] == "SKIPPED" and res["why"][0] == "EDGE_INCONCLUSIVE" and any(x.startswith("COST_OF_CAPITAL_UNKNOWN:") for x in res["why"])
+    assert not [r for r in w.fake.requests if r[0] == "POST"], "an order was placed on capital priced as free"
+
+
+def test_stating_the_cost_of_capital_is_what_opens_the_profit_seeking_session(w):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    res, _ = cycle(w)                                                                                  # the fixture's world states 4%/yr
+    assert res["result"] == "DONE" and res["session_class"] == "PROFIT_SEEKING"
+    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    assert ev["edge"]["capital"]["state"] == "STATED" and ev["edge"]["capital"]["cash_alternative_apr"] == "0.04" and ev["edge"]["capital"]["opportunity_cost_bps"] is not None      # the local verdict keeps full precision
+    shipped = AP.evidence_edge(ev["edge"])["capital_basis"]                                           # the evidence payload carries the rounded basis (the guard refuses long digit runs)
+    assert shipped["state"] == "STATED" and shipped["cash_alternative_apr"] == "0.040000" and shipped["cash_alternative_provenance"] == "modelled" and shipped["committed_usd"] is not None
+
+
+def test_the_status_command_tells_the_owner_the_state_of_the_cost_of_capital(w, tmp_path, capsys):
+    assert AP.main(["status", "--root", str(tmp_path / "ap")], env=w.env) == 0
+    stated = json.loads(capsys.readouterr().out)["cost_of_capital"]
+    assert stated["state"] == "STATED" and stated["usable"] is True and stated["apr"] == "0.04" and stated["names"] == list(CASH_ENV)
+    _no_cash(w)
+    assert AP.main(["status", "--root", str(tmp_path / "ap")], env=w.env) == 0
+    unstated = json.loads(capsys.readouterr().out)["cost_of_capital"]
+    assert unstated["state"] == "UNSTATED" and unstated["usable"] is False and unstated["apr"] is None and unstated["problems"] == ["NO_CASH_ALTERNATIVE_STATED"]
+
+
+def test_the_environment_the_image_and_the_fly_config_ship_never_states_a_cost_of_capital_for_the_owner():
+    """The owner states it; nothing in the repository's deployment files may default it (a default would be the old free-capital loophole again, one layer out)."""
+    bot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("Dockerfile.autopilot", "Dockerfile", "Dockerfile.drill", "Dockerfile.research", "fly.autopilot.toml", "fly.toml", "fly.drill.toml", "fly.research.toml"):
+        text = open(os.path.join(bot, name), encoding="utf-8").read()
+        assert not any(k in text for k in CASH_ENV), f"{name} ships a default cost of capital"
+
+
 def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_book_is_stated(tmp_path, monkeypatch):
     import ms_capital as CC
     ctx = AP._decision_context(str(tmp_path / "none"), 1.0)
@@ -1460,6 +1590,43 @@ def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_boo
     assert a == EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"] and a != EL.decision_record(base, code_sha="c" * 40, **ctx2)["decision_id"]
     (root / "capital.json").write_text("{broken")
     assert AP._decision_context(str(root), 1.0)["portfolio"]["status"] == "BOOK_UNREADABLE"
+
+
+def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_and_that_cash_was_not_checked(tmp_path, monkeypatch):
+    """Review R2-6: with an unexplained-cash review open the loop refuses (ACCOUNT_CASH_UNEXPLAINED), yet the read-only ``evaluate`` said ``halted: false`` and ELIGIBLE with no word of it, and its
+    authority gaps never said it had not looked at the cash ($200 of notional commits $408). The stops the book already holds are named in the record; eligibility stays a statement about economics."""
+    import json as _json
+    import ms_capital as CC
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    clean = _evaluate(w, notional_usd="200")
+    assert clean["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and clean["decision_record"]["capital_required_usd"] == "408.00"
+    assert "ACCOUNT_CASH_NOT_CHECKED" in clean["authority_gaps"] and "ACCOUNT_CASH_NOT_CHECKED" in clean["decision_record"]["authority_gaps"]      # evaluate never reads the account's cash
+    assert not any(g.startswith("CAPITAL_") for g in clean["authority_gaps"]), "no book, no stop"
+
+    root = tmp_path / "book_review"
+    book = CC.CapitalBook(str(root))
+    book.ensure_baseline("1")
+    assert book.park("prev_session", "1", "0.50", True, True)
+    assert book.settle("10000")["status"] == "UNEXPLAINED_CASH"                    # the review is persisted IN the book
+    res = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert res["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION", "eligibility is an economics statement: the stop is NAMED, not silently converted"
+    assert "CAPITAL_REVIEW_OPEN" in res["authority_gaps"] and "CAPITAL_REVIEW_OPEN" in res["decision_record"]["authority_gaps"], res["authority_gaps"]
+    assert res["decision_record"]["portfolio_context"]["review_required"] == "ACCOUNT_CASH_UNEXPLAINED"
+    assert res["decision_record"]["decision_id"] != clean["decision_record"]["decision_id"]            # a different capital state is a different decision
+
+    doc = _json.load(open(book.path))
+    doc["review_required"], doc["halted"] = None, True
+    with open(book.path, "w") as fh:
+        _json.dump(doc, fh)
+    halted = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert "CAPITAL_BOOK_HALTED" in halted["authority_gaps"] and "CAPITAL_REVIEW_OPEN" not in halted["authority_gaps"]
+
+    with open(book.path, "w") as fh:
+        fh.write("{broken")
+    broken = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert "CAPITAL_BOOK_UNREADABLE" in broken["authority_gaps"]
+    assert open(book.path).read() == "{broken", "a read-only evaluation never rewrites the book"
 
 
 def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w):

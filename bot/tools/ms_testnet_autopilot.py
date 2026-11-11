@@ -278,12 +278,13 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     sym = symbol or (gv.get("symbols") or [None])[0] or (auth["capability_symbols"] or [None])[0] or "BTCUSDT"
     gaps = [g for g, ok in (("CAPABILITY_FILE", auth["capability"] == "VALID"), ("UNATTENDED_GRANT", auth["grant"] == "VALID"),
                             ("DEDICATED_TESTNET_CREDENTIALS", auth["credentials"]["dedicated_key_present"] and auth["credentials"]["dedicated_secret_present"])) if not ok]
-    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "evaluated_ms": now, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
+    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "evaluated_ms": now, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF", "ACCOUNT_CASH_NOT_CHECKED"], "read_only": True}
 
     def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
         res = _res("EVALUATED", why, decision=decision, **{**base, **kw})
-        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD,
-                                                    **_decision_context(book_root or DEFAULT_ROOT, res.get("owner_funding_floor_bps"), gv.get("max_notional_usd")))
+        ctx = _decision_context(book_root or DEFAULT_ROOT, res.get("owner_funding_floor_bps"), gv.get("max_notional_usd"))
+        res["authority_gaps"] = list(res["authority_gaps"]) + _book_stops(ctx["portfolio"])      # a stop the LOOP would refuse on is never hidden behind a read-only ELIGIBLE
+        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD, **ctx)
         return res
     if not re.fullmatch(r"[A-Z0-9]{3,20}", str(sym)):
         return done("WAIT_FOR_DATA", ["SYMBOL_INVALID"])
@@ -309,20 +310,22 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     if secs < MIN_SECONDS_TO_SETTLEMENT or int(math.ceil(secs)) + EXIT_MARGIN_S > pseudo["max_hold_s"]:
         return done("SKIP_NO_OPPORTUNITY", [reason])                  # no hold across a settlement is possible now: there is nothing to price
     hold_for_edge = hold_s or int(math.ceil(secs)) + EXIT_MARGIN_S
+    cash, _cash_state, cash_problems = EG.cash_alternative_from_env(env)       # the owner's STATED alternative return; absent or malformed = the cost of capital is UNKNOWN, never zero
     try:
-        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()), clock=clock)
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()), clock=clock, cash_alternative=cash)
         verdict = EG.evaluate_edge(inp)
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return done("WAIT_FOR_DATA", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     edge = verdict.as_dict()
-    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms), inputs=inp.summary(), next_settlement_ms=int(nxt))
+    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms), inputs=inp.summary(), next_settlement_ms=int(nxt),
+                cost_of_capital=EG.describe_cash_alternative(env, int(inp.now_ms)))
     if verdict.session_class == EG.PROFIT_CANDIDATE and go:
         return done("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", [reason, "ECONOMICS_CLEAR_THE_HURDLE: eligibility is not authority; see authority_gaps"], session_class="PROFIT_SEEKING")
     if verdict.session_class == EG.REJECTED:
         return done("REJECT_UNECONOMIC", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
     if verdict.session_class == EG.PROFIT_CANDIDATE:                  # economics clear, the owner's own funding floor does not
         return done("SKIP_NO_OPPORTUNITY", [reason], session_class=None)
-    return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
+    return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4] + [p for p in cash_problems if cash is None and p != "NO_CASH_ALTERNATIVE_STATED"][:1], session_class=None)
 
 
 def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) -> Dict[str, Any]:
@@ -335,10 +338,24 @@ def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) ->
         if root and os.path.exists(os.path.join(root, "capital.json")):
             r = CC.CapitalBook(root).report()
             portfolio = {"status": "BOOK", "sizing_basis_usd": r.get("sizing_basis_usd"), "verified_result_usd": r.get("verified_realised_usd"), "lifecycles_settled": r.get("lifecycles_settled"),
-                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "pending_session": bool(r.get("pending"))}
+                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "pending_session": bool(r.get("pending")),
+                         "review_required": (r.get("review_required") or {}).get("code") if isinstance(r.get("review_required"), dict) else None}
     except Exception:                                              # noqa: BLE001 - an unreadable book is stated, never guessed
         portfolio = {"status": "BOOK_UNREADABLE"}
     return {"risk_limits": limits, "portfolio": portfolio, "venue": {"id": "testnet", "host": S._venues.get("testnet").host, "scope": "TESTNET_FAKE_MONEY"}}
+
+
+def _book_stops(portfolio: Mapping[str, Any]) -> List[str]:
+    """The stops the capital book ALREADY holds, named for the read-only decision record. The loop refuses on each of them (an open unexplained-cash review, a halt, a book it cannot read); a read-only
+    evaluation that said only 'ELIGIBLE' with ``halted: false`` while a review was open reproduced exactly the contradiction the second review found."""
+    out = []
+    if portfolio.get("review_required"):
+        out.append("CAPITAL_REVIEW_OPEN")
+    if portfolio.get("halted"):
+        out.append("CAPITAL_BOOK_HALTED")
+    if portfolio.get("status") == "BOOK_UNREADABLE":
+        out.append("CAPITAL_BOOK_UNREADABLE")
+    return out
 
 
 def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir: str, exc: Exception) -> None:
@@ -430,7 +447,8 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
         return _res("SKIPPED", [reason], funding_bps=rate * 1e4)
     on_state("RESEARCHING", "edge_gate")
     try:                                                              # the ECONOMICS gate: expected NET edge on the one economic model, from the venue's own rows, books and fee tier
-        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()), clock=clock)
+        cash, _cash_state, _cash_problems = EG.cash_alternative_from_env(env)   # the owner's STATED alternative return; absent or malformed = UNKNOWN cost of capital, so never a PROFIT_SEEKING session
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()), clock=clock, cash_alternative=cash)
         verdict = EG.evaluate_edge(inp)
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
@@ -495,11 +513,17 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     except CC.BookUnreadable as exc:
         _alert_book_unreadable(engine_root, clock, d, exc)
         return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])      # (settle = what the venue's cash REALLY did since the last verified-flat session: losses in full, gains only as far as explained)
-    if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
-        emit(EL.capital_settled(settled))
-        ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
-        return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     cb = book.load()
+    review = cb.get("review_required")
+    if settled["status"] == "UNEXPLAINED_CASH" or review:             # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
+        if settled["status"] == "UNEXPLAINED_CASH":
+            emit(EL.capital_settled(settled))
+        review = review or {}
+        # The BOOK holds the stop (written in the settlement's own save); this marker is re-asserted from it on every session, so a kill between the save and the marker, or an owner who cleared
+        # the marker without `capital --ack-review`, cannot resume trading.
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": review.get("session_id") or settled.get("session_id"),
+                                                         "delta_usd": review.get("delta_usd") or settled.get("delta_usd")})
+        return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.sizing_basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
                         loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
@@ -911,7 +935,8 @@ def evidence_edge(edge: Mapping[str, Any]) -> Dict[str, Any]:
     """The edge verdict as EVIDENCE: decimals rounded to 4 places, the digest shortened to a reference (full precision and the full digest stay in the local edge_verdict.json)."""
     return {"session_class": edge["session_class"], "reasons": list(edge["reasons"])[:6], "net_edge_bps": _r4(edge["net_edge_bps"]), "expected_funding_bps": _r4(edge["expected_funding_bps"]),
             "required_funding_bps": _r4(edge["required_funding_bps"]), "expected_net_usd": _r4(edge["expected_net_usd"]), "costs_bps": {k: _r4(v) for k, v in dict(edge["costs_bps"]).items()},
-            "assumed_inputs": list(edge["assumed_inputs"]), "settlements_in_hold": edge["settlements_in_hold"], "edge_ref": str(edge["digest"])[:16]}
+            "assumed_inputs": list(edge["assumed_inputs"]), "settlements_in_hold": edge["settlements_in_hold"], "edge_ref": str(edge["digest"])[:16],
+            "capital_basis": EL.capital_basis(edge.get("capital"))}
 
 
 def evidence_net(net: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1238,6 +1263,7 @@ def _parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("capital", help="print the verified-realised capital book; --ack-halt clears a four-loss stop after YOU reviewed the losses (no network)")
     cp.add_argument("--root", default=DEFAULT_ROOT)
     cp.add_argument("--ack-halt", action="store_true")
+    cp.add_argument("--ack-review", action="store_true", help="after YOU read the unexplained session's evidence (history[-1] and review_required in the book): let entries resume (it changes no money and no history; clearing the ALERT marker alone does not)")
     cp.add_argument("--ack-drawdown", action="store_true", help="after YOU reviewed the losses that hit the drawdown stop: resume from the current verified basis (a new drawdown peak)")
     cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
     cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
@@ -1279,7 +1305,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         g, why = load_grant(clock(), manifest or {}, None) if manifest else (None, ["NO_CAPABILITY"])
         eng = ES.EngineState(a.root, clock)
         print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "grant_problems": why, "engine": {k: v for k, v in eng.load().items() if k != "history"},
-                          "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json"))},
+                          "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json")),
+                          "cost_of_capital": EG.describe_cash_alternative(e, clock())},
                          indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "capital":
@@ -1291,6 +1318,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
             return 2
         if a.ack_halt:
             print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
+        if a.ack_review:
+            print("review acknowledged" if cbk.acknowledge_review() else "no review to acknowledge")
         if a.ack_drawdown:
             print("drawdown acknowledged" if cbk.acknowledge_drawdown() else "no drawdown to acknowledge")
         if a.reserve_fraction is not None:

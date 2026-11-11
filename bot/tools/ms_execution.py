@@ -36,6 +36,7 @@ from ms_types import GroupState as G  # noqa: E402
 GENESIS = "00" * 32
 EPS = Decimal("1e-9")
 LIVE, SENT, UNKNOWN, FILLED, CANCELLED, REJECTED, NEW = "LIVE", "SENT", "UNKNOWN", "FILLED", "CANCELLED", "REJECTED", "NEW"
+FEE_IN_BASE_MAX_FRACTION = Decimal("0.002")      # twice the highest spot taker fee on the published schedule (0.1%): a gross-vs-net remainder at most this large is a fee taken in the base coin, not a partial fill
 _OPEN_LEG = (LIVE, SENT, UNKNOWN)
 
 
@@ -71,16 +72,73 @@ class FileStore:
         self.path = path
 
     def append(self, line: str) -> None:
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        prefix = ""
+        if size:                                                  # a complete last line that lost only its newline must not have the next entry glued onto it (that would read as ONE torn line)
+            with open(self.path, "rb") as rb:
+                rb.seek(-1, os.SEEK_END)
+                prefix = "" if rb.read(1) == b"\n" else "\n"
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(prefix + line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            try:
+                os.truncate(self.path, size)                      # a failed append (out of disk, I/O error) leaves NO partial line behind: the process may live on and append again
+            except OSError:
+                pass
+            raise
 
     def read(self) -> List[str]:
         if not os.path.exists(self.path):
             return []
         with open(self.path, encoding="utf-8") as fh:
             return [l.rstrip("\n") for l in fh if l.strip()]
+
+    def drop_torn_tail(self, expected: Optional[str] = None) -> str:
+        """Set the LAST line aside (a torn append: killed or out of disk mid-write) so the next append starts on a clean line. The text is kept in ``<journal>.torn`` BEFORE the journal is cut, and
+        the cut is IN PLACE (a truncation at the start of that line): no second copy of the journal is written, because a torn append is very often a FULL DISK and a repair that needs space would
+        leave the owner's emergency unwind unable to open the journal (independent re-review, finding 6). A crash between the two steps leaves the original journal and the kept text, never a
+        mixture; keeping the text is best effort (when the disk refuses it, the text goes to stderr, the only copy, and the repair still proceeds).
+        ``expected`` is the line the CALLER judged torn: the file is re-read here, and unless its last line is still exactly that line nothing is changed (ValueError). Under the single-writer lock that
+        cannot differ; the emergency unwind's lock-broken branch runs WITHOUT it, where re-reading and dropping whatever is last could discard a good line another writer had just appended."""
+        lines = self.read()
+        if not lines or (expected is not None and lines[-1] != expected):
+            raise ValueError("journal changed while its torn tail was being set aside: nothing was changed")
+        dropped = lines[-1]
+        with open(self.path, "rb") as rb:
+            data = rb.read()
+        tail = dropped.encode("utf-8")
+        at = data.rfind(tail)
+        if at < 0 or (at > 0 and data[at - 1:at] != b"\n") or data[at + len(tail):].strip(b"\r\n\t ") != b"":
+            raise ValueError("journal changed while its torn tail was being set aside: the last line could not be located, nothing was changed")
+        try:
+            with open(self.path + ".torn", "a", encoding="utf-8") as fh:
+                fh.write(dropped + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            print(f"JOURNAL_TORN_TEXT_NOT_KEPT: {type(exc).__name__}: the torn line could not be written to {os.path.basename(self.path)}.torn; it follows, and this is the only copy:", file=sys.stderr)
+            print(dropped, file=sys.stderr)
+        _truncate_file(self.path, at)
+        try:
+            fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        return dropped
+
+
+def _truncate_file(path: str, size: int) -> None:
+    """Cut ``path`` to ``size`` bytes and make it durable (a seam the crash test replaces)."""
+    with open(path, "r+b") as fh:
+        fh.truncate(size)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def verify_chain(lines: Sequence[str]) -> Tuple[bool, str]:
@@ -106,10 +164,38 @@ class Journal:
         self.store = store
         lines = store.read()
         ok, why = verify_chain(lines)
+        dropped: Optional[str] = None
+        if not ok and lines and why == f"UNPARSEABLE_AT_{len(lines) - 1}" and verify_chain(lines[:-1])[0] and hasattr(store, "drop_torn_tail"):
+            # ONLY an unparseable LAST line over a chain that verifies: a torn append. The journal is write-ahead (the line is durable, THEN the action is taken), so a line that never finished was never
+            # acted on and setting it aside is safe; without this an owner's emergency `reconcile --unwind` could not even open the journal. A complete line with a wrong hash or sequence is tampering
+            # and, like any damaged earlier line, stays refused.
+            dropped = store.drop_torn_tail(expected=lines[-1])
+            lines = lines[:-1]
+            ok, why = verify_chain(lines)
         if not ok:
             raise ValueError(f"journal refused: {why}")
         self.entries: List[Dict[str, Any]] = [json.loads(l) for l in lines]
         self.head = self.entries[-1]["h"] if self.entries else GENESIS
+        self.repaired_torn_tail: Optional[Dict[str, Any]] = None
+        if dropped is not None:
+            self._record_repair(dropped)
+
+    def _record_repair(self, dropped: str) -> None:
+        """A repair is never silent: the evidence file holds the text, and the repair itself is printed and journalled as an ANOMALY (a reviewer found the only trace was ``<journal>.torn``). This module has no
+        clock, so the entry carries the last durable entry's time. Journalling is best effort: a torn append is often a full disk, and the owner's emergency unwind must still be able to open the journal."""
+        kept = os.path.basename(str(getattr(self.store, "path", "journal"))) + ".torn"
+        info = {"code": "TORN_TAIL_DROPPED", "dropped_chars": len(dropped), "dropped_sha16": hashlib.sha256(dropped.encode("utf-8")).hexdigest()[:16], "kept_in": kept}
+        self.repaired_torn_tail = dict(info)
+        print(f"JOURNAL_TORN_TAIL_DROPPED: a torn final journal line ({info['dropped_chars']} characters, sha256 {info['dropped_sha16']}) was set aside in {kept}; every earlier line verified", file=sys.stderr)
+        if not self.entries:
+            # the journal was ONLY the torn line: there is no durable entry to take a time from, and an entry stamped 0 would read to the lifecycle as a run that started in 1970 (a spurious
+            # LIFECYCLE_EXCEEDED, re-review T1). The printed line and the kept text are the evidence.
+            print(f"JOURNAL_TORN_TAIL_ANOMALY_NOT_JOURNALLED: the journal held nothing before the torn line; the line above and {kept} are the evidence", file=sys.stderr)
+            return
+        try:
+            self.append("ANOMALY", "", int(self.entries[-1]["ts_ms"]), info)
+        except OSError as exc:
+            print(f"JOURNAL_TORN_TAIL_ANOMALY_NOT_JOURNALLED: {type(exc).__name__}: the line above and {kept} are the evidence", file=sys.stderr)
 
     def append(self, typ: str, group_id: str, ts_ms: int, body: Mapping[str, Any]) -> Dict[str, Any]:
         e = {"seq": len(self.entries), "prev": self.head, "type": typ, "group_id": group_id, "ts_ms": int(ts_ms), "body": dict(body)}
@@ -344,6 +430,9 @@ class ExecutionEngine:
                 l.recon_fees += fee
             elif l.recon_qty > 0:                                      # a real execution for quantity a recon fill already booked: REPLACE that part, never add to it
                 a = min(q, l.recon_qty)
+                if l.plan.category == "spot" and _sgn(f["side"]) > 0 and l.recon_qty - a <= l.recon_qty * FEE_IN_BASE_MAX_FRACTION:
+                    a = l.recon_qty                                    # the execution covers the adopted quantity but for a fee-sized remainder: a spot BUY's fee is taken from the coin received, so the order row's
+                                                                       # cumulative quantity is GROSS and the execution NET; that remainder was never held, keeping it is phantom inventory the exit cannot sell
                 share = a / l.recon_qty
                 dc, df = l.recon_cost * share, l.recon_fees * share
                 l.recon_qty -= a
@@ -709,6 +798,12 @@ class ExecutionEngine:
             n = self._net(l)
             px = l.avg_px if l.filled > 0 else Decimal(0)
             out.append((l, n, n * px))
+        if g.first_intent_ms is not None:
+            # A PLAN leg that was never SENT has no LegRuntime: the first create's ack was lost (or refused), ``submit_group`` stopped before it, and reconcile later filled the first leg alone. Without an
+            # entry for the missing leg a group holding ONE filled leg reads as 'all legs filled' = HEDGED for the whole hold. It counts as an empty leg, so the pair reads UNHEDGED and is unwound.
+            for lp in g.plan.legs:
+                if lp.leg_id not in g.legs:
+                    out.append((LegRuntime(lp, "ENTRY", None, f"{g.plan.group_id}-{lp.leg_id}", status=CANCELLED), Decimal(0), Decimal(0)))
         return out
 
     def _step_of(self, l: LegRuntime) -> Optional[Decimal]:

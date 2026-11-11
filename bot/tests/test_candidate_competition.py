@@ -59,6 +59,90 @@ def test_committed_corpus_runs_the_btc_row_labelled_in_sample_and_every_candidat
     assert any("REJECTED policy" in r for r in b["rejection_reasons"])
 
 
+def test_a_btc_rejection_says_how_strong_it_is_by_the_repos_own_early_rejection_standard(committed):
+    """REJECTED here is the competition's documented in-sample verdict (it loses after costs or to cash by point estimate). The repo has a STRONGER standard for rejecting (candidate_readiness.early_rejection:
+    >= 12 independent observations, lower-tail p <= 0.01, the widest 90% interval wholly below zero). Every policy now carries whether it meets it, with the numbers, so a point-estimate loss is never read as a
+    statistical rejection (independent specialist review: the 51-print overlay does NOT meet it; ESS-adjusted p_lower 0.034 and a widest interval that includes zero)."""
+    rep, _ = committed
+    b = row(rep, "cash_and_carry")
+    pol = {p["policy"]: p for p in b["policies"]}
+    for name in ("unconditional_1_print_hold", "unconditional_3_print_hold", "unconditional_9_print_hold", "unconditional_17_print_hold"):
+        bar = pol[name]["statistical_rejection"]
+        assert bar["meets_early_rejection_standard"] is True and bar["p_lower"] <= CR.REJECT_EARLY_ALPHA and bar["independent_observations"] >= CR.REJECT_EARLY_MIN_INDEPENDENT and bar["widest_ci90"][1] < 0, name
+    p51 = pol["unconditional_51_print_hold"]
+    bar = p51["statistical_rejection"]
+    assert p51["verdict"] == "REJECTED"                                                   # the documented point-estimate verdict is unchanged ...
+    assert bar["meets_early_rejection_standard"] is False and bar["scope"] == "IN_SAMPLE_OVERLAPPING_ENTRIES"          # ... and it is NOT a statistical rejection at the repo's standard
+    assert bar["p_lower"] == pytest.approx(0.034, abs=0.01) and bar["p_lower"] > CR.REJECT_EARLY_ALPHA
+    assert bar["widest_ci90"][0] < 0 < bar["widest_ci90"][1]                              # the widest method's 90% interval includes zero: break-even is not excluded
+    assert bar["basis"] == "mean_excess_over_cash_bps_of_capital" and bar["mean"] == pytest.approx(-5.75, abs=0.05)
+    assert "NOT statistically rejected" in p51["note"] and "includes zero" in p51["note"]
+    g = pol["production_gated_sequence"]["statistical_rejection"]
+    assert g["scope"] == "IN_SAMPLE_OVERLAPPING_ENTRIES" and set(g) >= {"meets_early_rejection_standard", "p_lower", "widest_ci90", "independent_observations", "basis"}
+    summary = b["statistical_rejection_summary"]
+    assert "unconditional_51_print_hold" in summary["not_meeting_the_standard"] and "unconditional_1_print_hold" in summary["meeting_the_standard"]
+    assert b["verdict"] == "REJECTED" and any("point estimate" in r and "statistical" in r.lower() for r in b["rejection_reasons"])
+    assert rep["winner"] is None and "NO WINNER" in rep["winner_statement"]              # the economic conclusion is unchanged: nothing is a winner
+
+
+def _bar(**kw):
+    return {"meets_early_rejection_standard": False, "p_lower": 0.005, "widest_ci90": [-9.0, 2.0], "independent_observations": 30, "basis": "mean_excess_over_cash_bps_of_capital", **kw}
+
+
+def test_the_strength_note_prints_the_criterion_that_actually_failed_and_never_a_false_inequality():
+    """Second independent review: the note printed ``p=0.005 > 0.01`` when the interval was what failed, and 'does not exclude break-even' when the interval was wholly negative."""
+    note = CC_._strength_note
+    assert note(False, _bar()) == "" and note(True, None) == ""
+    ok = note(True, _bar(meets_early_rejection_standard=True, p_lower=0.004, widest_ci90=[-9.0, -1.0]))
+    assert ok.startswith("; meets the repo's early-rejection standard") and "NOT" not in ok
+    # p passes, the interval is what fails: no statement about p being too high
+    n1 = note(True, _bar(p_lower=0.005, widest_ci90=[-9.0, 2.0]))
+    assert "includes zero" in n1 and "above" not in n1 and "p=0.005" not in n1 and "NOT statistically rejected" in n1
+    # the 51-print numbers of the committed corpus: p fails AND the interval includes zero
+    n2 = note(True, _bar(p_lower=0.034, widest_ci90=[-15.7, 4.2]))
+    assert "p=0.034 is above 0.01" in n2 and "includes zero" in n2
+    # the interval is wholly negative, p is what fails: it must NOT say the interval includes zero or that break-even is not excluded
+    n3 = note(True, _bar(p_lower=0.02, widest_ci90=[-9.0, -1.0]))
+    assert "p=0.020 is above 0.01" in n3 and "includes zero" not in n3 and "not wholly below zero" not in n3 and "exclude break-even" not in n3
+    n4 = note(True, _bar(independent_observations=5))
+    assert "only 5 independent observations (the standard needs 12)" in n4
+    n5 = note(True, _bar(p_lower=None, widest_ci90=None, independent_observations=None))
+    assert "no usable lower-tail p" in n5 and "no usable 90% interval" in n5 and "only 0 independent observations" in n5
+    assert "is not wholly below zero" in note(True, _bar(p_lower=0.004, widest_ci90=[-3.0, 0.0]))                  # an upper bound of exactly 0 is not below zero
+    assert "a criterion of the standard could not be evaluated" in note(True, _bar(p_lower=0.004, widest_ci90=[-3.0, -1.0]))     # nothing failed yet the bar says it does not meet: said, never invented
+    import re
+    for bar in (_bar(p_lower=0.034), _bar(p_lower=0.011), _bar(p_lower=0.5, widest_ci90=[-1.0, 1.0])):
+        for m in re.finditer(r"p=([0-9.]+) is above ([0-9.]+)", note(True, bar)):
+            assert float(m.group(1)) > float(m.group(2)), "a printed inequality is false"
+
+
+def test_the_table_caveat_is_only_written_when_some_policy_is_rejected():
+    """Re-review finding 13: with no REJECTED policy the first reason read 'IN-SAMPLE; all 0 REJECTED policies meet the stat. rejection bar'."""
+    f = CC_._table_caveat
+    assert f([], []) is None, "no REJECTED policy: no caveat"
+    assert f(["unconditional_1_print_hold", "production_gated_sequence"], []) == "IN-SAMPLE; all 2 REJECTED policies meet the stat. rejection bar"
+    assert f(["unconditional_1_print_hold"], ["unconditional_51_print_hold"]) == "IN-SAMPLE; point-estimate only (NOT stat. rejected): 51p"
+    assert f([], ["unconditional_51_print_hold", "production_gated_sequence"]) == "IN-SAMPLE; point-estimate only (NOT stat. rejected): 51p, gated_seq"
+    assert all(len(x) <= 90 for x in (f(["a"] * 3, []), f([], ["unconditional_51_print_hold", "production_gated_sequence"]))), "the table prints 90 characters of it"
+
+
+def test_the_ranked_table_shows_the_point_estimate_only_caveat_first_for_the_btc_row(committed):
+    rep, _ = committed
+    b = row(rep, "cash_and_carry")
+    assert b["rejection_reasons"][0].startswith("IN-SAMPLE; point-estimate only (NOT stat. rejected):") and "51p" in b["rejection_reasons"][0], b["rejection_reasons"][0]
+    line = next(x for x in CC_.render_table(rep).splitlines() if x.split("\t")[1] == "cash_and_carry")
+    assert "point-estimate only" in line, line
+    assert any(r.startswith("REJECTED policy unconditional_1_print_hold") for r in b["rejection_reasons"]), "the per-policy reasons are still all there"
+
+
+def test_the_candidate_readiness_verdict_and_the_competition_still_agree_on_the_same_evidence(committed):
+    rep, _ = committed
+    econ = CR.build_report(with_economics=True)["economics"]["btc_carry_corpus"]
+    verdict, reasons, policies = CR._carry_verdict(econ)
+    assert verdict == row(rep, "cash_and_carry")["verdict"] == "REJECTED"
+    assert any("statistical" in r.lower() for r in reasons)
+
+
 def test_never_a_forced_winner_and_the_next_hypotheses_are_the_registered_untested_drafts(committed):
     rep, _ = committed
     assert rep["winner"] is None and rep["all_failed"] is True and "NO WINNER" in rep["winner_statement"]
@@ -95,7 +179,7 @@ def test_with_verified_data_and_a_universe_the_three_families_are_evaluated_and_
     _reset()
     root, uni, spot = _hist(tmp_path)
     ld = str(tmp_path / "led")
-    rep = CC_.run_competition(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_dir=ld)
+    rep = CC_.run_competition(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_dir=ld, unreserved_exploratory=True)         # this test is about the family plumbing: the holdout guard has its own file
     x = row(rep, "cross_sectional_funding")
     assert set(x["families"]) == set(CR.FAMILIES) and x["verdict"] == "INSUFFICIENT_DATA" and x["readiness_level"] in ("NONE", "DATA_READY")
     assert x["families"]["PERP_FUNDING_SPREAD"]["is_carry"] is False and x["families"]["SPOT_PERP_CARRY"]["is_carry"] is True

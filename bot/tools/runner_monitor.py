@@ -275,9 +275,18 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None
         elif state == "NOT_PERSISTING":
             detail = (f"the recorder reports (heartbeat {age:.0f} s old) but its log has not grown for {growth_age:.0f} s "
                       f"(limit {RECORDER_NO_GROWTH_S:.0f} s): nothing is being persisted; {_supervisor_summary(path)}")[:300]
+        free_bytes, free_src = store.get("free_bytes"), "recorder_status"
+        if state == "STALE" or free_bytes is None:
+            # A recorder that stopped reporting also stopped updating its free-space figure: copying it into a fresh history line would present the DEAD recorder's last reading as the volume's current one
+            # (it kept saying 511 MiB for as long as the file stayed stale, whatever the owner did to the volume). The monitor shares the recorder's container and volume, so it reads the volume itself.
+            try:
+                vfs = os.statvfs(os.path.dirname(os.path.abspath(path)))
+                free_bytes, free_src = int(vfs.f_bavail) * int(vfs.f_frsize), "statvfs"
+            except OSError:
+                free_bytes, free_src = None, "unavailable"
         return {"state": state, "age_s": round(age, 1), "detail": detail, "growth_age_s": growth_age,
                 "heartbeat_errors": (st.get("heartbeat") or {}).get("status_errors"), **_supervisor_counters(path), "records": store.get("records"),
-                "free_mb": None if store.get("free_bytes") is None else round(store["free_bytes"] / 1048576.0, 1),
+                "free_mb": None if free_bytes is None else round(free_bytes / 1048576.0, 1), "free_mb_source": free_src,
                 "fault": fault, "capacity_rows": cap.get("rows"),
                 "max_fillable_usd": cap.get("max_displayed_fillable_notional_usd"),
                 "chain_file": (cap.get("chain_head") or {}).get("file"),

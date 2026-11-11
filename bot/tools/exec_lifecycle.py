@@ -46,6 +46,18 @@ def num(x: Any, places: int = 4) -> Optional[str]:
     return format(v.quantize(D(1).scaleb(-places)), "f")
 
 
+def capital_basis(capital: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The cost-of-capital basis of a verdict, compact and rounded for the evidence guard (long digit runs are refused): the state, the capital committed, the stated rate with its source, time and
+    provenance, and the charge in bps of notional. An ABSENT statement shows as state UNSTATED with no figures; it is never rendered as a zero."""
+    c = dict(capital or {})
+    stated = c.get("cash_alternative_stated_ms")
+    return {"state": None if c.get("state") is None else str(c["state"])[:20], "committed_usd": num(c.get("committed_usd"), 2), "multiple_of_notional": num(c.get("multiple_of_notional"), 4),
+            "cash_alternative_apr": num(c.get("cash_alternative_apr"), 6), "cash_alternative_source": None if c.get("cash_alternative_source") is None else str(c["cash_alternative_source"])[:60],
+            "cash_alternative_stated_ms": stated if isinstance(stated, int) and not isinstance(stated, bool) else None,
+            "cash_alternative_provenance": None if c.get("cash_alternative_provenance") is None else str(c["cash_alternative_provenance"])[:20],
+            "opportunity_cost_bps": num(c.get("opportunity_cost_bps"), 4)}
+
+
 def neutral(v: Any) -> Any:
     """A value safe for the evidence guard: a number-like string or float becomes a decimal rounded to 4 places (the guard refuses long digit runs such as 0.30000000000000004), anything else is a
     short string; None and ints stay as they are."""
@@ -168,7 +180,8 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
         rec["edge"] = {"session_class": edge.get("session_class"), "net_edge_bps": num(edge.get("net_edge_bps")), "expected_funding_bps": num(edge.get("expected_funding_bps")),
                        "required_funding_bps": num(edge.get("required_funding_bps")), "expected_net_usd": num(edge.get("expected_net_usd")),
                        "costs_bps": {str(k)[:30]: num(v) for k, v in dict(edge.get("costs_bps", {})).items()}, "assumed_inputs": assumed[:10],
-                       "settlements_in_hold": edge.get("settlements_in_hold"), "edge_ref": ref16(edge.get("digest"))}
+                       "settlements_in_hold": edge.get("settlements_in_hold"), "edge_ref": ref16(edge.get("digest")),
+                       "capital_basis": capital_basis(edge.get("capital"))}
         rec["fee_tier"] = "ASSUMED" if any("fee" in a.lower() for a in assumed) else "MEASURED"
     rec["venue"] = None if venue is None else {str(k)[:20]: str(v)[:60] for k, v in dict(venue).items()}
     ms = result.get("observed_ms")

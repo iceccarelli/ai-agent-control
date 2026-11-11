@@ -15,6 +15,7 @@ for _p in (BOT, os.path.join(BOT, "tools"), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
@@ -45,7 +46,10 @@ class World:
                                     credential_env={"api_key": TT.KEY_ENV, "api_secret": TT.SECRET_ENV})
         if grant:
             self.write_capability()
-        self.env: Dict[str, str] = {TT.KEY_ENV: FAKE_KEY, TT.SECRET_ENV: FAKE_SECRET}
+        # the owner's STATED cost of capital (4%/yr, stated 2026-11-09, one day before the fixed test clock): the executor's gate never prices an unstated one as free, so a world whose tests expect a
+        # PROFIT_SEEKING session states it. Tests about the unstated case remove these three names (see test_ms_testnet_autopilot.py).
+        self.env: Dict[str, str] = {TT.KEY_ENV: FAKE_KEY, TT.SECRET_ENV: FAKE_SECRET,
+                                    EG.ENV_CASH_APR: "0.04", EG.ENV_CASH_SOURCE: "OWNER_STATED:test-fixture", EG.ENV_CASH_STATED_UTC: "2026-11-09"}
         self.typed: List[str] = []
         self.out: List[str] = []
 
@@ -57,11 +61,11 @@ class World:
             json.dump({"schema": AD.CAPABILITY_SCHEMA, "manifest": m, "manifest_plan_sha256": m["plan_sha256"]}, fh)
         os.chmod(self.cap_path, 0o600)
 
-    def run(self, *argv: str, env: Optional[Dict[str, str]] = None, inner: Any = "fake", typed: Optional[str] = None) -> int:
+    def run(self, *argv: str, env: Optional[Dict[str, str]] = None, inner: Any = "fake", typed: Optional[str] = None, pre_order_check: Any = None) -> int:
         self.out = []
         answers = list(self.typed) if typed is None else [typed]
         return S.main(["--state-dir", self.state_dir, *argv], env=self.env if env is None else env, inner_transport=self.fake if inner == "fake" else inner,
-                      clock_ms=self.clock.now, sleep=self.clock.sleep, input_fn=lambda _p: answers.pop(0) if answers else "", out=self.out.append)
+                      clock_ms=self.clock.now, sleep=self.clock.sleep, input_fn=lambda _p: answers.pop(0) if answers else "", out=self.out.append, pre_order_check=pre_order_check)
 
     def text(self) -> str:
         return "\n".join(self.out)

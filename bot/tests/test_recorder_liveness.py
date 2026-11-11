@@ -494,3 +494,44 @@ def test_the_disk_warning_fires_from_the_real_history_writer_not_just_from_hand_
         assert line["recorder_free_mb"] == pytest.approx(float(free)) and "free_mb" not in line       # the key the alert must read
         keys = [a.key for a in RA.evaluate(hist.read_text(), base + 300)]
         assert ("recorder_disk_low" in keys) is expect, (free, keys)
+
+
+# ---------------------------------------------------------------- the monitor must not report a DEAD recorder's last free-space figure as the volume's current one
+class _Vfs:
+    def __init__(self, avail_mib, frsize=4096):
+        self.f_frsize, self.f_bavail = frsize, int(avail_mib * 1048576 / frsize)
+
+
+def test_a_stale_status_does_not_freeze_the_free_space_at_the_dead_recorders_last_figure(tmp_path, monkeypatch):
+    """A recorder that stopped 6 days ago at 511 MiB free kept reporting 511 MiB as the volume's free space after the owner extended the volume (the history line is what recorder_disk_low reads). The monitor
+    shares the recorder's container and volume, so when the status is STALE it reads the volume itself."""
+    p, now = status_file(tmp_path, age_s=6 * 86_400)
+    doc = json.load(open(p))
+    doc["store"]["free_bytes"] = 511 * 1048576
+    json.dump(doc, open(p, "w"))
+    monkeypatch.setattr(RM.os, "statvfs", lambda path: _Vfs(4096))                     # the owner extended the volume: 4 GiB free now
+    obs = RM.recorder_observation(p, now=now)
+    assert obs["state"] == "STALE" and obs["free_mb"] == pytest.approx(4096.0) and obs["free_mb_source"] == "statvfs"
+
+
+def test_a_fresh_status_keeps_the_recorders_own_figure(tmp_path, monkeypatch):
+    p, now = status_file(tmp_path, age_s=5)
+    doc = json.load(open(p))
+    doc["store"]["free_bytes"] = 700 * 1048576
+    json.dump(doc, open(p, "w"))
+    monkeypatch.setattr(RM.os, "statvfs", lambda path: (_ for _ in ()).throw(AssertionError("a fresh status must not need the volume")))
+    obs = RM.recorder_observation(p, now=now)
+    assert obs["state"] == "RECORDING" and obs["free_mb"] == pytest.approx(700.0) and obs["free_mb_source"] == "recorder_status"
+
+
+def test_a_stale_status_on_a_volume_the_monitor_cannot_read_says_unknown_never_the_old_figure(tmp_path, monkeypatch):
+    p, now = status_file(tmp_path, age_s=6 * 86_400)
+    doc = json.load(open(p))
+    doc["store"]["free_bytes"] = 511 * 1048576
+    json.dump(doc, open(p, "w"))
+
+    def boom(path):
+        raise OSError(5, "I/O error")
+    monkeypatch.setattr(RM.os, "statvfs", boom)
+    obs = RM.recorder_observation(p, now=now)
+    assert obs["state"] == "STALE" and obs["free_mb"] is None and obs["free_mb_source"] == "unavailable"

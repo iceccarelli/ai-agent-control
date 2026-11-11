@@ -1,6 +1,9 @@
 # REAL container checks for the Testnet autopilot image (Dockerfile.autopilot): build it, run the real entrypoint, check the unprivileged user, the volume ownership and modes, that SIGTERM
 # reaches the Python process and stops the engine cleanly, and that no credential or live switch is in the image and the testnet host cannot be changed by environment.
 # Offline and secret-free: it never contacts Bybit or any service and uses no credential. It runs only when the image's inputs change (or on demand).
+# THE INPUTS ARE EVERYTHING THE DOCKERFILE COPIES: the top-level modules (md_*.py, carry_*.py ...), signals/, the named tools, the deploy scripts and the dependency pins. The filter below once named only
+# ms_*.py, exec_evidence.py and economic_model.py, so a change to md_store.py (which this image imports) shipped with no image validation. The check takes about a minute, so the filter is deliberately
+# WIDER than the exact COPY list; bot/tests/test_image_validation_triggers.py recomputes the COPY list and fails if any shipped file is not matched by a pattern here.
 name: autopilot-image
 
 on:
@@ -8,10 +11,11 @@ on:
     paths:
       - "bot/Dockerfile.autopilot"
       - "bot/fly.autopilot.toml"
+      - "bot/.dockerignore"
       - "bot/deploy/**"
-      - "bot/tools/ms_*.py"
-      - "bot/tools/exec_evidence.py"
-      - "bot/economic_model.py"
+      - "bot/*.py"
+      - "bot/signals/**"
+      - "bot/tools/*.py"
       - "bot/requirements.txt"
       - "bot/constraints.txt"
       - ".github/workflows/autopilot-image.yml"

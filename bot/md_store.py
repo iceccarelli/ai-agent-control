@@ -205,9 +205,71 @@ class MarketStore:
     def _segment_path(self, day: str) -> str:
         return os.path.join(self.dir, f"md-{day}.db")
 
+    def _initialised(self, name: str) -> bool:
+        """False for a segment the recorder died while CREATING (the file exists, its schema does not: a 0-byte file, or a database without its ``meta`` / ``log`` tables). Such a file holds no
+        record by construction, and the writer completes it idempotently (``CREATE TABLE IF NOT EXISTS``) when it next opens that day. Anything else is True, INCLUDING a file that is not a database
+        at all or cannot be opened: corruption stays an error for the caller to raise, it is never mistaken for an unfinished creation."""
+        path = os.path.join(self.dir, name)
+        try:
+            if os.path.getsize(path) == 0:
+                return False
+        except OSError:
+            return True
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return True
+        return {"meta", "log"} <= tables
+
+    def _abandoned(self, name: str) -> bool:
+        """True for an uninitialised segment that held NO record: an unfinished CREATION (the recorder died while making the day it was about to write). That is certain for the NEWEST segment. An
+        uninitialised segment with a successor is either that creation followed by later days after a restart (the file simply stayed behind) or a closed day whose file lost its content; the hash chain
+        tells them apart, because it is global: if a segment had held records, the next segment's ``chain_start`` would be the chain AFTER them. When the chain continues across the file (the nearest
+        earlier record's chain is exactly the nearest later segment's ``chain_start``) nothing was ever in it and it is skipped like the newest one; when it does not, its records are LOST and every
+        reader must say so loudly instead of counting around the hole (an independent review zeroed a middle segment and ``count()`` quietly returned 15 records instead of 20, and a second one showed
+        that treating EVERY middle file as damage bricked the recorder's own ``refresh_count`` after a crash during creation followed by a day without data).
+
+        THE LIMIT, stated: an unfinished creation and a file that LOST its content (a power cut that left a zero-length file the day it was being written) look identical from here, and once the
+        writer has continued from the last readable record the chain is re-linked past it, so even the chain cannot tell them apart afterwards. The newest file and a trailing run are skipped on
+        trust; a file between records is skipped only when the chain continues across it. Every skipped file is still NAMED by ``verify()`` (never silently counted around), and if it held
+        records they are gone and their ids will be reused."""
+        segs = self.segments()
+        if not segs or name not in segs or self._initialised(name):
+            return False
+        return segs[-1] == name or self._in_trailing_dead_run(name, segs) or self._chain_continues_across(name, segs)
+
+    def _in_trailing_dead_run(self, name: str, segs: List[str]) -> bool:
+        """True when EVERY segment from ``name`` to the newest is uninitialised: a creation that kept failing across several midnights (a full disk, for one). Nothing after them can prove the chain
+        continues, and nothing can prove a loss either, so they are treated like the single newest one (the independent re-review's ``[records, dead, dead]`` made ``MarketStore(dir)`` itself raise and the
+        recorder unable to start). ``verify()`` still names every one of them."""
+        return all(not self._initialised(n) for n in segs[segs.index(name):])
+
+    def _chain_continues_across(self, name: str, segs: List[str]) -> bool:
+        i = segs.index(name)
+        before: Optional[str] = None
+        for n in reversed(segs[:i]):                              # the nearest earlier segment that actually holds a record
+            if self._initialised(n):
+                last = self._segment_meta(n)[1]
+                if last:
+                    before = last
+                    break
+        if before is None:
+            pruned = self._pruned_manifest()                      # nothing earlier survives: the chain it must continue is the pruned tail, or genesis
+            before = pruned[-1]["last_chain"] if pruned else GENESIS
+        for n in segs[i + 1:]:
+            if self._initialised(n):
+                return self._segment_meta(n)[0] == before
+        return False
+
     def _scan_tail(self) -> Tuple[int, str]:
         segs = self.segments()
         for name in reversed(segs):
+            if self._abandoned(name):
+                continue                                          # an abandoned creation (the newest segment, no log yet) holds no record: read the tail from the last segment that has a log
             conn = sqlite3.connect(os.path.join(self.dir, name))
             try:
                 row = conn.execute("SELECT id, chain FROM log ORDER BY id DESC LIMIT 1").fetchone()
@@ -244,6 +306,8 @@ class MarketStore:
         except FileNotFoundError:
             pass
         for name in self.segments():
+            if not self._initialised(name):
+                continue                                          # no meta yet: it belongs to no environment until the writer completes it (under THIS store's)
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 row = conn.execute("SELECT value FROM meta WHERE key='environment'").fetchone()
@@ -392,7 +456,7 @@ class MarketStore:
         # retention window measured from the wall clock, and only while stalled. A failed free-space
         # look is NOT "stalled" here (unlike the writer, which treats it as low): an error must never
         # enable a deletion.
-        segs = self.segments()
+        segs = [n for n in self.segments() if self._initialised(n)]       # an abandoned creation (possibly dated by a wrong clock) must not move the clock-jump bound
         if segs:
             newest_ms = int(datetime.strptime(segs[-1][3:11], "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()) * 1000
             stalled = False
@@ -447,6 +511,8 @@ class MarketStore:
         """Records in id order across every segment (read-only connections)."""
         self.flush()
         for name in self.segments():
+            if self._abandoned(name):
+                continue                                          # an abandoned creation (the newest segment) holds no record; an emptied OLDER segment raises below
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 cur = conn.execute(
@@ -471,6 +537,8 @@ class MarketStore:
         self.flush()
         total = 0
         for name in self.segments():
+            if self._abandoned(name):
+                continue                                          # an abandoned creation (the newest segment) holds no record; an emptied OLDER segment raises below
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 total += conn.execute("SELECT COUNT(*) FROM log").fetchone()[0]
@@ -498,6 +566,22 @@ class MarketStore:
         prev_last: Optional[str] = None
         pruned = self._pruned_manifest()
         for idx, name in enumerate(self.segments()):
+            if not self._initialised(name):
+                if self._abandoned(name):
+                    segs_now = self.segments()
+                    if name == segs_now[-1]:
+                        why = ""
+                    elif self._in_trailing_dead_run(name, segs_now):
+                        why = ("; it is part of a trailing run of unfinished creations: nothing after it can prove whether it ever held a record, so it is treated like the newest one "
+                               "(check the recorder's counters, move it aside when convenient, RUNBOOKS section 14)")
+                    else:
+                        why = ("; the hash chain continues across it: if the recorder died while creating it, it held no record; if the file lost its content the writer has since re-linked the chain "
+                               "past it and the store cannot tell the two apart (check the monitor's id counter; move it aside when convenient, RUNBOOKS section 14)")
+                    problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record" + why)
+                else:
+                    problems.append(f"{name}: EMPTY segment that is not the newest and the hash chain does NOT continue across it: its records are LOST (damage); readers refuse it. "
+                                    f"Check, then move it aside deliberately (RUNBOOKS section 14)")
+                continue
             start, _ = self._segment_meta(name)
             if idx == 0:
                 if pruned:
@@ -558,6 +642,19 @@ class MarketStore:
         for name in removable:
             if removed == [] and name != segs[0]:
                 break                       # only ever prune from the oldest end
+            if not self._initialised(name):                    # an emptied segment holds no record: nothing to checkpoint. It is removed WITH an audit row, never silently
+                before = self._pruned_manifest()
+                with open(self._manifest_path(), "a") as fh:
+                    fh.write(json.dumps({"segment": name, "records": 0, "uninitialised": True, "last_chain": before[-1]["last_chain"] if before else GENESIS,
+                                         "pruned_at_ms": int(time.time() * 1000)}, sort_keys=True) + "\n")
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.remove(os.path.join(self.dir, name + suffix))
+                    except FileNotFoundError:
+                        pass
+                removed.append(name)
+                segs = self.segments()
+                continue
             _, last = self._segment_meta(name)
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:

@@ -304,3 +304,242 @@ def test_below_the_retained_days_plus_the_reserve_the_stall_is_still_permanent_a
     for vol in (1.0, 3.0):
         got = _simulate_volume(tmp_path, label=f"small{vol}", stalled_aware=True, vol=vol)
         assert all(got.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), (vol, got)
+
+
+# ---------------------------------------------------------------- a recorder that died while CREATING a segment must restart (an independent review: it looped until a human deleted the file)
+def _segment_path(directory, day):
+    return os.path.join(str(directory), f"md-{day}.db")
+
+
+def _two_days_then_a_dead_creation(tmp_path, kind):
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    s.append(ST.FRAME, wall_ms=BASE, mono_s=1.0, category="spot", payload='{"a":1}')
+    s.append(ST.FRAME, wall_ms=BASE + 1, mono_s=1.1, category="spot", payload='{"a":2}')
+    s.close()
+    dead = _segment_path(d, "20261105")
+    if kind == "zero_bytes":
+        open(dead, "wb").close()                                       # the file existed, nothing else did (ENOSPC / kill at the moment of the day rollover)
+    elif kind == "meta_only":
+        import sqlite3
+        c = sqlite3.connect(dead)
+        c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        c.commit()
+        c.close()
+    return d, dead
+
+
+@pytest.mark.parametrize("kind", ["zero_bytes", "meta_only"])
+def test_a_segment_the_recorder_died_while_creating_does_not_brick_the_next_start(tmp_path, kind):
+    d, dead = _two_days_then_a_dead_creation(tmp_path, kind)
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")            # raised OperationalError / StoreError forever before
+    assert s.count() == 2                                                         # the real records are untouched and the tail is read from the last INITIALISED segment
+    s.append(ST.FRAME, wall_ms=BASE + DAY + 5, mono_s=2.0, category="spot", payload='{"a":3}')      # the writer completes the segment it finds half-created, on the same day
+    s.close()
+    r = ST.MarketStore(str(d))                                                    # read-only handle
+    assert r.count() == 3 and r.verify() == [], r.verify()
+
+
+@pytest.mark.parametrize("kind", ["zero_bytes", "meta_only"])
+def test_verify_reports_an_uninitialised_segment_instead_of_crashing_or_hiding_it(tmp_path, kind):
+    d, dead = _two_days_then_a_dead_creation(tmp_path, kind)
+    r = ST.MarketStore(str(d))
+    problems = r.verify()
+    assert any("md-20261105.db" in p and "uninitialised" in p for p in problems), problems
+
+
+def test_retention_removes_an_uninitialised_oldest_segment_without_a_checkpoint_it_has_no_records(tmp_path):
+    d = tmp_path / "md"
+    os.makedirs(d)
+    open(_segment_path(d, "20261101"), "wb").close()                              # an abandoned creation, two days before the real data
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((2 * DAY, 3 * DAY, 4 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload="{}")
+    removed = s.apply_retention(BASE + 4 * DAY, 2)
+    assert "md-20261101.db" in removed and not os.path.exists(_segment_path(d, "20261101"))
+    assert s.verify() == [] or all("uninitialised" not in p for p in s.verify())
+
+
+def test_a_file_that_is_not_a_database_is_still_refused_not_treated_as_uninitialised(tmp_path):
+    d, dead = _two_days_then_a_dead_creation(tmp_path, "none")
+    with open(dead, "wb") as fh:
+        fh.write(b"this is not a sqlite database at all" * 40)
+    with pytest.raises(Exception) as exc:
+        ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    assert "not a database" in str(exc.value) or isinstance(exc.value, ST.StoreError)
+
+
+def test_a_segment_with_records_is_never_treated_as_uninitialised(tmp_path):
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    s.append(ST.FRAME, wall_ms=BASE, mono_s=1.0, category="spot", payload="{}")
+    s.close()
+    assert ST.MarketStore(str(d))._initialised("md-20261104.db") is True
+
+
+# ---------------------------------------------------------------- second independent review: an unfinished CREATION is only ever the newest segment
+def _three_days_two_frames(tmp_path):
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((0, DAY, 2 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload='{"i":%d}' % i)
+        s.append(ST.FRAME, wall_ms=BASE + off + 1, mono_s=float(i) + 0.1, category="spot", payload='{"j":%d}' % i)
+    s.close()
+    return d
+
+
+def test_an_emptied_segment_that_has_a_successor_is_damage_every_reader_refuses_it_not_a_hole_to_count_around(tmp_path):
+    import sqlite3
+    d = _three_days_two_frames(tmp_path)
+    segs = sorted(f for f in os.listdir(d) if f.startswith("md-") and f.endswith(".db"))
+    assert len(segs) == 3
+    open(os.path.join(d, segs[1]), "wb").close()                                   # the MIDDLE closed day lost its content
+    r = ST.MarketStore(str(d))
+    with pytest.raises(sqlite3.DatabaseError, match="no such table"):
+        r.count()                                                                   # it used to return 4 (not 6) without a word
+    with pytest.raises(sqlite3.DatabaseError, match="no such table"):
+        list(r.iter_records())
+    problems = r.verify()
+    assert any(segs[1] in p and "not the newest" in p and "LOST" in p for p in problems), problems
+
+
+def _after_a_dead_creation_and_a_quiet_day(tmp_path, *, quiet_days=2):
+    """Day 1 has records; the recorder dies while CREATING day 2 (a 0-byte file); it is restarted ``quiet_days`` later and writes again."""
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for j in range(2):
+        s.append(ST.FRAME, wall_ms=BASE + j, mono_s=float(j), category="spot", payload='{"a":%d}' % j)
+    s.close()
+    dead = _segment_path(d, "20261105")
+    open(dead, "wb").close()
+    s2 = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for j in range(2):
+        s2.append(ST.FRAME, wall_ms=BASE + quiet_days * DAY + j, mono_s=float(10 + j), category="spot", payload='{"b":%d}' % j)
+    s2.close()
+    return d, dead
+
+
+def test_an_abandoned_creation_followed_by_later_days_does_not_brick_the_readers_and_loses_nothing(tmp_path):
+    """Independent re-review, finding 5: the previous rule made EVERY uninitialised segment with a successor damage, so a crash during creation followed by a day without data left
+    ``count()`` and ``iter_records()`` raising 'no such table: log' (and the recorder's own refresh_count failing every cycle) until the owner moved the file aside by hand. The hash chain is global:
+    when it continues across the file, nothing was ever in it."""
+    d, dead = _after_a_dead_creation_and_a_quiet_day(tmp_path)
+    r = ST.MarketStore(str(d))
+    assert r.segments() == ["md-20261104.db", "md-20261105.db", "md-20261106.db"] and os.path.getsize(dead) == 0
+    assert r.count() == 4 and [x.id for x in r.iter_records()] == [1, 2, 3, 4], "every record of the other segments must stay readable"
+    problems = r.verify()
+    assert len(problems) == 1 and "md-20261105.db" in problems[0] and "uninitialised" in problems[0] and "hash chain continues across it" in problems[0] and "LOST" not in problems[0], problems
+    assert "cannot tell the two apart" in problems[0], "the verdict must not claim certainty the store does not have"
+    w = ST.MarketStore(str(d), commit_every=1, environment="mainnet")                    # and the recorder goes on writing
+    w.append(ST.FRAME, wall_ms=BASE + 2 * DAY + 50, mono_s=99.0, category="spot", payload='{"c":1}')
+    assert w.count() == 5 and [x.id for x in w.iter_records()] == [1, 2, 3, 4, 5]
+    w.close()
+
+
+def test_an_abandoned_creation_before_any_record_is_provably_empty_with_or_without_a_prune_checkpoint(tmp_path):
+    d = tmp_path / "md"
+    os.makedirs(d)
+    open(_segment_path(d, "20261101"), "wb").close()                                       # the oldest file: nothing ever came before it
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((2 * DAY, 3 * DAY, 4 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload="{}")
+    s.close()
+    r = ST.MarketStore(str(d))
+    assert r.count() == 3 and len(list(r.iter_records())) == 3 and all("LOST" not in p for p in r.verify())
+    # after a prune checkpoint the chain it must continue is the pruned tail: still provable
+    removed = r.prune_segments_before("20261106")
+    assert "md-20261101.db" not in r.segments() or removed
+    r2 = ST.MarketStore(str(d))
+    assert all("LOST" not in p for p in r2.verify()) and r2.count() == len(list(r2.iter_records()))
+
+
+def test_a_trailing_run_of_dead_creations_does_not_stop_the_recorder_from_starting(tmp_path):
+    """Independent re-review of the fix, N1: ``[records, 0-byte, 0-byte]`` (creation failing across two midnights, for instance on a full disk) made ``MarketStore(dir)`` itself raise 'no such table: log':
+    the recorder could not start, and even a read-only open or verify was refused until the files were moved by hand. A trailing RUN of unfinished creations is treated like the newest one."""
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for j in range(2):
+        s.append(ST.FRAME, wall_ms=BASE + j, mono_s=float(j), category="spot", payload='{"a":%d}' % j)
+    s.close()
+    for day in ("20261105", "20261106"):
+        open(_segment_path(d, day), "wb").close()                                           # creation failed on two consecutive days
+    r = ST.MarketStore(str(d))                                                              # a read-only style open works
+    assert r.count() == 2 and [x.id for x in r.iter_records()] == [1, 2]
+    problems = r.verify()
+    assert len(problems) == 2 and all("uninitialised" in p for p in problems) and any("trailing run" in p for p in problems) and not any("LOST" in p for p in problems), problems
+    w = ST.MarketStore(str(d), commit_every=1, environment="mainnet")                       # and the recorder starts, continuing from the last real record
+    w.append(ST.FRAME, wall_ms=BASE + 2 * DAY + 5, mono_s=9.0, category="spot", payload='{"b":1}')
+    assert [x.id for x in w.iter_records()] == [1, 2, 3] and w.count() == 3
+    w.close()
+    # the dead files now sit BEFORE a real segment: the chain proves them empty (the earlier rule), and a trailing run needs no proof
+    again = ST.MarketStore(str(d))
+    assert again.count() == 3 and all("LOST" not in p for p in again.verify())
+
+
+def test_a_zeroed_day_followed_only_by_dead_creations_is_reported_not_counted_around_in_silence(tmp_path):
+    """The ambiguity a trailing run cannot resolve is stated, not hidden: a closed day that lost its content followed only by a dead creation reads like two unfinished creations. verify() names
+    both and says it cannot tell them apart. (Once the writer continues, it re-links the chain from the last readable record, so the files then read as skipped-and-named, with the same caveat.)"""
+    d = _three_days_two_frames(tmp_path)
+    segs = sorted(f for f in os.listdir(d) if f.startswith("md-") and f.endswith(".db"))
+    open(os.path.join(d, segs[1]), "wb").close()                                           # the middle day (with records) loses its content
+    open(os.path.join(d, segs[2]), "wb").close()                                           # and the newest is dead too
+    r = ST.MarketStore(str(d))
+    problems = r.verify()
+    assert r.count() == 2 and len(problems) == 2 and all("uninitialised" in p for p in problems), problems
+    w = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    w.append(ST.FRAME, wall_ms=BASE + 5 * DAY, mono_s=50.0, category="spot", payload='{"later":1}')
+    w.close()
+    r2 = ST.MarketStore(str(d))
+    after = r2.verify()
+    assert r2.count() == 3 and len(after) == 2 and all("cannot tell the two apart" in p or "trailing run" in p for p in after), after
+    assert [x.id for x in r2.iter_records()] == [1, 2, 3], "the new record continues from the last readable one (and any lost ids are reused: stated in verify)"
+
+
+def test_an_abandoned_creation_that_becomes_the_oldest_file_after_a_prune_is_proven_empty_by_the_pruned_tail(tmp_path):
+    d, dead = _after_a_dead_creation_and_a_quiet_day(tmp_path)
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    removed = s.prune_segments_before("20261105")                                           # day 1 (with records) goes; the dead creation is now the oldest retained file
+    assert removed == ["md-20261104.db"] and s.segments() == ["md-20261105.db", "md-20261106.db"]
+    s.close()
+    r = ST.MarketStore(str(d))
+    assert r.count() == 2 and [x.id for x in r.iter_records()] == [3, 4]
+    assert all("LOST" not in p for p in r.verify()), r.verify()
+
+
+def test_a_closed_day_that_held_records_stays_damage_even_when_an_abandoned_creation_sits_beside_it(tmp_path):
+    import sqlite3
+    d, dead = _after_a_dead_creation_and_a_quiet_day(tmp_path)
+    s3 = ST.MarketStore(str(d), commit_every=1, environment="mainnet")                     # a later day, then lose a day that HELD records
+    s3.append(ST.FRAME, wall_ms=BASE + 3 * DAY, mono_s=200.0, category="spot", payload='{"d":1}')
+    s3.close()
+    held = _segment_path(d, "20261106")
+    assert os.path.getsize(held) > 0
+    open(held, "wb").close()                                                                 # the day with records b0, b1 loses its content
+    r = ST.MarketStore(str(d))
+    with pytest.raises(sqlite3.DatabaseError, match="no such table"):
+        r.count()
+    problems = r.verify()
+    assert any("md-20261106.db" in p and "LOST" in p and "does NOT continue" in p for p in problems), problems
+    # two empty files in a row: the chain break is somewhere across the PAIR, so neither can be proven empty and both are reported (conservative: never count around a possible hole)
+    assert any("md-20261105.db" in p and "LOST" in p and "does NOT continue" in p for p in problems), problems
+    assert any("id gap" in p or "chain_start does not continue" in p for p in problems), "and the break itself is reported by the chain checks"
+
+
+def test_the_newest_segment_is_still_the_only_one_an_unfinished_creation_can_be(tmp_path):
+    d = _three_days_two_frames(tmp_path)
+    segs = sorted(f for f in os.listdir(d) if f.startswith("md-") and f.endswith(".db"))
+    open(os.path.join(d, segs[-1]), "wb").close()                                   # the day being created when the recorder died
+    r = ST.MarketStore(str(d))
+    assert r.count() == 4 and any(segs[-1] in p and "recorder died while creating" in p for p in r.verify())
+
+
+def test_removing_an_emptied_segment_by_retention_leaves_an_audit_row_not_a_silent_deletion(tmp_path):
+    d = tmp_path / "md"
+    os.makedirs(d)
+    open(_segment_path(d, "20261101"), "wb").close()
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((2 * DAY, 3 * DAY, 4 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload="{}")
+    assert "md-20261101.db" in s.apply_retention(BASE + 4 * DAY, 2)
+    rows = [json.loads(line) for line in open(os.path.join(d, "pruned.jsonl")) if line.strip()]
+    assert [(r["segment"], r.get("uninitialised"), r["records"]) for r in rows if r["segment"] == "md-20261101.db"] == [("md-20261101.db", True, 0)]

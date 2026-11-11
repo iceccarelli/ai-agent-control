@@ -88,3 +88,17 @@ def test_an_unreadable_history_is_retried_once_and_its_cause_is_shown():
 def test_the_retry_does_not_become_a_mutating_or_hiding_command():
     assert "|| true" not in CODE and "continue-on-error" not in CODE
     assert [m for m in re.findall(r'-C "([^"]*)"', CODE)] == ["cat /data/monitor/monitor.jsonl"]
+
+
+def test_a_failed_read_is_classified_into_the_closed_vocabulary_and_never_forwarded_as_text():
+    """An expired token and an unreachable machine used to both page `no_data`. The read step now writes ONLY a class word; the alert step passes it to runner_alerts."""
+    steps = _steps(CODE)
+    read = [s for s in steps if "flyctl ssh console" in s][0]
+    alert = [s for s in steps if "runner_alerts.py" in s][0]
+    assert "python bot/tools/fly_read_failure.py fly.err > read_failure.txt" in read, "the classification is code a test executes (tests/test_fly_read_failure.py), not a grep chain in the workflow"
+    assert "grep -qiE" not in read and "echo auth_failed" not in read, "the old grep chain (bare `token`, `401|403`) must not come back"
+    assert "--read-failure" in alert and 'cat read_failure.txt' in alert
+    assert 'cat fly.err' not in alert and "fly.err" not in alert, "error text must never reach the alert step (it can carry a token fragment)"
+    import runner_alerts as RA
+    for word in ("auth_failed", "timeout", "machine_unreachable", "unknown"):
+        assert word in RA.READ_FAILURES, word

@@ -162,8 +162,23 @@ def test_an_unflat_group_is_not_a_completed_attempt_and_shows_its_residual():
 
 # ------------------------------------------------------------------ the comparison never invents a winner
 def _attempt(style, bps, done=True, n=1):
-    return {"style": style, "attempt_completed": done, "cost_complete": True, "total_execution_cost_bps_of_position_notional": str(bps), "total_execution_cost_usd": "0.2",
-            "position_notional_usd": "100"}
+    """A complete hedged-pair attempt (both entry legs filled) when ``done``; an unfilled maker attempt otherwise. Policy samples count only full pairs (see the one-legged test below)."""
+    return {"style": style, "attempt_completed": done, "cost_complete": True, "all_entry_legs_filled": bool(done), "total_execution_cost_bps_of_position_notional": str(bps),
+            "total_execution_cost_usd": "0.2", "position_notional_usd": "100"}
+
+
+def test_a_one_legged_attempt_is_not_a_cheap_policy_sample():
+    """Review R2-7: ``policy_summary`` counted a one-legged completed attempt (about half a pair's cost per unit of notional) as a cheap sample while ``feedback_report`` already excluded it."""
+    full = [_attempt("TAKER", 22) for _ in range(5)]
+    one_legged = [dict(_attempt("MAKER_FIRST", 11), all_entry_legs_filled=False) for _ in range(5)]
+    unstated = [{k: v for k, v in _attempt("MAKER_FIRST", 11).items() if k != "all_entry_legs_filled"} for _ in range(5)]
+    for bad in (one_legged, unstated):
+        s = EQ.policy_summary(full + bad, min_orders=5)
+        mk = s["policies"]["MAKER_FIRST"]
+        assert mk["attempts"] == 5 and mk["completed_with_complete_costs"] == 0 and mk["mean_cost_bps"] is None and mk["completion_rate"] == "0.0000", mk
+        assert s["verdict"] == "INSUFFICIENT_SAMPLE"
+    both = EQ.policy_summary(full + [_attempt("MAKER_FIRST", 11) for _ in range(5)], min_orders=5)
+    assert both["verdict"] == "COMPARABLE_SAMPLE" and both["policies"]["MAKER_FIRST"]["completed_with_complete_costs"] == 5, "control: full pairs are counted"
 
 
 def test_the_policy_comparison_is_insufficient_below_the_minimum_sample_and_counts_unfilled_attempts():
@@ -303,9 +318,100 @@ def test_the_session_record_schema_is_untouched(w):
     assert S.record_refusals(w.record()) == [] and "execution_quality" not in w.record()
 
 
+# ------------------------------------------------------------------ an order that says it filled while no execution rows came back is an UNKNOWN cost, never a measured zero
+def _filled_order(cum="2"):
+    return {"status": "Filled", "created_ms": 1_510, "updated_ms": 2_001, "cum_qty": cum, "avg_price": "100.25"}
+
+
+def test_an_order_the_venue_says_filled_with_no_execution_rows_has_an_unknown_cost_never_zero():
+    """A lagging or dropped execution list: orderStatus Filled, cumExecQty 2, zero executions. The old record said fee 0 and total cost 0 with nothing unknown (specialist E, G4)."""
+    r = leg("Buy", [], order=_filled_order("2"))
+    assert "fills_incomplete" in r["unknown"] and r["fee"]["usd_signed"] is None and r["cost"]["total_usd"] is None and r["cost"]["fee_usd"] is None
+    assert r["fills"]["count"] == 0 and D(r["fills"]["qty"]) == 0                              # what the rows show is stated as it is; the cost is what is unknown
+
+
+def test_executions_that_cover_only_part_of_the_orders_filled_quantity_make_the_cost_unknown():
+    r = leg("Buy", [fill(1, "1", "100.20", "0.05")], order=_filled_order("2"))
+    assert "fills_incomplete" in r["unknown"] and r["cost"]["total_usd"] is None and r["fee"]["usd_signed"] is None
+
+
+def test_complete_executions_are_unaffected_and_an_unsent_or_unfilled_order_is_a_real_zero():
+    full = leg("Buy", [fill(1, "2", "100.20", "0.05")], order=_filled_order("2"))
+    assert "fills_incomplete" not in full["unknown"] and D(full["cost"]["total_usd"]) > 0
+    unfilled = leg("Buy", [], order={"status": "Cancelled", "cum_qty": "0", "avg_price": "0"})
+    assert "fills_incomplete" not in unfilled["unknown"] and D(unfilled["fee"]["usd_signed"]) == 0           # a venue-confirmed nothing is a real zero
+    unsent = leg("Buy", [], order=None)
+    assert "fills_incomplete" not in unsent["unknown"] and D(unsent["fee"]["usd_signed"]) == 0
+    absent = leg("Buy", [], order={"status": "Cancelled", "cum_qty": None})
+    assert "fills_incomplete" not in absent["unknown"]                                                      # an absent cumulative quantity on an order that did not trade is not a claim of a fill
+    for status in ("Filled", "PartiallyFilled", "PartiallyFilledCanceled"):
+        for cum in (None, "0"):
+            said = leg("Buy", [], order={"status": status, "cum_qty": cum})
+            assert "fills_incomplete" in said["unknown"] and said["fee"]["usd_signed"] is None and said["cost"]["total_usd"] is None, (status, cum)
+    # ... but an execution that IS there prices the leg whatever the order row's quantity says
+    priced = leg("Buy", [fill(1, "2", "100.20", "0.05")], order={"status": "Filled", "cum_qty": None}, qty="2")
+    assert "fills_incomplete" not in priced["unknown"] and D(priced["fee"]["usd_signed"]) != 0
+
+
+def test_the_fee_in_base_tolerance_belongs_to_a_spot_buy_alone():
+    """A spot SELL's fee is taken from the quote coin: its order row and its executions agree, so a missing execution is a missing execution, never a fee-sized remainder."""
+    net = {"fill_id": "E1", "qty": "0.999", "price": "100.20", "fee_usd": "0.0001", "fee_ccy": "USDT", "liquidity": "TAKER", "ts_ms": 2_000}
+    sell = leg("Sell", [net], order=_filled_order("1"), category="spot", qty="1")
+    assert "fills_incomplete" in sell["unknown"]
+    buy = leg("Buy", [net], order=_filled_order("1"), category="spot", qty="1")
+    assert "fills_incomplete" not in buy["unknown"]
+
+
+def test_a_spot_buy_whose_fee_is_taken_in_the_base_coin_is_net_of_it_and_complete_within_the_fee_bound():
+    """The order row's cumulative quantity is GROSS, the execution NET of a fee taken from the coin received: a 0.1% gap on a SPOT leg is the fee, not a missing fill. A perp has no such gap."""
+    net = {"fill_id": "E1", "qty": "0.999", "price": "100.20", "fee_usd": "0.0001", "fee_ccy": "BTC", "liquidity": "TAKER", "ts_ms": 2_000}
+    spot = leg("Buy", [net], order=_filled_order("1"), category="spot", qty="1")
+    assert "fills_incomplete" not in spot["unknown"]
+    perp = leg("Buy", [dict(net, fee_ccy="USDT")], order=_filled_order("1"), category="linear", qty="1")
+    assert "fills_incomplete" in perp["unknown"]                                                            # no tolerance where no fee is taken in kind
+    wide = leg("Buy", [dict(net, qty="0.9")], order=_filled_order("1"), category="spot", qty="1")
+    assert "fills_incomplete" in wide["unknown"]                                                            # a 10% gap is a missing fill on any leg
+
+
+def test_the_fee_bound_is_the_execution_engines_single_constant():
+    import ms_execution as X
+    assert EQ.FEE_IN_BASE_MAX_FRACTION == X.FEE_IN_BASE_MAX_FRACTION
+
+
+def test_the_group_cost_is_incomplete_not_zero_when_any_leg_lacks_its_executions():
+    legs = [leg("Sell", [fill(1, "2", "100.00", "0.05")], leg_id="p", order=_filled_order("2")), leg("Buy", [], leg_id="s", order=_filled_order("2"), category="spot")]
+    g = EQ.group_quality(legs, style="TAKER", notional_usd="200", flat_verified=True)
+    assert g["cost_complete"] is False and g["total_execution_cost_usd"] is None and g["total_execution_cost_bps_of_position_notional"] is None
+    assert g["attempt_completed"] is True and "fills_incomplete" in g["unknown"]                              # the attempt did finish flat; its cost is what is unknown
+    assert EQ.policy_summary([g])["policies"]["TAKER"]["completed_with_complete_costs"] == 0                  # never enters a policy average
+    assert EQ.feedback_report([EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality={"group": g}, funding=None, edge={"costs_bps": {"fees": "31"}}, flat_verified=True)])["model_vs_measured"]["sessions"] == 0
+
+
+def test_every_leg_with_complete_executions_gives_a_complete_group_as_before():
+    legs = [leg("Sell", [fill(1, "2", "100.00", "0.05")], leg_id="p", order=_filled_order("2")), leg("Buy", [fill(2, "2", "100.20", "0.05")], leg_id="s", order=_filled_order("2"), category="spot")]
+    g = EQ.group_quality(legs, style="TAKER", notional_usd="200", flat_verified=True)
+    assert g["cost_complete"] is True and g["total_execution_cost_usd"] is not None and g["unknown"] == []
+
+
+def test_a_one_legged_attempt_is_not_a_like_for_like_comparison_with_the_two_legged_model_cost():
+    """Specialist C, F4: an attempt whose second entry leg never filled has about half the fees; compared with the model's full-pair cost it reads as a large negative 'surprise'."""
+    legs = [leg("Sell", [fill(1, "2", "100.00", "0.05")], leg_id="p", order=_filled_order("2")),
+            leg("Buy", [], leg_id="s", order={"status": "Cancelled", "cum_qty": "0"}, category="spot"),
+            leg("Buy", [fill(3, "2", "100.10", "0.05")], leg_id="x1", kind="EXIT", reduce=True, order=_filled_order("2"))]
+    g = EQ.group_quality(legs, style="TAKER", notional_usd="200", flat_verified=True)
+    assert g["all_entry_legs_filled"] is False and g["attempt_completed"] is True and g["cost_complete"] is True
+    row = EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality={"group": g}, funding=None, edge={"costs_bps": {"fees": "31", "spread": "0.4", "slippage": "0"}}, flat_verified=True)
+    assert row["all_entry_legs_filled"] is False
+    rep = EQ.feedback_report([row])
+    assert rep["model_vs_measured"]["sessions"] == 0 and rep["sessions_logged"] == 1                          # logged, counted as a session, but not compared with a cost it did not incur
+    assert EQ.policy_summary([g])["policies"]["TAKER"]["attempts"] == 1                                       # and the policy table still counts the attempt (a policy that fails its hedge is not flattered)
+    both = dict(row, all_entry_legs_filled=True)
+    assert EQ.feedback_report([both])["model_vs_measured"]["sessions"] == 1
+
+
 # ------------------------------------------------------------------ research feedback: measured vs modelled
 def _row(style="TAKER", measured="22.0", modelled="20.0", expected="9.0", realised="8.0", done=True):
-    return {"style": style, "attempt_completed": done, "cost_complete": True, "total_execution_cost_bps_of_position_notional": measured, "total_execution_cost_usd": "0.2",
+    return {"style": style, "attempt_completed": done, "cost_complete": True, "all_entry_legs_filled": True, "total_execution_cost_bps_of_position_notional": measured, "total_execution_cost_usd": "0.2",
             "position_notional_usd": "100", "modelled_cost_bps": modelled, "expected_funding_bps": expected, "realised_funding_bps": realised}
 
 

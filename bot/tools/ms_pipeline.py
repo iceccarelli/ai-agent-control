@@ -148,11 +148,13 @@ def history_requirement(*, formation_days: float, hold_days: float, min_rows: in
             "components": w["components"], "min_holding_rows": int(min_rows), "formula": w["formula"], "source": "backfill_plan.required_window"}
 
 
-def competition_row_for(candidate_id: str, *, history_root: str, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], ledger_dir: str) -> Optional[Dict[str, Any]]:
-    """The candidate's row of the REAL candidate_competition over the same verified inputs (its persistent multiple-testing ledger lives in ``ledger_dir``). None when the competition has
-    no row for this candidate id."""
+def competition_row_for(candidate_id: str, *, history_root: str, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], ledger_dir: str,
+                        unreserved_exploratory: bool = False) -> Optional[Dict[str, Any]]:
+    """The candidate's row of the REAL candidate_competition over the same verified inputs (its persistent multiple-testing ledger, and the reserved-holdout ledger, live in ``ledger_dir``).
+    None when the competition has no row for this candidate id."""
     import candidate_competition as CCMP
-    rep = CCMP.run_competition(data_root=history_root, history_root=history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_dir=ledger_dir)
+    rep = CCMP.run_competition(data_root=history_root, history_root=history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_dir=ledger_dir,
+                               unreserved_exploratory=unreserved_exploratory)
     for r in rep["results"]:
         if r.get("candidate") == candidate_id:
             return dict(r)
@@ -196,13 +198,18 @@ def input_parts(info: Mapping[str, Any], spot_dir: Optional[str], collector_dige
     marks = sorted(k for k in ds if k != "funding")
     mark = (ds[marks[0]] or {}).get("manifest_digest") if marks else None
     uni = (info.get("universe") or {}).get("manifest_sha256")
+    h = info.get("holdout") if isinstance(info.get("holdout"), Mapping) else {}
+    holdout = f"RESERVED:{h.get('cut_ms')}" if h.get("status") == "RESERVED" else str(h.get("status") or "NOT_GUARDED")        # a cut run and a full-window run read different data: the identity says which
     return {"history_funding": fund or "UNKNOWN", "history_mark": mark or "UNKNOWN", "universe": uni or "UNKNOWN",
-            "spot": "ABSENT" if spot_dir is None else (_manifest_digest(spot_dir) or "UNKNOWN"), "collector": collector_digest or "ABSENT"}
+            "spot": "ABSENT" if spot_dir is None else (_manifest_digest(spot_dir) or "UNKNOWN"), "collector": collector_digest or "ABSENT", "holdout": holdout}
 
 
-def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str]) -> LoadedHistory:
-    """The ONLY way a history root enters the pipeline: ``candidate_readiness.load_history_root`` (re-verifies every dataset, the universe capture and the spot snapshot)."""
-    series, label, info = load_series(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Any = None,
+                  unreserved_exploratory: bool = False) -> LoadedHistory:
+    """The ONLY way a history root enters the pipeline: ``history_holdout.load`` over ``candidate_readiness.load_history_root`` (re-verifies every dataset, the universe capture and the
+    spot snapshot, and cuts the series at the reserved-holdout boundary)."""
+    series, label, info = load_series(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, holdout_ledger=holdout_ledger,
+                                      unreserved_exploratory=unreserved_exploratory)
     assert label == DATA_HISTORY
     return LoadedHistory(tuple(series), info, input_parts(info, spot_dir, None))
 
@@ -335,10 +342,11 @@ class LedgerAdapter:
         if canon["net"] is not None:                                              # a COMPLETE ledger: THE net is ms_accounting's canonical_net (one definition; reconcile compares against it)
             price_leg, funding, fees, adj, net = canon["price_leg"], canon["funding"], canon["fees"], canon["exit_adjustment"], canon["net"]
             mid_fb = canon["valuation"] == "MID_FALLBACK"
+        complete = p["net"] is not None and canon["net_complete"]                 # an unknown component OR an integrity conflict (a duplicate fill whose content differs ...) is INCOMPLETE
         unreal = p["unrealised_price"]
         unreal = None if unreal is None else unreal + adj                         # the value of closing what is open NOW (exit side of the book, less the taker exit fee)
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": taker + adverse, "adverse_selection": adverse, "taker_slippage": taker,
-                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]) + (["MID_FALLBACK"] if mid_fb else []), "valuation": "MID_FALLBACK" if mid_fb else "EXIT_SIDE", "status": p["status"],
+                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_subtotal": net, "net_complete": complete, "flags": list(p["flags"]) + [f for f in canon["flags"] if f not in p["flags"] and f.startswith(MACC.INTEGRITY_FLAG_PREFIXES)] + (["MID_FALLBACK"] if mid_fb else []), "valuation": "MID_FALLBACK" if mid_fb else "EXIT_SIDE", "status": p["status"],
                 "prov": p["prov"], "ledger": p}
 
 
@@ -622,7 +630,8 @@ def _instrument_for(x: RP.ReplaySeries, cfg: RP.ReplayConfig) -> T.Instrument:
                         cfg.default_min_qty, cfg.default_max_qty, cfg.default_max_qty, cfg.default_min_notional, "10", x.symbol, _hedge_of(x.spot_listed))
 
 
-def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[str], mark_interval: Optional[str]) -> Tuple[List[Any], str, Dict[str, Any]]:
+def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Any = None,
+                unreserved_exploratory: bool = False) -> Tuple[List[Any], str, Dict[str, Any]]:
     """(series, data_label, info). A string is a market_history root and goes through the VERIFIED loader; anything else is a sequence of injected series (INJECTED_TEST_DATA)."""
     if isinstance(source, LoadedHistory):
         info = dict(source.info)
@@ -633,10 +642,13 @@ def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[
     if isinstance(source, str):
         if not universe_dir:
             raise PipelineRefused("UNIVERSE_DIR_REQUIRED_FOR_A_HISTORY_ROOT")
-        import candidate_readiness as CR                                  # lazy: heavy, and only the verified path needs it
+        import history_holdout as HH                                      # lazy: heavy, and only the verified path needs it
         import research_harness as RH
+        if holdout_ledger is None:
+            raise PipelineRefused("HOLDOUT_LEDGER_REQUIRED: a history root is only read through the reserved-holdout registry (history_holdout.default_registry_path()) or the explicit history_holdout.UNGUARDED")
         try:
-            series, info = CR.load_history_root(source, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+            series, info = HH.load(source, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_path=holdout_ledger,
+                                   reader="ms_pipeline", unreserved_exploratory=unreserved_exploratory)
         except RH.HarnessError as exc:
             raise PipelineRefused(f"HISTORY_REFUSED: {exc}") from exc
         if not series:
@@ -1027,9 +1039,13 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     else:
         parts = {"injected": "UNKNOWN"}
     series = _to_replay_series(raw_series, replay_cfg)
+    cut_ms = holdout_cut_of(info) if label == DATA_HISTORY else None
+    past = _window_past_boundary(replay_cfg.end_ms, cut_ms)
+    if past:
+        raise PipelineRefused(past)
     micro_info: Optional[Dict[str, Any]] = None
     if micro is not None:
-        series, micro_info = apply_micro(series, micro)
+        series, micro_info = apply_micro(series, micro, cut_ms=cut_ms)
         parts = {**parts, "collector": micro.data_digest()}
     symbols = [s.symbol for s in series]
     scope = str(info.get("survivorship", "SURVIVORS_ONLY"))
@@ -1091,7 +1107,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     first_ms, last_ms = _series_span(series)
     history = history_requirement(formation_days=float(params.get("formation_days", SC.DEFAULT_PARAMS["formation_days"])), hold_days=replay_cfg.hold_ms / DAY_MS,
                                   min_rows=min_holding_rows, first_ms=first_ms, last_ms=last_ms, end_ms=replay_cfg.end_ms)
-    evidence = {"data": label, "data_parts": dict(sorted(parts.items())), "execution": "MODELLED",
+    evidence = {"data": label, "data_parts": dict(sorted(parts.items())), "holdout": (info.get("holdout") if label == DATA_HISTORY else None), "execution": "MODELLED",
                 "books": "SYNTHETIC_ASSUMED_BOOK_FROM_MARKS (no collector: no measured depth or trades)" if micro_info is None else "MEASURED_BOOK_TAPE (PERP leg only; the spot leg uses the synthetic book; fills MODELLED)",
                 "microstructure": micro_info,
                 "fills": f"bar_policy={replay_cfg.fill.bar_policy}: a touch is never a fill; maker fills need a strict trade-through", "claim": "SIMULATED; never MEASURED execution"}
@@ -1120,7 +1136,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
                              "exits_refused_stale_quote": int(res.stats.get("transport", {}).get("exits_refused_stale_quote", 0)),
                              "taker_entries_refused_stale_quote": int(res.stats.get("transport", {}).get("refused", {}).get("STALE_QUOTE", 0))},
                "trials_total": trials_total, "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
-               "ledger": {"net": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
+               "ledger": {"net": pnl["net"] if pnl["net_complete"] else None, "net_subtotal": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
                "reconcile": {"ever_disagreed": rec_doc["ever_disagreed"], "halt_new_exposure": rec_doc["halt_new_exposure"], "n_steps_checked": rec_doc["n_steps_checked"],
                              "codes": sorted({h["code"] for h in rec_doc["history"]})},
                "journal_head": res.journal_head, "promotion_eligible": False, "report": report,
@@ -1193,6 +1209,7 @@ class Validated:
     collector_digest: Optional[str]
     data_digest: str
     data_parts: Dict[str, str]
+    unreserved_exploratory: bool = False
 
 
 def _int_arg(v: Any, code: str, what: str, lo: int, hi: Optional[int] = None) -> int:
@@ -1307,9 +1324,13 @@ MICRO_LIMITS = ("NO_SPOT_ORDERBOOK_RECORDED: the spot / hedge leg is NOT measure
                 "QUEUE_POSITION_ESTIMATED_FROM_VISIBLE_SIZE_ONLY")
 
 
-def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any) -> Tuple[List[RP.ReplaySeries], Dict[str, Any]]:
+def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any, *, cut_ms: Optional[int] = None) -> Tuple[List[RP.ReplaySeries], Dict[str, Any]]:
     """Give each symbol the collector's MEASURED books (keyed by the collector's local receive time) and tape (only windows whose coverage the tape proves). Symbols without a recorded
-    book are EXCLUDED from a collector run (never traded on a synthetic book beside measured ones) and listed."""
+    book are EXCLUDED from a collector run (never traded on a synthetic book beside measured ones) and listed.
+
+    ``cut_ms`` is the reserved-holdout boundary when the history was loaded cut: the collector is a SECOND source of prices for the same calendar time, so every book snapshot and trade at or
+    after the boundary is dropped here (the independent re-review replayed a series cut at the boundary with collector books that continued past it and the exit was filled and valued from
+    the reserved period: a result stamped RESERVED that depended on reserved prices). The count dropped is reported."""
     import ms_microstructure as MM
     if not getattr(micro, "verified", False) or getattr(micro, "problems", ()):
         raise PipelineRefused("COLLECTOR_NOT_VERIFIED: an unverified collector dataset is never labelled MEASURED")
@@ -1317,17 +1338,37 @@ def apply_micro(series: Sequence[RP.ReplaySeries], micro: Any) -> Tuple[List[RP.
         raise PipelineRefused("COLLECTOR_COHORT_FUNDING_SELECTED: a funding-selected cohort must not evaluate a funding edge")
     out: List[RP.ReplaySeries] = []
     without: List[str] = []
+    dropped = 0
     for x in series:
-        snaps = sorted((v for v in micro.snapshots(x.symbol) if v.valid), key=lambda v: (v.local_receive_ms, v.cycle))
+        every = sorted((v for v in micro.snapshots(x.symbol) if v.valid), key=lambda v: (v.local_receive_ms, v.cycle))
+        snaps = [v for v in every if cut_ms is None or v.local_receive_ms < cut_ms]
+        dropped += len(every) - len(snaps)
         if not snaps:
             without.append(x.symbol)
             continue
         books = tuple((v.local_receive_ms, v.bids, v.asks) for v in snaps)
-        ticks = tuple(sorted({(t[0], t[1], t[2]) for v in snaps if v.tape_complete for t in v.trades}))
+        ticks = tuple(sorted({(t[0], t[1], t[2]) for v in snaps if v.tape_complete for t in v.trades if cut_ms is None or t[0] < cut_ms}))
         out.append(dataclasses.replace(x, books=books, ticks=tuple(FM_Tick(a, b, c) for a, b, c in ticks)))
     if not out:
-        raise PipelineRefused("COLLECTOR_HAS_NO_BOOK_FOR_ANY_HISTORY_SYMBOL")
-    return out, {"symbols_with_micro": [x.symbol for x in out], "symbols_without_micro_excluded": sorted(without), "limits": list(MICRO_LIMITS), "cohort_id": micro.cohort_id}
+        raise PipelineRefused("COLLECTOR_HAS_NO_BOOK_FOR_ANY_HISTORY_SYMBOL" + ("" if cut_ms is None else " BEFORE THE RESERVED HOLDOUT BOUNDARY"))
+    return out, {"symbols_with_micro": [x.symbol for x in out], "symbols_without_micro_excluded": sorted(without), "limits": list(MICRO_LIMITS), "cohort_id": micro.cohort_id,
+                 "holdout_cut_ms": cut_ms, "book_snapshots_dropped_at_or_after_the_cut": dropped}
+
+
+def holdout_cut_of(info: Mapping[str, Any]) -> Optional[int]:
+    """The reserved boundary (epoch ms) the history was loaded CUT at, or None (no reservation in force for this load)."""
+    h = info.get("holdout") if isinstance(info.get("holdout"), Mapping) else {}
+    cut = h.get("cut_ms")
+    return int(cut) if h.get("status") == "RESERVED" and isinstance(cut, int) and not isinstance(cut, bool) else None
+
+
+def _window_past_boundary(end_ms: int, cut_ms: Optional[int]) -> Optional[str]:
+    """The refusal text when a replay window reaches into the reserved region (None when it does not). The series are cut, but a window that ends after the boundary is a window about data that was
+    never read: positions would be exited and valued on whatever the other sources hold for that period."""
+    if cut_ms is None or int(end_ms) <= int(cut_ms):
+        return None
+    return (f"WINDOW_PAST_THE_HOLDOUT_BOUNDARY: the window ends {int(end_ms)} but the reserved holdout begins {int(cut_ms)}: a run stamped RESERVED may not extend into the reserved region; "
+            f"use --end-ms {int(cut_ms)} or earlier")
 
 
 def validate_inputs(ns: argparse.Namespace) -> Validated:
@@ -1406,12 +1447,18 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
     coll_digest = micro.data_digest() if micro is not None else None
     # ---- the real verifiers
     try:
-        loaded = verify_inputs(hist, universe_dir=uni, spot_dir=spot, mark_interval=ns.mark_interval)
+        import history_holdout as HH
+        unreserved = bool(getattr(ns, "unreserved_exploratory", False))
+        loaded = verify_inputs(hist, universe_dir=uni, spot_dir=spot, mark_interval=ns.mark_interval, holdout_ledger=HH.default_registry_path(), unreserved_exploratory=unreserved)
     except PipelineRefused as exc:
-        raise CliRefused("INPUT_NOT_VERIFIED", _short(exc, 400)) from None
+        held = "HOLDOUT_NOT_RESERVED" in str(exc) or "HOLDOUT_SPENT" in str(exc) or "HOLDOUT_LEDGER" in str(exc)
+        raise CliRefused("HOLDOUT_NOT_RESERVED" if held else "INPUT_NOT_VERIFIED", _short(exc, 800 if held else 400)) from None
     parts = dict(loaded.parts)
     if coll_digest:
         parts["collector"] = coll_digest
+    past = _window_past_boundary(end, holdout_cut_of(loaded.info))
+    if past:
+        raise CliRefused("WINDOW_PAST_THE_HOLDOUT_BOUNDARY", past)
     first, last = _series_span(loaded.series)
     if first is None or end < first or start > last:
         raise CliRefused("WINDOW_OUTSIDE_DATA", f"the window [{start}, {end}] does not overlap the verified history [{first}, {last}]: nothing could be tested")
@@ -1420,7 +1467,7 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
         if lacks:
             raise CliRefused("RISK_POLICY_ALLOW_LIST_LACKS", "the risk policy allow-list lacks verified symbols (it is never widened): " + ",".join(lacks)[:200])
     return Validated(hist, uni, spot, col, art, led, start, end, ns.mark_interval, rows, hold, every, ns.execution_policy, policy, daily, frac, ns.mode, clock, rev, os.path.abspath(ns.candidate), spec, cid,
-                     digest, kind, loaded, micro, coll_digest, data_digest_of(parts), parts)
+                     digest, kind, loaded, micro, coll_digest, data_digest_of(parts), parts, unreserved)
 
 
 def build_replay_config(v: Validated) -> RP.ReplayConfig:
@@ -1443,7 +1490,10 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--spot-dir", required=True, help="verified spot-instruments snapshot directory (hedgeability)")
     p.add_argument("--collector-root", default=None, help="optional microstructure collector root: decision-time books and trades (needs ms_microstructure; refused when unavailable)")
     p.add_argument("--artifacts-dir", required=True, help="a NEW or EMPTY directory outside git (never an existing dataset)")
-    p.add_argument("--ledger-dir", required=True, help="persistent directory for the multiple-testing trial ledgers (candidate_competition + this pipeline's trials)")
+    p.add_argument("--ledger-dir", required=True, help="persistent directory for the multiple-testing trial ledgers (candidate_competition + this pipeline's trials); the reserved-holdout registry is per user, not here")
+    p.add_argument("--unreserved-exploratory", action="store_true",
+                   help="run on a history root with NO reserved holdout: the whole window is read, the result is stamped NOT_A_HOLDOUT_STUDY and the dataset can never be reserved afterwards "
+                        "(default: refuse until `tools/history_holdout.py --reserve` has been run)")
     p.add_argument("--start-ms", required=True, help="window start, epoch ms")
     p.add_argument("--end-ms", required=True, help="window end, epoch ms")
     p.add_argument("--candidate", required=True, help="candidate spec JSON: a file under research/candidates, or any file together with --candidate-digest")
@@ -1483,7 +1533,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.makedirs(v.ledger_dir, exist_ok=True)
         warnings: List[str] = []
         try:
-            row = competition_row_for(v.candidate_id, history_root=v.history_root, universe_dir=v.universe_dir, spot_dir=v.spot_dir, mark_interval=v.mark_interval, ledger_dir=v.ledger_dir)
+            row = competition_row_for(v.candidate_id, history_root=v.history_root, universe_dir=v.universe_dir, spot_dir=v.spot_dir, mark_interval=v.mark_interval, ledger_dir=v.ledger_dir,
+                                      unreserved_exploratory=v.unreserved_exploratory)
         except (ValueError, OSError, KeyError) as exc:                       # the competition could not run: its verdict is unknown, and an unknown verdict allocates nothing
             row = None
             warnings.append("COMPETITION_FAILED:" + _short(exc, 160))

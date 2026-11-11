@@ -305,3 +305,14 @@ def _entry_authority_for_tests(request, monkeypatch):
     monkeypatch.setattr(bybit_connection, "DEFAULT_ENTRY_AUTHORITY", _PermissiveForTests())
     monkeypatch.setattr(entry_authority, "build_for_book", lambda **kw: _PermissiveForTests())
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_history_holdout_registry(tmp_path, monkeypatch):
+    """No test may read or write the REAL per-user holdout registry (``~/.ai-agent-control/history_holdout.jsonl``).
+
+    ``tools/history_holdout.py`` keeps ONE registry per user so that no ledger directory, data root or mark dataset can give an unreserved read a clean slate. The price of that is a global
+    file, and a test that touched it would burn (or reserve) real calendar time on the owner's machine. Every test gets its own empty registry through ``$HISTORY_HOLDOUT_LEDGER``; a test
+    that wants a specific path sets the variable itself (its monkeypatch runs after this one).
+    """
+    monkeypatch.setenv("HISTORY_HOLDOUT_LEDGER", str(tmp_path / "isolated_holdout_registry" / "history_holdout.jsonl"))

@@ -35,6 +35,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import economic_model as EM  # noqa: E402
 import exec_quality as EQ  # noqa: E402
 import ms_executor_lock as XL  # noqa: E402
 import funding_settlement as FS  # noqa: E402
@@ -398,7 +399,7 @@ def build_plan(manifest: Mapping[str, Any], pre: Mapping[str, Any], *, symbol: s
         raise ValueError("QTY_NOTIONAL_ABOVE_CEILING")
     usdt = pre.get("usdt")
     if isinstance(usdt, (int, float)) and not isinstance(usdt, bool):          # the spot buy (notional) plus the perp initial margin (notional / leverage) plus a 2% buffer must fit in the USDT read
-        need = notional * (1.0 + 1.0 / max(1, leverage)) * 1.02
+        need = float(EM.hedged_pair_capital_usd(D(repr(notional)), max(1, leverage)).value)      # ONE definition of the capital a pair commits (economic_model); the allocator's margin cap reads the same
         if need > float(usdt) + 1e-9:
             raise ValueError(f"INSUFFICIENT_USDT_FOR_PLAN:need {need:.2f} have {float(usdt):.2f} (spot buy + perp margin at leverage {leverage} + 2%)")
     for cat, f, ref in (("linear", lin, mark), ("spot", sp, D(str(mk["spot_ask"])))):
@@ -937,7 +938,17 @@ class Run:
             self.reconcile_step(int(self.ctx.clock()))
             cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
             rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
-            self.execution_quality(view, True, bool(flat))
+            errors_before = getattr(self, "quality_errors", 0)
+            doc = self.execution_quality(view, True, bool(flat))
+            integrity = [f for f in cn.get("flags", []) if str(f).startswith(AC.INTEGRITY_FLAG_PREFIXES)]
+            quality_failed = getattr(self, "quality_errors", 0) > errors_before                     # the final measurement RAISED: the incomplete-fills safeguard below never ran
+            incomplete = bool(doc) and "fills_incomplete" in (doc.get("group") or {}).get("unknown", [])
+            if integrity or quality_failed or incomplete:
+                # (1) An order the VENUE says filled has no (or too few) execution rows: the ledger, which is fed only from executions, then holds a LOWER BOUND of the fees and the price leg, not a
+                # measurement. (2) The ledger itself flags a conflict in its inputs (a duplicate fill with different content, an orphan fill ...): its partial sums are not a net. (3) The measurement that
+                # would have told us (1) failed. Publishing any of them would turn "we could not tell" into a measured number (the capital book's `known` is None whenever either is None, so such a
+                # session can debit a loss but never credit a gain).
+                rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None, **({"funding_usd": None} if integrity else {})}      # a flagged conflict taints the ledger's funding sum too (two prints for one settlement)
         elif rec["orders"] or rec["executions"]:
             self.execution_quality(view, False, None)
         return view
@@ -1029,6 +1040,8 @@ def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Option
             why.append("PLAN_IS_FOR_ANOTHER_MANIFEST")
         if ctx.clock() - int(plan.get("created_ms", 0)) > MAX_PLAN_AGE_MIN * 60_000:
             why.append("PLAN_TOO_OLD")
+    if unattended and ctx.pre_order_check is None:                      # ONLY the autopilot loop supplies this hook, and the loop is what enforces the halts (ALERT, STOP, PAUSED, the capital book) and the single-writer lease
+        why.append("UNATTENDED_ONLY_VALID_UNDER_THE_AUTOPILOT_LOOP: a grant replaces the typed digest, it does not replace the halts and the lease the loop enforces; run the loop, or use the typed `execute`")
     if unattended:                                                      # the owner's standing, bounded, expiring authorisation replaces the typed digest: nothing else is relaxed
         import ms_testnet_autopilot as AP
         if manifest is not None and isinstance(plan, dict) and not plan_refusals(plan):
@@ -1431,6 +1444,13 @@ def guarded_main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[
     parsed = _parser().parse_args(argv_l)
     if parsed.cmd != "execute":
         return run(argv_l, env=environ)
+    if getattr(parsed, "unattended", False):
+        # `--unattended` replaces the typed digest with the owner's standing grant, and is only safe under the autopilot LOOP: the loop is what checks ALERT / STOP / PAUSED, the capital book (halts and a
+        # review in force), grant revocation and the allocator, and it calls main() directly with its own pre-order hook. This command line supplies a hook that only renews the lease, so accepting the flag
+        # here would run a full unattended session past every one of those stops (the guard in _gate_execute tests only that a hook EXISTS).
+        print("execute --unattended REFUSED (no order was sent): an unattended session is valid only under the autopilot loop, which enforces the halts, the capital book and the revocation of the grant. "
+              "Run the attended `execute --confirm-plan-digest <digest>` (you type the digest) or start the autopilot.")
+        return EXIT_REFUSED
     import legacy_executor_guard as LG
     take = acquire or (lambda e: LG.acquire(e, ttl_seconds=LEASE_TTL_S, service="manual-session"))
     handle, why = take(environ)
