@@ -155,7 +155,7 @@ ECONOMIC_ZERO = Decimal("1e-9")
 #: The ONLY reasons an input may be exactly zero (or, for the hedge ratio, exactly one) without being a measurement, each BOUND to the one scenario input it speaks about. A reason is a claim about ONE
 #: input: the same words declared against another input justify nothing (an owner-stated zero COST OF CAPITAL cannot excuse a zero market impact; a review reproduced exactly that). A zero that is not
 #: 'measured' / 'venue_stated' and not justified by a reason bound to ITS input is UNJUSTIFIED: it counts as an ASSUMED input and so can never PASS (``ChainResult.assumed_inputs``). A source scan can only
-#: be a tripwire for spellings it knows; this is value-based and cannot be spelled around.
+#: be a tripwire for spellings it knows; this is value-based: every spelling of a value under ECONOMIC_ZERO is caught, while a larger number is an ESTIMATE the caller owns, with its provenance, that this rule cannot judge (the independent re-review passed 2E-9 for impact, basis, borrow and opportunity cost: above the bound, so a number).
 STRUCTURAL_ZERO_INPUTS: Mapping[str, frozenset] = {
     "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW": frozenset({"borrow_apr"}),                  # the spot buy is paid from the USDT balance (the plan refuses a plan the cash cannot fund): there is no loan to pay interest on
     "OWNER_STATED_ZERO_COST_OF_CAPITAL": frozenset({"opportunity_cost_apr"}),             # the owner explicitly stated 0%/yr: capital is free by decision, not by omission

@@ -231,11 +231,22 @@ class MarketStore:
         tells them apart, because it is global: if a segment had held records, the next segment's ``chain_start`` would be the chain AFTER them. When the chain continues across the file (the nearest
         earlier record's chain is exactly the nearest later segment's ``chain_start``) nothing was ever in it and it is skipped like the newest one; when it does not, its records are LOST and every
         reader must say so loudly instead of counting around the hole (an independent review zeroed a middle segment and ``count()`` quietly returned 15 records instead of 20, and a second one showed
-        that treating EVERY middle file as damage bricked the recorder's own ``refresh_count`` after a crash during creation followed by a day without data)."""
+        that treating EVERY middle file as damage bricked the recorder's own ``refresh_count`` after a crash during creation followed by a day without data).
+
+        THE LIMIT, stated: an unfinished creation and a file that LOST its content (a power cut that left a zero-length file the day it was being written) look identical from here, and once the
+        writer has continued from the last readable record the chain is re-linked past it, so even the chain cannot tell them apart afterwards. The newest file and a trailing run are skipped on
+        trust; a file between records is skipped only when the chain continues across it. Every skipped file is still NAMED by ``verify()`` (never silently counted around), and if it held
+        records they are gone and their ids will be reused."""
         segs = self.segments()
         if not segs or name not in segs or self._initialised(name):
             return False
-        return segs[-1] == name or self._chain_continues_across(name, segs)
+        return segs[-1] == name or self._in_trailing_dead_run(name, segs) or self._chain_continues_across(name, segs)
+
+    def _in_trailing_dead_run(self, name: str, segs: List[str]) -> bool:
+        """True when EVERY segment from ``name`` to the newest is uninitialised: a creation that kept failing across several midnights (a full disk, for one). Nothing after them can prove the chain
+        continues, and nothing can prove a loss either, so they are treated like the single newest one (the independent re-review's ``[records, dead, dead]`` made ``MarketStore(dir)`` itself raise and the
+        recorder unable to start). ``verify()`` still names every one of them."""
+        return all(not self._initialised(n) for n in segs[segs.index(name):])
 
     def _chain_continues_across(self, name: str, segs: List[str]) -> bool:
         i = segs.index(name)
@@ -557,8 +568,16 @@ class MarketStore:
         for idx, name in enumerate(self.segments()):
             if not self._initialised(name):
                 if self._abandoned(name):
-                    problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record"
-                                    + ("" if name == self.segments()[-1] else "; the hash chain continues across it, so no record was lost (move it aside when convenient, RUNBOOKS section 14)"))
+                    segs_now = self.segments()
+                    if name == segs_now[-1]:
+                        why = ""
+                    elif self._in_trailing_dead_run(name, segs_now):
+                        why = ("; it is part of a trailing run of unfinished creations: nothing after it can prove whether it ever held a record, so it is treated like the newest one "
+                               "(check the recorder's counters, move it aside when convenient, RUNBOOKS section 14)")
+                    else:
+                        why = ("; the hash chain continues across it: if the recorder died while creating it, it held no record; if the file lost its content the writer has since re-linked the chain "
+                               "past it and the store cannot tell the two apart (check the monitor's id counter; move it aside when convenient, RUNBOOKS section 14)")
+                    problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record" + why)
                 else:
                     problems.append(f"{name}: EMPTY segment that is not the newest and the hash chain does NOT continue across it: its records are LOST (damage); readers refuse it. "
                                     f"Check, then move it aside deliberately (RUNBOOKS section 14)")

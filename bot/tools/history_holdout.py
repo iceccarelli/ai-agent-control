@@ -118,11 +118,17 @@ def default_registry_path() -> str:
     return os.path.abspath(os.path.expanduser(_registry_setting() or REGISTRY_DEFAULT))
 
 
-def registry_source() -> Dict[str, Any]:
+def registry_source(registry: Optional[str] = None) -> Dict[str, Any]:
     """Where the registry path came from. Another registry file is a clean slate for every guarantee here (it is the floor, not a census), so the override is SAID on every stamp rather than left
-    for a reader to infer: a result produced against an overridden registry carries ``REGISTRY_OVERRIDDEN_BY_ENV``."""
-    return {"registry_source": "ENV:" + REGISTRY_ENV if _registry_setting() else "DEFAULT",
-            **({"registry_warning": "REGISTRY_OVERRIDDEN_BY_ENV: this run used a registry file chosen by the environment; another file is a clean slate for the burn horizon and the one-time final read"} if _registry_setting() else {})}
+    for a reader to infer: a result produced against a registry chosen by the environment (``REGISTRY_OVERRIDDEN_BY_ENV``) or by an argument other than the default path
+    (``REGISTRY_OVERRIDDEN_BY_ARGUMENT``: the CLI's ``--registry``) carries the warning."""
+    if _registry_setting():
+        return {"registry_source": "ENV:" + REGISTRY_ENV,
+                "registry_warning": "REGISTRY_OVERRIDDEN_BY_ENV: this run used a registry file chosen by the environment; another file is a clean slate for the burn horizon and the one-time final read"}
+    if registry is not None and os.path.abspath(str(registry)) != default_registry_path():
+        return {"registry_source": "ARGUMENT",
+                "registry_warning": "REGISTRY_OVERRIDDEN_BY_ARGUMENT: this run used a registry file other than the per-user default; another file is a clean slate for the burn horizon and the one-time final read"}
+    return {"registry_source": "DEFAULT"}
 
 
 def _window(root: str) -> Tuple[int, int]:
@@ -159,27 +165,59 @@ def effective_window(root: str, a: int, b: int) -> Tuple[int, int]:
     return (a, b) if sw is None else (max(int(a), sw[0]), min(int(b), sw[1]))
 
 
+CATEGORIES = ("linear", "spot", "inverse", "option")
+
+
+MAX_END_SHORTFALL_MS = 2 * 86_400_000            # the funding data may end this long before the requested end (the last print precedes the request's end by up to one funding interval)
+
+
+def reservation_problem(root: str, a: int, b: int, cut: int) -> Tuple[Optional[str], Tuple[int, int]]:
+    """``(problem, effective_window)``: why a boundary ``cut`` over the REQUESTED window ``[a, b]`` cannot be a holdout of the data these datasets actually SERVED (None when it can). A dataset with
+    no served coverage, one that ends days before its request, a boundary at or before the first served row, and a boundary with under a day of data after it are each refused with their own code
+    (independent re-review: the arithmetic and the RESERVED stamp used to come from the request, so a stale dataset 'reserved' months that did not exist, and a request that opened two years
+    before the data put the boundary before the first row, reserving the whole dataset)."""
+    sw = served_window(root)
+    if sw is None:
+        return ("NO_SERVED_COVERAGE: the funding manifest records no served coverage for any symbol (a dataset with no rows): there is nothing to reserve", (a, b))
+    ea, eb = max(int(a), sw[0]), min(int(b), sw[1])
+    if int(b) - eb > MAX_END_SHORTFALL_MS:
+        return (f"DATA_ENDS_BEFORE_THE_REQUESTED_END: the funding data these datasets actually served ends {_iso(eb)} but the request asks for {_iso(b)} ({(int(b) - eb) / DAY:.1f} days short). A STALE or "
+                f"PARTIAL dataset verifies, but a boundary fixed over data that has not arrived is a prospective holdout, not a reserved one: finish the collection, then reserve", (ea, eb))
+    if cut - ea < DAY:
+        return (f"NO_EXPLORE_DATA_BEFORE_THE_BOUNDARY: the boundary {_iso(cut)} is at or before the first served row ({_iso(ea)}): the whole dataset would be reserved and nothing could be explored", (ea, eb))
+    if eb - cut < DAY:
+        return (f"RESERVED_REGION_HAS_NO_DATA: the boundary {_iso(cut)} leaves {max(0.0, (eb - cut) / DAY):.2f} days of data after it (the funding data actually served ends {_iso(eb)}): a holdout over "
+                f"data that does not exist yet is a prospective holdout, not a reserved one", (ea, eb))
+    return None, (ea, eb)
+
+
 def venue_id(root: str) -> str:
-    """The venue the history is of: ``<registered venue name>|<category>``, the manifest's request host mapped THROUGH ``bot/venues.py`` (never a string compared as written: the independent re-review
-    forged ``request.host`` as ``API.BYBIT.COM`` and, with the digest recomputed, got a venue the burn did not apply to). A host that is not a registered venue's REST host (the EU venue among them,
-    which is unqualified and refused) is ``VENUE_UNKNOWN``. A holdout is a region of TIME on a venue: the mark interval, the data root and the ledger directory are not part of it (the same region
-    reached through any of them is the same region). Read without verification: every path that grants a read goes on to verify the datasets."""
+    """The venue the history is of: ``<price source>|<category>``, the manifest's request host mapped THROUGH ``bot/venues.py`` (never a string compared as written: the independent re-review forged
+    ``request.host`` as ``API.BYBIT.COM`` and, with the digest recomputed, got a venue the burn did not apply to). The key is the registry's FEED ENVIRONMENT, because a holdout is a region of
+    the PRICE series: Bybit demo trading is matched against real mainnet prices, so a demo history and a mainnet history are the same region and share one burn (the re-review's ``demo|linear``
+    clean slate). A host that is not a registered venue's REST host (the EU venue among them, which is unqualified and refused) and a category outside ``CATEGORIES`` are ``VENUE_UNKNOWN``. A
+    holdout is a region of TIME on a venue: the mark interval, the data root and the ledger directory are not part of it. Read without verification: every path that grants a read goes on to
+    verify the datasets."""
     import venues as V
     path = os.path.join(root, MH.FUNDING, "manifest.json")
     try:
         with open(path, "rb") as fh:
-            req = (json.loads(fh.read()).get("request") or {})
+            man = json.loads(fh.read())
     except (OSError, ValueError) as exc:
         raise RH.HarnessError(f"VENUE_UNKNOWN: the funding manifest is unreadable ({type(exc).__name__})") from exc
+    req = man.get("request") if isinstance(man, dict) else None
+    req = req if isinstance(req, dict) else {}
     host, cat = req.get("host"), req.get("category")
     if not isinstance(host, str) or not isinstance(cat, str) or not host.strip() or not cat.strip():
         raise RH.HarnessError("VENUE_UNKNOWN: the funding manifest records no request host/category")
-    wanted = host.strip().lower()
+    wanted, category = host.strip().lower(), cat.strip().lower()
     names = sorted(n for n, h in V.rest_hosts().items() if h == wanted)
     if len(names) != 1:
         raise RH.HarnessError(f"VENUE_UNKNOWN: the funding manifest's request host {host!r} is not the REST host of a registered venue ({sorted(V.rest_hosts().values())}); the registry in bot/venues.py decides "
                               f"what a venue is, and an unqualified venue (such as Bybit EU) is not one")
-    return f"{names[0]}|{cat.strip().lower()}"
+    if category not in CATEGORIES:
+        raise RH.HarnessError(f"VENUE_UNKNOWN: the funding manifest's request category {cat!r} is not one of {CATEGORIES}")
+    return f"{V.feed_environment(names[0])}|{category}"
 
 
 # ------------------------------------------------------------------ the registry
@@ -292,7 +330,7 @@ def corpus_overlap(venue: str, cut_ms: int, end_ms: int, *, manifest_path: Optio
     overlap = min(last, int(end_ms)) - max(first, int(cut_ms))
     if span <= 0 or overlap <= 0:
         return None
-    return {"symbols": ["BTCUSDT"], "corpus": os.path.relpath(os.path.dirname(os.path.dirname(manifest_path or CORPUS_MANIFEST)), BOT) if not manifest_path else "custom", "corpus_first": _iso(first),
+    return {"symbols": ["BTCUSDT"], "corpus": os.path.relpath(os.path.dirname(CORPUS_MANIFEST), BOT) if not manifest_path else "custom", "corpus_first": _iso(first),
             "corpus_last": _iso(last), "overlap_days": round(overlap / DAY, 3), "fraction_of_reserved_region": round(overlap / span, 3),
             "consequence": "BTCUSDT funding and the BTC-driven regime in this part of the reserved region are ALREADY in sample (the committed corpus is read in sample by candidate_competition): a final read "
                            "cannot claim ignorance of them; exclude BTCUSDT from it, or say so with the result"}
@@ -316,7 +354,7 @@ def _arithmetic(a: int, b: int, cut: int, *, requested: Optional[Tuple[int, int]
     """The window arithmetic over ``[a, b]`` (the EFFECTIVE window: what the datasets actually served) with the boundary ``cut``. ``requested`` is the window the manifest asked for; when the data
     stops short of it the difference is stated (and warned about) rather than counted as held-out rows that do not exist."""
     need = int(CR.grid_requirements(formation_days=30, hold_days=7, min_rows=60)["window_days_required"])
-    explore, reserved = round((cut - a) / DAY, 3), round(max(0, b - cut) / DAY, 3)
+    explore, reserved = round(max(0, cut - a) / DAY, 3), round(max(0, b - max(cut, a)) / DAY, 3)
     floor = int(CR.SV.MIN_OBSERVATIONS["oos_test"])
     rows = int(reserved // 7)
     out = {"standard_grid_days_required": need, "explore_days": explore, "reserved_days": reserved, "explore_supports_standard_grid": explore >= need, "reserved_rows_possible": rows,
@@ -359,11 +397,9 @@ def reserve(registry: str, root: str, *, mark_interval: Optional[str] = None, fr
                 out["requested_fraction_ignored"] = float(frac)             # the boundary never moves: the ledgered one stays
             return out
         cut = cut_for(a, b, frac)
-        ea, eb = effective_window(root, a, b)
-        if eb - cut < DAY:
-            raise RH.HarnessError(f"RESERVED_REGION_HAS_NO_DATA: the boundary {_iso(cut)} (the last {frac:.0%} of the REQUESTED window {_iso(a)}..{_iso(b)}) leaves {max(0.0, (eb - cut) / DAY):.2f} days of data after "
-                                  f"it: the funding data these datasets actually served ends {_iso(eb)}. A holdout over data that does not exist yet is a prospective holdout, not a reserved one: finish the "
-                                  f"collection, then reserve. (Nothing was recorded.)")
+        problem, (ea, eb) = reservation_problem(root, a, b, cut)
+        if problem:
+            raise RH.HarnessError(f"{problem}. (The boundary is the last {frac:.0%} of the REQUESTED window {_iso(a)}..{_iso(b)}. Nothing was recorded.)")
         prior, scanned = prior_evaluations_anywhere(root, ledger_dir)
         stated = any(r.get("purpose") == PRIOR_STATED for r in st["reads"])
         if prior and prior_reads_through_ms is None and not stated:
@@ -394,7 +430,7 @@ def status(registry: str, root: str, *, mark_interval: Optional[str] = None, led
     v = venue_id(root)
     a, b = _window(root)
     st = _state(registry, v)
-    out: Dict[str, Any] = {"schema": SCHEMA, "venue": v, "registry": registry, "chain_head": chain_head(registry), **registry_source(), "history_root": os.path.abspath(root), "window_ms": [a, b],
+    out: Dict[str, Any] = {"schema": SCHEMA, "venue": v, "registry": registry, "chain_head": chain_head(registry), **registry_source(registry), "history_root": os.path.abspath(root), "window_ms": [a, b],
                            "window_days": round((b - a) / DAY, 3), "burned_through_ms": st["burned_to"] or None, "burned_through": _iso(st["burned_to"]) if st["burned_to"] else None,
                            "floor_note": FLOOR_NOTE}
     prior, scanned = prior_evaluations_anywhere(root, ledger_dir)
@@ -423,16 +459,20 @@ def status(registry: str, root: str, *, mark_interval: Optional[str] = None, led
         ea, eb = effective_window(root, a, b)
         out.update(_arithmetic(ea, eb, cut, requested=(a, b)))
         out["btc_corpus_overlap"] = corpus_overlap(v, cut, eb)
-        if out["state"] == "NOT_RESERVED" and eb - cut < DAY:
-            out["reservable"] = False
-            out["not_reservable_because"] = (f"RESERVED_REGION_HAS_NO_DATA: the funding data actually served ends {_iso(eb)}, before one day past the boundary {_iso(cut)}; finish the collection first")
+        if out["state"] == "NOT_RESERVED":
+            problem, _w = reservation_problem(root, a, b, cut)
+            if problem:
+                out["reservable"] = False
+                out["not_reservable_because"] = (out["not_reservable_because"] + "; " + problem) if out.get("not_reservable_because") else problem
+    out["prior_evaluations_note"] = ("only the directories listed in ledger_dirs_scanned were looked in: an evaluation that wrote its ledgers elsewhere (for example an ms_pipeline run with another required "
+                                      "--ledger-dir) is invisible to this; if the venue's history was EVER evaluated, state --prior-reads-through")
     return out
 
 
 # ------------------------------------------------------------------ the guarded loads
 def _info_stamp(registry: Any, status_: str, purpose: Optional[str], cut: Optional[int], label: str, **extra: Any) -> Dict[str, Any]:
     reg = registry if isinstance(registry, str) else None
-    return {"status": status_, "purpose": purpose, "cut_ms": cut, "label": label, "schema": SCHEMA, "registry": reg, "chain_head": chain_head(reg) if reg else None, **registry_source(), **extra}
+    return {"status": status_, "purpose": purpose, "cut_ms": cut, "label": label, "schema": SCHEMA, "registry": reg, "chain_head": chain_head(reg) if reg else None, **registry_source(reg), **extra}
 
 
 def load(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, ledger_path: Any = None, reader: str = "",
@@ -456,7 +496,7 @@ def load(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_i
         a, b = _window(root)
         info["holdout"] = _info_stamp(ledger_path, "RESERVED", EXPLORE, cut, "EXPLORE_WINDOW_ONLY: the reserved holdout was not read", reserved_from_ms=cut, reserved_from=_iso(cut), venue=v,
                                       note="every funding print and mark close at or after the boundary was never built into a series; the loader's coverage window ends at the boundary; manifest "
-                                           "status flags computed over the WHOLE dataset are not cut",
+                                           "status flags computed over the WHOLE dataset are NOT cut and are not neutral (a funding-interval change inside the reserved region is a funding-cap event)",
                                       **{k: x for k, x in _arithmetic(*effective_window(root, a, b), cut, requested=(a, b)).items()
                                          if k in ("explore_days", "reserved_days", "reserved_rows_possible", "warning", "data_ends_before_the_requested_end_days")})
         return series, info

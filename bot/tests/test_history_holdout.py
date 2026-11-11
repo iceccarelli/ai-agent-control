@@ -42,6 +42,15 @@ H4 = TMH.H8 // 2
 VENUE = "mainnet|linear"                                          # the manifest's request host mapped through bot/venues.py (api.bybit.com is the registered mainnet REST host)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_ledger_lookup(tmp_path, monkeypatch):
+    """``--reserve`` looks for earlier evaluations in EVERY directory the ledger rule can resolve to, including $CANDIDATE_LEDGER_DIR and ``~/.cache/ai-agent-control/candidate_ledgers``. A developer's
+    own research ledgers must not decide these tests (the independent re-review ran them with one ledger row in HOME: 37 of 76 failed with PRIOR_EVALUATION_DETECTED, green in CI, red on the
+    owner's research machine). conftest isolates the registry; this isolates the lookup."""
+    monkeypatch.delenv("CANDIDATE_LEDGER_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated_home"))
+
+
 @pytest.fixture()
 def world(tmp_path, offline, monkeypatch):
     root, uni, spot = _hist(tmp_path)
@@ -404,6 +413,13 @@ def test_an_earlier_evaluation_in_ANY_ledger_directory_the_rule_can_resolve_to_b
         _reserve(world, ledger_dir=elsewhere)
     monkeypatch.delenv("CANDIDATE_LEDGER_DIR")
     shutil.rmtree(envdir)
+    home_cache = os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers")
+    assert str(tmp_path / "isolated_home") in home_cache, "the hermetic fixture must have moved HOME"
+    _earlier_row(home_cache, "ms_pipeline_trials")                                          # ... or the home-cache default every research CLI falls back to
+    with pytest.raises(RH.HarnessError, match="PRIOR_EVALUATION_DETECTED") as e2:
+        _reserve(world, ledger_dir=elsewhere)
+    assert home_cache in str(e2.value)
+    shutil.rmtree(home_cache)
     clean = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=elsewhere)
     assert clean["prior_evaluations"] == [] and clean["reservable"] is True and "not_reservable_because" not in clean, "control: with no earlier ledger anywhere the same call is reservable"
     ok = _reserve(world, ledger_dir=elsewhere)
@@ -560,19 +576,40 @@ def test_a_rollback_to_an_older_consistent_state_is_visible_only_in_the_chain_he
     assert info2["holdout"]["chain_head"]["n"] == 1 != head_after_final["n"] and info2["holdout"]["chain_head"]["head"] != head_after_final["head"]
 
 
-def test_a_boundary_over_data_that_does_not_exist_yet_is_refused_and_records_nothing(world, monkeypatch):
-    """Independent re-review, finding 4 (E8): funding that ended 120 days before the REQUEST's end still reserved 'the last 30%' and stamped every result RESERVED with zero rows withheld: a
-    prospective holdout presented as a present one. The reserved region must hold at least a day of data that exists."""
+def test_a_boundary_the_served_data_cannot_support_is_refused_with_its_own_code_and_records_nothing(world, monkeypatch):
+    """Independent re-review, finding 4 (E8, W1, W3, W4): funding that ended 120 days before the REQUEST's end still reserved 'the last 30%' and stamped every result RESERVED with zero rows withheld;
+    a request that opened two years before the data put the boundary before the first row (explore_days -94, the whole dataset reserved); a dataset with no coverage was accepted. Each now has its own
+    refusal, before anything is recorded, owner statement or not."""
     a, b = _window(world)
-    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 400 * DAY))                    # the request is far longer than what the datasets served
-    with pytest.raises(RH.HarnessError, match="RESERVED_REGION_HAS_NO_DATA") as e:
-        _reserve(world)
-    assert "actually served" in str(e.value) and "Nothing was recorded" in str(e.value)
-    with pytest.raises(RH.HarnessError, match="RESERVED_REGION_HAS_NO_DATA"):
-        _reserve(world, prior_reads_through_ms=a + DAY)                                     # an owner statement alongside must not leave a half-written registry
-    assert not os.path.exists(world["reg"]), "a refused reservation appended something"
-    st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
-    assert st["reservable"] is False and "RESERVED_REGION_HAS_NO_DATA" in st["not_reservable_because"]
+    sa, sb = HH.served_window(world["root"])
+
+    def refused(code, **kw):
+        with pytest.raises(RH.HarnessError, match=code) as e:
+            _reserve(world, **kw)
+        assert "Nothing was recorded" in str(e.value)
+        with pytest.raises(RH.HarnessError, match=code):
+            _reserve(world, prior_reads_through_ms=a + DAY, **kw)                       # an owner statement alongside must not leave a half-written registry
+        assert not os.path.exists(world["reg"]), f"{code}: a refused reservation appended something"
+        st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+        assert st["reservable"] is False and code in st["not_reservable_because"], (code, st.get("not_reservable_because"))
+    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 400 * DAY))                    # the request runs 400 days past what the datasets served
+    refused("DATA_ENDS_BEFORE_THE_REQUESTED_END")
+    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 3 * DAY))                      # even a few days: tolerance is two
+    refused("DATA_ENDS_BEFORE_THE_REQUESTED_END")
+    monkeypatch.setattr(HH, "_window", lambda root: (a - 700 * DAY, b))                    # the request opens long before the first served row: the cut lands before it
+    refused("NO_EXPLORE_DATA_BEFORE_THE_BOUNDARY")
+    monkeypatch.setattr(HH, "_window", lambda root: (a, b))
+    monkeypatch.setattr(HH, "served_window", lambda root: None)                            # a verified dataset with no rows
+    refused("NO_SERVED_COVERAGE")
+    monkeypatch.undo()
+    monkeypatch.setenv(HH.REGISTRY_ENV, world["reg"])
+    # the empty-region code, at the function that decides: a boundary less than a day before the last served row
+    problem, _w = HH.reservation_problem(world["root"], sa, sb, sb - DAY // 2)
+    assert problem.startswith("RESERVED_REGION_HAS_NO_DATA")
+    assert HH.reservation_problem(world["root"], sa, sb, sb - 2 * DAY)[0] is None, "control: two days of data after the boundary is enough to be a (small) holdout"
+    assert HH.reservation_problem(world["root"], sa, sb, sa + DAY // 2)[0].startswith("NO_EXPLORE_DATA_BEFORE_THE_BOUNDARY")
+    assert HH.reservation_problem(world["root"], sa, sb + 2 * DAY, sb - 2 * DAY)[0] is None, "a shortfall inside the two-day tolerance is accepted (the last print precedes the request's end)"
+    assert _reserve(world)["kind"] == "reserve", "control: the real window is reservable"
 
 
 def test_the_arithmetic_counts_the_data_that_exists_not_the_window_that_was_requested(world, monkeypatch, tmp_path):
@@ -583,36 +620,40 @@ def test_the_arithmetic_counts_the_data_that_exists_not_the_window_that_was_requ
     control = HH.reserve(str(tmp_path / "control.jsonl"), world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
     assert round(control["reserved_days"], 3) == round((sb - control["from_ms"]) / DAY, 3) and control["explore_days"] == round((control["from_ms"] - max(a, sa)) / DAY, 3)
     assert "data_ends_before_the_requested_end_days" not in control, "control: a collection that reaches its request's end has nothing to warn about"
-    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 40 * DAY))                     # a request that ends 40 days after the data does
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])           # reserved on the real window (a 40-day shortfall would now be REFUSED at reserve) ...
+    monkeypatch.setattr(HH, "_window", lambda root: (a, b + 40 * DAY))                     # ... then the manifest's request is read as ending 40 days after the data (the stamps must not count them)
     requested_reserved = round(((b + 40 * DAY) - r["from_ms"]) / DAY, 3)
-    assert r["reserved_days"] == round((min(b + 40 * DAY, sb) - r["from_ms"]) / DAY, 3) < requested_reserved - 39, "the reserved days must be the data's, not the request's"
-    assert abs(r["data_ends_before_the_requested_end_days"] - 40) < 0.01
+    served_reserved = round((min(b + 40 * DAY, sb) - r["from_ms"]) / DAY, 3)
+    assert served_reserved < requested_reserved - 39, "the reserved days must be the data's, not the request's"
     ser, info = _load(world)
     h = info["holdout"]
-    assert h["reserved_days"] == r["reserved_days"] and abs(h["data_ends_before_the_requested_end_days"] - 40) < 0.01 and "ends" in h["warning"] and "days before the requested window end" in h["warning"]
+    assert h["reserved_days"] == served_reserved and abs(h["data_ends_before_the_requested_end_days"] - 40) < 0.01 and "ends" in h["warning"] and "days before the requested window end" in h["warning"]
     st = HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
-    assert st["reserved_days"] == r["reserved_days"] and st["served_window_ms"] == [max(a, sa), sb] and st["requested_window_ms"] == [a, b + 40 * DAY]
+    assert st["reserved_days"] == served_reserved and st["served_window_ms"] == [max(a, sa), sb] and st["requested_window_ms"] == [a, b + 40 * DAY]
 
 
-def test_the_venue_is_the_registered_venue_not_the_string_the_manifest_spells(tmp_path):
-    """Independent re-review, finding 7 (E2): forging ``request.host`` as ``API.BYBIT.COM`` (digest recomputed) passed verification and gave a venue the burn did not apply to. CLAUDE.md: venue
-    identity comes from bot/venues.py, never a string comparison."""
-    def root_with(name, host, cat="linear"):
+def test_the_venue_is_the_registered_price_source_not_the_string_the_manifest_spells(tmp_path):
+    """Independent re-review, finding 7 (E2, V2, V3, N4): forging ``request.host`` as ``API.BYBIT.COM`` (digest recomputed) passed verification and gave a venue the burn did not apply to; the demo host
+    (real mainnet prices) got its own clean slate; a category with a suffix or a zero-width character was a new venue; a manifest whose ``request`` was a string raised AttributeError. CLAUDE.md: venue
+    identity comes from bot/venues.py, never a string comparison, and a holdout is a region of the PRICE series."""
+    def root_with(name, host, cat="linear", raw=None):
         d = tmp_path / name
         (d / "funding").mkdir(parents=True)
-        (d / "funding" / "manifest.json").write_text(json.dumps({"request": {"host": host, "category": cat}}))
+        (d / "funding" / "manifest.json").write_text(raw if raw is not None else json.dumps({"request": {"host": host, "category": cat}}))
         return str(d)
     assert HH.venue_id(root_with("a", "api.bybit.com")) == "mainnet|linear"
     assert HH.venue_id(root_with("b", "API.BYBIT.COM")) == "mainnet|linear" == HH.venue_id(root_with("c", "  api.bybit.com  ", "LINEAR"))
     assert HH.venue_id(root_with("d", "api-testnet.bybit.com")) == "testnet|linear" != HH.venue_id(root_with("e", "api.bybit.com"))
-    assert HH.venue_id(root_with("f", "api-demo.bybit.com", "spot")) == "demo|spot"
+    assert HH.venue_id(root_with("f", "api-demo.bybit.com", "spot")) == "mainnet|spot" == HH.venue_id(root_with("g", "api.bybit.com", "spot")), "demo trading is matched on real mainnet prices: the same region, one burn"
     for i, bad in enumerate(("api.bybit.eu", "evil.example.com", "api.bybit.com.evil.com", "", "   ", 7, None)):
         with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
             HH.venue_id(root_with(f"bad{i}", bad))
-    for i, cat in enumerate(("", "  ", None, 3)):
+    for i, cat in enumerate(("", "  ", None, 3, "linear2", "lin\u200bear", "linear ; drop", "Perpetual")):
         with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
             HH.venue_id(root_with(f"cat{i}", "api.bybit.com", cat))
+    for i, raw in enumerate(('{"request": "api.bybit.com"}', '[1, 2]', '"x"', 'null', '{"request": null}', '{"request": []}', '{"request": {"host": ["api.bybit.com"], "category": "linear"}}', "{not json")):
+        with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
+            HH.venue_id(root_with(f"raw{i}", None, raw=raw))
     with pytest.raises(RH.HarnessError, match="VENUE_UNKNOWN"):
         HH.venue_id(str(tmp_path / "no_manifest_here"))
 
@@ -626,6 +667,11 @@ def test_a_registry_chosen_by_the_environment_is_said_on_the_status_and_on_every
     assert info["holdout"]["registry_source"] == "ENV:" + HH.REGISTRY_ENV and "REGISTRY_OVERRIDDEN_BY_ENV" in info["holdout"]["registry_warning"]
     monkeypatch.delenv(HH.REGISTRY_ENV)
     assert HH.registry_source() == {"registry_source": "DEFAULT"} and HH.default_registry_path() == os.path.abspath(os.path.expanduser(HH.REGISTRY_DEFAULT))
+    assert HH.registry_source(HH.default_registry_path()) == {"registry_source": "DEFAULT"}, "the default path itself is not an override"
+    other = HH.registry_source(str(world["tmp"] / "some_other_registry.jsonl"))
+    assert other["registry_source"] == "ARGUMENT" and "REGISTRY_OVERRIDDEN_BY_ARGUMENT" in other["registry_warning"], "the CLI's --registry is an override too (re-review R1)"
+    st2 = HH.status(str(world["tmp"] / "some_other_registry.jsonl"), world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    assert st2["registry_source"] == "ARGUMENT" and "prior_evaluations_note" in st2 and "--prior-reads-through" in st2["prior_evaluations_note"]
 
 
 def test_the_status_report_is_read_only_and_states_the_arithmetic_and_the_burn(world):
@@ -924,14 +970,26 @@ def _is_cr(node):
     return (isinstance(node, ast.Name) and node.id in ("CR", "candidate_readiness")) or (isinstance(node, ast.Attribute) and node.attr in ("CR", "candidate_readiness"))
 
 
-def _shipped_python():
-    """``(basename, path)`` of every shipped .py under bot/ (tests, caches, virtual environments and data are not shipped). A RECURSIVE walk: both tripwires used to read only bot/*.py and
-    bot/tools/*.py, so a new subdirectory was a hiding place (independent re-review, finding 10)."""
+def _shipped_python(base=None):
+    """``(basename, path)`` of every shipped .py under bot/. Tests, caches, hidden directories and real VIRTUAL ENVIRONMENTS (a directory holding ``pyvenv.cfg``, or ``site-packages`` /
+    ``node_modules``) are not shipped; nothing is skipped by NAME otherwise (the re-review's leak planted under ``bot/lib`` passed both tripwires while ``lib``, ``data``, ``env`` and ``venv`` were
+    skipped). A RECURSIVE walk: both tripwires used to read only bot/*.py and bot/tools/*.py, so a new subdirectory was a hiding place (independent re-review, finding 10)."""
     out = []
-    for root, dirs, files in os.walk(BOT):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("tests", "venv", "env", "site-packages", "node_modules", "__pycache__", "data", "lib"))
+    for root, dirs, files in os.walk(base or BOT):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("tests", "site-packages", "node_modules", "__pycache__") and not os.path.exists(os.path.join(root, d, "pyvenv.cfg")))
         out.extend((name, os.path.join(root, name)) for name in sorted(files) if name.endswith(".py"))
     return out
+
+
+def test_the_shipped_code_walker_skips_only_what_is_not_shipped(tmp_path):
+    for rel, content in (("tools/a.py", ""), ("lib/b.py", ""), ("data/c.py", ""), ("env/d.py", ""), ("venv_named_but_real/e.py", ""), ("research/sub/f.py", ""),
+                         ("tests/skip_t.py", ""), (".hidden/skip_h.py", ""), ("__pycache__/skip_c.py", ""), ("realvenv/skip_v.py", ""), ("realvenv/pyvenv.cfg", "home = /usr\n"),
+                         ("x/site-packages/skip_s.py", ""), ("x/node_modules/skip_n.py", "")):
+        f = tmp_path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+    got = sorted(os.path.relpath(p, str(tmp_path)) for _n, p in _shipped_python(str(tmp_path)))
+    assert got == ["data/c.py", "env/d.py", "lib/b.py", "research/sub/f.py", "tools/a.py", "venv_named_but_real/e.py"], got
 
 
 def _references():

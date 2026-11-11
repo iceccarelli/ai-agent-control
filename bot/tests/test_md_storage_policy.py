@@ -428,7 +428,8 @@ def test_an_abandoned_creation_followed_by_later_days_does_not_brick_the_readers
     assert r.segments() == ["md-20261104.db", "md-20261105.db", "md-20261106.db"] and os.path.getsize(dead) == 0
     assert r.count() == 4 and [x.id for x in r.iter_records()] == [1, 2, 3, 4], "every record of the other segments must stay readable"
     problems = r.verify()
-    assert len(problems) == 1 and "md-20261105.db" in problems[0] and "uninitialised" in problems[0] and "no record was lost" in problems[0] and "LOST" not in problems[0], problems
+    assert len(problems) == 1 and "md-20261105.db" in problems[0] and "uninitialised" in problems[0] and "hash chain continues across it" in problems[0] and "LOST" not in problems[0], problems
+    assert "cannot tell the two apart" in problems[0], "the verdict must not claim certainty the store does not have"
     w = ST.MarketStore(str(d), commit_every=1, environment="mainnet")                    # and the recorder goes on writing
     w.append(ST.FRAME, wall_ms=BASE + 2 * DAY + 50, mono_s=99.0, category="spot", payload='{"c":1}')
     assert w.count() == 5 and [x.id for x in w.iter_records()] == [1, 2, 3, 4, 5]
@@ -450,6 +451,48 @@ def test_an_abandoned_creation_before_any_record_is_provably_empty_with_or_witho
     assert "md-20261101.db" not in r.segments() or removed
     r2 = ST.MarketStore(str(d))
     assert all("LOST" not in p for p in r2.verify()) and r2.count() == len(list(r2.iter_records()))
+
+
+def test_a_trailing_run_of_dead_creations_does_not_stop_the_recorder_from_starting(tmp_path):
+    """Independent re-review of the fix, N1: ``[records, 0-byte, 0-byte]`` (creation failing across two midnights, for instance on a full disk) made ``MarketStore(dir)`` itself raise 'no such table: log':
+    the recorder could not start, and even a read-only open or verify was refused until the files were moved by hand. A trailing RUN of unfinished creations is treated like the newest one."""
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for j in range(2):
+        s.append(ST.FRAME, wall_ms=BASE + j, mono_s=float(j), category="spot", payload='{"a":%d}' % j)
+    s.close()
+    for day in ("20261105", "20261106"):
+        open(_segment_path(d, day), "wb").close()                                           # creation failed on two consecutive days
+    r = ST.MarketStore(str(d))                                                              # a read-only style open works
+    assert r.count() == 2 and [x.id for x in r.iter_records()] == [1, 2]
+    problems = r.verify()
+    assert len(problems) == 2 and all("uninitialised" in p for p in problems) and any("trailing run" in p for p in problems) and not any("LOST" in p for p in problems), problems
+    w = ST.MarketStore(str(d), commit_every=1, environment="mainnet")                       # and the recorder starts, continuing from the last real record
+    w.append(ST.FRAME, wall_ms=BASE + 2 * DAY + 5, mono_s=9.0, category="spot", payload='{"b":1}')
+    assert [x.id for x in w.iter_records()] == [1, 2, 3] and w.count() == 3
+    w.close()
+    # the dead files now sit BEFORE a real segment: the chain proves them empty (the earlier rule), and a trailing run needs no proof
+    again = ST.MarketStore(str(d))
+    assert again.count() == 3 and all("LOST" not in p for p in again.verify())
+
+
+def test_a_zeroed_day_followed_only_by_dead_creations_is_reported_not_counted_around_in_silence(tmp_path):
+    """The ambiguity a trailing run cannot resolve is stated, not hidden: a closed day that lost its content followed only by a dead creation reads like two unfinished creations. verify() names
+    both and says it cannot tell them apart. (Once the writer continues, it re-links the chain from the last readable record, so the files then read as skipped-and-named, with the same caveat.)"""
+    d = _three_days_two_frames(tmp_path)
+    segs = sorted(f for f in os.listdir(d) if f.startswith("md-") and f.endswith(".db"))
+    open(os.path.join(d, segs[1]), "wb").close()                                           # the middle day (with records) loses its content
+    open(os.path.join(d, segs[2]), "wb").close()                                           # and the newest is dead too
+    r = ST.MarketStore(str(d))
+    problems = r.verify()
+    assert r.count() == 2 and len(problems) == 2 and all("uninitialised" in p for p in problems), problems
+    w = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    w.append(ST.FRAME, wall_ms=BASE + 5 * DAY, mono_s=50.0, category="spot", payload='{"later":1}')
+    w.close()
+    r2 = ST.MarketStore(str(d))
+    after = r2.verify()
+    assert r2.count() == 3 and len(after) == 2 and all("cannot tell the two apart" in p or "trailing run" in p for p in after), after
+    assert [x.id for x in r2.iter_records()] == [1, 2, 3], "the new record continues from the last readable one (and any lost ids are reused: stated in verify)"
 
 
 def test_an_abandoned_creation_that_becomes_the_oldest_file_after_a_prune_is_proven_empty_by_the_pruned_tail(tmp_path):
