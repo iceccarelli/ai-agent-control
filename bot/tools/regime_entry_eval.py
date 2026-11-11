@@ -389,8 +389,8 @@ def evaluate(series: Sequence[CR.SymbolSeries], *, ledger_path: str, universe_in
     return out
 
 
-def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, registration_name: str = "reg-1",
-                holdout_ledger: Optional[str] = None, unreserved_exploratory: bool = False) -> Dict[str, Any]:
+def run_on_root(history_root: str, *, universe_dir: str, ledger_path: str, holdout_ledger: Any, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
+                registration_name: str = "reg-1", unreserved_exploratory: bool = False) -> Dict[str, Any]:
     import history_holdout as HH
     series, info = HH.load(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_path=holdout_ledger,
                            reader="regime_entry_eval", unreserved_exploratory=unreserved_exploratory)
@@ -425,7 +425,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import history_holdout as HH
     try:
         out = run_on_root(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval, registration_name=a.registration,
-                          holdout_ledger=HH.ledger_for(os.path.dirname(os.path.abspath(lpath))), unreserved_exploratory=a.unreserved_exploratory)
+                          holdout_ledger=HH.default_registry_path(), unreserved_exploratory=a.unreserved_exploratory)
     except RH.HarnessError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

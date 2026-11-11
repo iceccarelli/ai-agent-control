@@ -938,10 +938,16 @@ class Run:
             self.reconcile_step(int(self.ctx.clock()))
             cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
             rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
+            errors_before = getattr(self, "quality_errors", 0)
             doc = self.execution_quality(view, True, bool(flat))
-            if doc and "fills_incomplete" in (doc.get("group") or {}).get("unknown", []):
-                # An order the VENUE says filled has no (or too few) execution rows: the ledger, which is fed only from executions, then holds a LOWER BOUND of the fees and the price leg, not a measurement. Publishing
-                # it would turn "the list never came back" into a measured zero (the capital book's `known` is None whenever either is None, so such a session can debit a loss but never credit a gain).
+            integrity = [f for f in cn.get("flags", []) if str(f).startswith(AC.INTEGRITY_FLAG_PREFIXES)]
+            quality_failed = getattr(self, "quality_errors", 0) > errors_before                     # the final measurement RAISED: the incomplete-fills safeguard below never ran
+            incomplete = bool(doc) and "fills_incomplete" in (doc.get("group") or {}).get("unknown", [])
+            if integrity or quality_failed or incomplete:
+                # (1) An order the VENUE says filled has no (or too few) execution rows: the ledger, which is fed only from executions, then holds a LOWER BOUND of the fees and the price leg, not a
+                # measurement. (2) The ledger itself flags a conflict in its inputs (a duplicate fill with different content, an orphan fill ...): its partial sums are not a net. (3) The measurement that
+                # would have told us (1) failed. Publishing any of them would turn "we could not tell" into a measured number (the capital book's `known` is None whenever either is None, so such a
+                # session can debit a loss but never credit a gain).
                 rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None}
         elif rec["orders"] or rec["executions"]:
             self.execution_quality(view, False, None)
@@ -1438,6 +1444,13 @@ def guarded_main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[
     parsed = _parser().parse_args(argv_l)
     if parsed.cmd != "execute":
         return run(argv_l, env=environ)
+    if getattr(parsed, "unattended", False):
+        # `--unattended` replaces the typed digest with the owner's standing grant, and is only safe under the autopilot LOOP: the loop is what checks ALERT / STOP / PAUSED, the capital book (halts and a
+        # review in force), grant revocation and the allocator, and it calls main() directly with its own pre-order hook. This command line supplies a hook that only renews the lease, so accepting the flag
+        # here would run a full unattended session past every one of those stops (the guard in _gate_execute tests only that a hook EXISTS).
+        print("execute --unattended REFUSED (no order was sent): an unattended session is valid only under the autopilot loop, which enforces the halts, the capital book and the revocation of the grant. "
+              "Run the attended `execute --confirm-plan-digest <digest>` (you type the digest) or start the autopilot.")
+        return EXIT_REFUSED
     import legacy_executor_guard as LG
     take = acquire or (lambda e: LG.acquire(e, ttl_seconds=LEASE_TTL_S, service="manual-session"))
     handle, why = take(environ)

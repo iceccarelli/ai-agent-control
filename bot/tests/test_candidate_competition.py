@@ -85,6 +85,46 @@ def test_a_btc_rejection_says_how_strong_it_is_by_the_repos_own_early_rejection_
     assert rep["winner"] is None and "NO WINNER" in rep["winner_statement"]              # the economic conclusion is unchanged: nothing is a winner
 
 
+def _bar(**kw):
+    return {"meets_early_rejection_standard": False, "p_lower": 0.005, "widest_ci90": [-9.0, 2.0], "independent_observations": 30, "basis": "mean_excess_over_cash_bps_of_capital", **kw}
+
+
+def test_the_strength_note_prints_the_criterion_that_actually_failed_and_never_a_false_inequality():
+    """Second independent review: the note printed ``p=0.005 > 0.01`` when the interval was what failed, and 'does not exclude break-even' when the interval was wholly negative."""
+    note = CC_._strength_note
+    assert note(False, _bar()) == "" and note(True, None) == ""
+    ok = note(True, _bar(meets_early_rejection_standard=True, p_lower=0.004, widest_ci90=[-9.0, -1.0]))
+    assert ok.startswith("; meets the repo's early-rejection standard") and "NOT" not in ok
+    # p passes, the interval is what fails: no statement about p being too high
+    n1 = note(True, _bar(p_lower=0.005, widest_ci90=[-9.0, 2.0]))
+    assert "includes zero" in n1 and "above" not in n1 and "p=0.005" not in n1 and "NOT statistically rejected" in n1
+    # the 51-print numbers of the committed corpus: p fails AND the interval includes zero
+    n2 = note(True, _bar(p_lower=0.034, widest_ci90=[-15.7, 4.2]))
+    assert "p=0.034 is above 0.01" in n2 and "includes zero" in n2
+    # the interval is wholly negative, p is what fails: it must NOT say the interval includes zero or that break-even is not excluded
+    n3 = note(True, _bar(p_lower=0.02, widest_ci90=[-9.0, -1.0]))
+    assert "p=0.020 is above 0.01" in n3 and "includes zero" not in n3 and "not wholly below zero" not in n3 and "exclude break-even" not in n3
+    n4 = note(True, _bar(independent_observations=5))
+    assert "only 5 independent observations (the standard needs 12)" in n4
+    n5 = note(True, _bar(p_lower=None, widest_ci90=None, independent_observations=None))
+    assert "no usable lower-tail p" in n5 and "no usable 90% interval" in n5 and "only 0 independent observations" in n5
+    assert "is not wholly below zero" in note(True, _bar(p_lower=0.004, widest_ci90=[-3.0, 0.0]))                  # an upper bound of exactly 0 is not below zero
+    assert "a criterion of the standard could not be evaluated" in note(True, _bar(p_lower=0.004, widest_ci90=[-3.0, -1.0]))     # nothing failed yet the bar says it does not meet: said, never invented
+    import re
+    for bar in (_bar(p_lower=0.034), _bar(p_lower=0.011), _bar(p_lower=0.5, widest_ci90=[-1.0, 1.0])):
+        for m in re.finditer(r"p=([0-9.]+) is above ([0-9.]+)", note(True, bar)):
+            assert float(m.group(1)) > float(m.group(2)), "a printed inequality is false"
+
+
+def test_the_ranked_table_shows_the_point_estimate_only_caveat_first_for_the_btc_row(committed):
+    rep, _ = committed
+    b = row(rep, "cash_and_carry")
+    assert b["rejection_reasons"][0].startswith("IN-SAMPLE; point-estimate only (NOT stat. rejected):") and "51p" in b["rejection_reasons"][0], b["rejection_reasons"][0]
+    line = next(x for x in CC_.render_table(rep).splitlines() if x.split("\t")[1] == "cash_and_carry")
+    assert "point-estimate only" in line, line
+    assert any(r.startswith("REJECTED policy unconditional_1_print_hold") for r in b["rejection_reasons"]), "the per-policy reasons are still all there"
+
+
 def test_the_candidate_readiness_verdict_and_the_competition_still_agree_on_the_same_evidence(committed):
     rep, _ = committed
     econ = CR.build_report(with_economics=True)["economics"]["btc_carry_corpus"]

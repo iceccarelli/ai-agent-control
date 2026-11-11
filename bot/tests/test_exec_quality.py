@@ -162,8 +162,23 @@ def test_an_unflat_group_is_not_a_completed_attempt_and_shows_its_residual():
 
 # ------------------------------------------------------------------ the comparison never invents a winner
 def _attempt(style, bps, done=True, n=1):
-    return {"style": style, "attempt_completed": done, "cost_complete": True, "total_execution_cost_bps_of_position_notional": str(bps), "total_execution_cost_usd": "0.2",
-            "position_notional_usd": "100"}
+    """A complete hedged-pair attempt (both entry legs filled) when ``done``; an unfilled maker attempt otherwise. Policy samples count only full pairs (see the one-legged test below)."""
+    return {"style": style, "attempt_completed": done, "cost_complete": True, "all_entry_legs_filled": bool(done), "total_execution_cost_bps_of_position_notional": str(bps),
+            "total_execution_cost_usd": "0.2", "position_notional_usd": "100"}
+
+
+def test_a_one_legged_attempt_is_not_a_cheap_policy_sample():
+    """Review R2-7: ``policy_summary`` counted a one-legged completed attempt (about half a pair's cost per unit of notional) as a cheap sample while ``feedback_report`` already excluded it."""
+    full = [_attempt("TAKER", 22) for _ in range(5)]
+    one_legged = [dict(_attempt("MAKER_FIRST", 11), all_entry_legs_filled=False) for _ in range(5)]
+    unstated = [{k: v for k, v in _attempt("MAKER_FIRST", 11).items() if k != "all_entry_legs_filled"} for _ in range(5)]
+    for bad in (one_legged, unstated):
+        s = EQ.policy_summary(full + bad, min_orders=5)
+        mk = s["policies"]["MAKER_FIRST"]
+        assert mk["attempts"] == 5 and mk["completed_with_complete_costs"] == 0 and mk["mean_cost_bps"] is None and mk["completion_rate"] == "0.0000", mk
+        assert s["verdict"] == "INSUFFICIENT_SAMPLE"
+    both = EQ.policy_summary(full + [_attempt("MAKER_FIRST", 11) for _ in range(5)], min_orders=5)
+    assert both["verdict"] == "COMPARABLE_SAMPLE" and both["policies"]["MAKER_FIRST"]["completed_with_complete_costs"] == 5, "control: full pairs are counted"
 
 
 def test_the_policy_comparison_is_insufficient_below_the_minimum_sample_and_counts_unfilled_attempts():
@@ -327,8 +342,24 @@ def test_complete_executions_are_unaffected_and_an_unsent_or_unfilled_order_is_a
     assert "fills_incomplete" not in unfilled["unknown"] and D(unfilled["fee"]["usd_signed"]) == 0           # a venue-confirmed nothing is a real zero
     unsent = leg("Buy", [], order=None)
     assert "fills_incomplete" not in unsent["unknown"] and D(unsent["fee"]["usd_signed"]) == 0
-    no_qty = leg("Buy", [], order={"status": "Filled", "cum_qty": None})
-    assert "fills_incomplete" not in no_qty["unknown"]                                                      # an absent cumulative quantity is not a claim of a fill
+    absent = leg("Buy", [], order={"status": "Cancelled", "cum_qty": None})
+    assert "fills_incomplete" not in absent["unknown"]                                                      # an absent cumulative quantity on an order that did not trade is not a claim of a fill
+    for status in ("Filled", "PartiallyFilled", "PartiallyFilledCanceled"):
+        for cum in (None, "0"):
+            said = leg("Buy", [], order={"status": status, "cum_qty": cum})
+            assert "fills_incomplete" in said["unknown"] and said["fee"]["usd_signed"] is None and said["cost"]["total_usd"] is None, (status, cum)
+    # ... but an execution that IS there prices the leg whatever the order row's quantity says
+    priced = leg("Buy", [fill(1, "2", "100.20", "0.05")], order={"status": "Filled", "cum_qty": None}, qty="2")
+    assert "fills_incomplete" not in priced["unknown"] and D(priced["fee"]["usd_signed"]) != 0
+
+
+def test_the_fee_in_base_tolerance_belongs_to_a_spot_buy_alone():
+    """A spot SELL's fee is taken from the quote coin: its order row and its executions agree, so a missing execution is a missing execution, never a fee-sized remainder."""
+    net = {"fill_id": "E1", "qty": "0.999", "price": "100.20", "fee_usd": "0.0001", "fee_ccy": "USDT", "liquidity": "TAKER", "ts_ms": 2_000}
+    sell = leg("Sell", [net], order=_filled_order("1"), category="spot", qty="1")
+    assert "fills_incomplete" in sell["unknown"]
+    buy = leg("Buy", [net], order=_filled_order("1"), category="spot", qty="1")
+    assert "fills_incomplete" not in buy["unknown"]
 
 
 def test_a_spot_buy_whose_fee_is_taken_in_the_base_coin_is_net_of_it_and_complete_within_the_fee_bound():

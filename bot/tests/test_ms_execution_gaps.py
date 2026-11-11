@@ -111,17 +111,100 @@ def _journal_file(tmp_path, n=3):
     return X, st
 
 
-def test_a_torn_last_line_is_set_aside_kept_for_the_owner_and_the_journal_continues_cleanly(tmp_path):
+def test_a_torn_last_line_is_set_aside_kept_for_the_owner_and_the_journal_continues_cleanly(tmp_path, capsys):
     X, st = _journal_file(tmp_path)
     lines = open(st.path).read().splitlines()
     with open(st.path, "w") as fh:
         fh.write("\n".join(lines[:2]) + "\n" + lines[2][:25])
     j = X.Journal(X.FileStore(st.path))
-    assert [e["seq"] for e in j.entries] == [0, 1]
+    assert [e["seq"] for e in j.entries[:2]] == [0, 1]
     assert open(st.path + ".torn").read() == lines[2][:25] + "\n"                  # evidence kept, never silently discarded
+    # the repair is not silent either (second review: the only trace used to be the .torn file): it is journalled as an ANOMALY and printed
+    assert [e["type"] for e in j.entries] == ["STATE", "STATE", "ANOMALY"] and j.entries[2]["seq"] == 2
+    a = j.entries[2]["body"]
+    assert a["code"] == "TORN_TAIL_DROPPED" and a["dropped_chars"] == 25 and a["kept_in"] == "engine_journal.jsonl.torn"
+    import hashlib
+    assert a["dropped_sha16"] == hashlib.sha256(lines[2][:25].encode()).hexdigest()[:16] and j.entries[2]["ts_ms"] == j.entries[1]["ts_ms"]
+    assert j.repaired_torn_tail == a
+    err = capsys.readouterr().err
+    assert "JOURNAL_TORN_TAIL_DROPPED" in err and "25 characters" in err and "engine_journal.jsonl.torn" in err
     j.append("STATE", "g1", 2000, {"to": "AFTER_REPAIR"})
     again = X.Journal(X.FileStore(st.path))
-    assert [e["seq"] for e in again.entries] == [0, 1, 2] and X.verify_chain(open(st.path).read().splitlines())[0]
+    assert [e["seq"] for e in again.entries] == [0, 1, 2, 3] and X.verify_chain(open(st.path).read().splitlines())[0] and again.repaired_torn_tail is None
+    assert "JOURNAL_TORN_TAIL_DROPPED" not in capsys.readouterr().err, "a clean journal prints nothing"
+
+
+def test_the_repair_refuses_to_drop_a_line_it_did_not_judge_and_changes_nothing(tmp_path):
+    """A lock-broken emergency unwind has no single-writer lock: between judging the tail torn and dropping it another writer may have appended a good line. Re-reading and dropping 'whatever is
+    last' would discard that line; the repair now drops only the line it judged, otherwise it refuses."""
+    X, st = _journal_file(tmp_path)
+    lines = open(st.path).read().splitlines()
+    with open(st.path, "w") as fh:
+        fh.write("\n".join(lines[:2]) + "\n" + lines[2][:25])
+    judged = X.FileStore(st.path).read()[-1]
+
+    class Racy(X.FileStore):
+        def drop_torn_tail(self, expected=None):
+            with open(self.path, "a") as fh:                                          # another writer completes / extends the file between judging and dropping
+                fh.write("\n" + lines[2] + "\n")
+            return super().drop_torn_tail(expected)
+    racy = Racy(st.path)
+    with pytest.raises(ValueError, match="journal changed while its torn tail was being set aside"):
+        X.Journal(racy)
+    after = open(st.path).read()
+    assert lines[2] in after and not os.path.exists(st.path + ".torn"), "the good line another writer appended must survive and nothing may be set aside"
+    assert judged == lines[2][:25]
+    # called directly: a stale expectation or an empty journal is refused, an exact one is honoured
+    solo = X.FileStore(str(tmp_path / "solo.jsonl"))
+    with pytest.raises(ValueError):
+        solo.drop_torn_tail(expected="x")
+    with open(solo.path, "w") as fh:
+        fh.write("a\nb\n")
+    with pytest.raises(ValueError):
+        solo.drop_torn_tail(expected="not-the-last")
+    assert open(solo.path).read() == "a\nb\n" and not os.path.exists(solo.path + ".torn")
+    assert solo.drop_torn_tail(expected="b") == "b" and open(solo.path).read() == "a\n" and open(solo.path + ".torn").read() == "b\n"
+
+
+def test_the_torn_text_is_kept_before_the_journal_is_replaced_so_a_crash_between_loses_nothing(tmp_path, monkeypatch):
+    X, st = _journal_file(tmp_path)
+    lines = open(st.path).read().splitlines()
+    with open(st.path, "w") as fh:
+        fh.write("\n".join(lines[:2]) + "\n" + lines[2][:25])
+    torn_state = open(st.path).read()
+    seen = {}
+    real_replace = X.os.replace
+
+    def crash_at_replace(src, dst):
+        seen["torn_file_at_replace"] = open(st.path + ".torn").read() if os.path.exists(st.path + ".torn") else None
+        raise SimulatedCrash("killed between keeping the torn text and replacing the journal")
+    monkeypatch.setattr(X.os, "replace", crash_at_replace)
+    with pytest.raises(SimulatedCrash):
+        X.Journal(X.FileStore(st.path))
+    monkeypatch.setattr(X.os, "replace", real_replace)
+    assert seen["torn_file_at_replace"] == lines[2][:25] + "\n", "the evidence must be durable BEFORE the journal is replaced"
+    assert open(st.path).read() == torn_state, "a crash at the replace leaves the ORIGINAL journal, never a mixture"
+    again = X.Journal(X.FileStore(st.path))                                              # and the next open repairs it
+    assert [e["type"] for e in again.entries] == ["STATE", "STATE", "ANOMALY"]
+
+
+def test_a_full_disk_that_cannot_journal_the_anomaly_still_lets_the_owner_open_the_journal(tmp_path, monkeypatch, capsys):
+    """The torn append is often a full disk: journalling the repair must be best effort, or the emergency unwind could not open the journal at all."""
+    X, st = _journal_file(tmp_path)
+    lines = open(st.path).read().splitlines()
+    with open(st.path, "w") as fh:
+        fh.write("\n".join(lines[:2]) + "\n" + lines[2][:25])
+    real_append = X.FileStore.append
+
+    def full(self, line):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(X.FileStore, "append", full)
+    j = X.Journal(X.FileStore(st.path))
+    monkeypatch.setattr(X.FileStore, "append", real_append)
+    assert [e["seq"] for e in j.entries] == [0, 1] and j.repaired_torn_tail["code"] == "TORN_TAIL_DROPPED"
+    err = capsys.readouterr().err
+    assert "JOURNAL_TORN_TAIL_DROPPED" in err and "JOURNAL_TORN_TAIL_ANOMALY_NOT_JOURNALLED" in err and open(st.path + ".torn").read() == lines[2][:25] + "\n"
+    assert X.verify_chain(open(st.path).read().splitlines())[0]
 
 
 @pytest.mark.parametrize("damage,why", [
@@ -226,9 +309,18 @@ def test_a_session_whose_executions_all_arrive_keeps_a_measured_net(w):
     assert g["cost_complete"] is True and "fills_incomplete" not in g["unknown"] and g["total_execution_cost_usd"] is not None
 
 
-def test_the_loop_books_no_gain_for_a_session_whose_net_is_unknown():
-    """The arithmetic the autopilot applies to the record: any None among fees / price leg makes `known` None, and the book credits nothing it cannot explain."""
-    import ms_capital as CC
-    b_known = lambda fees, price, fund: None if (fees is None or price is None) else price - fees + (fund or D(0))     # noqa: E731 - the rule at ms_testnet_autopilot.py (`known = None if ...`)
-    assert b_known(None, D(0), None) is None and b_known(D("0.2"), None, None) is None
-    assert CC.allocate(grant_max_usd=375, ceiling_usd=500, open_gross_usd=0, available_usdt=10_000, basis=D(10_000), start_cash=D(10_000), loss_streak=0, drawdown_usd=D(0), profit_seeking=True).notional > 0
+def test_the_fee_in_base_remainder_rule_belongs_to_a_spot_buy_alone():
+    """Second independent review: the rule that drops a fee-sized remainder when a real execution replaces an adopted (recon) fill was not limited to spot BUY legs. A PERP whose execution list lags
+    its order row by 0.1% would have lost the remainder from the engine's exposure and then halted on a position mismatch with the venue (which holds the full quantity)."""
+    import ms_execution as EX
+    import ms_types as T
+    from test_ms_execution import GID, PERP, SPOT, H, PL, SL
+    h = H()
+    h.start()
+    h.e.on_fill(h.v.execute(PL, 10, 100.0, 3000, fill_id="recon:perp"), 3000)             # adopted from the order rows' cumulative quantity (the executions have not been listed yet)
+    h.e.on_fill(h.v.execute(SL, 10, 100.0, 3000, fill_id="recon:spot"), 3000)
+    h.e.on_fill(T.Fill("E-perp", GID, PERP, "XUSDT", "Sell", 9.98, 100.0, 0.0, "USDT", "TAKER", 3100, "MEASURED"), 3100)     # the list arrives, 0.2% short
+    h.e.on_fill(T.Fill("E-spot", GID, SPOT, "XUSDT", "Buy", 9.98, 100.0, 0.0, "USDT", "TAKER", 3100, "MEASURED"), 3100)
+    assert h.e.positions_exp["linear:XUSDT"] == D("-10"), "a perp keeps the venue's quantity: the missing 0.02 is a lagging execution, not a fee"
+    assert h.e.positions_exp["spot:XUSDT"] == D("9.98"), "a spot BUY's fee is taken from the coin received: the 0.02 was never held"
+    assert EX.FEE_IN_BASE_MAX_FRACTION * 10 == D("0.020")

@@ -469,6 +469,8 @@ def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_
             pr.append(f"{nobs} independent OOS observations < {MIN_PROMISING_OOS_OBS}")
         if ev.get("terminal_exit_unpriced"):
             pr.append("unpriced terminal exits")
+        if "holdout_status" in ev and ev.get("holdout_status") not in ("RESERVED", "SPENT"):
+            pr.append(f"the evaluation was exploratory (holdout {ev.get('holdout_status')}): NOT_A_HOLDOUT_STUDY cannot reach PROMISING")
         promising = not pr
     put("PROMISING", promising, pr)
     pp = prospective if isinstance(prospective, Mapping) else {}
@@ -1285,9 +1287,10 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     THE FUNNEL. Which symbols are loaded is decided by ``backfill_plan.funnel`` (the same function ``plan``, ``diagnose`` and the audit call), not here: this function loads EXACTLY ``funnel.loadable``
     and embeds the funnel report as ``info['funnel']``. ``window`` = the (from_ms, to_ms) the history must cover (default: the window the funding manifest itself requested).
 
-    ``cut_ms`` is the RESERVED-HOLDOUT boundary (``history_holdout``): the study window ends there and no funding print or mark close observed at or after it is built into a series
-    (the funnel is judged on the cut window too, so which symbols are loaded cannot depend on the reserved rows). Only ``history_holdout`` passes it; an evaluator must go through
-    ``history_holdout.load`` (a test enforces that nothing else calls this function)."""
+    ``cut_ms`` is the RESERVED-HOLDOUT boundary (``history_holdout``): the study window ends there and no funding print or mark close observed at or after it is built into a series, the
+    funding-interval segments are clipped at it, and the funnel's COVERAGE window ends there (a symbol with no row before it is dropped and listed). What is NOT cut: facts the manifests
+    compute over the WHOLE dataset (a symbol's non-COMPLETE status, a conflict, an interval disagreement) can still flag or exclude a symbol; they carry no return information. Only
+    ``history_holdout`` passes it; an evaluator must go through ``history_holdout.load`` (a test enforces that nothing else calls this function)."""
     from decimal import Decimal, InvalidOperation
     if not isinstance(universe_dir, str) or not universe_dir:
         raise RH.HarnessError("universe_dir is required: instrument attributes do not live in the history manifests")
@@ -1339,6 +1342,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
             warnings.append(f"dataset {nm} dataset_status {man.get('dataset_status')!r}: the evaluation inherits that")
     excluded = [{"symbol": sy, "reason": why} for sy, why in sorted(fn.reasons_for_symbols_in_datasets().items())]
     series: List[SymbolSeries] = []
+    cut_dropped: List[str] = []
     for sym in fn.loadable:
         sts = {"funding": fman["symbols"][sym].get("status"), mark_name: mman["symbols"][sym].get("status")}
         if any(v != "COMPLETE" for v in sts.values()):
@@ -1361,8 +1365,19 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
             raise RH.HarnessError(f"{sym}: rows.jsonl unreadable after verification: {type(exc).__name__}") from exc
         segs, seg_why = funding_interval_segments(fman["symbols"][sym], [t for t, _ in fund])
+        if cut_ms is not None and (not fund or not mark):
+            # a late listing: its first print or candle is AT or after the holdout boundary, so it has nothing to explore. The funnel admitted it (it launched before the cut); dropping it here keeps
+            # one such symbol from aborting every explore load, and the boundary is frozen, so an abort would be permanent.
+            cut_dropped.append(sym)
+            non_complete.pop(sym, None)
+            excluded.append({"symbol": sym, "reason": "no_rows_before_the_holdout_cut"})
+            continue
         if not fund or not mark or segs is None:
             raise RH.HarnessError(f"FUNNEL_DISAGREES_WITH_LOADER: {sym} passed the funnel but its rows are unusable ({'no_rows' if not fund or not mark else seg_why})")
+        if cut_ms is not None:
+            # the interval segments are facts about the whole dataset: one that begins inside the reserved region (a funding-cap regime change) must not reach the series, and one that
+            # spans the boundary ends at it
+            segs = [(s0, min(s1, int(cut_ms) - 1), sv) for (s0, s1, sv) in segs if s0 < cut_ms]
         if "interval_disagrees_with_record" in (fman["symbols"][sym].get("reasons") or []):
             mismatch.append(sym)
         rec = recs[sym]
@@ -1376,7 +1391,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                                    d if isinstance(d, int) and not isinstance(d, bool) and d > 0 else None, SPOT_VERDICT_TO_LISTED.get(verdicts.get(sym)) if verdicts else None,
                                    funding_intervals=segs, key_basis=_KEY_BASIS_OBSERVED,
                                    mark_interval_ms=iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None))
-    if [x.symbol for x in series] != fn.loadable:
+    if [x.symbol for x in series] != [y for y in fn.loadable if y not in set(cut_dropped)]:
         raise RH.HarnessError("FUNNEL_DISAGREES_WITH_LOADER: the loaded series are not the funnel's loadable symbols")
     in_series = {x.symbol for x in series}
     w0, w1 = fn.window
@@ -1388,6 +1403,8 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
             survivorship = SURVIVORS_ONLY
         warnings.append(f"SURVIVORS_ONLY: {len(closed_missing)} Closed/delivered perpetuals in the universe record overlap the study window but are absent from the evaluated series "
                         f"(first: {closed_missing[:5]}): the evaluated series is survivors-only whatever the universe capture observed")
+    if cut_dropped:
+        warnings.append(f"{len(cut_dropped)} symbols have no funding print or mark close before the holdout boundary (late listings; dropped, listed in excluded): {cut_dropped[:5]}")
     if non_complete:
         warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
     short_cov = sorted(set(fn.loadable) - set(fn.complete) - set(non_complete))
@@ -1412,7 +1429,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                             "not_complete_over_window": sorted(set(fn.loadable) - set(fn.complete)), "closed_in_universe_not_in_series": closed_info, "point_in_time_claim": False,
                             "point_in_time_note": "this loader builds series from capture snapshots; it makes no point-in-time claim (use PointInTimeUniverse.from_capture_dirs for that). " + PIT_LABEL_NOTE,
                             "time_basis": "marks and funding are keyed by observation_time (replay mode: receipt time is not stored per row)",
-                            "interval_mismatch_symbols": mismatch, "holdout_cut_ms": cut_ms,
+                            "interval_mismatch_symbols": mismatch, "holdout_cut_ms": cut_ms, "holdout_dropped_no_rows_before_cut": cut_dropped,
                             "non_complete_symbols": non_complete, "excluded": excluded, "symbols_loaded": len(series), "warnings": warnings})
     info.verdict = UniverseVerdict(survivorship, len(closed_missing), tuple(closed_missing[:NAMES_CAP]), _UNIVERSE_SEAL)
     if hedge_info is not None:
@@ -1845,7 +1862,8 @@ def _require_universe_dir(universe_dir: Any) -> str:
 def ledger_dir_for(data_root: Optional[str], ledger_dir: Optional[str] = None) -> str:
     """THE rule for where a research ledger directory is (pure: nothing is created): ``ledger_dir``, else $CANDIDATE_LEDGER_DIR, else ``<parent of data_root>/candidate_ledgers``, else
     ``~/.cache/ai-agent-control/candidate_ledgers``. Every research CLI resolves its ledgers through this one function: two tools that each re-derive the rule drift apart, and a
-    family counted in two directories is two families (the multiple-testing count then understates the trials, and a holdout reserved in one directory is invisible from the other)."""
+    family counted in two directories is two families (the multiple-testing count then understates the trials). ``--ledger FILE`` on candidate_readiness.py names one file and bypasses this
+    rule on purpose. The reserved-holdout registry does NOT live here: it is per user (``history_holdout.default_registry_path``), so no ledger directory can give a read a clean slate."""
     if ledger_dir:
         return os.path.abspath(ledger_dir)
     env = os.environ.get("CANDIDATE_LEDGER_DIR")
@@ -1866,15 +1884,16 @@ def default_ledger_path(family: str, data_root: str, ledger_dir: Optional[str] =
     return path
 
 
-def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], ledger_path: Optional[str], spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
-                             spec: Optional[Mapping[str, Any]] = None, holdout_ledger: Optional[str] = None, unreserved_exploratory: bool = False, reader: str = "",
+def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], ledger_path: Optional[str], holdout_ledger: Any, spot_dir: Optional[str] = None,
+                             mark_interval: Optional[str] = None, spec: Optional[Mapping[str, Any]] = None, unreserved_exploratory: bool = False, reader: str = "",
                              **kw: Any) -> Dict[str, Any]:
     """Load a market_history root against its verified universe capture and run the ranked-funding walk-forward. The universe dir is REQUIRED (HarnessError UNIVERSE_DIR_REQUIRED) and
     so is a persistent ``ledger_path``: a fresh process must not reset the multiple-testing family count (HarnessError otherwise).
 
-    ``holdout_ledger`` is the reserved-holdout ledger (``history_holdout``): with it the load is CUT at the reserved boundary and refused (HOLDOUT_NOT_RESERVED, with the exact command)
-    when nothing is reserved, unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY and recorded). Without it (a library call) the whole window is read and
-    ``input['holdout']['status']`` says NOT_GUARDED; every research CLI passes its ledger."""
+    ``holdout_ledger`` is REQUIRED: the per-user reserved-holdout registry (``history_holdout.default_registry_path()``), or ``history_holdout.UNGUARDED`` to read the whole window on
+    purpose (tests, embeddings; stamped NOT_GUARDED). With a registry the load is CUT at the reserved boundary and refused (HOLDOUT_NOT_RESERVED, with the exact command) when nothing is
+    reserved, unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY, recorded, and the time it read is burned). Whatever the stamp, an evaluation that was not run on a reserved
+    explore window cannot reach PROMISING (``readiness_levels``)."""
     _require_universe_dir(universe_dir)
     if not isinstance(ledger_path, str) or not ledger_path:
         raise RH.HarnessError("LEDGER_PATH_REQUIRED: a cross-sectional evaluation records its variants in a persistent ledger so the family count survives a restart")
@@ -1888,6 +1907,10 @@ def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], 
                                     "note": "this run is a SHORT DIAGNOSTIC: it must never be quoted as evidence for or against the strategy"}
     stem = os.path.splitext(ledger_path)[0]
     out["families"] = {k: evaluate_family(series, k, ledger_path=f"{stem}.{k.lower()}.jsonl", universe_info=info) for k in FAMILIES}
+    hstatus = (info.get("holdout") or {}).get("status")
+    out["holdout_status"] = hstatus
+    for f in out["families"].values():
+        f["holdout_status"] = hstatus                                   # read by readiness_levels: an exploratory evaluation cannot reach PROMISING
     return out
 
 
@@ -2012,7 +2035,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             import history_holdout as HH
             lpath = a.ledger or default_ledger_path("cross_sectional_funding", a.history_root)
             rep["ranked_funding"] = evaluate_cross_sectional(a.history_root, universe_dir=a.universe_dir, ledger_path=lpath, spot_dir=a.spot_dir, mark_interval=a.mark_interval,
-                                                             holdout_ledger=HH.ledger_for(os.path.dirname(os.path.abspath(lpath))), unreserved_exploratory=a.unreserved_exploratory,
+                                                             holdout_ledger=HH.default_registry_path(), unreserved_exploratory=a.unreserved_exploratory,
                                                              reader="candidate_readiness.py --history-root")
         except RH.HarnessError as exc:
             ap.exit(2, f"refused: {exc}\n")

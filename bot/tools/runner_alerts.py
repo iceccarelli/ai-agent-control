@@ -113,7 +113,7 @@ READ_FAILURES = {
                             "`fly ssh` could not reach the carry-drill machine (connection refused or failed, machine stopped, or a Fly outage): the history was NOT read, which is not the same as an empty history"),
     "timeout": ("machine_unreachable", CRITICAL,
                 "`fly ssh` timed out reaching the carry-drill machine: the history was NOT read, which is not the same as an empty history"),
-    "unknown": ("read_failed", WARNING,
+    "unknown": ("read_failed", CRITICAL,
                 "the monitor history could not be read for a reason the watcher could not classify (see the job log): this is a READ failure, not an empty history"),
 }
 RECOVERED = "RECOVERED"

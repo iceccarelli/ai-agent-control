@@ -375,3 +375,49 @@ def test_a_segment_with_records_is_never_treated_as_uninitialised(tmp_path):
     s.append(ST.FRAME, wall_ms=BASE, mono_s=1.0, category="spot", payload="{}")
     s.close()
     assert ST.MarketStore(str(d))._initialised("md-20261104.db") is True
+
+
+# ---------------------------------------------------------------- second independent review: an unfinished CREATION is only ever the newest segment
+def _three_days_two_frames(tmp_path):
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((0, DAY, 2 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload='{"i":%d}' % i)
+        s.append(ST.FRAME, wall_ms=BASE + off + 1, mono_s=float(i) + 0.1, category="spot", payload='{"j":%d}' % i)
+    s.close()
+    return d
+
+
+def test_an_emptied_segment_that_has_a_successor_is_damage_every_reader_refuses_it_not_a_hole_to_count_around(tmp_path):
+    import sqlite3
+    d = _three_days_two_frames(tmp_path)
+    segs = sorted(f for f in os.listdir(d) if f.startswith("md-") and f.endswith(".db"))
+    assert len(segs) == 3
+    open(os.path.join(d, segs[1]), "wb").close()                                   # the MIDDLE closed day lost its content
+    r = ST.MarketStore(str(d))
+    with pytest.raises(sqlite3.DatabaseError, match="no such table"):
+        r.count()                                                                   # it used to return 4 (not 6) without a word
+    with pytest.raises(sqlite3.DatabaseError, match="no such table"):
+        list(r.iter_records())
+    problems = r.verify()
+    assert any(segs[1] in p and "not the newest" in p and "LOST" in p for p in problems), problems
+
+
+def test_the_newest_segment_is_still_the_only_one_an_unfinished_creation_can_be(tmp_path):
+    d = _three_days_two_frames(tmp_path)
+    segs = sorted(f for f in os.listdir(d) if f.startswith("md-") and f.endswith(".db"))
+    open(os.path.join(d, segs[-1]), "wb").close()                                   # the day being created when the recorder died
+    r = ST.MarketStore(str(d))
+    assert r.count() == 4 and any(segs[-1] in p and "recorder died while creating" in p for p in r.verify())
+
+
+def test_removing_an_emptied_segment_by_retention_leaves_an_audit_row_not_a_silent_deletion(tmp_path):
+    d = tmp_path / "md"
+    os.makedirs(d)
+    open(_segment_path(d, "20261101"), "wb").close()
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((2 * DAY, 3 * DAY, 4 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload="{}")
+    assert "md-20261101.db" in s.apply_retention(BASE + 4 * DAY, 2)
+    rows = [json.loads(line) for line in open(os.path.join(d, "pruned.jsonl")) if line.strip()]
+    assert [(r["segment"], r.get("uninitialised"), r["records"]) for r in rows if r["segment"] == "md-20261101.db"] == [("md-20261101.db", True, 0)]

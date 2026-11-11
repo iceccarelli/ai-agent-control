@@ -133,8 +133,11 @@ def leg_quality(*, link_id: str, group_id: str, leg_id: str, kind: str, candidat
     cum = _d(order.get("cum_qty"))
     incomplete = False
     if cum is not None and cum > 0:
-        tolerance = cum * FEE_IN_BASE_MAX_FRACTION if (str(plan.get("category")) == "spot" and filled > 0) else D(0)
+        # only a spot BUY's fee is taken from the coin received (the order row's cumulative quantity is then GROSS and the execution NET): a missing SELL execution is never a fee-sized remainder
+        tolerance = cum * FEE_IN_BASE_MAX_FRACTION if (str(plan.get("category")) == "spot" and str(plan.get("side")) == "Buy" and filled > 0) else D(0)
         incomplete = cum - filled > tolerance
+    elif filled <= 0 and str(order.get("status") or "") in ("Filled", "PartiallyFilled", "PartiallyFilledCanceled"):
+        incomplete = True                                               # the venue says (part of) the order traded, yet neither a cumulative quantity nor an execution row says how much
     if incomplete:
         unknown.append("fills_incomplete")
     fee_known = bool(fl) and all(f["fee"] is not None for f in fl)
@@ -254,7 +257,9 @@ def policy_summary(groups: Sequence[Mapping[str, Any]], *, min_orders: int = MIN
         by.setdefault(str(g.get("style") or UNKNOWN), []).append(g)
     rows: Dict[str, Dict[str, Any]] = {}
     for style, gs in sorted(by.items()):
-        done = [g for g in gs if g.get("attempt_completed") and g.get("cost_complete") and g.get("total_execution_cost_bps_of_position_notional") is not None]
+        # the model prices a FULL hedged pair: a one-legged attempt incurred about half that cost per unit of notional, so counting it would flatter the policy (feedback_report already filtered it)
+        done = [g for g in gs if g.get("attempt_completed") and g.get("cost_complete") and g.get("all_entry_legs_filled") is True
+                and g.get("total_execution_cost_bps_of_position_notional") is not None]
         bps = [_d(g["total_execution_cost_bps_of_position_notional"]) for g in done]
         bps = [b for b in bps if b is not None]
         usd = [_d(g["total_execution_cost_usd"]) for g in done]

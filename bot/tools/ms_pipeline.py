@@ -204,7 +204,7 @@ def input_parts(info: Mapping[str, Any], spot_dir: Optional[str], collector_dige
             "spot": "ABSENT" if spot_dir is None else (_manifest_digest(spot_dir) or "UNKNOWN"), "collector": collector_digest or "ABSENT", "holdout": holdout}
 
 
-def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Optional[str] = None,
+def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Any = None,
                   unreserved_exploratory: bool = False) -> LoadedHistory:
     """The ONLY way a history root enters the pipeline: ``history_holdout.load`` over ``candidate_readiness.load_history_root`` (re-verifies every dataset, the universe capture and the
     spot snapshot, and cuts the series at the reserved-holdout boundary)."""
@@ -630,7 +630,7 @@ def _instrument_for(x: RP.ReplaySeries, cfg: RP.ReplayConfig) -> T.Instrument:
                         cfg.default_min_qty, cfg.default_max_qty, cfg.default_max_qty, cfg.default_min_notional, "10", x.symbol, _hedge_of(x.spot_listed))
 
 
-def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Optional[str] = None,
+def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Any = None,
                 unreserved_exploratory: bool = False) -> Tuple[List[Any], str, Dict[str, Any]]:
     """(series, data_label, info). A string is a market_history root and goes through the VERIFIED loader; anything else is a sequence of injected series (INJECTED_TEST_DATA)."""
     if isinstance(source, LoadedHistory):
@@ -644,6 +644,8 @@ def load_series(source: Any, *, universe_dir: Optional[str], spot_dir: Optional[
             raise PipelineRefused("UNIVERSE_DIR_REQUIRED_FOR_A_HISTORY_ROOT")
         import history_holdout as HH                                      # lazy: heavy, and only the verified path needs it
         import research_harness as RH
+        if holdout_ledger is None:
+            raise PipelineRefused("HOLDOUT_LEDGER_REQUIRED: a history root is only read through the reserved-holdout registry (history_holdout.default_registry_path()) or the explicit history_holdout.UNGUARDED")
         try:
             series, info = HH.load(source, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, ledger_path=holdout_ledger,
                                    reader="ms_pipeline", unreserved_exploratory=unreserved_exploratory)
@@ -1419,7 +1421,7 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
     try:
         import history_holdout as HH
         unreserved = bool(getattr(ns, "unreserved_exploratory", False))
-        loaded = verify_inputs(hist, universe_dir=uni, spot_dir=spot, mark_interval=ns.mark_interval, holdout_ledger=HH.ledger_for(led), unreserved_exploratory=unreserved)
+        loaded = verify_inputs(hist, universe_dir=uni, spot_dir=spot, mark_interval=ns.mark_interval, holdout_ledger=HH.default_registry_path(), unreserved_exploratory=unreserved)
     except PipelineRefused as exc:
         held = "HOLDOUT_NOT_RESERVED" in str(exc) or "HOLDOUT_SPENT" in str(exc) or "HOLDOUT_LEDGER" in str(exc)
         raise CliRefused("HOLDOUT_NOT_RESERVED" if held else "INPUT_NOT_VERIFIED", _short(exc, 800 if held else 400)) from None
@@ -1457,7 +1459,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--spot-dir", required=True, help="verified spot-instruments snapshot directory (hedgeability)")
     p.add_argument("--collector-root", default=None, help="optional microstructure collector root: decision-time books and trades (needs ms_microstructure; refused when unavailable)")
     p.add_argument("--artifacts-dir", required=True, help="a NEW or EMPTY directory outside git (never an existing dataset)")
-    p.add_argument("--ledger-dir", required=True, help="persistent directory for the multiple-testing trial ledgers (candidate_competition + this pipeline's trials) AND the reserved-holdout ledger")
+    p.add_argument("--ledger-dir", required=True, help="persistent directory for the multiple-testing trial ledgers (candidate_competition + this pipeline's trials); the reserved-holdout registry is per user, not here")
     p.add_argument("--unreserved-exploratory", action="store_true",
                    help="run on a history root with NO reserved holdout: the whole window is read, the result is stamped NOT_A_HOLDOUT_STUDY and the dataset can never be reserved afterwards "
                         "(default: refuse until `tools/history_holdout.py --reserve` has been run)")

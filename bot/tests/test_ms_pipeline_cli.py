@@ -21,6 +21,7 @@ for _p in (BOT, HERE, os.path.join(BOT, "tools")):
     sys.path.insert(0, _p)
 
 import control_centre as CCE  # noqa: E402
+import history_holdout as HH  # noqa: E402
 import ms_pipeline as MP  # noqa: E402
 import ms_types as T  # noqa: E402
 import strategy_verdict as SV  # noqa: E402
@@ -526,7 +527,7 @@ def fails(fn, *a, **k):
 
 def test_mutation_skipping_verification_is_caught(world, tampered, tmp_path, capsys, monkeypatch):
     refusal(capsys, argv(tampered, str(tmp_path / "ok")), "INPUT_NOT_VERIFIED")
-    good = MP.verify_inputs(world.root, universe_dir=world.uni, spot_dir=world.spot, mark_interval=TCR.MARK_IV)
+    good = MP.verify_inputs(world.root, universe_dir=world.uni, spot_dir=world.spot, mark_interval=TCR.MARK_IV, holdout_ledger=HH.UNGUARDED)
     monkeypatch.setattr(MP, "verify_inputs", lambda *a, **k: good)                                # what a CLI that does not re-verify the dataset in front of it would do
     fails(refusal, capsys, argv(tampered, str(tmp_path / "mut")), "INPUT_NOT_VERIFIED")
 

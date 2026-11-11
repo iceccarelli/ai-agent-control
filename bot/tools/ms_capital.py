@@ -278,8 +278,10 @@ class CapitalBook:
             status, credited, excess = "SETTLED", D(0), D(0)
             if delta < 0:
                 credited = delta                                        # a realised loss is always booked in full
-                if p.get("funding_was_read") and known is not None and abs(delta - known) > tol:
-                    status = "UNEXPLAINED_CASH"
+                if p.get("funding_was_read") and known is not None:
+                    credited = min(delta, known)                        # the ledger saw EVERY component (funding included): the loss it saw is booked whole even when an undeclared inflow made the cash fall by less
+                    if abs(delta - known) > tol:
+                        status = "UNEXPLAINED_CASH"
             elif known is None:
                 excess = delta                                          # nothing verifiable explains a gain: it does not size anything
                 status = "UNVERIFIED_GAIN" if delta > tol else "SETTLED"

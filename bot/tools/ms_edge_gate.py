@@ -50,6 +50,8 @@ PROFIT_CANDIDATE, REJECTED, INCONCLUSIVE = "PROFIT_CANDIDATE", "REJECTED_UNECONO
 
 # ---------------------------------------------------------------------------------------------------- the owner's cost of capital: STATED, never defaulted
 MAX_CASH_ALTERNATIVE_APR = D("1")                        # 100%/yr: above this it is a unit slip (4 instead of 0.04), refused
+MATERIAL_CASH_ALTERNATIVE_APR = D("0.0001")             # 0.01%/yr (1 bp): a stated rate BELOW this prices the capital as free in everything but name (at a one-day hold it is < 0.003 bps), so it is DISCLOSED as the owner's
+                                                         # zero-cost-of-capital decision exactly like an explicit 0: a near-zero statement must not read as a charged cost
 MAX_CASH_ALTERNATIVE_AGE_MS = 30 * 86_400_000            # a statement older than this is STALE: the owner re-states it (a cash rate moves slowly, but it is not a constant)
 CASH_ALTERNATIVE_FUTURE_TOLERANCE_MS = 86_400_000        # a date-only statement means 00:00 UTC of that day; a stamp more than a day ahead of the clock is a mistake, not a statement
 CASH_PROVENANCES = ("measured", "venue_stated", "derived", "modelled")      # never 'assumed' or 'unknown': an assumption is not a statement
@@ -262,6 +264,8 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
     zero_reasons = {"borrow_apr": "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW"}
     if cash_state == "STATED" and cash is not None and cash.apr == 0:
         zero_reasons["opportunity_cost_apr"] = "OWNER_STATED_ZERO_COST_OF_CAPITAL"            # capital priced as free BY THE OWNER'S STATEMENT: the only way a zero cost of capital may pass
+    if abs(D(1) - hedge_ratio) < EM.ECONOMIC_ZERO and spot_tier.source != "assumed":              # the model's own test for a whole hedge (so the declaration and the rule cannot disagree)
+        zero_reasons["hedge_ratio"] = "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL"        # the account's spot taker fee is exactly 0: no base coin is withheld, the perp short IS a whole hedge (an assumed tier never gets this)
     scn = EM.Scenario(
         legs=(EM.Leg("spot", spot, "buy", inp.spot_book, spot_tier, "taker", fee_in_base=True), EM.Leg("perp", perp, "sell", inp.perp_book, perp_tier, "taker")),
         notional_usd=inp.notional_usd, gross_edge_bps=EM.Quantity(expected_funding, "modelled", "bps"), hold_days=D(inp.hold_s) / D(86_400), now_ms=inp.now_ms,
@@ -285,8 +289,8 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
     reasons += cash_reasons
     if spot_tier.source == "assumed" or perp_tier.source == "assumed":
         reasons.append("FEE_TIER_ASSUMED:" + (inp.fee_read_error or "NOT_READ"))        # the published VIP 0 tier is a stand-in, never the account's: say whether it was never read or the read failed, and how
-    if cash_state == "STATED" and cash is not None and cash.apr == 0:
-        reasons.append("COST_OF_CAPITAL_ZERO_BY_OWNER_STATEMENT")                # capital priced as free BY DECISION: said out loud, never silent
+    if cash_state == "STATED" and cash is not None and cash.apr < MATERIAL_CASH_ALTERNATIVE_APR:
+        reasons.append("COST_OF_CAPITAL_ZERO_BY_OWNER_STATEMENT")                # capital priced as free BY DECISION (an explicit 0 or an immaterial rate): said out loud, never silent
     # the funding (bps per settlement) at which the expected net equals the hurdle: all known costs + the hurdle, spread over the settlements and the haircut
     known_costs = [v for v in comps.values() if v is not None]
     required = None

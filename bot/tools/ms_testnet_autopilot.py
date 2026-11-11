@@ -278,12 +278,13 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     sym = symbol or (gv.get("symbols") or [None])[0] or (auth["capability_symbols"] or [None])[0] or "BTCUSDT"
     gaps = [g for g, ok in (("CAPABILITY_FILE", auth["capability"] == "VALID"), ("UNATTENDED_GRANT", auth["grant"] == "VALID"),
                             ("DEDICATED_TESTNET_CREDENTIALS", auth["credentials"]["dedicated_key_present"] and auth["credentials"]["dedicated_secret_present"])) if not ok]
-    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "evaluated_ms": now, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
+    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "evaluated_ms": now, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF", "ACCOUNT_CASH_NOT_CHECKED"], "read_only": True}
 
     def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
         res = _res("EVALUATED", why, decision=decision, **{**base, **kw})
-        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD,
-                                                    **_decision_context(book_root or DEFAULT_ROOT, res.get("owner_funding_floor_bps"), gv.get("max_notional_usd")))
+        ctx = _decision_context(book_root or DEFAULT_ROOT, res.get("owner_funding_floor_bps"), gv.get("max_notional_usd"))
+        res["authority_gaps"] = list(res["authority_gaps"]) + _book_stops(ctx["portfolio"])      # a stop the LOOP would refuse on is never hidden behind a read-only ELIGIBLE
+        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD, **ctx)
         return res
     if not re.fullmatch(r"[A-Z0-9]{3,20}", str(sym)):
         return done("WAIT_FOR_DATA", ["SYMBOL_INVALID"])
@@ -337,10 +338,24 @@ def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) ->
         if root and os.path.exists(os.path.join(root, "capital.json")):
             r = CC.CapitalBook(root).report()
             portfolio = {"status": "BOOK", "sizing_basis_usd": r.get("sizing_basis_usd"), "verified_result_usd": r.get("verified_realised_usd"), "lifecycles_settled": r.get("lifecycles_settled"),
-                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "pending_session": bool(r.get("pending"))}
+                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "pending_session": bool(r.get("pending")),
+                         "review_required": (r.get("review_required") or {}).get("code") if isinstance(r.get("review_required"), dict) else None}
     except Exception:                                              # noqa: BLE001 - an unreadable book is stated, never guessed
         portfolio = {"status": "BOOK_UNREADABLE"}
     return {"risk_limits": limits, "portfolio": portfolio, "venue": {"id": "testnet", "host": S._venues.get("testnet").host, "scope": "TESTNET_FAKE_MONEY"}}
+
+
+def _book_stops(portfolio: Mapping[str, Any]) -> List[str]:
+    """The stops the capital book ALREADY holds, named for the read-only decision record. The loop refuses on each of them (an open unexplained-cash review, a halt, a book it cannot read); a read-only
+    evaluation that said only 'ELIGIBLE' with ``halted: false`` while a review was open reproduced exactly the contradiction the second review found."""
+    out = []
+    if portfolio.get("review_required"):
+        out.append("CAPITAL_REVIEW_OPEN")
+    if portfolio.get("halted"):
+        out.append("CAPITAL_BOOK_HALTED")
+    if portfolio.get("status") == "BOOK_UNREADABLE":
+        out.append("CAPITAL_BOOK_UNREADABLE")
+    return out
 
 
 def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir: str, exc: Exception) -> None:

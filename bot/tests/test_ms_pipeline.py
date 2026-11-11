@@ -1252,3 +1252,17 @@ def test_the_ledger_gross_is_the_price_result_alone_so_funding_is_counted_once(h
     slip = lp["taker_slippage_usd"] + lp["adverse_selection_usd"]
     # realised gross = realised price result at mid; net = gross + funding - fees - modelled slippage; funding is a separate line and is never inside the gross
     assert lp["realised_gross_usd"] + lp["funding_usd"] - lp["fees_usd"] - slip == pytest.approx(lp["realised_net_usd"], rel=1e-9, abs=1e-6)
+
+
+def test_the_run_summary_publishes_no_ledger_net_when_the_ledger_is_incomplete_and_labels_the_subtotal(tmp_path):
+    """The summary's ``ledger.net`` is the headline number a reader quotes: with an unknown settlement price it must be None (never a partial sum), the subtotal must be labelled as such and the flags carried."""
+    a = ser("AAAUSDT", 480, 6.0)
+    gap = replace(a, mark=tuple((t, p) for t, p in a.mark if not (T0 + 2 * D + 2 * H < t < T0 + 4 * D)))
+    pr = go(tmp_path, [gap], cfg(end_ms=T0 + 6 * D))
+    assert pr.ledger.pnl()["net_complete"] is False, "control: the scenario really leaves the ledger incomplete"
+    led = pr.summary["ledger"]
+    assert led["net_complete"] is False and led["net"] is None, f"an incomplete ledger published a net: {led}"
+    assert isinstance(led["net_subtotal"], float) and any(f.startswith("FUNDING_AMOUNT_UNKNOWN") for f in led["flags"])
+    ok = go(tmp_path, [ser("AAAUSDT", 480, 6.0)], cfg(end_ms=T0 + 6 * D), name="complete")
+    assert ok.ledger.pnl()["net_complete"] is True, "control: a clean run has a complete ledger"
+    assert ok.summary["ledger"]["net"] == pytest.approx(ok.ledger.pnl()["net"]) and ok.summary["ledger"]["net_complete"] is True

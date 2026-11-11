@@ -1592,6 +1592,43 @@ def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_boo
     assert AP._decision_context(str(root), 1.0)["portfolio"]["status"] == "BOOK_UNREADABLE"
 
 
+def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_and_that_cash_was_not_checked(tmp_path, monkeypatch):
+    """Review R2-6: with an unexplained-cash review open the loop refuses (ACCOUNT_CASH_UNEXPLAINED), yet the read-only ``evaluate`` said ``halted: false`` and ELIGIBLE with no word of it, and its
+    authority gaps never said it had not looked at the cash ($200 of notional commits $408). The stops the book already holds are named in the record; eligibility stays a statement about economics."""
+    import json as _json
+    import ms_capital as CC
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    clean = _evaluate(w, notional_usd="200")
+    assert clean["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and clean["decision_record"]["capital_required_usd"] == "408.00"
+    assert "ACCOUNT_CASH_NOT_CHECKED" in clean["authority_gaps"] and "ACCOUNT_CASH_NOT_CHECKED" in clean["decision_record"]["authority_gaps"]      # evaluate never reads the account's cash
+    assert not any(g.startswith("CAPITAL_") for g in clean["authority_gaps"]), "no book, no stop"
+
+    root = tmp_path / "book_review"
+    book = CC.CapitalBook(str(root))
+    book.ensure_baseline("1")
+    assert book.park("prev_session", "1", "0.50", True, True)
+    assert book.settle("10000")["status"] == "UNEXPLAINED_CASH"                    # the review is persisted IN the book
+    res = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert res["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION", "eligibility is an economics statement: the stop is NAMED, not silently converted"
+    assert "CAPITAL_REVIEW_OPEN" in res["authority_gaps"] and "CAPITAL_REVIEW_OPEN" in res["decision_record"]["authority_gaps"], res["authority_gaps"]
+    assert res["decision_record"]["portfolio_context"]["review_required"] == "ACCOUNT_CASH_UNEXPLAINED"
+    assert res["decision_record"]["decision_id"] != clean["decision_record"]["decision_id"]            # a different capital state is a different decision
+
+    doc = _json.load(open(book.path))
+    doc["review_required"], doc["halted"] = None, True
+    with open(book.path, "w") as fh:
+        _json.dump(doc, fh)
+    halted = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert "CAPITAL_BOOK_HALTED" in halted["authority_gaps"] and "CAPITAL_REVIEW_OPEN" not in halted["authority_gaps"]
+
+    with open(book.path, "w") as fh:
+        fh.write("{broken")
+    broken = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert "CAPITAL_BOOK_UNREADABLE" in broken["authority_gaps"]
+    assert open(book.path).read() == "{broken", "a read-only evaluation never rewrites the book"
+
+
 def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w):
     _profit_world(w)
     root = w.tmp / "eng_corrupt"

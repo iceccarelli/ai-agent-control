@@ -96,10 +96,14 @@ class FileStore:
         with open(self.path, encoding="utf-8") as fh:
             return [l.rstrip("\n") for l in fh if l.strip()]
 
-    def drop_torn_tail(self) -> str:
+    def drop_torn_tail(self, expected: Optional[str] = None) -> str:
         """Set the LAST line aside (a torn append: killed or out of disk mid-write) so the next append starts on a clean line. The text is kept in ``<journal>.torn`` BEFORE the journal is replaced; the
-        replacement is a temp file + fsync + rename + directory fsync, so a crash here leaves either the old or the new journal, never a mixture."""
+        replacement is a temp file + fsync + rename + directory fsync, so a crash here leaves either the old or the new journal, never a mixture.
+        ``expected`` is the line the CALLER judged torn: the file is re-read here, and unless its last line is still exactly that line nothing is changed (ValueError). Under the single-writer lock that
+        cannot differ; the emergency unwind's lock-broken branch runs WITHOUT it, where re-reading and dropping whatever is last could discard a good line another writer had just appended."""
         lines = self.read()
+        if not lines or (expected is not None and lines[-1] != expected):
+            raise ValueError("journal changed while its torn tail was being set aside: nothing was changed")
         dropped = lines[-1]
         with open(self.path + ".torn", "a", encoding="utf-8") as fh:
             fh.write(dropped + "\n")
@@ -145,17 +149,33 @@ class Journal:
         self.store = store
         lines = store.read()
         ok, why = verify_chain(lines)
+        dropped: Optional[str] = None
         if not ok and lines and why == f"UNPARSEABLE_AT_{len(lines) - 1}" and verify_chain(lines[:-1])[0] and hasattr(store, "drop_torn_tail"):
             # ONLY an unparseable LAST line over a chain that verifies: a torn append. The journal is write-ahead (the line is durable, THEN the action is taken), so a line that never finished was never
             # acted on and setting it aside is safe; without this an owner's emergency `reconcile --unwind` could not even open the journal. A complete line with a wrong hash or sequence is tampering
             # and, like any damaged earlier line, stays refused.
-            store.drop_torn_tail()
+            dropped = store.drop_torn_tail(expected=lines[-1])
             lines = lines[:-1]
             ok, why = verify_chain(lines)
         if not ok:
             raise ValueError(f"journal refused: {why}")
         self.entries: List[Dict[str, Any]] = [json.loads(l) for l in lines]
         self.head = self.entries[-1]["h"] if self.entries else GENESIS
+        self.repaired_torn_tail: Optional[Dict[str, Any]] = None
+        if dropped is not None:
+            self._record_repair(dropped)
+
+    def _record_repair(self, dropped: str) -> None:
+        """A repair is never silent: the evidence file holds the text, and the repair itself is printed and journalled as an ANOMALY (a reviewer found the only trace was ``<journal>.torn``). This module has no
+        clock, so the entry carries the last durable entry's time. Journalling is best effort: a torn append is often a full disk, and the owner's emergency unwind must still be able to open the journal."""
+        kept = os.path.basename(str(getattr(self.store, "path", "journal"))) + ".torn"
+        info = {"code": "TORN_TAIL_DROPPED", "dropped_chars": len(dropped), "dropped_sha16": hashlib.sha256(dropped.encode("utf-8")).hexdigest()[:16], "kept_in": kept}
+        self.repaired_torn_tail = dict(info)
+        print(f"JOURNAL_TORN_TAIL_DROPPED: a torn final journal line ({info['dropped_chars']} characters, sha256 {info['dropped_sha16']}) was set aside in {kept}; every earlier line verified", file=sys.stderr)
+        try:
+            self.append("ANOMALY", "", int(self.entries[-1]["ts_ms"]) if self.entries else 0, info)
+        except OSError as exc:
+            print(f"JOURNAL_TORN_TAIL_ANOMALY_NOT_JOURNALLED: {type(exc).__name__}: the line above and {kept} are the evidence", file=sys.stderr)
 
     def append(self, typ: str, group_id: str, ts_ms: int, body: Mapping[str, Any]) -> Dict[str, Any]:
         e = {"seq": len(self.entries), "prev": self.head, "type": typ, "group_id": group_id, "ts_ms": int(ts_ms), "body": dict(body)}
@@ -390,7 +410,7 @@ class ExecutionEngine:
                 l.recon_fees += fee
             elif l.recon_qty > 0:                                      # a real execution for quantity a recon fill already booked: REPLACE that part, never add to it
                 a = min(q, l.recon_qty)
-                if l.recon_qty - a <= l.recon_qty * FEE_IN_BASE_MAX_FRACTION:
+                if l.plan.category == "spot" and _sgn(f["side"]) > 0 and l.recon_qty - a <= l.recon_qty * FEE_IN_BASE_MAX_FRACTION:
                     a = l.recon_qty                                    # the execution covers the adopted quantity but for a fee-sized remainder: a spot BUY's fee is taken from the coin received, so the order row's
                                                                        # cumulative quantity is GROSS and the execution NET; that remainder was never held, keeping it is phantom inventory the exit cannot sell
                 share = a / l.recon_qty

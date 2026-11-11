@@ -225,11 +225,18 @@ class MarketStore:
             return True
         return {"meta", "log"} <= tables
 
+    def _abandoned(self, name: str) -> bool:
+        """An unfinished CREATION can only be the NEWEST segment (the recorder died while making the day it was about to write). An uninitialised segment with a successor is not an abandoned
+        creation: it is a closed day whose file lost its content, so its records are gone and every reader must say so, loudly, instead of counting around the hole (an independent review zeroed a middle
+        segment and ``count()`` quietly returned 15 records instead of 20)."""
+        segs = self.segments()
+        return bool(segs) and segs[-1] == name and not self._initialised(name)
+
     def _scan_tail(self) -> Tuple[int, str]:
         segs = self.segments()
         for name in reversed(segs):
-            if not self._initialised(name):
-                continue                                          # an abandoned creation holds no record: read the tail from the last segment that has a log
+            if self._abandoned(name):
+                continue                                          # an abandoned creation (the newest segment, no log yet) holds no record: read the tail from the last segment that has a log
             conn = sqlite3.connect(os.path.join(self.dir, name))
             try:
                 row = conn.execute("SELECT id, chain FROM log ORDER BY id DESC LIMIT 1").fetchone()
@@ -471,8 +478,8 @@ class MarketStore:
         """Records in id order across every segment (read-only connections)."""
         self.flush()
         for name in self.segments():
-            if not self._initialised(name):
-                continue                                          # an abandoned creation holds no record
+            if self._abandoned(name):
+                continue                                          # an abandoned creation (the newest segment) holds no record; an emptied OLDER segment raises below
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 cur = conn.execute(
@@ -497,8 +504,8 @@ class MarketStore:
         self.flush()
         total = 0
         for name in self.segments():
-            if not self._initialised(name):
-                continue                                          # an abandoned creation holds no record
+            if self._abandoned(name):
+                continue                                          # an abandoned creation (the newest segment) holds no record; an emptied OLDER segment raises below
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 total += conn.execute("SELECT COUNT(*) FROM log").fetchone()[0]
@@ -527,7 +534,11 @@ class MarketStore:
         pruned = self._pruned_manifest()
         for idx, name in enumerate(self.segments()):
             if not self._initialised(name):
-                problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record")
+                if self._abandoned(name):
+                    problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record")
+                else:
+                    problems.append(f"{name}: EMPTY segment that is not the newest: its records are LOST (damage) unless it is an abandoned creation of an earlier day; readers refuse it. "
+                                    f"Check, then move it aside deliberately (RUNBOOKS section 14)")
                 continue
             start, _ = self._segment_meta(name)
             if idx == 0:
@@ -589,7 +600,11 @@ class MarketStore:
         for name in removable:
             if removed == [] and name != segs[0]:
                 break                       # only ever prune from the oldest end
-            if not self._initialised(name):                    # an abandoned creation holds no record: nothing to checkpoint, nothing to lose
+            if not self._initialised(name):                    # an emptied segment holds no record: nothing to checkpoint. It is removed WITH an audit row, never silently
+                before = self._pruned_manifest()
+                with open(self._manifest_path(), "a") as fh:
+                    fh.write(json.dumps({"segment": name, "records": 0, "uninitialised": True, "last_chain": before[-1]["last_chain"] if before else GENESIS,
+                                         "pruned_at_ms": int(time.time() * 1000)}, sort_keys=True) + "\n")
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.remove(os.path.join(self.dir, name + suffix))

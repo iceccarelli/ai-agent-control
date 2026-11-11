@@ -95,9 +95,8 @@ def test_a_failed_read_is_classified_into_the_closed_vocabulary_and_never_forwar
     steps = _steps(CODE)
     read = [s for s in steps if "flyctl ssh console" in s][0]
     alert = [s for s in steps if "runner_alerts.py" in s][0]
-    for word in ("auth_failed", "timeout", "machine_unreachable", "unknown"):
-        assert f"echo {word} > read_failure.txt" in read, word
-    assert read.index("auth_failed") < read.index("machine_unreachable"), "an expired token also says 'failed to connect': the credential class must win"
+    assert "python bot/tools/fly_read_failure.py fly.err > read_failure.txt" in read, "the classification is code a test executes (tests/test_fly_read_failure.py), not a grep chain in the workflow"
+    assert "grep -qiE" not in read and "echo auth_failed" not in read, "the old grep chain (bare `token`, `401|403`) must not come back"
     assert "--read-failure" in alert and 'cat read_failure.txt' in alert
     assert 'cat fly.err' not in alert and "fly.err" not in alert, "error text must never reach the alert step (it can carry a token fragment)"
     import runner_alerts as RA

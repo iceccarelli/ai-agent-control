@@ -433,3 +433,50 @@ def test_a_known_gain_and_a_plain_loss_are_booked_exactly_as_before(tmp_path):
     b.park("s2", "10001", "-2.00", True, True)
     r = b.settle("9999")
     assert D(r["credited_usd"]) == D("-2.00") and b.load()["loss_streak"] == 1
+
+
+# ---- a loss the ledger saw WHOLE is booked whole on both sides of zero (second independent review: the delta < 0 branch used to book only the cash's smaller fall)
+@pytest.mark.parametrize("inflow", ["0", "0.02", "1", "2.98", "3", "3.01", "10"])
+def test_a_known_loss_is_debited_whole_whatever_undeclared_inflow_lifted_the_cash(tmp_path, inflow):
+    """Ledger known -3.00 (funding read, flat). An undeclared inflow I makes the cash move by -3 + I: credited must be -3 for EVERY I (it used to be -3 + I while the cash still fell, and the
+    result was not even monotone: an inflow of 2.98 erased 2.98 of the loss, an inflow of 3.00 erased none). The unexplained cash is flagged and stops entries; the loss stays booked."""
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("100")
+    assert book.park("s1", "100", "-3.00", True, True)
+    r = book.settle(str(D("100") - D("3") + D(inflow)))
+    assert D(r["credited_usd"]) == D("-3.00"), r
+    tol = max(C.TOLERANCE_USD, D("3") * C.TOLERANCE_FRAC)
+    unexplained = abs(D(inflow)) > tol                                            # inside the tolerance the cash simply agrees with the ledger
+    assert r["status"] == ("UNEXPLAINED_CASH" if unexplained else "SETTLED")
+    assert (book.load()["review_required"] or {}).get("code") == ("ACCOUNT_CASH_UNEXPLAINED" if unexplained else None)
+    assert book.load()["loss_streak"] == 1 and D(book.load()["realised_usd"]) == D("-3.00")
+
+
+def test_a_cash_loss_bigger_than_the_ledger_knew_is_still_debited_in_full(tmp_path):
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("100")
+    assert book.park("s1", "100", "-3.00", True, True)
+    r = book.settle("95")                                                      # the cash fell by 5: the larger loss is the truth
+    assert D(r["credited_usd"]) == D("-5") and r["status"] == "UNEXPLAINED_CASH"
+
+
+def test_when_funding_was_not_read_the_cash_delta_alone_decides_a_loss(tmp_path):
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("100")
+    assert book.park("s1", "100", "-3.00", False, True)                         # funding unread: the ledger's -3.00 is a partial figure, not the whole truth
+    r = book.settle("99")
+    assert D(r["credited_usd"]) == D("-1") and r["status"] == "SETTLED"
+
+
+def test_a_dust_sized_booked_loss_still_counts_toward_the_loss_streak_a_conservative_rule_only_the_owner_may_change(tmp_path):
+    """Review finding 9 (LOW, KNOWN): the ledger saw a 2-cent loss with funding read while the cash rose 2 cents (rounding). The loss is booked in full and extends the streak, so four such sessions
+    halt entries. That is spurious but CONSERVATIVE, and the loss-streak stop is a risk limit: loosening it (a materiality floor on the streak) is the owner's policy decision (the same class as the
+    deferred dust/mechanics streak question), not a rounding fix to slip into a review round. Pinned so any change to it is deliberate and visible."""
+    book = C.CapitalBook(str(tmp_path))
+    book.ensure_baseline("1000")
+    for i in range(C.LOSS_STREAK_STOP):
+        assert book.park(f"s{i}", "1000", "-0.02", True, True)
+        r = book.settle("1000.02")
+        assert r["status"] == "SETTLED" and D(r["credited_usd"]) == D("-0.02"), r
+    rep = book.report()
+    assert rep["loss_streak"] == C.LOSS_STREAK_STOP and rep["halted"] is True and D(rep["verified_losses_usd"]) == D("-0.08")

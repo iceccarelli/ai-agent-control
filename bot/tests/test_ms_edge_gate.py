@@ -274,6 +274,38 @@ def test_an_explicit_owner_zero_is_a_stated_decision_and_stays_visible():
     assert "COST_OF_CAPITAL_ZERO_BY_OWNER_STATEMENT" in v.reasons and v.capital["cash_alternative_apr"] == "0"      # priced as free BY DECISION, said out loud
 
 
+@pytest.mark.parametrize("apr,disclosed", [("0", True), ("0.00001", True), ("0.00005", True), ("0.000099", True), ("0.0001", False), ("0.0002", False), ("0.04", False)])
+def test_an_immaterial_stated_cost_of_capital_is_disclosed_as_free_by_the_owner_and_a_material_one_is_not(apr, disclosed):
+    """Review R2-4: the disclosure was keyed to an exact 0, so a stated 0.00001 (1/1000 of a percent a year) priced the capital as free and said nothing. Below the floor it is the SAME owner decision as an explicit 0."""
+    stated = EG.CashAlternative(apr=D(apr), source="OWNER_STATED", stated_ms=NOW - DAY_MS)
+    v = EG.evaluate_edge(inputs("0.0100", cash_alternative=stated))
+    assert ("COST_OF_CAPITAL_ZERO_BY_OWNER_STATEMENT" in v.reasons) is disclosed, (apr, v.reasons)
+    assert v.capital["cash_alternative_apr"] == str(D(apr))                              # the statement itself is reported either way, never rounded to zero
+    assert v.assumed_inputs == ()
+
+
+def test_the_materiality_floor_is_below_anything_that_could_change_a_verdict():
+    """The floor is only a disclosure threshold: at it, one day of capital costs under 0.003 bps against a 2 bps hurdle."""
+    one_day_bps = EG.MATERIAL_CASH_ALTERNATIVE_APR * D("2.04") / D(365) * EG.BPS
+    assert one_day_bps < D("0.006") < EG.MIN_NET_EDGE_BPS / 100
+
+
+def test_an_account_whose_spot_taker_fee_is_exactly_zero_has_a_whole_hedge_declared_not_assumed(monkeypatch):
+    """A spot BUY with a 0% taker fee withholds no base coin, so the hedge ratio is exactly 1. The model now makes a bare whole hedge a claim (review R2-4); the gate declares its reason for this case ONLY."""
+    seen = {}
+    real = EG.EM.evaluate_chain
+
+    def spy(scn):
+        seen["reasons"], seen["hedge"] = dict(scn.zero_reasons), scn.hedge_ratio.value
+        return real(scn)
+    monkeypatch.setattr(EG.EM, "evaluate_chain", spy)
+    v = EG.evaluate_edge(inputs("0.0100", spot_fee=(D("0"), D("0"))))
+    assert seen["hedge"] == 1 and seen["reasons"].get("hedge_ratio") == "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL"
+    assert v.assumed_inputs == () and v.session_class == EG.PROFIT_CANDIDATE, (v.session_class, v.reasons)
+    v2 = EG.evaluate_edge(inputs("0.0100"))                                              # the ordinary 0.1% spot taker fee: the hedge is 0.999, nothing to declare
+    assert seen["hedge"] == D("0.999") and "hedge_ratio" not in seen["reasons"] and v2.assumed_inputs == ()
+
+
 def test_a_hopeless_edge_is_rejected_even_when_the_cost_of_capital_is_unknown():
     """A cost of capital can only LOWER the net edge: if the edge misses the hurdle with the cost floored at zero, no capital cost could rescue it, so the honest answer is REJECTED, not 'need more input'."""
     v = EG.evaluate_edge(inputs("0.0001", cash_alternative=None))

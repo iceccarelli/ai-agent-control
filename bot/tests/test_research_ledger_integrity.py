@@ -25,6 +25,7 @@ for _p in (HERE, BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import candidate_readiness as CR  # noqa: E402
+import history_holdout as HH  # noqa: E402
 import research_harness as RH  # noqa: E402
 from test_candidate_readiness import MARK_IV, _hist, offline, sx  # noqa: E402,F401  (fixtures and builders the readiness tests already own)
 
@@ -48,7 +49,7 @@ def test_an_identical_rerun_on_a_short_history_does_not_enlarge_the_family(tmp_p
     led = str(tmp_path / "x.jsonl")
     counts = []
     for _ in range(3):
-        out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=led, spot_dir=spot, mark_interval=MARK_IV)
+        out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=led, spot_dir=spot, mark_interval=MARK_IV, holdout_ledger=HH.UNGUARDED)
         counts.append((out["n_variants_counted"], _lines(led)))
     assert out["status"] == "TOO_FEW_HOLDING_ROWS"
     assert counts[0] == counts[1] == counts[2], f"an identical re-run changed the family count: {counts}"
@@ -102,7 +103,7 @@ def test_the_carry_family_without_any_hedgeability_fact_is_not_evaluated_and_rec
 def test_the_other_two_families_do_not_need_a_spot_snapshot_and_are_still_counted(tmp_path, offline):
     root, uni, _ = _hist(tmp_path, spot=False)
     led = str(tmp_path / "x.jsonl")
-    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=led, mark_interval=MARK_IV)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=led, mark_interval=MARK_IV, holdout_ledger=HH.UNGUARDED)
     fams = out["families"]
     assert fams["SPOT_PERP_CARRY"]["status"] == "HEDGEABILITY_UNKNOWN_FOR_EVERY_SYMBOL"
     assert fams["PERP_FUNDING_SPREAD"]["status"] == "TOO_FEW_HOLDING_ROWS" and fams["PERP_FUNDING_SPREAD"]["n_variants_counted"] > 0

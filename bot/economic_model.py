@@ -151,12 +151,16 @@ def qsum(items: Sequence[Quantity], unit: str = "") -> Quantity:
 #: A cost input below this is a zero whatever its spelling (0, '0E-8', 1e-30, D(1) - D(1), -0, replace(), **dict).
 ECONOMIC_ZERO = Decimal("1e-12")
 
-#: The ONLY reasons a cost input may be exactly zero without being a measurement. A zero that is not 'measured' / 'venue_stated' and not on this list is UNJUSTIFIED: it counts as an ASSUMED input and
-#: so can never PASS (``ChainResult.assumed_inputs``). A source scan can only be a tripwire for spellings it knows; this is value-based and cannot be spelled around.
-STRUCTURAL_ZERO_REASONS = frozenset({
-    "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW",          # the spot buy is paid from the USDT balance (the plan refuses a plan the cash cannot fund): there is no loan to pay interest on
-    "OWNER_STATED_ZERO_COST_OF_CAPITAL",               # the owner explicitly stated 0%/yr: capital is free by decision, not by omission
-})
+#: The ONLY reasons an input may be exactly zero (or, for the hedge ratio, exactly one) without being a measurement, each BOUND to the one scenario input it speaks about. A reason is a claim about ONE
+#: input: the same words declared against another input justify nothing (an owner-stated zero COST OF CAPITAL cannot excuse a zero market impact; a review reproduced exactly that). A zero that is not
+#: 'measured' / 'venue_stated' and not justified by a reason bound to ITS input is UNJUSTIFIED: it counts as an ASSUMED input and so can never PASS (``ChainResult.assumed_inputs``). A source scan can only
+#: be a tripwire for spellings it knows; this is value-based and cannot be spelled around.
+STRUCTURAL_ZERO_INPUTS: Mapping[str, frozenset] = {
+    "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW": frozenset({"borrow_apr"}),                  # the spot buy is paid from the USDT balance (the plan refuses a plan the cash cannot fund): there is no loan to pay interest on
+    "OWNER_STATED_ZERO_COST_OF_CAPITAL": frozenset({"opportunity_cost_apr"}),             # the owner explicitly stated 0%/yr: capital is free by decision, not by omission
+    "ZERO_SPOT_TAKER_FEE_SO_NO_BASE_COIN_SHORTFALL": frozenset({"hedge_ratio"}),          # a spot BUY whose taker fee is exactly 0 leaves no base-coin shortfall: the perp short is a whole hedge
+}
+STRUCTURAL_ZERO_REASONS = frozenset(STRUCTURAL_ZERO_INPUTS)
 
 
 def structural_zero(unit: str, reason: str) -> Quantity:
@@ -607,7 +611,8 @@ class Scenario:
     margin_usd: Quantity = field(default_factory=lambda: unknown("usd"))
     # probability that ONE maker leg fills; required (explicit, with provenance) for any maker leg, else the maker leg's cost is UNKNOWN
     maker_fill_probability: Quantity = field(default_factory=lambda: unknown("probability"))
-    # input name -> a STRUCTURAL_ZERO_REASONS entry: the ONLY way a cost input that is exactly zero may be anything other than 'measured' / 'venue_stated' (see ``_unjustified_zeros``)
+    # input name -> a STRUCTURAL_ZERO_INPUTS reason BOUND to that input: the ONLY way a cost input that is exactly zero (or a hedge ratio that is exactly one) may be anything other than 'measured' /
+    # 'venue_stated' (see ``_unjustified_zeros``). A reason declared against an input it is not bound to justifies nothing.
     zero_reasons: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -620,7 +625,7 @@ class ChainResult:
     capital_utilisation: Quantity          # notional / margin
     digest: str
     scenario_inputs: Mapping[str, Quantity] = field(default_factory=dict)      # the scenario's own non-cost inputs (gross edge, hedge ratio ...) with provenance
-    unjustified_zero_inputs: Tuple[str, ...] = ()                              # cost inputs that are a bare zero labelled derived / modelled / assumed with no structural reason: counted as ASSUMED
+    unjustified_zero_inputs: Tuple[str, ...] = ()                              # cost inputs that are a bare zero (and a hedge ratio that is a bare one) labelled derived / modelled / assumed with no structural reason bound to them: counted as ASSUMED
 
     @property
     def unknown_inputs(self) -> Tuple[str, ...]:
@@ -707,20 +712,38 @@ def _validate_scenario(scn: Scenario) -> None:
         raise EconomicModelError(f"the funding edge was built for hold_days={ge.hold_days} ({ge.n_settlements} settlements) but the scenario holds {hold}")
 
 
-_ZERO_CHECKED = {"impact_bps": "impact", "basis_cost_bps": "basis", "borrow_apr": "borrow", "opportunity_cost_apr": "opportunity_cost", "adverse_selection_bps": "adverse_selection"}
+_ZERO_CHECKED = {"impact_bps": "impact", "basis_cost_bps": "basis", "borrow_apr": "borrow", "opportunity_cost_apr": "opportunity_cost", "adverse_selection_bps": "adverse_selection",
+                 "adverse_move_bps": "adverse_move"}
+_NOT_OBSERVED = ("derived", "modelled", "assumed")
+
+
+def _is_whole_hedge(scn: Scenario) -> bool:
+    return scn.hedge_ratio.known and abs(Decimal(1) - scn.hedge_ratio.value) < ECONOMIC_ZERO
+
+
+def _zero_is_justified(scn: Scenario, name: str) -> bool:
+    """True only when ``scn.zero_reasons`` names, for THIS input, a reason on the closed list that is BOUND to this input (``STRUCTURAL_ZERO_INPUTS``). Never raises on a malformed reason."""
+    reason = scn.zero_reasons.get(name)
+    return isinstance(reason, str) and name in STRUCTURAL_ZERO_INPUTS.get(reason, frozenset())
 
 
 def _unjustified_zeros(scn: Scenario, maker_legs: int) -> Tuple[str, ...]:
-    """Cost inputs that are a bare ZERO the model cannot vouch for: |value| below ECONOMIC_ZERO, a provenance that is not an observation (derived / modelled / assumed) and no accepted entry in
-    ``scn.zero_reasons``. Value-based, so it holds however the zero was spelled. A zero adverse-selection input is only checked when a maker leg actually uses it."""
+    """Inputs that are a bare ZERO (the hedge ratio: a bare ONE) the model cannot vouch for: |value| below ECONOMIC_ZERO, a provenance that is not an observation (derived / modelled / assumed) and no
+    reason bound to that input in ``scn.zero_reasons``. Value-based, so it holds however the zero was spelled. A zero adverse-selection input is only checked when a maker leg actually uses it; a zero adverse
+    move is only checked while the hedge is not whole (the hedge error is |1 - hedge_ratio| x the move, so a whole hedge has nothing to move against); and a whole hedge is itself a claim: it must be
+    measured / venue_stated or carry its bound reason, because a hedge error of exactly zero is the cheapest cost to claim."""
     out = []
+    whole = _is_whole_hedge(scn)
     for name, comp in _ZERO_CHECKED.items():
         if name == "adverse_selection_bps" and not maker_legs:
             continue
+        if name == "adverse_move_bps" and whole:
+            continue
         q = getattr(scn, name)
-        if q.known and abs(q.value) < ECONOMIC_ZERO and q.provenance in ("derived", "modelled", "assumed"):
-            if scn.zero_reasons.get(name) not in STRUCTURAL_ZERO_REASONS:
-                out.append(comp)
+        if q.known and abs(q.value) < ECONOMIC_ZERO and q.provenance in _NOT_OBSERVED and not _zero_is_justified(scn, name):
+            out.append(comp)
+    if whole and scn.hedge_ratio.provenance in _NOT_OBSERVED and not _zero_is_justified(scn, "hedge_ratio"):
+        out.append("hedge_ratio")
     return tuple(sorted(out))
 
 

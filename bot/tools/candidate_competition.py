@@ -120,16 +120,28 @@ def btc_policies(econ: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _strength_note(rejected: bool, bar: Optional[Mapping[str, Any]]) -> str:
-    """Say, in the note, whether a REJECTED policy meets the repo's early-rejection standard: a point-estimate loss that does not is not a statistical rejection."""
+    """Say, in the note, whether a REJECTED policy meets the repo's early-rejection standard, and when it does NOT, WHICH criterion failed with its own number (a point-estimate loss that does not meet the
+    standard is not a statistical rejection). The standard is the conjunction (candidate_readiness.early_rejection): >= REJECT_EARLY_MIN_INDEPENDENT independent observations, a negative mean, lower-tail
+    p <= REJECT_EARLY_ALPHA (ESS-adjusted) AND the widest 90% interval wholly below zero. Each failed criterion is printed as itself: an earlier version printed ``p=0.005 > 0.01`` when the interval was what
+    failed, and 'does not exclude break-even' when the interval was wholly negative (second independent review)."""
     if not rejected or not bar:
         return ""
     if bar.get("meets_early_rejection_standard"):
         return f"; meets the repo's early-rejection standard in-sample (ESS-adjusted lower-tail p={bar['p_lower']:.4f}, widest 90% interval {[round(x, 1) for x in bar['widest_ci90']]} wholly below zero)"
-    ci, p = bar.get("widest_ci90"), bar.get("p_lower")
-    return ("; NOT statistically rejected at the repo's early-rejection standard"
-            + (f" (ESS-adjusted lower-tail p={p:.3f} > {CR.REJECT_EARLY_ALPHA}" if p is not None else " (no usable p")
-            + (f"; widest 90% interval {[round(x, 1) for x in ci]} " + ("includes zero" if ci[0] < 0 < ci[1] else "does not clear the standard") if ci else "; no usable interval") + ")"
-            + ": the point estimate loses, the evidence does not exclude break-even")
+    ci, p, ind = bar.get("widest_ci90"), bar.get("p_lower"), bar.get("independent_observations")
+    failed: List[str] = []
+    if not isinstance(ind, int) or ind < CR.REJECT_EARLY_MIN_INDEPENDENT:
+        failed.append(f"only {ind if isinstance(ind, int) else 0} independent observations (the standard needs {CR.REJECT_EARLY_MIN_INDEPENDENT})")
+    if not isinstance(p, (int, float)):
+        failed.append("no usable lower-tail p")
+    elif not (p <= CR.REJECT_EARLY_ALPHA):
+        failed.append(f"ESS-adjusted lower-tail p={p:.3f} is above {CR.REJECT_EARLY_ALPHA}")
+    if not (isinstance(ci, (list, tuple)) and len(ci) == 2 and all(isinstance(x, (int, float)) for x in ci)):
+        failed.append("no usable 90% interval")
+    elif not (ci[1] < 0):
+        failed.append(f"the widest 90% interval {[round(x, 1) for x in ci]} " + ("includes zero" if ci[0] < 0 < ci[1] else "is not wholly below zero"))
+    return ("; NOT statistically rejected at the repo's early-rejection standard (" + ("; ".join(failed) if failed else "a criterion of the standard could not be evaluated")
+            + "): the point estimate loses, the standard for calling it a rejection is not met")
 
 
 def btc_multiple_testing(econ: Optional[Mapping[str, Any]], ldir: str) -> Dict[str, Any]:
@@ -153,9 +165,10 @@ def btc_multiple_testing(econ: Optional[Mapping[str, Any]], ldir: str) -> Dict[s
 
 # ---------------------------------------------------------------- cross-sectional
 def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], ldir: str, *, spot_dir: Optional[str], mark_interval: Optional[str], history_root: Optional[str],
-                        unreserved_exploratory: bool = False) -> Dict[str, Any]:
+                        unreserved_exploratory: bool = False, holdout_registry: Any = None) -> Dict[str, Any]:
     """The cross-sectional evaluation or the loud reason it did not run. Never raises on missing/failed data. The load is CUT at the reserved-holdout boundary and refused (HOLDOUT_NOT_RESERVED,
-    with the exact command) when nothing is reserved in ``ldir``, unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY and recorded)."""
+    with the exact command) when nothing is reserved in the per-user registry (``holdout_registry``, default ``history_holdout.default_registry_path()``; ``ldir`` only holds the
+    multiple-testing ledgers), unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY, recorded, and the time it read is burned)."""
     root = history_root or data_root
     if not universe_dir:
         return {"status": "UNIVERSE_DIR_REQUIRED", "reason": "UNIVERSE_DIR_REQUIRED: the cross-sectional path takes an explicit verified universe_capture directory (--universe-dir); nothing was evaluated"}
@@ -164,7 +177,8 @@ def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], l
     import history_holdout as HH
     try:
         out = CR.evaluate_cross_sectional(root, universe_dir=universe_dir, ledger_path=_path("cross_sectional_funding", ldir), spot_dir=spot_dir, mark_interval=mark_interval,
-                                          holdout_ledger=HH.ledger_for(ldir), unreserved_exploratory=unreserved_exploratory, reader="candidate_competition")
+                                          holdout_ledger=HH.default_registry_path() if holdout_registry is None else holdout_registry, unreserved_exploratory=unreserved_exploratory,
+                                          reader="candidate_competition")
     except RH.HarnessError as exc:
         return {"status": "REFUSED", "reason": str(exc)[:600]}
     return {"status": "EVALUATED", "evaluation": out}
@@ -221,11 +235,13 @@ def _tier(row: Mapping[str, Any]) -> int:
 
 
 def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[str] = None, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
-                    ledger_dir: Optional[str] = None, history_root: Optional[str] = None, with_economics: bool = True, unreserved_exploratory: bool = False) -> Dict[str, Any]:
+                    ledger_dir: Optional[str] = None, history_root: Optional[str] = None, with_economics: bool = True, unreserved_exploratory: bool = False,
+                    holdout_registry: Any = None) -> Dict[str, Any]:
     """Run the competition. Deterministic for fixed inputs (no clock). The ledger is persistent by default (``default_ledger_dir``)."""
     ldir = default_ledger_dir(data_root or history_root, ledger_dir)
     base = CR.build_report(data_root=data_root or history_root, universe_dir=universe_dir, with_economics=with_economics)
-    xs = _xs_summary(run_cross_sectional(data_root, universe_dir, ldir, spot_dir=spot_dir, mark_interval=mark_interval, history_root=history_root, unreserved_exploratory=unreserved_exploratory))
+    xs = _xs_summary(run_cross_sectional(data_root, universe_dir, ldir, spot_dir=spot_dir, mark_interval=mark_interval, history_root=history_root, unreserved_exploratory=unreserved_exploratory,
+                                           holdout_registry=holdout_registry))
     evals = {"cross_sectional_funding": xs["evaluation"]["families"].get("PERP_FUNDING_SPREAD")} if xs["evaluation"] else None
     if evals and evals["cross_sectional_funding"] is not None:
         base = CR.build_report(data_root=data_root or history_root, universe_dir=universe_dir, with_economics=with_economics, evaluations=evals)
@@ -274,6 +290,9 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                                                                  "listed; registered holds are at most 17 days, longer holds (90/365 days) were never registered and this verdict does not cover them"}
             reasons.append(f"REJECTED is an IN-SAMPLE point-estimate verdict on registered holds of at most 17 days; policies meeting the repo's statistical rejection standard: {len(meeting)} of {len(meeting) + len(not_meeting)}"
                            + (f"; NOT statistically rejected: {', '.join(not_meeting)}" if not_meeting else "") + "; longer holds were never registered")
+            short = lambda n: n.replace("unconditional_", "").replace("_print_hold", "p").replace("production_gated_sequence", "gated_seq")             # noqa: E731
+            reasons.insert(0, ("IN-SAMPLE; point-estimate only (NOT stat. rejected): " + ", ".join(short(n) for n in not_meeting)) if not_meeting
+                           else f"IN-SAMPLE; all {len(meeting)} REJECTED policies meet the stat. rejection bar")                            # the ranked table prints reasons[0]: the caveat must be what a reader sees first
         elif name == "cross_sectional_funding":
             verdict, reasons = xs["verdict"], xs["reasons"] + [x for x in reasons if "UNIVERSE_DIR_REQUIRED" in x]
             net = xs["net_edge"]
@@ -335,7 +354,7 @@ def render_table(rep: Mapping[str, Any]) -> str:
         lines.append("\t".join(str(x) for x in (r["rank"] if r["rank"] is not None else "-", r["name"], r["origin"], r["verdict"], r["readiness_level"], "n/a" if ne is None else f"{ne:.1f}",
                                                 r["data_readiness"]["value"], r["point_in_time"], r.get("survivorship") or "-", (r.get("holdout") or {}).get("status") or "-",
                                                 r["executable_on_qualified_venue"]["value"], r["multiple_testing"]["n_variants_counted"],
-                                                (r["rejection_reasons"][0][:70] if r["rejection_reasons"] else ""))))
+                                                (r["rejection_reasons"][0][:90] if r["rejection_reasons"] else ""))))
     lines.append("")
     lines.append(rep["winner_statement"])
     for f in rep["findings"]:

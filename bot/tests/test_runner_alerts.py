@@ -543,7 +543,7 @@ def _by_key(alerts):
     ("auth_failed", "watcher_credentials", "WARNING"),            # the watcher's own token is dead: fix the secret, the machine may be fine
     ("machine_unreachable", "machine_unreachable", "CRITICAL"),   # fly ssh could not reach the machine at all: down, stopped or a Fly outage; must not look like an empty history
     ("timeout", "machine_unreachable", "CRITICAL"),
-    ("unknown", "read_failed", "WARNING"),
+    ("unknown", "read_failed", "CRITICAL"),           # a blind watcher that cannot even say why is not a warning
 ])
 def test_a_failed_history_read_is_reported_as_what_it_is_and_never_as_no_data(klass, key, severity):
     alerts = RA.evaluate("", 1_000_000.0, read_failure=klass)
@@ -573,7 +573,18 @@ def test_the_cli_takes_the_read_failure_class_and_still_exits_nonzero(tmp_path, 
     assert code != 0 and "[CRITICAL] machine_unreachable" in out and "no_data" not in out
 
 
-def test_a_failed_read_does_not_hide_other_alerts_a_readable_history_raises():
-    rows = json.dumps({"order_sent": True, "cycle": 1})
-    got = _by_key(RA.evaluate(rows, 1_000_000.0, read_failure="timeout"))
-    assert "machine_unreachable" in got                      # the read failed: whatever text arrived is not trusted as a history
+def test_a_failed_read_distrusts_the_text_that_arrived_but_never_hides_an_alert_that_does_not_come_from_it():
+    """Review: the old test was named 'does not hide other alerts' but asserted only that the history was ignored, on one key. The two halves of the contract, each with its own control:
+    (1) whatever text arrived with a failed read is NOT trusted as a history (an order alarm in it raises nothing, and nothing is called no_data);
+    (2) an alert that does not come from the history (the forward-shadow evidence) is still raised next to the read failure."""
+    alarm = json.dumps({"order_sent": True, "cycle": 1})
+    control = _by_key(RA.evaluate(alarm, 1_000_000.0))                                          # the same text READ fine is an ORDER ALARM
+    assert "order_sent" in control and "machine_unreachable" not in control
+    for failure, key in (("timeout", "machine_unreachable"), ("machine_unreachable", "machine_unreachable"), ("auth_failed", "watcher_credentials"), ("unknown", "read_failed"), ("nonsense", "read_failed")):
+        got = _by_key(RA.evaluate(alarm, 1_000_000.0, read_failure=failure))
+        assert key in got and set(got) == {key}, (failure, sorted(got))                         # (1): only the read failure; no order_sent, no no_data, no stale, no problem:*
+    forward = {"state": "STALE", "path": "forward.json", "reasons": ["the evidence file is old"]}
+    both = _by_key(RA.evaluate(alarm, 1_000_000.0, read_failure="timeout", forward=forward))
+    assert set(both) == {"machine_unreachable", "forward_stale"}, sorted(both)                  # (2): the independent alert is NOT hidden by the failed read
+    assert "the evidence file is old" in both["forward_stale"].text
+    assert set(_by_key(RA.evaluate(alarm, 1_000_000.0, read_failure="timeout", forward={"state": "OK"}))) == {"machine_unreachable"}, "an OK forward status adds nothing"
