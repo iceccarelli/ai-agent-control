@@ -648,6 +648,14 @@ Bybit TESTNET only (fake money, `api-testnet.bybit.com`). Nothing in this reposi
 
 **What the unattended engine does with capital.** Day one it deploys 40% of the $500 ceiling (never the whole grant); the compounded size never exceeds 80% of the ceiling and never exceeds your grant. Realised results come ONLY from the venue's own USDT wallet cash read at the start of consecutive sessions with the account verified flat in between: a loss is booked in full, a gain only as far as the ledger's known components explain it, unexplained cash credits nothing, and unexplained cash with funding read raises an ALERT and stops new entries. 25% of every verified gain is withheld from the sizing basis (the reserve). Two consecutive losses halve the size; four stop entries until you acknowledge. Everything is Testnet simulation, not real performance.
 
+**Your cost of capital (you state it; the executor's gate never defaults it).** The edge gate charges the alternative return of the capital a session ties up (spot notional plus perp margin: about 2x the notional at leverage 1) and refuses to call anything a PROFIT_CANDIDATE until YOU have stated that rate. Until you do, a verdict that is not already hopeless is INCONCLUSIVE (`COST_OF_CAPITAL_UNKNOWN`), no PROFIT_SEEKING session is opened, and the read-only evaluation says so; an edge that misses the hurdle even with a zero cost of capital is still REJECTED. State the rate you could actually earn on the same capital elsewhere, with where it comes from and the date you state it (re-state it after 30 days; a future date or a malformed value is refused, never defaulted):
+
+```bash
+fly secrets set -a carry-autopilot OWNER_CASH_ALTERNATIVE_APR=0.04 OWNER_CASH_ALTERNATIVE_SOURCE="<where the 4% comes from>" OWNER_CASH_ALTERNATIVE_STATED_UTC=2026-11-11
+```
+
+These are plain settings, not secrets; `fly secrets set` is simply the way to set a running machine's environment without a redeploy. It restarts the machine, so do it only while the autopilot is DRAINED (`autopilot-ctl deploy-check`), or add `--stage` to apply it at the next deploy. Verify with `autopilot-ctl status`: `cost_of_capital` shows the state (STATED, UNSTATED, INVALID, STALE or FUTURE_DATED), the rate, the source and its age; every decision record carries the basis (`capital_basis`: state, capital committed, rate, source, time, provenance, charge). An explicit `0` is accepted as your decision that the capital is free and is reported in every verdict; this software suggests no value, and the research verdict prices capital against the OKX USDT lending series, not against this setting. No deployment file in this repository sets it.
+
 ```bash
 cd bot
 python3 tools/ms_testnet_autopilot.py capital                                   # the verified-realised book (no network)
