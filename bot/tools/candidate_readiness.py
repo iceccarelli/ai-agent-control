@@ -1684,12 +1684,21 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
     for name, rets in series_by.items():
         if RH.series_digest(rets) not in ledger.returns_digests(name):          # same variant on the very same series = the same trial; new data or a new name counts
             ledger.record(name, params_of[name], rets, horizon=1)
+    # A MODELLED-cost variant (maker: 100% fill, zero adverse selection, never measured) is counted in the family but is NEVER selectable: train_only_best picks the highest training mean, which on
+    # identical funding is always the cheapest variant, so its modelled 7 bps would drive the out-of-sample figure the competition ranks.
+    modelled = sorted(n for n in series_by if (costs.get(n.rsplit("|C", 1)[-1]) or {}).get("prov") == "MODELLED")
+    selectable = {k: v for k, v in series_by.items() if k not in modelled}
+    out["selection_excludes_modelled_cost_variants"] = modelled
+    if not selectable:
+        out.update({"status": "NO_SELECTABLE_VARIANT", "verdict": "INSUFFICIENT_DATA", "family_ledger": fam, "n_variants_counted": ledger.n_variants,
+                    "reason": "every variant carries a MODELLED cost: none can be selected as a result"})
+        return out
     folds = RH.walk_forward_folds(n_rows, train_min=max(20, n_rows // 2), test_len=max(5, n_rows // 10), label_horizon=1, embargo=1)
     oos: List[float] = []
     chosen: List[str] = []
     test_idx: List[int] = []
     for f in folds:
-        pick = RH.train_only_best({k: [v[i] for i in f.train] for k, v in series_by.items()})
+        pick = RH.train_only_best({k: [v[i] for i in f.train] for k, v in selectable.items()})
         chosen.append(pick)
         oos.extend(series_by[pick][i] for i in f.test)
         test_idx.extend((pick, i) for i in f.test)                                           # type: ignore[arg-type]

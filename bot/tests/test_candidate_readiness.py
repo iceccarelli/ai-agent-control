@@ -1322,3 +1322,35 @@ def test_the_loader_embeds_the_one_funnel_and_loads_exactly_its_loadable_list(tm
     root, uni, _ = _hist(tmp_path, spot=False)
     series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
     assert [x.symbol for x in series] == info["funnel"]["loadable"] and info["funnel"]["funnel_digest"] == BP.funnel(uni, root, window=tuple(info["funnel"]["window"].values())).report()["funnel_digest"]
+
+
+def test_a_modelled_maker_cost_variant_is_counted_but_never_selected(tmp_path):
+    """The maker scenario is MODELLED (100% fill, zero adverse selection) and always the cheapest on identical funding, so a train-mean selector always picked it and its modelled 7 bps drove the
+    out-of-sample figure the competition ranks. It stays in the multiple-testing family and out of the selection."""
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    ser = _world(520, seed=3, edge=0.6)
+    out = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "led.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out["status"] == "WALK_FORWARD_DONE" and out["oos_rows"] > 0
+    assert out["selection_excludes_modelled_cost_variants"] and all(n.endswith("Cmaker_modelled") for n in out["selection_excludes_modelled_cost_variants"])
+    assert out["selected_per_fold"] and not any(n.endswith("Cmaker_modelled") for n in out["selected_per_fold"])       # only the taker variant is ever chosen
+    assert out["n_variants_counted"] == 2                                                                                # but both were recorded: the family size is unchanged
+    assert any(n.endswith("Ctaker") for n in out["variants_tried"]) and any(n.endswith("Cmaker_modelled") for n in out["variants_tried"])
+
+
+def test_mutation_without_the_modelled_exclusion_the_maker_variant_is_selected(tmp_path):
+    """The exclusion is load-bearing: with it removed the cheapest (modelled) variant is chosen in every fold."""
+    import types
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    path = os.path.join(BOT, "tools", "candidate_readiness.py")
+    src = open(path, encoding="utf-8").read()
+    old = 'selectable = {k: v for k, v in series_by.items() if k not in modelled}'
+    assert src.count(old) == 1
+    mod = types.ModuleType("cr_mut_" + uuid.uuid4().hex)
+    mod.__file__ = path
+    sys.modules[mod.__name__] = mod
+    exec(compile(src.replace(old, "selectable = dict(series_by)"), path, "exec"), mod.__dict__)
+    out = mod.evaluate_family(_world(520, seed=3, edge=0.6), mod.FAMILY_SPREAD, ledger_path=str(tmp_path / "m.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60,
+                             allow_unverified_key_basis_for_tests=True)                                   # the copy has its own key-basis sentinel; selection is what is under test
+    assert out["selected_per_fold"] and all(n.endswith("Cmaker_modelled") for n in out["selected_per_fold"])
