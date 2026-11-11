@@ -1383,3 +1383,52 @@ def test_a_short_capture_shows_the_modelled_scenario_apart_and_the_competition_h
     assert maker_mean > taker_mean                                                                 # the modelled scenario is the cheaper one: it must not become the headline
     summary = CCmp._xs_summary({"status": "EVALUATED", "evaluation": {"families": {CR.FAMILY_SPREAD: f}}})
     assert summary["families"][CR.FAMILY_SPREAD]["descriptive_best_in_sample_net_bps"] == pytest.approx(taker_mean)
+
+# ---------------------------------------------------------------- reject-only early rejection (a clear loser is not kept waiting for 50 independent observations; nothing is ever promoted by it)
+def test_early_rejection_needs_a_significantly_negative_mean_and_enough_independent_observations():
+    rnd = random.Random(5)
+    loser = [-30.0 + rnd.gauss(0, 10.0) for _ in range(30)]
+    e = CR.early_rejection(RH.significance(loser, ci=False))
+    assert e is not None and e["mean_bps"] < -25 and e["p_lower"] <= CR.REJECT_EARLY_ALPHA and e["independent_observations"] >= CR.REJECT_EARLY_MIN_INDEPENDENT
+    winner = [30.0 + rnd.gauss(0, 10.0) for _ in range(30)]
+    assert CR.early_rejection(RH.significance(winner, ci=False)) is None                     # a positive family is never rejected by it
+    noisy = [-3.0 + rnd.gauss(0, 60.0) for _ in range(30)]
+    assert CR.early_rejection(RH.significance(noisy, ci=False)) is None                      # negative but not significantly
+    assert CR.early_rejection(RH.significance(loser[:6], ci=False)) is None                  # too few observations: no claim
+    assert CR.early_rejection({"mean": None, "t": None, "p_one_sided": 1.0, "independent_observations": 0}) is None
+    assert CR.early_rejection({"mean": -5.0, "t": None, "p_one_sided": 1.0, "independent_observations": 40}) is None      # no t (zero variance / ESS < 3): no claim
+
+
+def test_a_family_that_clearly_loses_after_costs_is_rejected_from_a_short_capture_but_a_winner_is_never_promoted(tmp_path, monkeypatch):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    real = CR.family_costs
+    # a taker round trip of 500 bps: the family's net is deeply negative whatever the funding does
+    monkeypatch.setattr(CR, "family_costs", lambda kind: {k: ({**v, "bps": 500.0} if k == "taker" else v) for k, v in real(kind).items()})
+    lose = CR.evaluate_family(_world(520, seed=2, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "a.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert lose["status"] == "WALK_FORWARD_DONE" and lose["oos_independent_observations"] < 50       # far below the promotion floor ...
+    assert lose["verdict"] == "REJECTED" and lose["reject_early"]["p_lower"] <= CR.REJECT_EARLY_ALPHA and "REJECTED_EARLY" in lose["reason"]      # ... and still a decision
+    monkeypatch.setattr(CR, "family_costs", real)
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    win = CR.evaluate_family(_world(520, seed=3, edge=3.0), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "b.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert win["oos_mean_total_bps_per_row"] > 0 and win["verdict"] == "INSUFFICIENT_DATA" and win["reject_early"] is None   # a clear winner is capped, never promoted, never rejected
+
+
+def test_the_ranked_funding_path_applies_the_same_reject_only_rule(tmp_path):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    lose = CR.evaluate_ranked_funding(_long_capture(1, 2.0), spec=spec("t_" + uuid.uuid4().hex), formation_days_grid=(3, 7), hold_days=7, cost_scenarios={"base": 5000.0})
+    assert lose["status"] == "WALK_FORWARD_DONE" and lose["verdict"] == "REJECTED" and lose["reject_early"] is not None
+    ok = CR.evaluate_ranked_funding(_long_capture(1, 2.0), spec=spec("t_" + uuid.uuid4().hex), formation_days_grid=(3, 7), hold_days=7)
+    assert ok["verdict"] == "INSUFFICIENT_DATA" and ok["reject_early"] is None
+
+
+def test_mutation_without_the_early_rule_a_clear_loser_stays_insufficient(tmp_path, monkeypatch):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    monkeypatch.setattr(CR, "early_rejection", lambda st: None)
+    real = CR.family_costs
+    monkeypatch.setattr(CR, "family_costs", lambda kind: {k: ({**v, "bps": 500.0} if k == "taker" else v) for k, v in real(kind).items()})
+    out = CR.evaluate_family(_world(520, seed=2, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "m.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out["verdict"] == "INSUFFICIENT_DATA"                                                    # the rule is what turns the same evidence into a decision

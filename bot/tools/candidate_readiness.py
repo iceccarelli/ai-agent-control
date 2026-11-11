@@ -1134,13 +1134,18 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    early = early_rejection(st)
+    if verdict == "INSUFFICIENT_DATA" and early:
+        verdict = "REJECTED"                              # reject-only: a significantly negative net cannot clear its costs, whatever the sample size
+    out["reject_early"] = early
     if out["terminal_exit_unpriced"] or unkeyed:
         verdict = "INSUFFICIENT_DATA"                   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
     out.update({"status": "WALK_FORWARD_DONE", "evidence_class": "FULL_SPAN_WALK_FORWARD_NOT_PROFIT_EVIDENCE", "verdict": verdict, "family": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(out["variants_tried"]),
                 "correction": "holm", "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean,
                 "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"], "p_adjusted": adj, "selected_per_fold": chosen,
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
-                "reason": "directional total = funding + short price leg - perp round trip; PERP_ONLY legs are never carry. A pass would still need prospective evidence"})
+                "reason": "directional total = funding + short price leg - perp round trip; PERP_ONLY legs are never carry. A pass would still need prospective evidence"
+                          + ((" | REJECTED_EARLY: " + early["rule"]) if early and verdict == "REJECTED" else "")})
     return out
 
 
@@ -1394,6 +1399,27 @@ FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
                          "cost_position_class": "perp_only_unhedged", "risk_model": "outright short-perp price exposure (beta to the market is ~ -1) plus funding; a squeeze can exceed funding by orders of magnitude",
                          "price_leg": "measured per leg from marks", "name_rule": "NEVER called carry"},
 }
+
+
+#: PRE-REGISTERED early-rejection rule (constants fixed here, not tuned to any result). A family whose out-of-sample net mean is NEGATIVE and significantly so (one-sided, ESS-adjusted) cannot clear its costs;
+#: waiting for 50 independent observations before saying so only delays the owner's decision. It can only REJECT: promotion keeps its floor (SV.MIN_OBSERVATIONS) and every other gate. A family whose true
+#: net edge is positive is rejected with probability at most this alpha when its out-of-sample mean happens to be negative, and never promoted by it.
+REJECT_EARLY_MIN_INDEPENDENT = 8
+REJECT_EARLY_ALPHA = 0.025
+
+
+def early_rejection(st: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The early-rejection evidence from ``RH.significance`` output, or None. Requires at least ``REJECT_EARLY_MIN_INDEPENDENT`` independent observations (the ESS floor, not the row count), a negative mean
+    and a lower-tail p (1 - p_one_sided) at or below ``REJECT_EARLY_ALPHA``."""
+    mean, t, p1 = st.get("mean"), st.get("t"), st.get("p_one_sided")
+    ind = int(st.get("independent_observations") or 0)
+    if mean is None or t is None or p1 is None or ind < REJECT_EARLY_MIN_INDEPENDENT or not (mean < 0):
+        return None
+    p_lower = 1.0 - float(p1)
+    if p_lower > REJECT_EARLY_ALPHA:
+        return None
+    return {"rule": f">= {REJECT_EARLY_MIN_INDEPENDENT} independent OOS observations, negative mean, lower-tail p <= {REJECT_EARLY_ALPHA} (ESS-adjusted); reject-only, never promotes",
+            "independent_observations": ind, "mean_bps": float(mean), "t": float(t), "p_lower": p_lower, "alpha": REJECT_EARLY_ALPHA}
 
 
 def family_costs(kind: str) -> Dict[str, Dict[str, Any]]:
@@ -1715,15 +1741,20 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
     verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    early = early_rejection(st)
+    if verdict == "INSUFFICIENT_DATA" and early:
+        verdict = "REJECTED"                              # reject-only: a significantly negative net cannot clear its costs, whatever the sample size
     if unpriced or unkeyed:
         verdict = "INSUFFICIENT_DATA"
     oos_rows = [by_t(pick)[common_sorted[i]] for pick, i in test_idx]
+    out["reject_early"] = early
     out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(results), "correction": "holm",
                 "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean, "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"],
                 "p_adjusted": adj, "selected_per_fold": chosen, "oos_book_analytics": book_analytics(oos_rows),
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
-                "reason": ("carry: funding - spot+perp round trip (basis residual UNMEASURED)" if kind == FAMILY_CARRY else
-                           "perp-only book: funding earned/paid + measured price legs - perp round trips; NOT carry")})
+                "reason": (("carry: funding - spot+perp round trip (basis residual UNMEASURED)" if kind == FAMILY_CARRY else
+                           "perp-only book: funding earned/paid + measured price legs - perp round trips; NOT carry")
+                          + ((" | REJECTED_EARLY: " + early["rule"]) if early and verdict == "REJECTED" else ""))})
     return out
 
 
