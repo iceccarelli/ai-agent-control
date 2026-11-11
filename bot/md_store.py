@@ -205,9 +205,31 @@ class MarketStore:
     def _segment_path(self, day: str) -> str:
         return os.path.join(self.dir, f"md-{day}.db")
 
+    def _initialised(self, name: str) -> bool:
+        """False for a segment the recorder died while CREATING (the file exists, its schema does not: a 0-byte file, or a database without its ``meta`` / ``log`` tables). Such a file holds no
+        record by construction, and the writer completes it idempotently (``CREATE TABLE IF NOT EXISTS``) when it next opens that day. Anything else is True, INCLUDING a file that is not a database
+        at all or cannot be opened: corruption stays an error for the caller to raise, it is never mistaken for an unfinished creation."""
+        path = os.path.join(self.dir, name)
+        try:
+            if os.path.getsize(path) == 0:
+                return False
+        except OSError:
+            return True
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return True
+        return {"meta", "log"} <= tables
+
     def _scan_tail(self) -> Tuple[int, str]:
         segs = self.segments()
         for name in reversed(segs):
+            if not self._initialised(name):
+                continue                                          # an abandoned creation holds no record: read the tail from the last segment that has a log
             conn = sqlite3.connect(os.path.join(self.dir, name))
             try:
                 row = conn.execute("SELECT id, chain FROM log ORDER BY id DESC LIMIT 1").fetchone()
@@ -244,6 +266,8 @@ class MarketStore:
         except FileNotFoundError:
             pass
         for name in self.segments():
+            if not self._initialised(name):
+                continue                                          # no meta yet: it belongs to no environment until the writer completes it (under THIS store's)
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 row = conn.execute("SELECT value FROM meta WHERE key='environment'").fetchone()
@@ -392,7 +416,7 @@ class MarketStore:
         # retention window measured from the wall clock, and only while stalled. A failed free-space
         # look is NOT "stalled" here (unlike the writer, which treats it as low): an error must never
         # enable a deletion.
-        segs = self.segments()
+        segs = [n for n in self.segments() if self._initialised(n)]       # an abandoned creation (possibly dated by a wrong clock) must not move the clock-jump bound
         if segs:
             newest_ms = int(datetime.strptime(segs[-1][3:11], "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()) * 1000
             stalled = False
@@ -447,6 +471,8 @@ class MarketStore:
         """Records in id order across every segment (read-only connections)."""
         self.flush()
         for name in self.segments():
+            if not self._initialised(name):
+                continue                                          # an abandoned creation holds no record
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 cur = conn.execute(
@@ -471,6 +497,8 @@ class MarketStore:
         self.flush()
         total = 0
         for name in self.segments():
+            if not self._initialised(name):
+                continue                                          # an abandoned creation holds no record
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
                 total += conn.execute("SELECT COUNT(*) FROM log").fetchone()[0]
@@ -498,6 +526,9 @@ class MarketStore:
         prev_last: Optional[str] = None
         pruned = self._pruned_manifest()
         for idx, name in enumerate(self.segments()):
+            if not self._initialised(name):
+                problems.append(f"{name}: uninitialised segment (the recorder died while creating it: no log table); it holds no record")
+                continue
             start, _ = self._segment_meta(name)
             if idx == 0:
                 if pruned:
@@ -558,6 +589,15 @@ class MarketStore:
         for name in removable:
             if removed == [] and name != segs[0]:
                 break                       # only ever prune from the oldest end
+            if not self._initialised(name):                    # an abandoned creation holds no record: nothing to checkpoint, nothing to lose
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.remove(os.path.join(self.dir, name + suffix))
+                    except FileNotFoundError:
+                        pass
+                removed.append(name)
+                segs = self.segments()
+                continue
             _, last = self._segment_meta(name)
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:

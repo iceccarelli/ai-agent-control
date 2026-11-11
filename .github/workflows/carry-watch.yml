@@ -3,7 +3,8 @@
 # WHY: the runner pages Slack itself, but a dead machine cannot report its own
 # death. This job runs on GitHub's machines, reads the runner's monitor history
 # over `fly ssh`, and runs the same alert rules (tools/runner_alerts.py). A
-# machine that is down or silent gives no history, which is itself an alert.
+# machine that is down or silent gives no history, which is itself an alert. A failed READ (expired
+# token, unreachable machine, timeout) is reported as that, with a classified cause, never as "no_data".
 #
 # WHAT IT CANNOT DO: collect market data (Bybit's CloudFront blocks GitHub-
 # hosted runners, see carry-drill-testnet.yml, and the real-market evidence is
@@ -53,8 +54,11 @@ jobs:
           # One read, tried twice: a single transient `fly ssh` failure should not
           # page "no_data". A persistent failure still ends with an empty history,
           # which the alert rules below report. The cause is printed, never hidden.
+          : > read_failure.txt
+          ok=0
           for attempt in 1 2; do
             if flyctl ssh console -a carry-drill -C "cat /data/monitor/monitor.jsonl" > history.jsonl 2> fly.err; then
+              ok=1
               break
             fi
             echo "history unreadable (attempt $attempt of 2)"
@@ -62,8 +66,22 @@ jobs:
             : > history.jsonl
             if [ "$attempt" = 1 ]; then sleep 30; fi
           done
+          if [ "$ok" = 0 ]; then
+            # A failed READ is not "no data": classify it into the closed vocabulary runner_alerts knows. Only the CLASS leaves this step (error text can carry a token fragment and goes to the job log
+            # above, never to Slack). Order matters: an expired token also says "failed to connect".
+            if grep -qiE 'token|unauthori[sz]ed|forbidden|expired|401|403|permission denied' fly.err; then echo auth_failed > read_failure.txt
+            elif grep -qiE 'timed? ?out|deadline exceeded' fly.err; then echo timeout > read_failure.txt
+            elif grep -qiE 'connection refused|no such host|unreachable|could not connect|failed to connect|no machines|not found|is stopped|not running|dial' fly.err; then echo machine_unreachable > read_failure.txt
+            else echo unknown > read_failure.txt; fi
+            echo "history READ FAILED, class: $(cat read_failure.txt)"
+          fi
           wc -c < history.jsonl
       - name: run the alert rules
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python bot/tools/runner_alerts.py history.jsonl
+        run: |
+          if [ -s read_failure.txt ]; then
+            python bot/tools/runner_alerts.py history.jsonl --read-failure "$(cat read_failure.txt)"
+          else
+            python bot/tools/runner_alerts.py history.jsonl
+          fi

@@ -304,3 +304,74 @@ def test_below_the_retained_days_plus_the_reserve_the_stall_is_still_permanent_a
     for vol in (1.0, 3.0):
         got = _simulate_volume(tmp_path, label=f"small{vol}", stalled_aware=True, vol=vol)
         assert all(got.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), (vol, got)
+
+
+# ---------------------------------------------------------------- a recorder that died while CREATING a segment must restart (an independent review: it looped until a human deleted the file)
+def _segment_path(directory, day):
+    return os.path.join(str(directory), f"md-{day}.db")
+
+
+def _two_days_then_a_dead_creation(tmp_path, kind):
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    s.append(ST.FRAME, wall_ms=BASE, mono_s=1.0, category="spot", payload='{"a":1}')
+    s.append(ST.FRAME, wall_ms=BASE + 1, mono_s=1.1, category="spot", payload='{"a":2}')
+    s.close()
+    dead = _segment_path(d, "20261105")
+    if kind == "zero_bytes":
+        open(dead, "wb").close()                                       # the file existed, nothing else did (ENOSPC / kill at the moment of the day rollover)
+    elif kind == "meta_only":
+        import sqlite3
+        c = sqlite3.connect(dead)
+        c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        c.commit()
+        c.close()
+    return d, dead
+
+
+@pytest.mark.parametrize("kind", ["zero_bytes", "meta_only"])
+def test_a_segment_the_recorder_died_while_creating_does_not_brick_the_next_start(tmp_path, kind):
+    d, dead = _two_days_then_a_dead_creation(tmp_path, kind)
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")            # raised OperationalError / StoreError forever before
+    assert s.count() == 2                                                         # the real records are untouched and the tail is read from the last INITIALISED segment
+    s.append(ST.FRAME, wall_ms=BASE + DAY + 5, mono_s=2.0, category="spot", payload='{"a":3}')      # the writer completes the segment it finds half-created, on the same day
+    s.close()
+    r = ST.MarketStore(str(d))                                                    # read-only handle
+    assert r.count() == 3 and r.verify() == [], r.verify()
+
+
+@pytest.mark.parametrize("kind", ["zero_bytes", "meta_only"])
+def test_verify_reports_an_uninitialised_segment_instead_of_crashing_or_hiding_it(tmp_path, kind):
+    d, dead = _two_days_then_a_dead_creation(tmp_path, kind)
+    r = ST.MarketStore(str(d))
+    problems = r.verify()
+    assert any("md-20261105.db" in p and "uninitialised" in p for p in problems), problems
+
+
+def test_retention_removes_an_uninitialised_oldest_segment_without_a_checkpoint_it_has_no_records(tmp_path):
+    d = tmp_path / "md"
+    os.makedirs(d)
+    open(_segment_path(d, "20261101"), "wb").close()                              # an abandoned creation, two days before the real data
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    for i, off in enumerate((2 * DAY, 3 * DAY, 4 * DAY)):
+        s.append(ST.FRAME, wall_ms=BASE + off, mono_s=float(i), category="spot", payload="{}")
+    removed = s.apply_retention(BASE + 4 * DAY, 2)
+    assert "md-20261101.db" in removed and not os.path.exists(_segment_path(d, "20261101"))
+    assert s.verify() == [] or all("uninitialised" not in p for p in s.verify())
+
+
+def test_a_file_that_is_not_a_database_is_still_refused_not_treated_as_uninitialised(tmp_path):
+    d, dead = _two_days_then_a_dead_creation(tmp_path, "none")
+    with open(dead, "wb") as fh:
+        fh.write(b"this is not a sqlite database at all" * 40)
+    with pytest.raises(Exception) as exc:
+        ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    assert "not a database" in str(exc.value) or isinstance(exc.value, ST.StoreError)
+
+
+def test_a_segment_with_records_is_never_treated_as_uninitialised(tmp_path):
+    d = tmp_path / "md"
+    s = ST.MarketStore(str(d), commit_every=1, environment="mainnet")
+    s.append(ST.FRAME, wall_ms=BASE, mono_s=1.0, category="spot", payload="{}")
+    s.close()
+    assert ST.MarketStore(str(d))._initialised("md-20261104.db") is True

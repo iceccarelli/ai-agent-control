@@ -103,6 +103,19 @@ WATCHDOG_POLL_S = 60.0
 
 CRITICAL = "CRITICAL"
 WARNING = "WARNING"
+
+#: HOW the external watcher's READ of the history failed. The workflow classifies the failure into this closed vocabulary (error text is never forwarded: it can carry a token fragment) and a failed
+#: read is reported as what it is: a dead watcher credential, an unreachable machine, or an unknown read failure. It is NEVER reported as ``no_data`` (an empty history the machine really wrote).
+READ_FAILURES = {
+    "auth_failed": ("watcher_credentials", WARNING,
+                    "the watcher's own Fly credential was refused (expired or revoked token): the history was NOT read, so nothing is known about the machine; renew FLY_API_TOKEN (fly tokens create deploy -a carry-drill)"),
+    "machine_unreachable": ("machine_unreachable", CRITICAL,
+                            "`fly ssh` could not reach the carry-drill machine (connection refused or failed, machine stopped, or a Fly outage): the history was NOT read, which is not the same as an empty history"),
+    "timeout": ("machine_unreachable", CRITICAL,
+                "`fly ssh` timed out reaching the carry-drill machine: the history was NOT read, which is not the same as an empty history"),
+    "unknown": ("read_failed", WARNING,
+                "the monitor history could not be read for a reason the watcher could not classify (see the job log): this is a READ failure, not an empty history"),
+}
 RECOVERED = "RECOVERED"
 INFO = "INFO"
 
@@ -387,14 +400,23 @@ def _failed_streak(rows: Sequence[Mapping[str, object]]) -> int:
 def evaluate(history_text: str, now: float, *,
              stale_minutes: float = STALE_MINUTES,
              failed_streak: int = FAILED_STREAK,
-             forward: Optional[Mapping[str, object]] = None) -> List[Alert]:
+             forward: Optional[Mapping[str, object]] = None,
+             read_failure: Optional[str] = None) -> List[Alert]:
     """The alerts a history deserves right now. Pure: no clock, no network.
-    `forward` is a `forward_status` result (dict), or None for no check."""
+    `forward` is a `forward_status` result (dict), or None for no check.
+    `read_failure` (a key of READ_FAILURES; anything else counts as 'unknown') says the history was
+    NOT read: no history-derived alert is raised from the text that arrived, and the failure is
+    reported as what it is, never as ``no_data``."""
     return _evaluate(history_text, now, stale_minutes, failed_streak,
-                     forward)[0]
+                     forward, read_failure)[0]
 
 
-def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
+def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, read_failure=None):
+    if read_failure is not None:
+        key, severity, text = READ_FAILURES.get(str(read_failure), READ_FAILURES["unknown"])
+        alerts = [Alert(key, severity, text + (f" [class: {read_failure}]" if str(read_failure) in READ_FAILURES else " [class: unknown]"))]
+        alerts.extend(forward_alerts(forward))
+        return alerts, {"exit": 2, "problems": [], "read_failure": str(read_failure) if str(read_failure) in READ_FAILURES else "unknown"}
     rows = distinct_rows(MS.scan(history_text)[0])
     s = MS.summarise(rows, now=now, stale_minutes=stale_minutes,
                      raw_text=history_text)
@@ -445,7 +467,8 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
         alerts.append(Alert(
             "recorder_disk_low", WARNING,
             f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {RECORDER_RESERVE_MB} MiB write reserve). "
-            "At the reserve the recorder stops writing; it recovers only at the next UTC day boundary and only if the volume holds the retained days plus the reserve, otherwise it stays stopped. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
+            "At the reserve the recorder stops writing; it recovers only at the next UTC day boundary and only if the volume holds the retained days plus the reserve, otherwise it stays stopped. The RUNNING image may predate even that bounded "
+            "recovery (merging it changes no running machine): check with RUNBOOKS section 18. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
             "--recorder-retention-days; see MONEY_MISSION.md (recorder size model) and RUNBOOKS section 14."))
     rising = _recorder_restarting(rows)
     if rising:
@@ -565,6 +588,10 @@ def main(argv: Optional[Sequence[str]] = None,
     ap.add_argument("--stale-minutes", type=float, default=STALE_MINUTES)
     ap.add_argument("--failed-streak", type=int, default=FAILED_STREAK)
     ap.add_argument("--now", type=float, default=None)
+    ap.add_argument("--read-failure", default=None,
+                    help="the history was NOT read: one of auth_failed, machine_unreachable, timeout, unknown "
+                         "(the workflow classifies the `fly ssh` failure; error text is never passed on). Reported "
+                         "as that failure, never as no_data")
     ap.add_argument("--forward-artifact", default=None,
                     help="also check this forward-shadow artefact's freshness "
                          "(forward_status.py); omitted, no forward check")
@@ -591,7 +618,7 @@ def main(argv: Optional[Sequence[str]] = None,
         return 2
     now = time.time() if args.now is None else args.now
     alerts, summary = _evaluate(raw, now, args.stale_minutes, args.failed_streak,
-                                forward_status(args.forward_artifact, now))
+                                forward_status(args.forward_artifact, now), args.read_failure)
     code = max(int(summary["exit"]), 1 if alerts else 0)
     for a in alerts:
         print(f"[{a.severity}] {a.key}: {a.text}")
