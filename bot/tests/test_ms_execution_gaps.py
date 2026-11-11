@@ -420,4 +420,3 @@ def test_the_exit_halt_floor_the_owner_lifts_to_counts_only_real_rejections_and_
     # the reason is a pure fold of the journal: a restart rebuilds it
     again = h.make()
     assert [l.reject_reason for l in again.groups[GID].exit_legs()] == [l.reject_reason for l in g.exit_legs()]
-
