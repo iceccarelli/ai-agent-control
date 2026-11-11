@@ -167,7 +167,53 @@ class CapitalBook:
         missing = [k for k in ("start_cash_usd", "realised_usd", "loss_streak", "halted", "history", "pending") if k not in d]
         if missing:                                                    # schema-valid but stripped of the state that stops entries: also NOT a fresh book
             raise BookUnreadable(f"capital book {self.path!r} lacks {missing}; it is NOT treated as a fresh book")
-        return {**self._fresh(), **d}
+        book = {**self._fresh(), **d}
+        self._validate(book)
+        return book
+
+    def _validate(self, b: Mapping[str, Any]) -> None:
+        """Every figure the stops read must be what it claims to be. A book that PARSES but holds nonsense used to LOAD: ``_d`` reads "abc" or "NaN" as None (or 0), so a corrupted or tampered ``realised_usd``
+        made the basis, the drawdown check and the lifetime stop go silent (the allocator sized 200.00 where the honest book said LIFETIME_LOSS_STOP), and a string streak raised mid-session. A violation is
+        ``BookUnreadable`` like any other unreadable book: entries stop, the file is left untouched as evidence, and nothing is rewritten."""
+        def bad(name: str) -> None:
+            raise BookUnreadable(f"capital book {self.path!r} has an invalid {name}; it is NOT treated as a fresh book")
+
+        def number(v: Any, name: str, *, none_ok: bool = False, lo: Optional[Decimal] = None, hi: Optional[Decimal] = None, lo_open: bool = False) -> None:
+            if v is None and none_ok:
+                return
+            x = _d(v)
+            if x is None or (lo is not None and (x <= lo if lo_open else x < lo)) or (hi is not None and x > hi):
+                bad(name)
+
+        def rows(v: Any, name: str, need: Mapping[str, str]) -> None:
+            if not isinstance(v, list):
+                bad(name)
+            for e in v:
+                if not isinstance(e, dict):
+                    bad(name)
+                for k, kind in need.items():
+                    if (kind == "str" and not (isinstance(e.get(k), str) and e[k])) or (kind == "num" and _d(e.get(k)) is None):
+                        bad(f"{name}[].{k}")
+
+        for k in ("realised_usd", "gains_usd", "losses_usd", "unverified_excess_usd"):
+            number(b.get(k), k)
+        number(b.get("start_cash_usd"), "start_cash_usd", none_ok=True, lo=D(0), lo_open=True)
+        number(b.get("peak_basis_usd"), "peak_basis_usd", none_ok=True)
+        number(b.get("last_cash_usdt"), "last_cash_usdt", none_ok=True)
+        number(b.get("reserve_fraction"), "reserve_fraction", lo=D(0), hi=D("0.9"))
+        ls = b.get("loss_streak")
+        if isinstance(ls, bool) or not isinstance(ls, int) or ls < 0:
+            bad("loss_streak")
+        if not isinstance(b.get("halted"), bool):
+            bad("halted")
+        rows(b.get("history"), "history", {"session_id": "str", "credited_usd": "num"})
+        rows(b.get("transfers_pending"), "transfers_pending", {"event_id": "str", "amount_usd": "num"})
+        rows(b.get("transfers_applied"), "transfers_applied", {"event_id": "str", "amount_usd": "num"})
+        p = b.get("pending")
+        if p is not None:
+            rows([p], "pending", {"session_id": "str", "usdt_before": "num"})
+        if b.get("review_required") is not None and not isinstance(b["review_required"], dict):
+            bad("review_required")
 
     def _save(self, b: Mapping[str, Any]) -> None:
         ES.write_json_atomic(self.path, b)

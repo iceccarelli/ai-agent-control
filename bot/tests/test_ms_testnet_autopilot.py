@@ -1914,3 +1914,21 @@ def test_a_session_with_time_to_spare_still_enters_across_the_settlement(w, tmp_
     assert res["result"] == "DONE" and res["flat_verified"] is True and res["orders"] > 0               # positive control: the guard does not stop a session with time left
     log = os.path.join(str(tmp_path / "ap"), "exec_quality_log.jsonl")
     assert os.path.exists(log) and open(log).read().strip()                                          # a session that sent orders is a feedback sample
+
+
+@pytest.mark.parametrize("field,bad", [("realised_usd", "abc"), ("realised_usd", "NaN"), ("peak_basis_usd", "abc"), ("loss_streak", "x"), ("halted", "false")])
+def test_a_capital_book_with_a_nonsense_figure_stops_the_session_before_any_order_and_is_not_rewritten(w, field, bad):
+    """REPRODUCED (specialist E N1): a parsable book with realised_usd='abc' made the allocator size 200.00 where the honest book said LIFETIME_LOSS_STOP."""
+    _profit_world(w)
+    root = w.tmp / "eng_semantic"
+    b = CC.CapitalBook(str(root))
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-30", True, True)
+    b.settle("9970")
+    doc = json.load(open(root / "capital.json"))
+    doc[field] = bad
+    text = json.dumps(doc)
+    (root / "capital.json").write_text(text)
+    res, _got = _collect(w, eng_name="eng_semantic")
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
+    assert (root / "capital.json").read_text() == text and not w.requests_to("/v5/order/create")

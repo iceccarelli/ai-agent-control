@@ -627,3 +627,69 @@ def test_a_gain_after_losses_lifts_the_lifetime_figure_it_is_a_net_realised_boun
     assert b.report()["lifetime_loss_stop_active"] is False
     assert b.park("l2", "9980", "-3.00", True, True) and b.settle("9977")
     assert b.report()["lifetime_loss_stop_active"] is True and D(b.load()["realised_usd"]) == D("-23.00")
+
+
+# ---- a book that PARSES but holds nonsense is not a book (specialist E N1, REPRODUCED): ``_d`` reads "abc" or "NaN" as None/0, so a corrupted or tampered ``realised_usd`` made the basis, the drawdown check and the
+# lifetime stop go silent (the allocator sized 200.00 where the honest book said LIFETIME_LOSS_STOP) and a string streak raised ValueError mid-session. Every figure the stops read is validated at load.
+BAD_BOOK_FIELDS = [
+    ("realised_usd", "abc"), ("realised_usd", "NaN"), ("realised_usd", "Infinity"), ("realised_usd", None), ("realised_usd", []), ("realised_usd", True),
+    ("gains_usd", "x"), ("losses_usd", "x"), ("unverified_excess_usd", "x"),
+    ("start_cash_usd", "abc"), ("start_cash_usd", "-5"), ("start_cash_usd", "0"),
+    ("peak_basis_usd", "abc"), ("peak_basis_usd", "NaN"), ("last_cash_usdt", "abc"),
+    ("reserve_fraction", "abc"), ("reserve_fraction", "0.95"), ("reserve_fraction", "-0.1"), ("reserve_fraction", None),
+    ("loss_streak", "x"), ("loss_streak", -1), ("loss_streak", 1.5), ("loss_streak", True), ("loss_streak", None),
+    ("halted", "false"), ("halted", 0), ("halted", None),
+    ("history", "oops"), ("history", [{}]), ("history", [1]), ("history", [{"session_id": "s", "credited_usd": "abc"}]), ("history", [{"session_id": 5, "credited_usd": "1"}]),
+    ("pending", "oops"), ("pending", {"session_id": "s"}), ("pending", {"session_id": 5, "usdt_before": "1"}), ("pending", {"session_id": "s", "usdt_before": "abc"}),
+    ("transfers_pending", {}), ("transfers_pending", [{"event_id": "e", "amount_usd": "abc"}]), ("transfers_applied", [{"amount_usd": "1"}]),
+    ("review_required", "yes"),
+]
+
+
+@pytest.mark.parametrize("field,bad", BAD_BOOK_FIELDS)
+def test_a_book_holding_a_nonsense_figure_is_unreadable_and_left_as_evidence_not_a_book_with_no_stops(tmp_path, field, bad):
+    import json
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-30", True, True)
+    b.settle("9970")                                                            # realised -30: the lifetime stop is active, the drawdown is 30
+    doc = json.load(open(b.path))
+    doc[field] = bad
+    text = json.dumps(doc)
+    with open(b.path, "w") as fh:
+        fh.write(text)
+    with pytest.raises(C.BookUnreadable) as exc:
+        b.load()
+    assert field in str(exc.value) and open(b.path).read() == text, "the message names the field, the file is untouched evidence"
+    for call in (lambda: b.report(), lambda: b.park("s2", "9970", None, False, True), lambda: b.settle("9970"), lambda: b.acknowledge_halt(), lambda: b.declare_transfer("x", "1")):
+        with pytest.raises(C.BookUnreadable):
+            call()
+
+
+def test_every_book_the_software_itself_writes_validates(tmp_path):
+    """The validator must never refuse the book's own output: the whole lifecycle (baseline, park, settle with declared transfers, a review, acknowledgements, a reserve, a pending session)."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "0.50", True, True) and b.declare_transfer("dep", "100") and b.settle("10100.50")["status"] == "SETTLED"
+    assert b.park("s2", "10100.50", "-1.00", True, False) and b.settle("10099.50") and b.set_reserve_fraction("0.5") and b.declare_transfer("wd", "-10")
+    assert b.park("s3", "10099.50", "0.50", True, True) and b.settle("20000")["status"] == "UNEXPLAINED_CASH"
+    assert b.acknowledge_review()
+    assert b.park("l0", "20000", "-1.00", True, True) and b.settle("19999")
+    assert b.park("pending-one", "19999", None, False, False)
+    b.load()
+    assert b.report()["pending"]["session_id"] == "pending-one"
+
+
+def test_the_allocator_cannot_be_walked_past_a_stop_by_corrupting_the_realised_figure(tmp_path):
+    """The reproduction: with realised_usd='abc' the honest LIFETIME_LOSS_STOP became a 200.00 allocation. Now the load refuses, so there is no allocation at all."""
+    import json
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-30", True, True)
+    b.settle("9970")
+    doc = json.load(open(b.path))
+    doc["realised_usd"] = "abc"
+    with open(b.path, "w") as fh:
+        json.dump(doc, fh)
+    with pytest.raises(C.BookUnreadable):
+        b.sizing_basis()
