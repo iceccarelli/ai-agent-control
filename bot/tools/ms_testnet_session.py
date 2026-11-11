@@ -61,7 +61,7 @@ MAX_LIFECYCLE_H = 9.0
 DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
 MAX_PLAN_AGE_MIN = 120
 EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 2
-FILES = {"record": "testnet_session.json", "plan": "plan.json", "preflight": "preflight.json", "journal": "engine_journal.jsonl", "kill": "MS_KILL",
+FILES = {"record": "testnet_session.json", "plan": "plan.json", "preflight": "preflight.json", "journal": "engine_journal.jsonl", "kill": "MS_KILL", "owner_unwind": "OWNER_UNWIND",
          "meas": "exec_measurements.json", "quality": "execution_quality.json", "decision": "decision.json", "funding": "funding_settlement.json"}
 
 
@@ -695,7 +695,8 @@ class Run:
             leg = g.legs.get(leg_id)
             pos_leg = leg.parent if (leg is not None and leg.kind == "EXIT" and leg.parent) else None          # an exit closes the ENTRY leg's position, not a leg of its own
             self.ledger.record_fill(T.Fill(x["fill_id"], self.gid, leg_id, x["symbol"], x["side"], x["qty"], x["price"], x["fee_usd"], "USDT", x["liquidity"], int(x["ts_ms"]),
-                                           "MEASURED"), category=x["category"], position_leg=pos_leg)
+                                           "MEASURED" if x.get("fee_known", True) else "UNKNOWN"),      # a Trade row with no fee stated is an UNKNOWN fee: the ledger books fees as unknown, never a measured zero
+                                  category=x["category"], position_leg=pos_leg)
         try:
             now = int(self.ctx.clock())
             for sym, snap in self._snaps.get().items():
@@ -1210,6 +1211,8 @@ KILL_HONOURING_ROLES = ("execute", "unwind", "reconcile")
 
 #: written into the holder's kill file by the owner's emergency unwind; the autopilot recognises it and STOPS (an ALERT marker) instead of re-arming after its cooldown
 OWNER_UNWIND_KILL_REASON = "reconcile --unwind handover"
+#: a leg sent less than this long ago is not closed out by the unwind: its request may still land after the fresh exit (Bybit's receive window is 5 s; this is a wide margin over it)
+CLOSE_OUT_MIN_AGE_MS = 15_000
 
 
 def _hand_over_unwind(ctx: Ctx, plan: Mapping[str, Any], lock: "XL.ExecutorLock", holder: Optional[Mapping[str, Any]]) -> bool:
@@ -1242,6 +1245,14 @@ def _hand_over_unwind(ctx: Ctx, plan: Mapping[str, Any], lock: "XL.ExecutorLock"
     except OSError as exc:
         ctx.out(f"unwind NOT started: the holder's kill switch could not be engaged ({type(exc).__name__}). Stop pid {holder['pid']} by hand, then run this again. Nothing was sent.")
         return False
+    try:                                                                # the kill file is exclusive-create: when it already holds another reason this marker still tells the autopilot who asked
+        fd = os.open(os.path.join(os.path.realpath(sd), FILES["owner_unwind"]), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, OWNER_UNWIND_KILL_REASON.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass                                                            # advisory: the kill switch itself is what unwinds
     ctx.out(f"the account lock is held by {holder['role']} pid {holder['pid']} ({sd}): its kill switch was {'engaged' if created else 'already engaged'} so IT unwinds reduce-only (one writer). "
             "Waiting for it to finish; the kill file stays engaged until you remove it on purpose. An autopilot holder stops with an ALERT when its session ends: clear it only when you mean trading to resume.")
     deadline = int(ctx.clock()) + (int(plan["timing"]["exit_wait_s"]) + 60) * 1000
@@ -1282,9 +1293,18 @@ def _reconcile_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any], 
         ctx.out("LIFECYCLE_EXCEEDED: the session is past its lifecycle bound; unwind required (reconcile --unwind --confirm-plan-digest)")
     if ctx.args.unwind and run.state() not in ("CLOSED", "FAILED"):
         view = run.last_view
+        now_ms = int(ctx.clock())
         for link in stuck + stuck_exits:                                # a leg the venue (COMPLETE read) has no order for never existed there: close it out so the unwind can proceed (an exit leg left
-            if view and view.get("complete") and link not in view["orders"]:   # SENT/UNKNOWN would otherwise wedge the group for good: the engine sends no exit while any leg is unresolved)
-                eng.on_order_done(run.gid, link.split("-", 1)[1], int(ctx.clock()))
+            if not (view and view.get("complete") and link not in view["orders"]):   # SENT/UNKNOWN would otherwise wedge the group for good: the engine sends no exit while any leg is unresolved)
+                continue
+            leg_id = link[len(run.gid) + 1:]
+            leg = g.legs.get(leg_id) if g is not None else None
+            sent = getattr(leg, "sent_ms", None)
+            if sent is not None and now_ms - int(sent) < CLOSE_OUT_MIN_AGE_MS:      # a request that left a moment ago may still be on its way: closing it out and sending a fresh order could make TWO
+                ctx.out(f"LEG {link} was sent only {(now_ms - int(sent)) / 1000.0:.0f}s ago and may still reach the venue; it is NOT closed out (a late landing would double the order). "
+                        f"Wait {(CLOSE_OUT_MIN_AGE_MS - (now_ms - int(sent))) / 1000.0:.0f}s and run the unwind again.")
+                continue
+            eng.on_order_done(run.gid, leg_id, now_ms)
         cleared = eng.clear_exit_halt(run.gid, int(ctx.clock()))       # the owner's CONFIRMED unwind is the one thing allowed to lift an exit halt (journalled): a halted group would otherwise send no exit
         if cleared:
             ctx.out(f"group halt '{cleared}' lifted by the confirmed unwind (journalled); exits are reduce-only")

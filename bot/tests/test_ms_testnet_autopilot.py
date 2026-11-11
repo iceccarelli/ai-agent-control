@@ -1647,3 +1647,15 @@ def test_owner_unwind_alert_recognises_only_the_handover_reason(tmp_path):
     assert AP.owner_unwind_alert(str(d), eng, clock) is False and not ES.EngineState(eng, clock).has("ALERT")
     (d / "MS_KILL").write_text(S.OWNER_UNWIND_KILL_REASON)
     assert AP.owner_unwind_alert(str(d), eng, clock) is True and ES.EngineState(eng, clock).has("ALERT")
+
+
+def test_the_owner_marker_is_recognised_even_when_the_kill_file_already_holds_another_reason(tmp_path):
+    """engage_kill_switch is exclusive-create: when the session's kill file already says something else (the autopilot's own revocation), the handover's separate marker still tells the loop who asked."""
+    clock = lambda: 1_800_000_000_000                                   # noqa: E731
+    eng = str(tmp_path / "eng")
+    d = tmp_path / "session"
+    d.mkdir()
+    (d / "MS_KILL").write_text("revoked:GRANT:expired")
+    assert AP.owner_unwind_alert(str(d), eng, clock) is False
+    (d / S.FILES["owner_unwind"]).write_text(S.OWNER_UNWIND_KILL_REASON)
+    assert AP.owner_unwind_alert(str(d), eng, clock) is True and ES.EngineState(eng, clock).has("ALERT")

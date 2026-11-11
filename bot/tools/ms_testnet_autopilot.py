@@ -454,6 +454,7 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
         return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event), "decision_id": did}
     finally:
         _ACTIVE["dir"] = None
+        owner_unwind_alert(d, engine_root or DEFAULT_ROOT, clock)       # also when the session raised before its own check: the owner's emergency must stop the loop whatever happened after it
 
 
 def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], sleep: Callable[[float], None], d: str, sym: str, g: Mapping[str, Any], hold_s: int,
@@ -596,11 +597,13 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
 def owner_unwind_alert(session_dir: str, engine_root: str, clock: Callable[[], int]) -> bool:
     """The owner's ``reconcile --unwind`` took this session over (it engaged the session's kill file with its own reason). The session has unwound and verified flat, but the OWNER has just declared an
     emergency: the loop must not start the next session after its cooldown as if nothing happened. A persistent ALERT (cleared only by the owner) stops it. True when the alert was set."""
-    try:
-        with open(os.path.join(session_dir, S.FILES["kill"]), "r", encoding="utf-8", errors="replace") as fh:
-            reason = fh.read(512)
-    except OSError:
-        return False
+    reason = ""
+    for name in (S.FILES["owner_unwind"], S.FILES["kill"]):             # the owner's marker, or the kill file itself when it carries the owner's reason
+        try:
+            with open(os.path.join(session_dir, name), "r", encoding="utf-8", errors="replace") as fh:
+                reason += fh.read(512)
+        except OSError:
+            continue
     if S.OWNER_UNWIND_KILL_REASON not in reason:
         return False
     try:

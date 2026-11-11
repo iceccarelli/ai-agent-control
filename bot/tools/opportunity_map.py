@@ -56,6 +56,7 @@ import os
 import random
 import statistics
 import sys
+import zlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -547,6 +548,9 @@ HOLD_LONG_PRINTS = 51
 CASH_BENCHMARK_LABEL = "OKX_USDT_LENDING_1H_LENDER_FLOOR_NOT_OWNER_OPPORTUNITY_COST"
 _HOUR_MS = 3_600_000
 _DAY_MS = 86_400_000
+COVERAGE_MIN = 0.95
+#: more than this share of a hold's entries without a cash rate and the cost of capital is UNKNOWN for that hold: the entries that remain are a selection, not the whole history
+MAX_CASH_UNKNOWN_SHARE = 0.02
 
 
 class CashCurve:
@@ -574,8 +578,8 @@ class CashCurve:
             return None
         lo, hi = bisect.bisect_left(self.ts, start_ms), bisect.bisect_right(self.ts, end_ms)
         n = hi - lo
-        # a hole in the series must not be filled with a neighbour's rate: require ~the number of hourly samples the interval spans
-        if n < 1 or n < 0.8 * ((end_ms - start_ms) / _HOUR_MS):
+        # a hole in the series must not be filled with a neighbour's rate: require ~the number of hourly samples the interval spans (a hole of up to 5% of the hold is averaged over; more is UNKNOWN)
+        if n < 1 or n < COVERAGE_MIN * ((end_ms - start_ms) / _HOUR_MS):
             return None
         return (self._cum[hi] - self._cum[lo]) / n
 
@@ -593,7 +597,7 @@ def load_cash_curve(repo: str) -> CashCurve:
                 pts.append((ts, float(r["rate_annual"])))
             except (KeyError, ValueError, TypeError):
                 continue
-    except (OSError, ValueError, csv.Error):
+    except (OSError, ValueError, csv.Error, EOFError, zlib.error):     # a truncated or corrupt archive is "unreadable", not a crash: every capital-cost figure is then UNKNOWN
         return CashCurve([])
     return CashCurve(pts)
 
@@ -623,13 +627,20 @@ def on_capital(entries: Sequence[Dict[str, Any]], curve: CashCurve, *, capital_f
 def excess_summary(entries: Sequence[Dict[str, Any]], unknown: int, *, hold: int) -> Dict[str, Any]:
     """The summary the verdict reads: nominal (zero capital cost, notional), on capital, cash, and the EXCESS over cash, with a moving-block interval and the entry-year split."""
     ex = [e["excess_over_cash_bps_of_capital"] for e in entries]
+    total = len(entries) + int(unknown)
+    share = (int(unknown) / total) if total else 1.0
+    if not entries or share > MAX_CASH_UNKNOWN_SHARE:                 # too little of the history has a cash rate: what remains is a selection, so the capital cost is UNKNOWN for this hold, never a number
+        return {"n": len(entries), "n_cash_unknown": int(unknown), "hold_days": hold / PRINTS_PER_DAY, "cash_coverage_ok": False, "cash_unknown_share": share,
+                "mean_nominal_net_bps_of_notional": None, "mean_net_bps_on_capital": None, "mean_cash_bps_of_capital": None, "mean_excess_over_cash_bps_of_capital": None,
+                "share_positive": None, "excess_block_ci90": None, "by_entry_year_mean_excess_bps": {}, "annualised_excess_pct_of_capital": None,
+                "annualised_note": "UNKNOWN: the cash series does not cover enough of the history"}
     s = summarise(ex)
     by_year: Dict[str, List[float]] = {}
     for e in entries:
         by_year.setdefault(str(_year(e["ms"])), []).append(e["excess_over_cash_bps_of_capital"])
     days = hold / PRINTS_PER_DAY
     mean = s.get("mean")
-    return {"n": s.get("n", 0), "n_cash_unknown": unknown, "hold_days": days,
+    return {"n": s.get("n", 0), "n_cash_unknown": unknown, "hold_days": days, "cash_coverage_ok": True, "cash_unknown_share": share,
             "mean_nominal_net_bps_of_notional": statistics.fmean(e["net_bps"] for e in entries) if entries else None,
             "mean_net_bps_on_capital": statistics.fmean(e["net_bps_on_capital"] for e in entries) if entries else None,
             "mean_cash_bps_of_capital": statistics.fmean(e["cash_bps_of_capital"] for e in entries) if entries else None,

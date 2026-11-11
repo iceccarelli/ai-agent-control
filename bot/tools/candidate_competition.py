@@ -105,7 +105,7 @@ def btc_policies(econ: Mapping[str, Any]) -> List[Dict[str, Any]]:
                     "note": ("loses after costs over the whole corpus" if lost_nominal else
                              (f"positive on notional ({mean:.1f} bps, ZERO capital cost) but {excess:.1f} bps EXCESS over cash on the capital it ties up: it does not beat the cash alternative" if lost_to_cash else
                               ("in-sample positive, regime dependent" + (f"; latest year {ly}: {lv:.1f} bps" if lv is not None and lv <= 0 else "")
-                               + ("" if cap_ok else "; CASH_UNKNOWN: no cost of capital applied"))))})
+                               + ("" if (cap_ok and excess is not None) else "; CASH_UNKNOWN: no cost of capital applied"))))})
     g = econ["gated_sequential_taker"]
     gc = cap.get("gated_sequential_overlay") if cap_ok else None
     g_excess = (gc or {}).get("mean_excess_over_cash_bps_of_capital")

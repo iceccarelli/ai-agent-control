@@ -411,3 +411,37 @@ def test_the_committed_btc_carry_on_capital_after_cash_reproduces_the_audit_numb
     assert y["2023"] > 0 and all(y[k] < 0 for k in ("2022", "2024", "2025", "2026"))       # the one paying regime is the one that is over
     aq, unk2 = om.on_capital(om.all_forced(rows, 51, cost_bps=31.4), cur)
     assert om.excess_summary(aq, unk2, hold=51)["mean_excess_over_cash_bps_of_capital"] == pytest.approx(-22.99, abs=0.05)
+
+
+def test_a_truncated_cash_archive_is_unreadable_not_a_crash(tmp_path):
+    import gzip
+    repo = tmp_path / "repo"
+    path = repo / om.OKX_LENDING
+    path.parent.mkdir(parents=True)
+    body = "ts,utc,ccy,rate_annual,lending_rate,amount\n" + "".join(f"{1639472400000 + k * 3600000},2021-12-14T09:00:00Z,USDT,0.01,0.01,\n" for k in range(5000))
+    raw = gzip.compress(body.encode())
+    path.write_bytes(raw[: len(raw) // 2])                                                  # a transfer cut off half way
+    assert not om.load_cash_curve(str(repo))                                                  # empty = every capital cost UNKNOWN, never an exception
+    assert not om.load_cash_curve(str(tmp_path / "missing"))
+
+
+def test_too_little_cash_coverage_makes_the_cost_of_capital_unknown_not_a_survivor_selection():
+    rows = series([2.0] * 60)
+    ent = om.all_forced(rows, 3, cost_bps=3.0)
+    half = om.CashCurve([(T0 - 3_600_000 + k * 3_600_000, 0.05) for k in range(24 * 10)])         # covers only the first part of the history
+    oc, unknown = om.on_capital(ent, half)
+    assert 0 < len(oc) < len(ent) and unknown > 0
+    s = om.excess_summary(oc, unknown, hold=3)
+    assert s["cash_coverage_ok"] is False and s["mean_excess_over_cash_bps_of_capital"] is None and s["n_cash_unknown"] == unknown
+    full = om.CashCurve([(T0 - 3_600_000 + k * 3_600_000, 0.05) for k in range(24 * 40)])
+    oc2, unk2 = om.on_capital(ent, full)
+    assert unk2 == 0 and om.excess_summary(oc2, unk2, hold=3)["cash_coverage_ok"] is True
+    assert om.excess_summary([], 0, hold=3)["mean_excess_over_cash_bps_of_capital"] is None         # nothing covered: unknown, and no crash
+
+
+def test_a_hole_of_more_than_five_percent_of_a_hold_is_not_averaged_over():
+    pts = [(T0 + k * 3_600_000, 0.05) for k in range(100)]                                       # a 24 h hold spans 25 hourly samples (both ends inclusive); 95% of 24 = 22.8 are required
+    one = om.CashCurve([p for p in pts if p[0] != T0 + 10 * 3_600_000])                          # 24 samples: inside the tolerance
+    assert one.mean_apr(T0, T0 + 24 * 3_600_000) == pytest.approx(0.05)
+    three = om.CashCurve([p for p in pts if not (T0 + 10 * 3_600_000 <= p[0] < T0 + 13 * 3_600_000)])   # 22 samples: more than 5% of the hold is missing
+    assert three.mean_apr(T0, T0 + 24 * 3_600_000) is None

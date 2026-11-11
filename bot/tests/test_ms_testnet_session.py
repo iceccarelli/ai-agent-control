@@ -813,13 +813,56 @@ def test_a_wedged_exit_leg_is_closed_out_by_the_confirmed_unwind_and_the_account
     assert w.fake.wallet.get("BTC", D(0)) == D(0)                                               # no orphan spot long either
 
 
-def test_an_unwind_does_not_close_out_an_exit_leg_the_venue_may_still_hold(w):
-    """The close-out needs the venue's COMPLETE read to have no order under the link; an exit order that DID reach the venue is adopted, never re-created."""
+def test_an_exit_the_venue_accepted_but_whose_answer_was_lost_is_adopted_not_recreated(w):
+    """The request EXECUTES and the answer is lost: the engine adopts the venue's order, so no leg is ever stuck and nothing is closed out or sent twice."""
     d = _ready(w)
-    w.fake.inject(CREATE, "lose_response", times=1, match=_EXIT_TARGETS["exit-perp"])           # the request EXECUTES, the answer is lost
+    w.fake.inject(CREATE, "lose_response", times=1, match=_EXIT_TARGETS["exit-perp"])
     w.execute(d)
     w.fake.faults.clear()
     assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
     assert "UNRESOLVED EXIT LEG" not in w.text()
     assert all(p["size"] == 0 for p in w.fake.positions.values())
-    assert max(w.fake.create_calls.values()) == 1 or all(c <= 2 for c in w.fake.create_calls.values())
+    assert all(c == 1 for c in w.fake.create_calls.values() if c)                                 # every link was created exactly once
+
+
+def test_the_unwind_never_closes_out_an_exit_leg_on_an_incomplete_venue_read(w):
+    """The close-out needs the venue's COMPLETE read to have no order under the link. With the order read failing, nothing is closed out, nothing is sent, and the exit code says not flat."""
+    d = _ready(w)
+    w.fake.inject(CREATE, "timeout", times=2, match=_EXIT_TARGETS["exit-perp"])
+    assert w.execute(d) != 0
+    w.fake.faults.clear()
+    w.fake.inject("/v5/order/realtime", "http500", times=999)
+    before = len(w.requests_to(CREATE))
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) != 0
+    assert len(w.requests_to(CREATE)) == before                                                   # no fresh exit was sent on an unverified read
+    assert w.record()["flat_verified"] is not True
+    w.fake.faults.clear()                                                                         # the venue answers again: the same command now flattens
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_the_unwind_does_not_close_out_a_leg_sent_moments_ago(w, monkeypatch):
+    """A request that left a moment ago may still land after a fresh exit (a second exit would oversell pre-owned spot): it is left alone and the owner is told to wait."""
+    d = _ready(w)
+    w.fake.inject(CREATE, "timeout", times=2, match=_EXIT_TARGETS["exit-spot"])
+    assert w.execute(d) != 0
+    w.fake.faults.clear()
+    monkeypatch.setattr(S, "CLOSE_OUT_MIN_AGE_MS", 10 ** 12)                                      # every leg looks "sent moments ago"
+    before = len(w.requests_to(CREATE))
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) != 0
+    assert "NOT closed out" in w.text() and len(w.requests_to(CREATE)) == before
+    monkeypatch.setattr(S, "CLOSE_OUT_MIN_AGE_MS", 15_000)
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert w.record()["flat_verified"] is True
+
+
+def test_a_blank_execfee_leaves_the_session_net_unknown_not_a_measured_zero(w, monkeypatch):
+    """The unknown fee must reach the P&L, not only the quality record: the net's fees are null, so the capital book is never debited a zero fee."""
+    orig = TE.TestnetExecutor._take_exec
+
+    def blank(self, r, cat, out):
+        return orig(self, {**r, "execFee": ""} if r.get("execType", "Trade") == "Trade" else r, cat, out)
+    monkeypatch.setattr(TE.TestnetExecutor, "_take_exec", blank)
+    assert w.execute(_ready(w)) == 0
+    net = w.record()["net"]
+    assert net["fees_usd"] is None, net                                                           # unknown, never 0.0

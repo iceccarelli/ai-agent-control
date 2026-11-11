@@ -203,3 +203,25 @@ def test_without_a_cash_series_nothing_is_rejected_for_cash_and_the_gap_is_state
     econ = CR.btc_carry_economics()
     assert econ["on_capital_after_cash"]["status"] == CR.UNKNOWN and "CASH_SERIES_UNAVAILABLE" in econ["on_capital_after_cash"]["reason"]
     assert any("CASH_UNKNOWN" in r for r in CR._carry_verdict(econ)[1])
+
+
+def test_the_readiness_and_competition_verdicts_agree_on_the_btc_carry_candidates(committed):
+    """One rule, two tools: a candidate every policy of which loses after costs or to cash is REJECTED in both; they may never disagree on the same evidence."""
+    rep, _ = committed
+    base = CR.build_report()
+    comp = row(rep, "cash_and_carry")["verdict"]
+    assert comp == "REJECTED"
+    for n in ("cash_and_carry", "btcusdt_funding_carry_overlay"):
+        r = next(x for x in base["candidates"] if x["name"] == n)
+        assert r["readiness_verdict"] == comp, (n, r["readiness_verdict"], r["readiness_reasons"][-3:])
+
+
+def test_a_short_cash_series_does_not_crash_the_verdict_and_is_stated_unknown(monkeypatch):
+    monkeypatch.setattr(CR.OM, "load_cash_curve", lambda repo: CR.OM.CashCurve([(1_659_369_600_000 + k * 3_600_000, 0.04) for k in range(24 * 5)]))      # five days of cash rate
+    econ = CR.btc_carry_economics()
+    assert econ["on_capital_after_cash"]["status"] == "COMPUTED"
+    assert econ["on_capital_after_cash"]["classes"][CR.CAP_OVERLAY]["holds"]["51"]["mean_excess_over_cash_bps_of_capital"] is None
+    verdict, reasons, policies = CR._carry_verdict(econ)                                         # used to raise TypeError formatting None
+    assert verdict == "INSUFFICIENT_DATA" and any("CASH_UNKNOWN" in x for x in reasons) and policies["long_hold_vs_cash"] == CR.UNKNOWN
+    p51 = {p["policy"]: p for p in CC_.btc_policies(econ)}["unconditional_51_print_hold"]
+    assert p51["verdict"] == "INSUFFICIENT_DATA" and "CASH_UNKNOWN" in p51["note"]
