@@ -1734,7 +1734,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     release_writer: Optional[Callable[[], None]] = None
     if args.arm:
         longest = 900.0 + ((args.max_hold_hours + args.settle_wait_hours) * 3600.0 if args.hold_for_settlement else 0.0)       # the longest this run may take: the lease must outlast it
-        release_writer, writer_why = single_writer_guard(os.environ, max_runtime_s=longest)
+        release_writer, writer_why = single_writer_guard(_executor_env().guard_env(), max_runtime_s=longest)
         if release_writer is None:
             print(f"REFUSED: {writer_why}", file=sys.stderr)
             return 2
@@ -1774,6 +1774,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     stamp_capture_tail(report, args.evidence_path, args.out)
     _print_report(report, args)
     return drill_exit_code(report, hold=plan is not None)
+
+
+def _executor_env() -> Any:
+    import executor_env                                             # the one reviewed reader of the guard's named variables (this module reads no environment itself)
+    return executor_env
 
 
 def single_writer_guard(env: Any, max_runtime_s: Optional[float] = None) -> Tuple[Optional[Callable[[], None]], str]:

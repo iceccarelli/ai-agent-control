@@ -2515,5 +2515,6 @@ def main(argv: Optional[List[str]] = None, *,
 
 
 if __name__ == "__main__":
+    import executor_env as _XE
     import legacy_executor_guard as _LG
-    raise SystemExit(_LG.run_guarded_cli(main, env=os.environ, safe_pairs=(("--phase", "recover"),)))
+    raise SystemExit(_LG.run_guarded_cli(main, env=_XE.guard_env(), safe_pairs=(("--phase", "recover"),)))

@@ -38,7 +38,10 @@ def lock_path(capability_path: str) -> str:
 def resolve_path(env: Any) -> str:
     """Where the lock lives for a process that has no capability path of its own (the legacy drill and its guarded parent): ``MS_EXECUTOR_LOCK_PATH`` if the parent passed one, else the same
     per-account directory the autopilot and the session tool use (``~/.ai-agent-control``)."""
-    p = (env.get("MS_EXECUTOR_LOCK_PATH") if hasattr(env, "get") else None) or os.environ.get("MS_EXECUTOR_LOCK_PATH")
+    p = env.get("MS_EXECUTOR_LOCK_PATH") if hasattr(env, "get") else None
+    if not p:
+        import executor_env as _XE                                  # the one reviewed environment reader for the single-writer guard (no other module reads the environment for it)
+        p = _XE.guard_env().get("MS_EXECUTOR_LOCK_PATH")
     return str(p) if p else os.path.join(os.path.expanduser("~"), ".ai-agent-control", LOCK_NAME)
 
 

@@ -24,6 +24,8 @@ sys.path[:0] = [HERE, BOT, os.path.join(BOT, "tools")]
 
 import test_order_path_inventory as OPI  # noqa: E402
 
+pytestmark = pytest.mark.real_single_writer      # the drill-guard test exercises the REAL single-writer guard
+
 #: executable -> (class, how it is held to account)
 ENTRY_POINTS: Dict[str, str] = {
     "tools/ms_testnet_autopilot.py": "3 lease + account lock (via execute) + owner grant",

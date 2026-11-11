@@ -16,6 +16,7 @@ import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World, begin  # noqa: E402
 from test_ms_testnet_executor import drive_full  # noqa: E402
 
+pytestmark = pytest.mark.real_single_writer      # these tests exercise the REAL single-writer guard of the armed drill
 CREATE = "/v5/order/create"
 
 
