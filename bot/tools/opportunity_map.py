@@ -539,8 +539,9 @@ def all_forced(rows: Sequence[Settle], hold: int, *, cost_bps: float,
 
 
 # ---------------------------------------------------------------- the cost of the capital tied up (the verdict's missing line)
-#: Capital tied up per USD of hedged notional: the spot leg paid in full (or its owned equivalent) + ~15% perp margin + a 1% buffer. This is ms_capital.MARGIN_PER_USD; a test pins the two equal
-#: (this module is pure research arithmetic and does not import the capital book).
+#: Capital tied up per USD of hedged notional in the RESEARCH verdict: the spot leg paid in full (or its owned equivalent) + an ASSUMED ~15% perp initial margin + a 1% buffer. It is NOT the live plan's
+#: capital (ms_capital.MARGIN_PER_USD, 2.04: the autopilot runs the perp at leverage 1, so it commits spot + 100% margin + 2%); tests/test_opportunity_map.py pins their relation. The research factor is
+#: the FAVOURABLE one for carry, so a carry that does not beat cash on it does not beat cash on the live basis either. (This module is pure research arithmetic and does not import the capital book.)
 CAPITAL_PER_NOTIONAL = 1.16
 #: the long hold the verdict quotes (51 prints = 17 days at 8h)
 HOLD_LONG_PRINTS = 51

@@ -353,6 +353,9 @@ def scan(root: str) -> List[Site]:
 ALLOWED = {
     ("economic_model.py", "qsum", "Quantity(Decimal(0), 'derived', unit)"):
         "accumulator seed of a sum: 0 + q is q, and an unknown element makes the whole sum unknown (Quantity arithmetic); it is never reported on its own",
+    ("economic_model.py", "structural_zero", "Quantity(Decimal(0), 'derived', unit)"):
+        "the ONLY constructor of a JUSTIFIED zero: it refuses any reason outside the closed STRUCTURAL_ZERO_REASONS list, and the caller must ALSO declare the reason next to the input in "
+        "Scenario.zero_reasons, otherwise the runtime rule (_unjustified_zeros) counts the zero as ASSUMED and it can never PASS; pinned by tests/test_economic_zero_rule.py",
     ("economic_model.py", "_leg_costs", "Quantity(Decimal(0), p.provenance, 'bps')"):
         "a MAKER leg that does not cross has zero spread/slippage only as strongly as its stated fill probability: the provenance is the probability's (never upgraded to 'derived'); an unknown "
         "probability returns unknown(); no production caller builds a maker leg (the autopilot gate is taker-only), so this is exercised by the economic-model tests only",
@@ -361,12 +364,6 @@ ALLOWED = {
         "the scenario's own (possibly unknown) inputs are used instead",
     ("economic_model.py", "capacity_usd", "Quantity(Decimal(0), prov, 'usd')"):
         "a RESULT, not a cost: 'the largest notional that still clears the floor is 0' when even the smallest order fails; its provenance is the weakest of the chain's known components",
-    ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'derived', 'fraction')"):
-        "STRUCTURAL zero: the spot leg is bought with USDT, not borrowed, so there is no borrow cost to charge",
-    ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')"):
-        "REJECTION-ONLY PROBE: with the owner's cost of capital UNKNOWN the edge is re-priced with that one input floored at zero and labelled ASSUMED (the model refuses to PASS an assumed input). Its net is "
-        "compared with the hurdle to REJECT a hopeless edge and is never reported or used to pass: a cost of capital can only lower the net, so a miss at zero is a miss at any rate. Pinned by "
-        "test_ms_edge_gate.py::test_with_an_unknown_cost_of_capital_no_funding_level_can_make_a_profit_candidate",
 }
 
 
@@ -399,12 +396,14 @@ def test_zero_valued_quantities_without_an_observed_provenance_exist_only_where_
     assert all(isinstance(r, str) and len(r) >= 40 for r in ALLOWED.values()), "every allow-list entry needs a real reason"
 
 
-def test_no_known_loophole_is_left_and_the_one_rejection_probe_is_labelled_as_such():
-    """The allow-list is an exception list, so its composition is a metric. The executor gate's modelled-zero opportunity cost (an unset owner cost of capital priced as FREE) was removed: an unstated cost
-    of capital is UNKNOWN now (test_ms_edge_gate.py). No entry may be a KNOWN LOOPHOLE; the single REJECTION-ONLY probe is the assumed zero that can reject but never pass."""
-    assert [k for k, why in ALLOWED.items() if why.startswith("KNOWN LOOPHOLE")] == []
-    assert [k for k, why in ALLOWED.items() if why.startswith("REJECTION-ONLY PROBE")] == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')")]
+def test_no_known_loophole_is_left_and_the_executor_gate_holds_no_zero_literal_at_all():
+    """The allow-list is an exception list, so its composition is a metric. The executor gate's modelled-zero opportunity cost (an unset owner cost of capital priced as FREE) is gone: an unstated cost of
+    capital is UNKNOWN (test_ms_edge_gate.py), the borrow zero is a declared structural zero, the rejection bound comes from the model. Not one zero-valued Quantity is constructed in the gate; the
+    enforcement of the rule is the runtime check in economic_model (tests/test_economic_zero_rule.py), of which this scan is only the tripwire."""
+    assert [k for k, why in ALLOWED.items() if why.startswith("KNOWN LOOPHOLE") or why.startswith("REJECTION-ONLY PROBE")] == []
+    assert not [k for k in ALLOWED if k[0] == "tools/ms_edge_gate.py"], "the executor gate must not construct a zero-valued Quantity"
     assert not any(k[2].endswith("'modelled', 'fraction')") for k in ALLOWED), "a modelled zero cost is the loophole's exact shape"
+    assert {k[0] for k in ALLOWED} == {"economic_model.py"}
 
 
 # ------------------------------------------------------------------------------------------------ mutation tests: every bypass the scanner claims to catch must be caught
@@ -520,20 +519,20 @@ def test_a_new_labelled_zero_planted_in_a_real_production_file_fails_the_pin(tmp
 
 def test_a_second_identical_zero_inside_an_already_allowed_scope_fails_the_count_check(tmp_path):
     root = _copy_real(tmp_path)
-    gate = root / "tools" / "ms_edge_gate.py"
-    gate.write_text(gate.read_text() + "\n\ndef evaluate_edge():\n    return EM.Quantity(D(0), 'assumed', 'fraction')\n")
+    em = root / "economic_model.py"
+    em.write_text(em.read_text() + "\n\ndef structural_zero(unit):\n    return Quantity(Decimal(0), 'derived', unit)\n")
     _found, new, _stale, multi = review(str(root))
-    assert not new and multi == [("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')")], (new, multi)
+    assert not new and multi == [("economic_model.py", "structural_zero", "Quantity(Decimal(0), 'derived', unit)")], (new, multi)
 
 
 def test_removing_an_allowed_zero_from_a_real_file_makes_its_entry_stale(tmp_path):
     root = _copy_real(tmp_path)
-    gate = root / "tools" / "ms_edge_gate.py"
-    text = gate.read_text()
-    assert "EM.Quantity(D(0), \"assumed\", \"fraction\")" in text or "EM.Quantity(D(0), 'assumed', 'fraction')" in text
-    gate.write_text(text.replace("EM.Quantity(D(0), \"assumed\", \"fraction\")", "EM.unknown(\"fraction\")").replace("EM.Quantity(D(0), 'assumed', 'fraction')", "EM.unknown('fraction')"))
+    em = root / "economic_model.py"
+    text = em.read_text()
+    assert 'total = Quantity(Decimal(0), "derived", unit)' in text
+    em.write_text(text.replace('total = Quantity(Decimal(0), "derived", unit)', "total = unknown(unit)"))
     _found, _new, stale, _multi = review(str(root))
-    assert ("tools/ms_edge_gate.py", "evaluate_edge", "EM.Quantity(D(0), 'assumed', 'fraction')") in stale
+    assert ("economic_model.py", "qsum", "Quantity(Decimal(0), 'derived', unit)") in stale
 
 
 def test_reintroducing_the_free_capital_loophole_in_the_real_gate_fails_the_pin(tmp_path):

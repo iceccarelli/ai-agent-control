@@ -23,12 +23,18 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 import time
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Mapping, Optional
 
-import ms_engine_state as ES
+BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BOT not in sys.path:
+    sys.path.insert(0, BOT)
+
+import economic_model as EM  # noqa: E402
+import ms_engine_state as ES  # noqa: E402
 
 D = Decimal
 INITIAL_FRACTION = D("0.4")            # day-one deployment: 40% of the ceiling, not all of it
@@ -36,7 +42,10 @@ MAX_FRACTION = D("0.8")                # even after gains the compounded size ne
 MAX_SCALE = D("2")                     # basis/start_cash is clamped here (and then by MAX_FRACTION)
 MIN_NOTIONAL_USD = D("20")
 MECHANICS_CAP_USD = D("100")           # a session that is not a profit candidate proves plumbing only: it does not need real size
-MARGIN_PER_USD = D("1.16")             # spot leg paid in full + ~15% perp margin + 1% buffer per USD of notional
+#: Cash a session COMMITS per USD of notional at the leverage the autopilot plans with (1): the spot leg paid in full + the perp initial margin (1/leverage) + the plan's 2% buffer = 2.04. It is the plan's
+#: OWN definition (``economic_model.hedged_pair_capital_usd``, which ``ms_testnet_session.build_plan`` enforces), not a constant someone typed: the old 1.16 (a research overlay assumption: BTC already
+#: held + ~15% perp margin) sized $200 on $232 of cash while the plan then demanded $408 and refused.
+MARGIN_PER_USD = EM.hedged_pair_capital_usd(1, 1).value
 LOSS_STREAK_HALF = 2                   # from this many consecutive realised losses the size is halved
 LOSS_STREAK_STOP = 4                   # ... and at this many entries stop until the owner acknowledges
 DRAWDOWN_STOP_USD = D("11.10")         # twice the Testnet loss ceiling: peak basis minus basis at or beyond this stops entries
@@ -70,7 +79,7 @@ class Allocation:
 
 
 def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, available_usdt: Any, basis: Optional[Decimal], start_cash: Optional[Decimal], loss_streak: int,
-             drawdown_usd: Optional[Decimal], profit_seeking: bool, halted: bool = False) -> Allocation:
+             drawdown_usd: Optional[Decimal], profit_seeking: bool, halted: bool = False, leverage: int = 1) -> Allocation:
     """The smallest of every limit; a missing input is a refusal, never a guess."""
     reasons: List[str] = []
     gm, ce, og, av = _d(grant_max_usd), _d(ceiling_usd), _d(open_gross_usd), _d(available_usdt)
@@ -93,7 +102,7 @@ def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, avail
     compounded = min(ce * INITIAL_FRACTION * scale, ce * MAX_FRACTION)
     if loss_streak >= LOSS_STREAK_HALF:
         compounded = compounded / 2
-    caps = {"GRANT_MAX": gm, "AGGREGATE_CEILING_LEFT": ce - og, "COMPOUNDED_SIZE": compounded, "MARGIN": av / MARGIN_PER_USD}
+    caps = {"GRANT_MAX": gm, "AGGREGATE_CEILING_LEFT": ce - og, "COMPOUNDED_SIZE": compounded, "MARGIN": av / EM.hedged_pair_capital_usd(1, max(1, int(leverage))).value}
     if not profit_seeking:
         caps["MECHANICS_ONLY"] = MECHANICS_CAP_USD
     binding = min(caps, key=lambda k: caps[k])

@@ -199,8 +199,9 @@ def _cash_status(inp: "EdgeInputs") -> Tuple[Optional[CashAlternative], str, Lis
 
 def _capital_block(inp: "EdgeInputs", cash: Optional[CashAlternative], state: str, opportunity_cost_bps: Optional[D]) -> Dict[str, Any]:
     ok = inp.notional_usd > 0 and inp.leverage >= 1
-    mult = (D(1) + D(1) / D(inp.leverage)) if ok else None
-    return {"state": state, "committed_usd": None if mult is None else _q(inp.notional_usd * mult), "multiple_of_notional": None if mult is None else _q(mult),
+    committed = EM.hedged_pair_capital_usd(inp.notional_usd, inp.leverage).value if ok else None      # the plan's own capital: spot + perp margin + its buffer (economic_model)
+    mult = None if committed is None else committed / inp.notional_usd
+    return {"state": state, "committed_usd": None if committed is None else _q(committed), "multiple_of_notional": None if mult is None else _q(mult),
             "cash_alternative_apr": None if cash is None else _q(cash.apr), "cash_alternative_source": None if cash is None else cash.source,
             "cash_alternative_stated_ms": None if cash is None else cash.stated_ms, "cash_alternative_provenance": None if cash is None else cash.provenance,
             "opportunity_cost_bps": _q(opportunity_cost_bps)}
@@ -252,18 +253,22 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
     hedge_ratio = D(1) - spot_tier.taker                                         # a spot BUY's fee is taken in the base coin: the hedge is that much under
     # THE COST OF CAPITAL: the owner's STATED alternative return, charged on the capital COMMITTED (spot notional + perp margin = notional x (1 + 1/leverage)), expressed as an annual rate on NOTIONAL
     # because that is the base the model charges per hold. Anything but a usable statement is UNKNOWN (never zero): the model then has no net edge and the verdict cannot be a PROFIT_CANDIDATE.
-    capital_multiple = D(1) + D(1) / D(inp.leverage)
+    committed_q = EM.hedged_pair_capital_usd(inp.notional_usd, inp.leverage)
+    capital_multiple = committed_q.value / inp.notional_usd
     cash_q = EM.Quantity(cash.apr, cash.provenance, "fraction") if (cash is not None and cash_state == "STATED") else EM.unknown("fraction")
     opportunity_cost_apr = cash_q * EM.Quantity(capital_multiple, "derived", "ratio")
+    zero_reasons = {"borrow_apr": "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW"}
+    if cash_state == "STATED" and cash is not None and cash.apr == 0:
+        zero_reasons["opportunity_cost_apr"] = "OWNER_STATED_ZERO_COST_OF_CAPITAL"            # capital priced as free BY THE OWNER'S STATEMENT: the only way a zero cost of capital may pass
     scn = EM.Scenario(
         legs=(EM.Leg("spot", spot, "buy", inp.spot_book, spot_tier, "taker", fee_in_base=True), EM.Leg("perp", perp, "sell", inp.perp_book, perp_tier, "taker")),
         notional_usd=inp.notional_usd, gross_edge_bps=EM.Quantity(expected_funding, "modelled", "bps"), hold_days=D(inp.hold_s) / D(86_400), now_ms=inp.now_ms,
         max_book_age_ms=MAX_BOOK_AGE_MS, max_fee_age_ms=MAX_FEE_AGE_MS, impact_bps=EM.Quantity(IMPACT_BPS, "modelled", "bps"),
         basis_cost_bps=(EM.Quantity(max(basis_bps, BASIS_STRESS_BPS), "modelled", "bps") if basis_bps is not None else EM.unknown("bps")),
-        borrow_apr=EM.Quantity(D(0), "derived", "fraction"),                   # spot is bought with USDT, not borrowed
+        borrow_apr=EM.structural_zero("fraction", "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW"),     # spot is bought with USDT, not borrowed (declared in zero_reasons)
         opportunity_cost_apr=opportunity_cost_apr,
         hedge_ratio=EM.Quantity(hedge_ratio, "derived", "ratio"), adverse_move_bps=EM.Quantity(ADVERSE_MOVE_BPS, "modelled", "bps"),
-        margin_usd=EM.Quantity(inp.notional_usd * capital_multiple, "derived", "usd"))
+        margin_usd=EM.Quantity(inp.notional_usd * (D(1) + D(1) / D(inp.leverage)), "derived", "usd"), zero_reasons=zero_reasons)
     try:
         res = EM.evaluate_chain(scn)
     except EM.EconomicModelError as exc:
@@ -286,15 +291,12 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
     if not net.known or res.blockers:
         cls = INCONCLUSIVE
         if not res.blockers and not assumed and res.unknown_inputs == ("opportunity_cost",):
-            # REJECTION BY BOUND ONLY. The cost of capital can only LOWER the net edge, so if the edge misses the hurdle with that one unknown floored at zero, no capital cost can rescue it: REJECTED.
-            # The probe's zero is labelled ASSUMED (the model refuses to PASS an assumed input), its net is used for nothing but this comparison and never reported: it can reject, it can never pass.
-            try:
-                bound = EM.evaluate_chain(dataclasses.replace(scn, opportunity_cost_apr=EM.Quantity(D(0), "assumed", "fraction"))).net_edge_bps
-            except EM.EconomicModelError:
-                bound = EM.unknown("bps")
-            if bound.known and bound.value < MIN_NET_EDGE_BPS:
+            # REJECTION BY BOUND ONLY. The cost of capital can only LOWER the net edge, so if the edge misses the hurdle with that one unknown counted as free, no capital cost can rescue it: REJECTED.
+            # The bound (economic_model.net_edge_upper_bound_bps) is used for nothing but this comparison and is never reported as a net: it can reject, it can never pass.
+            bound = EM.net_edge_upper_bound_bps(res, nonneg_unknown=("opportunity_cost",))
+            if bound is not None and bound < MIN_NET_EDGE_BPS:
                 cls = REJECTED
-                reasons.append(f"NET_EDGE_AT_MOST_{bound.value:.2f}bps_BELOW_HURDLE_{MIN_NET_EDGE_BPS}bps_BEFORE_ANY_COST_OF_CAPITAL")
+                reasons.append(f"NET_EDGE_AT_MOST_{bound:.2f}bps_BELOW_HURDLE_{MIN_NET_EDGE_BPS}bps_BEFORE_ANY_COST_OF_CAPITAL")
     elif assumed:
         cls = INCONCLUSIVE
         reasons.append("ASSUMED_INPUTS_CANNOT_PASS:" + ",".join(assumed))

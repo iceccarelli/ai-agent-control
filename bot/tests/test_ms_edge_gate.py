@@ -228,21 +228,23 @@ def test_the_freshness_window_of_a_stated_cost_of_capital_is_exact():
 
 
 def test_a_stated_cost_of_capital_is_charged_on_the_capital_committed_not_on_the_notional():
-    """4%/yr on $375 notional at leverage 1 commits spot $375 + perp margin $375 = $750, held 720 s: the charge is 750 x 4% x 720/86400/365 dollars, expressed in bps of NOTIONAL."""
+    """4%/yr on $375 notional at leverage 1 commits spot $375 + perp margin $375 + the plan's 2% buffer = $765, held 720 s: the charge is 765 x 4% x 720/86400/365 dollars, expressed in bps of NOTIONAL."""
     v = EG.evaluate_edge(inputs("0.0100"))
     hold_years = D(720) / D(86_400) / D(365)
-    dollars = D(750) * D("0.04") * hold_years
+    dollars = D(765) * D("0.04") * hold_years
     assert abs(_oc(v) - dollars / D(375) * D(10_000)) < D("1e-12")                   # the independent derivation in DOLLARS then bps
-    assert abs(_oc(v) - D("0.04") * 2 * D(720) / D(86_400) / D(365) * D(10_000)) < D("1e-12")
-    assert v.capital["committed_usd"] == "750" and v.capital["multiple_of_notional"] == "2" and v.capital["state"] == "STATED"
+    assert abs(_oc(v) - D("0.04") * D("2.04") * D(720) / D(86_400) / D(365) * D(10_000)) < D("1e-12")
+    assert v.capital["committed_usd"] == "765" and v.capital["multiple_of_notional"] == "2.04" and v.capital["state"] == "STATED"
+    import ms_capital
+    assert D(v.capital["multiple_of_notional"]) == ms_capital.MARGIN_PER_USD          # ONE definition of the capital a pair commits: the gate, the allocator and the plan
     assert (v.capital["cash_alternative_apr"], v.capital["cash_alternative_source"], v.capital["cash_alternative_provenance"]) == ("0.04", "OWNER_STATED", "modelled")
 
 
 def test_a_leveraged_perp_commits_less_capital_and_the_charge_follows_the_committed_amount():
     one = _oc(EG.evaluate_edge(inputs("0.0100", leverage=1)))
-    five = _oc(EG.evaluate_edge(inputs("0.0100", leverage=5)))                       # capital multiple 1 + 1/5 = 1.2 instead of 2
+    five = _oc(EG.evaluate_edge(inputs("0.0100", leverage=5)))                       # (1 + 1/5) instead of (1 + 1), each with the plan's 2% buffer
     assert abs(five / one - D("1.2") / D(2)) < D("1e-12")
-    assert EG.evaluate_edge(inputs("0.0100", leverage=5)).capital["multiple_of_notional"] == "1.2"
+    assert EG.evaluate_edge(inputs("0.0100", leverage=5)).capital["multiple_of_notional"] == "1.224"
 
 
 def test_the_charge_is_linear_in_the_stated_rate_and_in_the_hold():

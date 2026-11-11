@@ -542,7 +542,8 @@ def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_co
     lending history (a lender's floor, not the owner's opportunity cost) and a hold the series cannot cover is UNKNOWN and dropped, never free."""
     curve = OM.load_cash_curve(BOT)
     base = {"capital_per_notional": OM.CAPITAL_PER_NOTIONAL,
-            "capital_basis": "spot leg (paid, or owned and so forgone) + ~15% perp margin + 1% buffer per USD of notional (ms_capital.MARGIN_PER_USD)",
+            "capital_basis": "spot leg (paid, or owned and so forgone) + an ASSUMED ~15% perp initial margin + 1% buffer per USD of notional (the research overlay basis; the live Testnet plan at leverage 1 "
+                             "commits 2.04x, so this is the FAVOURABLE basis for carry)",
             "cash_series": {"source": OM.OKX_LENDING, "label": OM.CASH_BENCHMARK_LABEL, "first_utc": OM._iso(curve.first_ms()), "last_utc": OM._iso(curve.last_ms())}, "label": LABEL_CORPUS}
     if not curve:
         return {**base, "status": UNKNOWN, "reason": "CASH_SERIES_UNAVAILABLE: no cost of capital can be applied; the notional figures elsewhere in this report carry NO capital cost and are not a return on capital"}

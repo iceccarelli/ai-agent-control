@@ -355,9 +355,15 @@ def _flat_cash(apr, start, hours):
     return om.CashCurve([(start + k * 3_600_000, apr) for k in range(hours)])
 
 
-def test_capital_per_notional_is_the_capital_books_own_allowance():
+def test_the_research_capital_factor_is_an_assumed_overlay_basis_and_is_not_the_live_plans_capital():
+    """The research verdict charges cash on 1.16x notional: the spot leg (paid, or owned and so forgone) + an ASSUMED ~15% perp initial margin + a 1% buffer. The live Testnet plan runs the perp at leverage 1 and
+    commits spot + 100% margin + 2% = 2.04x (ms_capital.MARGIN_PER_USD = economic_model.hedged_pair_capital_usd). They were pinned equal; they are different constructions, so the pin is now their documented
+    relation: the research factor is the FAVOURABLE one (a carry that does not beat cash on 1.16x does not on 2.04x), which is why NO WINNER is robust to the choice."""
+    import economic_model as EM
     import ms_capital
-    assert om.CAPITAL_PER_NOTIONAL == float(ms_capital.MARGIN_PER_USD)
+    assert om.CAPITAL_PER_NOTIONAL == pytest.approx(1.0 + 0.15 + 0.01)
+    assert float(ms_capital.MARGIN_PER_USD) == pytest.approx(float(EM.hedged_pair_capital_usd(1, 1).value)) == pytest.approx(2.04)
+    assert om.CAPITAL_PER_NOTIONAL < float(ms_capital.MARGIN_PER_USD)
 
 
 def test_on_capital_is_hand_computed_and_the_cash_term_is_charged():

@@ -1365,7 +1365,7 @@ def test_every_evaluation_carries_a_decision_record_whose_id_is_reproducible_fro
     rec1, rec2 = r1["decision_record"], r2["decision_record"]
     assert rec1["decision_id"].startswith("dec_") and rec1 == rec2, "the same market inputs, size and code must give the same record"
     assert rec1["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and rec1["fee_tier"] == "MEASURED" and rec1["inputs_ref"] and rec1["edge"]["edge_ref"] and rec1["data_scope"].startswith("TESTNET_DATA")
-    assert rec1["capital_required_usd"] == "232.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
+    assert rec1["capital_required_usd"] == "408.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
     assert "inputs_digest" in r1 and len(r1["inputs_digest"]) == 64                                  # the full digest stays in the local result; the record carries a 16-hex reference
 
 
@@ -1485,7 +1485,7 @@ def test_an_unstated_cost_of_capital_makes_even_an_80_bps_print_inconclusive_in_
     assert any(x.startswith("COST_OF_CAPITAL_UNKNOWN:") for x in res["why"]) and res["edge"]["net_edge_bps"] is None
     assert res["cost_of_capital"]["state"] == "UNSTATED" and res["cost_of_capital"]["usable"] is False and res["cost_of_capital"]["apr"] is None
     cb = res["decision_record"]["edge"]["capital_basis"]
-    assert cb["state"] == "UNSTATED" and cb["cash_alternative_apr"] is None and cb["opportunity_cost_bps"] is None and cb["committed_usd"] == "400.00"
+    assert cb["state"] == "UNSTATED" and cb["cash_alternative_apr"] is None and cb["opportunity_cost_bps"] is None and cb["committed_usd"] == "408.00"
     assert res["decision_record"]["market_inputs"]["cost_of_capital_state"] == "UNSTATED"
     assert not [r for r in w.fake.requests if r[0] == "POST"]
 
@@ -1507,9 +1507,9 @@ def test_a_stated_cost_of_capital_is_charged_on_the_committed_capital_and_shown_
         **res["cost_of_capital"], "state": "STATED", "usable": True, "apr": "0.04", "source": "OWNER_STATED:test-fixture", "provenance": "modelled"}
     cb = res["decision_record"]["edge"]["capital_basis"]
     assert (cb["state"], cb["cash_alternative_apr"], cb["cash_alternative_source"], cb["cash_alternative_provenance"], cb["multiple_of_notional"], cb["committed_usd"]) == (
-        "STATED", "0.040000", "OWNER_STATED:test-fixture", "modelled", "2.0000", "400.00")
+        "STATED", "0.040000", "OWNER_STATED:test-fixture", "modelled", "2.0400", "408.00")
     hold_s = res["hold_s"]
-    expected_bps = D("0.04") * 2 * D(hold_s) / D(86_400) / D(365) * D(10_000)
+    expected_bps = D("0.04") * D("2.04") * D(hold_s) / D(86_400) / D(365) * D(10_000)
     assert abs(D(res["edge"]["costs_bps"]["opportunity_cost"]) - expected_bps) < D("1e-9") and expected_bps > 0           # a real, positive, hold-proportional charge
 
 

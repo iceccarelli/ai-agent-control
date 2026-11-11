@@ -35,6 +35,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import economic_model as EM  # noqa: E402
 import exec_quality as EQ  # noqa: E402
 import ms_executor_lock as XL  # noqa: E402
 import funding_settlement as FS  # noqa: E402
@@ -398,7 +399,7 @@ def build_plan(manifest: Mapping[str, Any], pre: Mapping[str, Any], *, symbol: s
         raise ValueError("QTY_NOTIONAL_ABOVE_CEILING")
     usdt = pre.get("usdt")
     if isinstance(usdt, (int, float)) and not isinstance(usdt, bool):          # the spot buy (notional) plus the perp initial margin (notional / leverage) plus a 2% buffer must fit in the USDT read
-        need = notional * (1.0 + 1.0 / max(1, leverage)) * 1.02
+        need = float(EM.hedged_pair_capital_usd(D(repr(notional)), max(1, leverage)).value)      # ONE definition of the capital a pair commits (economic_model); the allocator's margin cap reads the same
         if need > float(usdt) + 1e-9:
             raise ValueError(f"INSUFFICIENT_USDT_FOR_PLAN:need {need:.2f} have {float(usdt):.2f} (spot buy + perp margin at leverage {leverage} + 2%)")
     for cat, f, ref in (("linear", lin, mark), ("spot", sp, D(str(mk["spot_ask"])))):

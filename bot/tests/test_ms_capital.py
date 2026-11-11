@@ -28,8 +28,11 @@ def test_the_grant_maximum_the_ceiling_left_and_margin_are_hard_caps():
     assert a.notional == D("120.00") and a.binding == "GRANT_MAX"
     a = alloc(open_gross_usd=450)
     assert a.notional == D("50.00") and a.binding == "AGGREGATE_CEILING_LEFT"
-    a = alloc(available_usdt=116)                                           # 116 / 1.16 = 100
+    a = alloc(available_usdt=204)                                           # 204 / 2.04 = 100: the plan commits spot + perp margin at leverage 1 + its 2% buffer per USD (was a 1.16 per-USD typed constant)
     assert a.notional == D("100.00") and a.binding == "MARGIN"
+    a = alloc(available_usdt=136, leverage=3)                               # the same function at leverage 3: (1 + 1/3) x 1.02 = 1.36 per USD
+    assert a.notional == D("100.00") and a.binding == "MARGIN"
+    assert alloc(available_usdt=232).notional < D("200")                    # $232 no longer sizes $200: the plan would demand $408 and refuse (the old allocator and the plan disagreed 1.16x vs 2.04x)
 
 
 def test_a_mechanics_session_is_capped_small():
@@ -387,3 +390,13 @@ def test_a_schema_valid_book_stripped_of_its_stop_state_is_not_a_fresh_book(tmp_
             fh.write(_json.dumps(doc))
         with pytest.raises(C.BookUnreadable):
             b.load()
+
+
+def test_the_allocators_margin_per_usd_is_the_plans_own_capital_for_every_leverage():
+    """One definition: for any notional and leverage the allocator's margin cap and build_plan's cash need are the same economic_model function (no 1.16 constant to drift from it)."""
+    import economic_model as EM
+    assert C.MARGIN_PER_USD == EM.hedged_pair_capital_usd(1, 1).value == D("2.04")
+    for lev in (1, 2, 3, 5):
+        per_usd = EM.hedged_pair_capital_usd(1, lev).value
+        a = alloc(available_usdt=per_usd * 100, leverage=lev)
+        assert a.notional == D("100.00") and a.binding == "MARGIN", lev
