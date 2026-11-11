@@ -406,6 +406,11 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
     try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        S._write_json(os.path.join(d, "decision.json"), drec)          # the decision this session executes: the session's measured execution quality carries its id
+    except OSError:
+        pass                                                           # evidence only: never a reason to refuse or to trade
+    try:
         return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, on_state, on_event), "decision_id": did}
     finally:
         _ACTIVE["dir"] = None
@@ -512,7 +517,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     known = None if (fees is None or price is None) else price - fees + (fund or D(0))
     book.update_pending(os.path.basename(d), known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT cash read, never from fill arithmetic alone
     summary["allocation"] = alloc.as_dict()
-    for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT")):
+    quality = ES.read_json(os.path.join(d, "execution_quality.json"))               # measured per-leg execution quality (observation only; None when it was not written)
+    for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT"), quality if isinstance(quality, dict) else None):
         emit(evt)
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)

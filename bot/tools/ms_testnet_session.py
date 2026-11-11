@@ -35,6 +35,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import exec_quality as EQ  # noqa: E402
 import ms_accounting as AC  # noqa: E402
 import ms_authority as MA  # noqa: E402
 import ms_execution as EX  # noqa: E402
@@ -58,7 +59,8 @@ MAX_LIFECYCLE_H = 9.0
 DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
 MAX_PLAN_AGE_MIN = 120
 EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 2
-FILES = {"record": "testnet_session.json", "plan": "plan.json", "preflight": "preflight.json", "journal": "engine_journal.jsonl", "kill": "MS_KILL"}
+FILES = {"record": "testnet_session.json", "plan": "plan.json", "preflight": "preflight.json", "journal": "engine_journal.jsonl", "kill": "MS_KILL",
+         "meas": "exec_measurements.json", "quality": "execution_quality.json", "decision": "decision.json"}
 
 
 # ---------------------------------------------------------------------------------------------------- small helpers
@@ -821,6 +823,46 @@ class Run:
             return "LOSS_LIMIT"
         return None
 
+    # ---- MEASURED execution quality (observation only: a fault here is counted and NEVER reaches the trading path)
+    def execution_quality(self, view: Mapping[str, Any], final: bool, flat: Optional[bool]) -> Optional[Dict[str, Any]]:
+        """Write ``exec_measurements.json`` (what this process saw and when, merged with what an earlier process of the same session saw: a restart keeps its timestamps) and
+        ``execution_quality.json`` (the canonical per-leg and group records). The session record itself has a closed schema and is untouched."""
+        g = self.engine.groups.get(self.gid) if self.engine else None
+        if g is None:
+            return None
+        try:
+            prior = _read_json(self.ctx.path("meas"))
+            meas: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in (prior or {}).items() if isinstance(v, dict)} if isinstance(prior, dict) else {}
+            for link, v in self.ex.meas.items():
+                meas.setdefault(link, {}).update({k: x for k, x in v.items() if x is not None})
+            _write_json(self.ctx.path("meas"), meas)
+            dec = _read_json(self.ctx.path("decision"))
+            decision_id = dec.get("decision_id") if isinstance(dec, dict) else None
+            legs: List[Dict[str, Any]] = []
+            for l in sorted(g.legs.values(), key=lambda x: x.link):
+                vo = view["orders"].get(l.link)
+                if vo is None and final:
+                    try:
+                        row = self.ex.lookup(l.plan.category, l.plan.symbol, l.link)       # a signed READ of one (possibly closed) order: its terminal status and venue timestamps
+                    except TE.ExecutorError:
+                        row = None
+                    if row is not None:
+                        vo = {"order_id": row.get("orderId"), "status": row.get("orderStatus"), "filled_qty": row.get("cumExecQty"), "avg_price": row.get("avgPrice"),
+                              "created_ms": TE._ms(row.get("createdTime")), "updated_ms": TE._ms(row.get("updatedTime"))}
+                order = None if vo is None else {"order_id": vo.get("order_id"), "status": vo.get("status"), "cum_qty": vo.get("filled_qty"), "avg_price": vo.get("avg_price"),
+                                                "created_ms": vo.get("created_ms"), "updated_ms": vo.get("updated_ms")}
+                m = meas.get(l.link, {})
+                legs.append(EQ.leg_quality(link_id=l.link, group_id=self.gid, leg_id=l.plan.leg_id, kind=l.kind, candidate_id=self.group_plan.candidate_id, decision_id=decision_id,
+                                           plan=asdict(l.plan), ref=m.get("reference"), timing={k: m.get(k) for k in ("sent_ms", "acked_ms", "cancel_sent_ms", "cancel_acked_ms", "cancel_result")},
+                                           order=order, fills=[x for x in view["executions"] if x["link_id"] == l.link]))
+            doc = EQ.session_quality(legs, style=self.group_plan.style, notional_usd=self.group_plan.notional_usd, flat_verified=flat, decision_id=decision_id)
+            _write_json(self.ctx.path("quality"), doc)
+            return doc
+        except Exception as exc:                                       # noqa: BLE001 - measurement must never touch trading; the fault is counted and visible
+            self.quality_errors = getattr(self, "quality_errors", 0) + 1
+            self.ctx.out(f"execution quality not written ({type(exc).__name__}); trading is unaffected")
+            return None
+
     def snapshot_record(self, rec: Dict[str, Any], final: bool = False) -> Dict[str, Any]:
         view = self.ex.venue_state()
         rec["orders"] = _orders_for_record(view["orders"], self.gid)
@@ -839,6 +881,9 @@ class Run:
             self.reconcile_step(int(self.ctx.clock()))
             cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
             rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
+            self.execution_quality(view, True, bool(flat))
+        elif rec["orders"] or rec["executions"]:
+            self.execution_quality(view, False, None)
         return view
 
 

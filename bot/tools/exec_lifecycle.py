@@ -165,6 +165,48 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
     return rec
 
 
-def session_events(rec: Mapping[str, Any], result: str) -> List[Event]:
-    """Everything the venue and the ledger said about a finished session, in lifecycle order."""
-    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), session_reconciled(rec, result)]
+def execution_quality(doc: Optional[Mapping[str, Any]]) -> List[Event]:
+    """MEASURED per-leg and per-group execution quality (``exec_quality``) as evidence: kind COST (an existing kind: no migration), stage ``EXECUTION_QUALITY_LEG`` / ``..._GROUP``. Every number is
+    the venue's own record or arithmetic over it; a field the venue did not give is the string ``UNKNOWN`` / null and is named in ``unknown``. Venue ids are shortened to 16-hex references;
+    the same session re-emitted is the same ids and the same bytes (a duplicate, never a second record)."""
+    if not isinstance(doc, Mapping):
+        return []
+    out: List[Event] = []
+    for l in list(doc.get("legs") or [])[:12]:
+        if not isinstance(l, Mapping):
+            continue
+        c, t, f, r, cx = l.get("cost") or {}, l.get("timing") or {}, l.get("fills") or {}, l.get("reference"), l.get("cancel")
+        out.append(("COST", "EXECUTION_QUALITY_LEG", {
+            "source": "VENUE", "leg": str(l.get("leg_id"))[:12], "role": l.get("kind"), "link_ref": ref16(l.get("link_id")), "decision_id": l.get("decision_id"), "candidate_id": l.get("candidate_id"),
+            "category": (l.get("instrument") or {}).get("category"), "symbol": (l.get("instrument") or {}).get("symbol"), "side": l.get("side"), "intent": l.get("intent"),
+            "order_type": l.get("order_type"), "time_in_force": l.get("time_in_force"), "planned_qty": num(l.get("planned_qty"), 6), "planned_price": num(l.get("planned_price"), 2),
+            "reference": None if not isinstance(r, Mapping) else {"bid": num(r.get("bid"), 4), "ask": num(r.get("ask"), 4), "mid": num(r.get("mid"), 4), "at_ms": r.get("ts_ms"),
+                                                               "origin": r.get("source"), "age_ms": r.get("age_ms_at_send")},
+            "sent_ms": t.get("sent_ms"), "acked_ms": t.get("acked_ms"), "ack_latency_ms": t.get("ack_latency_ms"), "venue_created_ms": t.get("venue_created_ms"),
+            "first_fill_ms": t.get("first_fill_ms"), "last_fill_ms": t.get("last_fill_ms"), "order_to_first_fill_ms": t.get("order_to_first_fill_ms"),
+            "order_status": (l.get("order") or {}).get("status"), "order_ref": ref16((l.get("order") or {}).get("venue_order_ref")),
+            "fill_count": f.get("count"), "fill_refs": [ref16(i) for i in list(f.get("ids") or [])[:8]], "fill_qty": num(f.get("qty"), 6), "fill_vwap": num(f.get("vwap"), 4),
+            "fill_ratio": num(f.get("fill_ratio"), 4), "duplicate_events_collapsed": f.get("duplicate_events_collapsed"), "liquidity": l.get("liquidity"),
+            "fee_usd": num(c.get("fee_usd"), 6), "fee_bps": num((l.get("fee") or {}).get("bps_of_notional"), 4), "fee_rate_origin": (l.get("fee") or {}).get("rate_provenance"),
+            "price_vs_mid_usd": num(c.get("price_vs_mid_usd"), 6), "walk_vs_touch_usd": num(c.get("walk_vs_touch_usd"), 6), "half_spread_usd": num(c.get("half_spread_usd"), 6),
+            "slippage_vs_mid_bps": num(c.get("slippage_vs_mid_bps"), 4), "slippage_vs_touch_bps": num(c.get("slippage_vs_touch_bps"), 4), "cost_total_usd": num(c.get("total_usd"), 6),
+            "cost_total_bps": num(c.get("total_bps"), 4), "sign_convention": "positive = cost to us relative to the reference",
+            "cancel": None if not isinstance(cx, Mapping) else {k: cx.get(k) for k in ("sent_ms", "acked_ms", "result", "latency_ms", "fills_after_request", "fills_within_clock_tolerance")},
+            "unknown": [str(u)[:30] for u in list(l.get("unknown") or [])[:12]]}))
+    g = doc.get("group")
+    if isinstance(g, Mapping):
+        out.append(("COST", "EXECUTION_QUALITY_GROUP", {
+            "source": "VENUE", "decision_id": g.get("decision_id"), "style": g.get("style"), "planned_notional_usd": num(g.get("planned_notional_usd"), 2),
+            "pair_notional_usd": num(g.get("position_notional_usd"), 4), "legs": g.get("legs"), "entry_legs_planned": g.get("entry_legs_planned"), "entry_legs_filled": g.get("entry_legs_filled"),
+            "exit_legs": g.get("exit_legs"), "all_entry_legs_filled": g.get("all_entry_legs_filled"), "unhedged_window_ms": g.get("unhedged_window_ms"),
+            "unwind_first_fill_ms": g.get("unwind_first_fill_ms"), "unwind_last_fill_ms": g.get("unwind_last_fill_ms"),
+            "residual_qty": {str(k)[:24]: num(v, 6) for k, v in dict(g.get("residual_qty_by_instrument") or {}).items()}, "venue_flat_verified": g.get("venue_flat_verified"),
+            "attempt_completed": g.get("attempt_completed"), "cost_total_usd": num(g.get("total_execution_cost_usd"), 6),
+            "cost_total_bps_of_pair": num(g.get("total_execution_cost_bps_of_position_notional"), 4), "cost_complete": g.get("cost_complete"),
+            "unknown": [str(u)[:30] for u in list(g.get("unknown") or [])[:12]]}))
+    return out
+
+
+def session_events(rec: Mapping[str, Any], result: str, quality: Optional[Mapping[str, Any]] = None) -> List[Event]:
+    """Everything the venue and the ledger said about a finished session, in lifecycle order (``quality`` = the session's measured execution quality, when it was written)."""
+    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), *execution_quality(quality), session_reconciled(rec, result)]
