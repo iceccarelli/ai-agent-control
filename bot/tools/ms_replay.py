@@ -128,11 +128,18 @@ class LocalLedger:
         self.unknown_funding = 0
         self._ids: set = set()
         self._cat: Dict[str, str] = {}
+        self._by_id: Dict[str, Tuple[Any, ...]] = {}
+        self._funding_keys: Dict[Tuple[str, int], float] = {}
+        self.conflicts: List[str] = []                             # integrity conflicts: a duplicate id whose CONTENT differs (the first record stays booked; the result is INCOMPLETE)
 
     def record_fill(self, f: T.Fill, category: str = "linear") -> None:
+        content = (f.symbol, f.side, f.qty, f.price, f.fee_usd, category)
         if f.fill_id in self._ids:
+            if self._by_id.get(f.fill_id) != content:
+                self.conflicts.append(f"DUPLICATE_FILL_CONFLICT:{f.fill_id}")
             return
         self._ids.add(f.fill_id)
+        self._by_id[f.fill_id] = content
         self.fills.append(f)
         self._cat[f.fill_id] = category
 
@@ -140,6 +147,12 @@ class LocalLedger:
         if amount_usd is None:                                     # unknown amount: counted, never summed as zero
             self.unknown_funding += 1
             return
+        key = (symbol, int(ts_ms))
+        if key in self._funding_keys:                              # idempotent by (symbol, settlement time), like the canonical ledger: the same print twice is ONE print
+            if self._funding_keys[key] != amount_usd:
+                self.conflicts.append(f"FUNDING_CONFLICT:{symbol}:{int(ts_ms)}")
+            return
+        self._funding_keys[key] = amount_usd
         self.funding_events.append((symbol, ts_ms, amount_usd, prov))
 
     def record_slippage(self, usd: float, kind: str, symbol: Optional[str] = None) -> None:
@@ -203,11 +216,16 @@ class LocalLedger:
         price_leg = price_actual + self.taker_slip
         slippage = self.taker_slip + self.adverse
         flat = all(abs(q) < 1e-9 for q in pos.values())
+        flags = (["MID_FALLBACK"] if mid_fallback else []) + [f"MARK_MISSING:{k}" for k in sorted(missing_marks)] + sorted(set(self.conflicts))
+        fee_flags = (["ZERO_FEE_UNVERIFIED"] if zero_fee_unverified else []) + (["FEE_REBATE_UNVERIFIED"] if rebate_unverified else [])
+        # COMPLETE means nothing in the figure is a guess: no position valued without a price, no unmeasured zero fee or unmeasured rebate, no funding amount that was never known, no conflicting
+        # duplicate record. MID_FALLBACK alone is a valuation convention (an open leg marked at mid when no book was seen), which the canonical ledger also allows. An incomplete result keeps its
+        # partial figure as ``net_subtotal``; ``net`` is meaningful only with ``net_complete`` (the same rule as ms_accounting.canonical_net and the pipeline's adapter).
+        complete = not (missing_marks or fee_flags or self.unknown_funding or self.conflicts)
+        net = price_leg + funding - fees - slippage
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": slippage, "adverse_selection": self.adverse, "taker_slippage": self.taker_slip,
-                "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": price_leg + funding - fees - slippage,
-                "unknown_funding_events": self.unknown_funding, "valuation": "MID_FALLBACK" if mid_fallback else "EXIT_SIDE",
-                "flags": (["MID_FALLBACK"] if mid_fallback else []) + [f"MARK_MISSING:{k}" for k in sorted(missing_marks)],
-                "fee_flags": (["ZERO_FEE_UNVERIFIED"] if zero_fee_unverified else []) + (["FEE_REBATE_UNVERIFIED"] if rebate_unverified else [])}
+                "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": net, "net_subtotal": net, "net_complete": complete,
+                "unknown_funding_events": self.unknown_funding, "valuation": "MID_FALLBACK" if mid_fallback else "EXIT_SIDE", "flags": flags, "fee_flags": fee_flags}
 
 
 # ------------------------------------------------------------------ the world: point-in-time lookups over the series
@@ -998,6 +1016,7 @@ def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int]
     for i, r in enumerate(results):
         assert_net_identity(r.pnl, f"window {i}: ")
     valuation = "MID_FALLBACK" if any(r.pnl.get("valuation") == "MID_FALLBACK" or any(g.mid_fallback for g in r.groups.values()) for r in results) else "EXIT_SIDE"
+    net_complete = all(bool(r.pnl.get("net_complete", True)) for r in results)          # every window's ledger said its result is whole; one incomplete window makes the total a SUBTOTAL
     tot = {"price_leg": 0.0, "funding": 0.0, "fees": 0.0, "slippage": 0.0, "adverse_selection": 0.0, "taker_slippage": 0.0, "net": 0.0}
     for r in results:
         for k in tot:
@@ -1060,7 +1079,8 @@ def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int]
     rep = {
         "schema": "ms_replay_report/1", "variant_id": cfg0.variant_id, "spec_digest": cfg0.spec_digest, "mode": "REPLAY_SIMULATED_TRANSPORT",
         "window": {"start_ms": min(r.cfg.start_ms for r in results), "end_ms": max(r.cfg.end_ms for r in results), "step_ms": cfg0.step_ms, "n_windows": len(results)},
-        "pnl": {"gross_usd": tot["price_leg"] + tot["funding"], "net_usd": tot["net"], "fees_usd": tot["fees"], "funding_usd": tot["funding"], "price_leg_usd": tot["price_leg"],
+        "pnl": {"gross_usd": tot["price_leg"] + tot["funding"], "net_usd": tot["net"] if net_complete else None, "net_subtotal_usd": tot["net"], "net_complete": net_complete,
+                "fees_usd": tot["fees"], "funding_usd": tot["funding"], "price_leg_usd": tot["price_leg"],
                 "valuation": valuation, "unknown_input_flags": sorted({f for r in results for f in (list(r.pnl.get("flags") or []) + list(r.pnl.get("fee_flags") or [])) if f != "MID_FALLBACK"}),
                 "slippage_usd": tot["slippage"], "taker_slippage_usd": tot["taker_slippage"], "adverse_selection_usd": tot["adverse_selection"],
                 "note": "ONE net definition: net = gross - fees - slippage with gross = price leg AT MID + funding; slippage = taker walk + adverse selection, each charged exactly once. The "
@@ -1143,6 +1163,8 @@ def default_score(res: ReplayResult) -> float:
     for _, eq in res.equity_curve:
         peak = max(peak, eq)
         dd = max(dd, peak - eq)
+    if not res.pnl.get("net_complete", True):                 # an incomplete run (an unmeasured fee, an unknown funding amount, a position with no price ...) has no net to rank by: never selected on a subtotal
+        return float("-inf")
     return res.pnl["net"] / (1.0 + dd)
 
 

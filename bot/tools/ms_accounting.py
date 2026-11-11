@@ -550,8 +550,11 @@ class Ledger:
         net = None if gross is None or p["fees"] is None else gross - p["fees"] - taker - adverse
         if strict_exit and missing_exit:
             net = None
-        out = {"net": net, "price_leg": price_leg, "funding": p["funding"], "fees": p["fees"], "taker_slippage": taker, "adverse_selection": adverse, "exit_adjustment": adj,
-               "valuation": "MID_FALLBACK" if missing_exit else "EXIT_SIDE", "net_complete": net is not None, "flags": list(dict.fromkeys(flags)), "ledger_net": p["net"]}
+        integrity = sorted({f for f in flags if f.startswith(INTEGRITY_FLAG_PREFIXES)})
+        # A conflicting duplicate fill / funding row / mark / leg identity means one of the records is WRONG. The first record stays booked (the figure does not change: duplicates never move the net), but
+        # the result is NOT complete: ``net`` is meaningful only with ``net_complete`` (the same rule for every ledger behind this contract).
+        out = {"net": net, "net_subtotal": net, "price_leg": price_leg, "funding": p["funding"], "fees": p["fees"], "taker_slippage": taker, "adverse_selection": adverse, "exit_adjustment": adj,
+               "valuation": "MID_FALLBACK" if missing_exit else "EXIT_SIDE", "net_complete": net is not None and not integrity, "flags": list(dict.fromkeys(flags)), "ledger_net": p["net"]}
         return _to_float(out)
 
     # ------------------------------------------------------------ account

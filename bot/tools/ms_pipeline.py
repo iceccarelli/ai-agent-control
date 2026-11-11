@@ -335,10 +335,11 @@ class LedgerAdapter:
         if canon["net"] is not None:                                              # a COMPLETE ledger: THE net is ms_accounting's canonical_net (one definition; reconcile compares against it)
             price_leg, funding, fees, adj, net = canon["price_leg"], canon["funding"], canon["fees"], canon["exit_adjustment"], canon["net"]
             mid_fb = canon["valuation"] == "MID_FALLBACK"
+        complete = p["net"] is not None and canon["net_complete"]                 # an unknown component OR an integrity conflict (a duplicate fill whose content differs ...) is INCOMPLETE
         unreal = p["unrealised_price"]
         unreal = None if unreal is None else unreal + adj                         # the value of closing what is open NOW (exit side of the book, less the taker exit fee)
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": taker + adverse, "adverse_selection": adverse, "taker_slippage": taker,
-                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_complete": p["net"] is not None, "flags": list(p["flags"]) + (["MID_FALLBACK"] if mid_fb else []), "valuation": "MID_FALLBACK" if mid_fb else "EXIT_SIDE", "status": p["status"],
+                "realised": net - (unreal or 0.0), "unrealised": unreal, "unrealised_price": p["unrealised_price"], "exit_adjustment": adj, "net": net, "net_subtotal": net, "net_complete": complete, "flags": list(p["flags"]) + [f for f in canon["flags"] if f not in p["flags"] and f.startswith(MACC.INTEGRITY_FLAG_PREFIXES)] + (["MID_FALLBACK"] if mid_fb else []), "valuation": "MID_FALLBACK" if mid_fb else "EXIT_SIDE", "status": p["status"],
                 "prov": p["prov"], "ledger": p}
 
 
@@ -1120,7 +1121,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
                              "exits_refused_stale_quote": int(res.stats.get("transport", {}).get("exits_refused_stale_quote", 0)),
                              "taker_entries_refused_stale_quote": int(res.stats.get("transport", {}).get("refused", {}).get("STALE_QUOTE", 0))},
                "trials_total": trials_total, "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
-               "ledger": {"net": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
+               "ledger": {"net": pnl["net"] if pnl["net_complete"] else None, "net_subtotal": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
                "reconcile": {"ever_disagreed": rec_doc["ever_disagreed"], "halt_new_exposure": rec_doc["halt_new_exposure"], "n_steps_checked": rec_doc["n_steps_checked"],
                              "codes": sorted({h["code"] for h in rec_doc["history"]})},
                "journal_head": res.journal_head, "promotion_eligible": False, "report": report,

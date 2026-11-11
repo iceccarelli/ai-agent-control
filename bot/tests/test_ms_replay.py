@@ -579,3 +579,27 @@ def test_the_report_carries_the_unknown_input_flags_so_a_consumer_cannot_miss_th
     r.pnl["flags"] = list(r.pnl.get("flags") or []) + ["MARK_MISSING:XUSDT"]
     r.pnl["fee_flags"] = ["ZERO_FEE_UNVERIFIED"]
     assert RP.build_report([r])["pnl"]["unknown_input_flags"] == ["MARK_MISSING:XUSDT", "ZERO_FEE_UNVERIFIED"]
+
+
+# ---------------------------------------------------------------- an incomplete net is a SUBTOTAL: never published as THE net, never ranked
+def test_a_complete_run_publishes_its_net_and_says_so():
+    r = go()
+    rep = RP.build_report([r])
+    assert rep["pnl"]["net_complete"] is True and rep["pnl"]["net_usd"] == rep["pnl"]["net_subtotal_usd"] and rep["pnl"]["net_usd"] is not None
+
+
+def test_default_score_never_ranks_an_incomplete_run(monkeypatch):
+    import types
+    monkeypatch.setattr(RP, "observations", lambda r: [object()])
+    c = types.SimpleNamespace(equity0=1000.0)
+    inc = types.SimpleNamespace(cfg=c, equity_curve=[(1, 1010.0)], pnl={"net": 50.0, "net_complete": False})
+    ok = types.SimpleNamespace(cfg=c, equity_curve=[(1, 1010.0)], pnl={"net": 50.0, "net_complete": True})
+    assert RP.default_score(inc) == float("-inf") and RP.default_score(ok) == pytest.approx(50.0)
+
+
+def test_the_report_withholds_the_net_of_an_incomplete_window_and_keeps_its_subtotal():
+    r = go()
+    inc = replace(r, pnl={**r.pnl, "net_complete": False, "fee_flags": ["ZERO_FEE_UNVERIFIED"]})
+    rep = RP.build_report([inc])
+    assert rep["pnl"]["net_complete"] is False and rep["pnl"]["net_usd"] is None and rep["pnl"]["net_subtotal_usd"] == pytest.approx(r.pnl["net"])
+    assert "ZERO_FEE_UNVERIFIED" in rep["pnl"]["unknown_input_flags"]
