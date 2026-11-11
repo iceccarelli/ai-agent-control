@@ -378,3 +378,49 @@ def test_a_partial_or_malformed_environment_statement_is_invalid_and_stays_unkno
 def test_the_environment_names_are_not_credential_shaped():
     for name in (EG.ENV_CASH_APR, EG.ENV_CASH_SOURCE, EG.ENV_CASH_STATED_UTC):
         assert not any(w in name.upper() for w in ("KEY", "SECRET", "TOKEN", "PASSWORD", "ACK")), name
+
+
+# ---------------------------------------------------------------- fee provenance: an account fee-rate READ is the VENUE's statement, an assumed published tier is never passed off as it, and a failed read says why
+def test_an_account_fee_rate_read_is_labelled_venue_stated_not_measured():
+    """The fee tier read from /v5/account/fee-rate is what the venue STATES about the account; 'measured' is reserved for what our own fills show (specialist review F9). Both are observations."""
+    v = EG.evaluate_edge(inputs("0.0100"))
+    res_inputs = EG.EM.evaluate_chain  # noqa: F841 - the chain itself is built inside evaluate_edge; the label is read from the model's own accounting of the fee component
+    scn_tier = EG.EM.FeeTier(maker=D("0.0002"), taker=D("0.00055"), source="venue_stated", observed_ms=NOW)
+    assert scn_tier.source == "venue_stated" and v.assumed_inputs == ()
+    assert inputs("0.0100").summary()["perp_fee_origin"] == "ACCOUNT_READ" and inputs("0.0100", measured=False).summary()["perp_fee_origin"] == "ASSUMED_PUBLISHED_VIP0"
+
+
+def test_the_fee_provenance_of_the_verdict_is_venue_stated_for_a_read_tier(monkeypatch):
+    seen = {}
+    real = EG.EM.evaluate_chain
+
+    def spy(scn):
+        seen["tiers"] = [(l.name, l.fee_tier.source) for l in scn.legs]
+        return real(scn)
+    monkeypatch.setattr(EG.EM, "evaluate_chain", spy)
+    EG.evaluate_edge(inputs("0.0100"))
+    assert seen["tiers"] == [("spot", "venue_stated"), ("perp", "venue_stated")]
+    EG.evaluate_edge(inputs("0.0100", measured=False))
+    assert seen["tiers"] == [("spot", "assumed"), ("perp", "assumed")]
+
+
+def test_an_assumed_tier_says_whether_it_was_never_read_or_the_read_failed_and_why(w):
+    w.fake.fee_rates = None                                                              # the key may not read its own fee rate
+    inp = EG.collect(_ex(w), "BTCUSDT", D("375"), 720, D("0.0100"), w.clock.now() + 600_000, w.clock.now(), cash_alternative=STATED)
+    assert inp.fee_read_error and inp.fee_read_error.split(":")[0].endswith("Error"), inp.fee_read_error
+    v = EG.evaluate_edge(inp)
+    assert v.session_class == EG.INCONCLUSIVE and any(r.startswith("FEE_TIER_ASSUMED:") and inp.fee_read_error in r for r in v.reasons), v.reasons
+    assert inp.summary()["fee_read_error"] == inp.fee_read_error
+    never = EG.evaluate_edge(inputs("0.0100", measured=False))
+    assert any(r == "FEE_TIER_ASSUMED:NOT_READ" for r in never.reasons)
+
+
+def test_a_read_tier_has_no_fee_read_error_and_no_assumed_reason(w):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    inp = EG.collect(_ex(w), "BTCUSDT", D("375"), 720, D("0.0100"), w.clock.now() + 600_000, w.clock.now(), cash_alternative=STATED)
+    assert inp.fee_read_error is None and not any(r.startswith("FEE_TIER_ASSUMED") for r in EG.evaluate_edge(inp).reasons)
+
+
+def test_a_fee_read_error_is_bound_into_the_input_digest():
+    a, b = inputs("0.0100", measured=False), inputs("0.0100", measured=False, fee_read_error="PermanentAPIError:retCode=10005")
+    assert a.digest() != b.digest()

@@ -118,6 +118,7 @@ class EdgeInputs:
     spot_fee: Optional[Tuple[D, D]] = None
     fee_observed_ms: Optional[int] = None
     cash_alternative: Optional[CashAlternative] = None   # the owner's STATED alternative return on capital; None = UNSTATED, so the cost of capital is UNKNOWN (never zero)
+    fee_read_error: Optional[str] = None                 # why the account fee-rate read did not give a usable tier (a closed-form class, never error text); None = it did, or it was not tried
 
     def digest(self) -> str:
         """A digest of EVERYTHING the verdict was computed from: the instrument rows, both books (every level), the funding observation, the horizon, the size and the fee tiers (with whether
@@ -128,7 +129,8 @@ class EdgeInputs:
                 "hold_s": int(self.hold_s), "leverage": int(self.leverage), "perp_row": self.perp_row, "spot_row": self.spot_row, "perp_book": book(self.perp_book), "spot_book": book(self.spot_book),
                 "perp_fee": None if self.perp_fee is None else [str(x) for x in self.perp_fee], "spot_fee": None if self.spot_fee is None else [str(x) for x in self.spot_fee],
                 "fee_observed_ms": self.fee_observed_ms,
-                "cash_alternative": None if self.cash_alternative is None else (dataclasses.asdict(self.cash_alternative) if isinstance(self.cash_alternative, CashAlternative) else {"invalid": type(self.cash_alternative).__name__})}
+                "cash_alternative": None if self.cash_alternative is None else (dataclasses.asdict(self.cash_alternative) if isinstance(self.cash_alternative, CashAlternative) else {"invalid": type(self.cash_alternative).__name__}),
+                "fee_read_error": self.fee_read_error}
         return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
 
 
@@ -152,7 +154,7 @@ def _inputs_summary(self: "EdgeInputs") -> Dict[str, Any]:
     """The market observation behind a verdict, readable without the full digest: both books' touch, spread, depth near the mid and age, the funding observation and the fee tiers' origin."""
     out: Dict[str, Any] = {"observed_ms": int(self.now_ms), "funding_rate_bps": str((self.funding_rate * D(10000)).quantize(D("0.0001"))), "next_funding_ms": int(self.next_funding_ms),
                            "hold_s": int(self.hold_s), "leverage": int(self.leverage), "perp_fee_origin": "ACCOUNT_READ" if self.perp_fee is not None else "ASSUMED_PUBLISHED_VIP0",
-                           "spot_fee_origin": "ACCOUNT_READ" if self.spot_fee is not None else "ASSUMED_PUBLISHED_VIP0", "fee_observed_ms": self.fee_observed_ms}
+                           "spot_fee_origin": "ACCOUNT_READ" if self.spot_fee is not None else "ASSUMED_PUBLISHED_VIP0", "fee_observed_ms": self.fee_observed_ms, "fee_read_error": self.fee_read_error}
     cash, state, _why = _cash_status(self)
     out.update({"cost_of_capital_state": state, "cash_alternative_apr": None if cash is None else _q(cash.apr), "cash_alternative_source": None if cash is None else cash.source,
                 "cash_alternative_stated_ms": None if cash is None else cash.stated_ms, "cash_alternative_provenance": None if cash is None else cash.provenance})
@@ -242,8 +244,8 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
         return _verdict(INCONCLUSIVE, ["INPUT_NOT_POSITIVE"], None, None, None, {}, (), n_settle, inp, capital=cap0)
 
     def tier(read: Optional[Tuple[D, D]], category: str) -> EM.FeeTier:
-        if read is not None and inp.fee_observed_ms is not None:
-            return EM.FeeTier(maker=read[0], taker=read[1], source="measured", observed_ms=inp.fee_observed_ms)
+        if read is not None and inp.fee_observed_ms is not None:        # what the venue STATES about THIS account (/v5/account/fee-rate); 'measured' is reserved for what our own fills show
+            return EM.FeeTier(maker=read[0], taker=read[1], source="venue_stated", observed_ms=inp.fee_observed_ms)
         return EM.FeeTier(maker=PUBLISHED_VIP0_MAKER[category], taker=PUBLISHED_VIP0_TAKER[category], source="assumed")
 
     spot_tier, perp_tier = tier(inp.spot_fee, "spot"), tier(inp.perp_fee, "linear")
@@ -281,6 +283,8 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
     if res.unknown_inputs:
         reasons.append("UNKNOWN_INPUTS:" + ",".join(res.unknown_inputs))
     reasons += cash_reasons
+    if spot_tier.source == "assumed" or perp_tier.source == "assumed":
+        reasons.append("FEE_TIER_ASSUMED:" + (inp.fee_read_error or "NOT_READ"))        # the published VIP 0 tier is a stand-in, never the account's: say whether it was never read or the read failed, and how
     if cash_state == "STATED" and cash is not None and cash.apr == 0:
         reasons.append("COST_OF_CAPITAL_ZERO_BY_OWNER_STATEMENT")                # capital priced as free BY DECISION: said out loud, never silent
     # the funding (bps per settlement) at which the expected net equals the hurdle: all known costs + the hurdle, spread over the settlements and the haircut
@@ -374,14 +378,19 @@ def collect(ex: Any, symbol: str, notional_usd: D, hold_s: int, funding_rate: D,
     spot_book = book_from_venue(ex._get("/v5/market/orderbook", {"category": "spot", "symbol": symbol, "limit": 50}, signed=False))
     perp_fee = spot_fee = None
     observed = None
+    fee_error: Optional[str] = None
     try:
         pf = ex._get("/v5/account/fee-rate", {"category": "linear", "symbol": symbol}, signed=True)["list"]
         sf = ex._get("/v5/account/fee-rate", {"category": "spot", "symbol": symbol}, signed=True)["list"]
         perp_fee, spot_fee = fee_from_venue(pf, symbol), fee_from_venue(sf, symbol)
         observed = now_ms if (perp_fee and spot_fee) else None
-    except Exception:                                                           # noqa: BLE001 - any refusal/permission/transport problem: the fee tier stays ASSUMED
+        if observed is None:
+            fee_error = "FEE_ROW_MISSING_OR_MALFORMED"
+    except Exception as exc:                                                    # noqa: BLE001 - any refusal/permission/transport problem: the fee tier stays ASSUMED, and says why
         perp_fee = spot_fee = None
         observed = None
+        rc = getattr(exc, "ret_code", None)
+        fee_error = (type(exc).__name__ + (f":retCode={int(rc)}" if isinstance(rc, int) and not isinstance(rc, bool) else ""))[:60]       # a class and a code, never the error text
     # the verdict's "now" is the clock AFTER the last read (a caller's earlier reading can only be older than the books it is about to price), and never earlier than the newest book within the bound
     now = max(int(now_ms), int(clock())) if clock is not None else int(now_ms)
     newest = max(int(perp_book.ts_ms), int(spot_book.ts_ms))
@@ -389,4 +398,4 @@ def collect(ex: Any, symbol: str, notional_usd: D, hold_s: int, funding_rate: D,
         now = newest
     if observed is not None:
         observed = now
-    return EdgeInputs(symbol, notional_usd, now, funding_rate, next_funding_ms, hold_s, perp_row, spot_row, perp_book, spot_book, leverage, perp_fee, spot_fee, observed, cash_alternative)
+    return EdgeInputs(symbol, notional_usd, now, funding_rate, next_funding_ms, hold_s, perp_row, spot_row, perp_book, spot_book, leverage, perp_fee, spot_fee, observed, cash_alternative, fee_error)
