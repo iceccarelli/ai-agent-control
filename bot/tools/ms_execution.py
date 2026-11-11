@@ -36,6 +36,7 @@ from ms_types import GroupState as G  # noqa: E402
 GENESIS = "00" * 32
 EPS = Decimal("1e-9")
 LIVE, SENT, UNKNOWN, FILLED, CANCELLED, REJECTED, NEW = "LIVE", "SENT", "UNKNOWN", "FILLED", "CANCELLED", "REJECTED", "NEW"
+FEE_IN_BASE_MAX_FRACTION = Decimal("0.002")      # twice the highest spot taker fee on the published schedule (0.1%): a gross-vs-net remainder at most this large is a fee taken in the base coin, not a partial fill
 _OPEN_LEG = (LIVE, SENT, UNKNOWN)
 
 
@@ -71,16 +72,54 @@ class FileStore:
         self.path = path
 
     def append(self, line: str) -> None:
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        prefix = ""
+        if size:                                                  # a complete last line that lost only its newline must not have the next entry glued onto it (that would read as ONE torn line)
+            with open(self.path, "rb") as rb:
+                rb.seek(-1, os.SEEK_END)
+                prefix = "" if rb.read(1) == b"\n" else "\n"
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(prefix + line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            try:
+                os.truncate(self.path, size)                      # a failed append (out of disk, I/O error) leaves NO partial line behind: the process may live on and append again
+            except OSError:
+                pass
+            raise
 
     def read(self) -> List[str]:
         if not os.path.exists(self.path):
             return []
         with open(self.path, encoding="utf-8") as fh:
             return [l.rstrip("\n") for l in fh if l.strip()]
+
+    def drop_torn_tail(self) -> str:
+        """Set the LAST line aside (a torn append: killed or out of disk mid-write) so the next append starts on a clean line. The text is kept in ``<journal>.torn`` BEFORE the journal is replaced; the
+        replacement is a temp file + fsync + rename + directory fsync, so a crash here leaves either the old or the new journal, never a mixture."""
+        lines = self.read()
+        dropped = lines[-1]
+        with open(self.path + ".torn", "a", encoding="utf-8") as fh:
+            fh.write(dropped + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp = self.path + ".repair"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("".join(l + "\n" for l in lines[:-1]))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+        try:
+            fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        return dropped
 
 
 def verify_chain(lines: Sequence[str]) -> Tuple[bool, str]:
@@ -106,6 +145,13 @@ class Journal:
         self.store = store
         lines = store.read()
         ok, why = verify_chain(lines)
+        if not ok and lines and why == f"UNPARSEABLE_AT_{len(lines) - 1}" and verify_chain(lines[:-1])[0] and hasattr(store, "drop_torn_tail"):
+            # ONLY an unparseable LAST line over a chain that verifies: a torn append. The journal is write-ahead (the line is durable, THEN the action is taken), so a line that never finished was never
+            # acted on and setting it aside is safe; without this an owner's emergency `reconcile --unwind` could not even open the journal. A complete line with a wrong hash or sequence is tampering
+            # and, like any damaged earlier line, stays refused.
+            store.drop_torn_tail()
+            lines = lines[:-1]
+            ok, why = verify_chain(lines)
         if not ok:
             raise ValueError(f"journal refused: {why}")
         self.entries: List[Dict[str, Any]] = [json.loads(l) for l in lines]
@@ -344,6 +390,9 @@ class ExecutionEngine:
                 l.recon_fees += fee
             elif l.recon_qty > 0:                                      # a real execution for quantity a recon fill already booked: REPLACE that part, never add to it
                 a = min(q, l.recon_qty)
+                if l.recon_qty - a <= l.recon_qty * FEE_IN_BASE_MAX_FRACTION:
+                    a = l.recon_qty                                    # the execution covers the adopted quantity but for a fee-sized remainder: a spot BUY's fee is taken from the coin received, so the order row's
+                                                                       # cumulative quantity is GROSS and the execution NET; that remainder was never held, keeping it is phantom inventory the exit cannot sell
                 share = a / l.recon_qty
                 dc, df = l.recon_cost * share, l.recon_fees * share
                 l.recon_qty -= a
@@ -709,6 +758,12 @@ class ExecutionEngine:
             n = self._net(l)
             px = l.avg_px if l.filled > 0 else Decimal(0)
             out.append((l, n, n * px))
+        if g.first_intent_ms is not None:
+            # A PLAN leg that was never SENT has no LegRuntime: the first create's ack was lost (or refused), ``submit_group`` stopped before it, and reconcile later filled the first leg alone. Without an
+            # entry for the missing leg a group holding ONE filled leg reads as 'all legs filled' = HEDGED for the whole hold. It counts as an empty leg, so the pair reads UNHEDGED and is unwound.
+            for lp in g.plan.legs:
+                if lp.leg_id not in g.legs:
+                    out.append((LegRuntime(lp, "ENTRY", None, f"{g.plan.group_id}-{lp.leg_id}", status=CANCELLED), Decimal(0), Decimal(0)))
         return out
 
     def _step_of(self, l: LegRuntime) -> Optional[Decimal]:

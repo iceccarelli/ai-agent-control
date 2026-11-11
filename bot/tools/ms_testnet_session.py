@@ -937,7 +937,11 @@ class Run:
             self.reconcile_step(int(self.ctx.clock()))
             cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
             rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
-            self.execution_quality(view, True, bool(flat))
+            doc = self.execution_quality(view, True, bool(flat))
+            if doc and "fills_incomplete" in (doc.get("group") or {}).get("unknown", []):
+                # An order the VENUE says filled has no (or too few) execution rows: the ledger, which is fed only from executions, then holds a LOWER BOUND of the fees and the price leg, not a measurement. Publishing
+                # it would turn "the list never came back" into a measured zero (the capital book's `known` is None whenever either is None, so such a session can debit a loss but never credit a gain).
+                rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None}
         elif rec["orders"] or rec["executions"]:
             self.execution_quality(view, False, None)
         return view
@@ -1029,6 +1033,8 @@ def _gate_execute(ctx: Ctx) -> Tuple[List[str], Optional[Dict[str, Any]], Option
             why.append("PLAN_IS_FOR_ANOTHER_MANIFEST")
         if ctx.clock() - int(plan.get("created_ms", 0)) > MAX_PLAN_AGE_MIN * 60_000:
             why.append("PLAN_TOO_OLD")
+    if unattended and ctx.pre_order_check is None:                      # ONLY the autopilot loop supplies this hook, and the loop is what enforces the halts (ALERT, STOP, PAUSED, the capital book) and the single-writer lease
+        why.append("UNATTENDED_ONLY_VALID_UNDER_THE_AUTOPILOT_LOOP: a grant replaces the typed digest, it does not replace the halts and the lease the loop enforces; run the loop, or use the typed `execute`")
     if unattended:                                                      # the owner's standing, bounded, expiring authorisation replaces the typed digest: nothing else is relaxed
         import ms_testnet_autopilot as AP
         if manifest is not None and isinstance(plan, dict) and not plan_refusals(plan):

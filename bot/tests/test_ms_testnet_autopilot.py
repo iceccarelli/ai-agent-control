@@ -60,10 +60,29 @@ def test_no_grant_means_no_unattended_execute_and_the_typed_path_is_untouched(w)
 def test_a_valid_grant_replaces_the_typed_digest_and_records_who_authorised_it(w):
     d = w.ready("BTCUSDT", 400.0)
     write_grant(w)
-    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="") == 0, w.text()
+    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: None) == 0, w.text()      # as the loop invokes it (it alone supplies the hook)
     assert w.record()["flat_verified"] is True and w.record()["confirmation"]["state"] == "CONFIRMED"
     prov = json.load(open(os.path.join(w.state_dir, "autopilot.json")))
     assert prov["mode"] == "UNATTENDED_STANDING_AUTHORISATION" and prov["plan_digest"] == d and prov["grant_reference"] == "owner test 2026-11-10"
+
+
+def test_unattended_execution_is_only_valid_under_the_autopilot_loop(w):
+    """The loop is the only caller that enforces the halts (ALERT, STOP, PAUSED, the capital book) and the single-writer lease, through the pre-order hook it alone can supply. `execute --unattended`
+    from a shell has no such hook, so a valid grant must not make it an order path that ignores every halt (specialist E, F1: reproduced with ALERT+STOP+PAUSED set and a 4-loss halt: 4 orders)."""
+    d = w.ready("BTCUSDT", 400.0)
+    write_grant(w)
+    text = refused_without_network(w, "execute", "--confirm-plan-digest", d, "--unattended")
+    assert "UNATTENDED_ONLY_VALID_UNDER_THE_AUTOPILOT_LOOP" in text
+    assert w.record().get("confirmation", {}).get("state") != "CONFIRMED" and not os.path.exists(os.path.join(w.state_dir, "autopilot.json"))
+    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: None) == 0, w.text()          # the loop's invocation (it passes its hook) is admitted
+
+
+def test_a_hook_that_refuses_the_entry_places_no_order_even_with_a_valid_grant(w):
+    d = w.ready("BTCUSDT", 400.0)
+    write_grant(w)
+    w.fake.requests.clear()
+    w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: "ENGINE_HALTED:TEST")
+    assert not [r for r in w.fake.requests if r[0] == "POST" and r[1] == "/v5/order/create"], "an entry order was sent although the pre-order hook refused it"
 
 
 def test_unattended_still_needs_the_plans_own_digest(w):
@@ -112,7 +131,7 @@ def test_the_plan_must_fit_the_grants_bounds(w):
 def test_the_grants_sessions_per_day_and_the_manifest_cap_both_hold(w):
     write_grant(w, max_sessions_per_day=1)
     d = w.ready("BTCUSDT", 400.0)
-    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="") == 0
+    assert w.run("execute", "--confirm-plan-digest", d, "--unattended", typed="", pre_order_check=lambda: None) == 0
     w.state_dir = os.path.join(os.path.dirname(w.state_dir), "state2")
     d = w.ready("BTCUSDT", 400.0)
     assert "GRANT_SESSIONS_PER_DAY_REACHED" in refused_without_network(w, "execute", "--confirm-plan-digest", d, "--unattended")

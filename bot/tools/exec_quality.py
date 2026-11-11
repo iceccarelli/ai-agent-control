@@ -58,6 +58,11 @@ def _i(x: Any) -> Optional[int]:
 REFERENCE_MAX_AGE_MS = {"ENTRY": 5_000, "EXIT": 60_000}
 
 
+#: A spot BUY's fee is taken from the coin it receives: the order row's cumulative quantity is GROSS and the execution NET, so a gap this small on a SPOT leg is the fee, not a missing fill. The same
+#: constant ``ms_execution`` uses to drop the matching phantom remainder (tests/test_exec_quality.py pins that they are one number).
+FEE_IN_BASE_MAX_FRACTION = D("0.002")
+
+
 def normalise_fill(x: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """One venue execution as the canonical dict, or None when it has no id / quantity / price (a row we cannot use is dropped, never guessed). ``liquidity`` is MAKER / TAKER only when the venue
     said so, else None. ``fee`` is the SIGNED venue fee in USD (None when absent)."""
@@ -123,8 +128,17 @@ def leg_quality(*, link_id: str, group_id: str, leg_id: str, kind: str, candidat
         walk = sgn * (vwap - touch) * filled
         slip_touch_bps = sgn * (vwap - touch) / touch * BPS
         half = (ask - bid) / 2 * filled
+    # The ORDER row says how much the venue filled; the executions are what this record prices. When the order row claims more than the executions show (a lagging or dropped execution list) the fee and the
+    # price cost of the missing part are UNKNOWN: "no executions seen" is not "no fee". A venue-confirmed nothing (cum_qty 0, or no order row at all) is still a real zero.
+    cum = _d(order.get("cum_qty"))
+    incomplete = False
+    if cum is not None and cum > 0:
+        tolerance = cum * FEE_IN_BASE_MAX_FRACTION if (str(plan.get("category")) == "spot" and filled > 0) else D(0)
+        incomplete = cum - filled > tolerance
+    if incomplete:
+        unknown.append("fills_incomplete")
     fee_known = bool(fl) and all(f["fee"] is not None for f in fl)
-    fee = sum((f["fee"] for f in fl), D(0)) if fee_known else (D(0) if not fl else None)
+    fee = None if incomplete else (sum((f["fee"] for f in fl), D(0)) if fee_known else (D(0) if not fl else None))
     if fl and not fee_known:
         unknown.append("fee")
     fee_bps = (fee / notional * BPS) if (fee is not None and notional > 0) else None
@@ -176,7 +190,7 @@ def leg_quality(*, link_id: str, group_id: str, leg_id: str, kind: str, candidat
                   "overfilled": bool(over), "ids": [f["fill_id"] for f in fl]},
         "liquidity": liq, "cancel": cancel,
         "fee": {"usd_signed": _s(fee), "bps_of_notional": _s(fee_bps, 4), "currencies": sorted({f["fee_ccy"] for f in fl}),
-                "rate_provenance": ("VENUE_EXECUTION_ROW" if fl and all(f["fee_rate"] is not None for f in fl) else UNKNOWN if fl else "NO_FILL")},
+                "rate_provenance": (UNKNOWN if incomplete else "VENUE_EXECUTION_ROW" if fl and all(f["fee_rate"] is not None for f in fl) else UNKNOWN if fl else "NO_FILL")},
         "cost": {"price_vs_mid_usd": _s(cost_mid), "walk_vs_touch_usd": _s(walk), "half_spread_usd": _s(half), "fee_usd": _s(fee), "total_usd": _s(total),
                  "slippage_vs_mid_bps": _s(slip_mid_bps, 4), "slippage_vs_touch_bps": _s(slip_touch_bps, 4), "total_bps": _s(total_bps, 4),
                  "convention": "positive = cost to us relative to the reference; fee is separate from the fill price"},
@@ -190,7 +204,7 @@ def group_quality(legs: Sequence[Mapping[str, Any]], *, style: Optional[str], no
     that failed its hedge and was unwound still carries its (real) cost, so a policy that fills cheaply but unwinds often is not flattered."""
     entries = [l for l in legs if l.get("kind") == "ENTRY"]
     exits = [l for l in legs if l.get("kind") == "EXIT"]
-    totals = [_d(l["cost"]["total_usd"]) for l in legs if l["fills"]["count"] > 0]
+    totals = [_d(l["cost"]["total_usd"]) for l in legs if l["fills"]["count"] > 0 or "fills_incomplete" in l.get("unknown", [])]      # a leg the venue says filled but whose executions are missing is UNKNOWN, not absent
     complete = all(t is not None for t in totals)
     total = sum((t for t in totals if t is not None), D(0)) if complete else None
     notional_sum = sum((_d(l["fills"]["notional"]) or D(0) for l in entries), D(0))
@@ -292,6 +306,7 @@ def feedback_row(*, session: str, at_ms: int, decision_id: Optional[str], qualit
     realised = (booked / notional * BPS) if (booked is not None and notional is not None and notional > 0) else None
     return {"schema": "exec_quality.feedback.v1", "at_ms": int(at_ms), "session": str(session)[:80], "decision_id": decision_id, "style": g.get("style") or UNKNOWN,
             "flat_verified": flat_verified is True, "attempt_completed": bool(g.get("attempt_completed")), "cost_complete": bool(g.get("cost_complete")),
+            "all_entry_legs_filled": g.get("all_entry_legs_filled"),
             "position_notional_usd": g.get("position_notional_usd"), "total_execution_cost_usd": g.get("total_execution_cost_usd"),
             "total_execution_cost_bps_of_position_notional": g.get("total_execution_cost_bps_of_position_notional"), "unhedged_window_ms": g.get("unhedged_window_ms"),
             "modelled_cost_bps": _s(modelled, 4), "expected_funding_bps": _s(_d((edge or {}).get("expected_funding_bps")), 4), "funding_booked_usd": _s(booked, 6),
@@ -301,7 +316,8 @@ def feedback_row(*, session: str, at_ms: int, decision_id: Optional[str], qualit
 def feedback_report(rows: Sequence[Mapping[str, Any]], *, min_orders: int = MIN_COMPARABLE_ORDERS) -> Dict[str, Any]:
     """What the log of sessions says: the policy comparison (never a winner below the sample minimum), how far the cost model is from measurement (positive surprise = the model was too
     optimistic about cost) and how realised funding compares with the expectation. Counts every row it uses; says INSUFFICIENT_SAMPLE instead of an average from a handful."""
-    done = [r for r in rows if r.get("attempt_completed") and r.get("cost_complete") and r.get("total_execution_cost_bps_of_position_notional") is not None and r.get("modelled_cost_bps") is not None]
+    done = [r for r in rows if r.get("attempt_completed") and r.get("cost_complete") and r.get("all_entry_legs_filled") is True        # the model prices a FULL hedged pair: a one-legged attempt incurred about half that cost
+            and r.get("total_execution_cost_bps_of_position_notional") is not None and r.get("modelled_cost_bps") is not None]
     sur = [_d(r["total_execution_cost_bps_of_position_notional"]) - _d(r["modelled_cost_bps"]) for r in done]
     fund = [r for r in rows if r.get("realised_funding_bps") is not None and r.get("expected_funding_bps") is not None]
     fs = [_d(r["realised_funding_bps"]) - _d(r["expected_funding_bps"]) for r in fund]

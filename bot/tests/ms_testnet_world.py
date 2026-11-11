@@ -61,11 +61,11 @@ class World:
             json.dump({"schema": AD.CAPABILITY_SCHEMA, "manifest": m, "manifest_plan_sha256": m["plan_sha256"]}, fh)
         os.chmod(self.cap_path, 0o600)
 
-    def run(self, *argv: str, env: Optional[Dict[str, str]] = None, inner: Any = "fake", typed: Optional[str] = None) -> int:
+    def run(self, *argv: str, env: Optional[Dict[str, str]] = None, inner: Any = "fake", typed: Optional[str] = None, pre_order_check: Any = None) -> int:
         self.out = []
         answers = list(self.typed) if typed is None else [typed]
         return S.main(["--state-dir", self.state_dir, *argv], env=self.env if env is None else env, inner_transport=self.fake if inner == "fake" else inner,
-                      clock_ms=self.clock.now, sleep=self.clock.sleep, input_fn=lambda _p: answers.pop(0) if answers else "", out=self.out.append)
+                      clock_ms=self.clock.now, sleep=self.clock.sleep, input_fn=lambda _p: answers.pop(0) if answers else "", out=self.out.append, pre_order_check=pre_order_check)
 
     def text(self) -> str:
         return "\n".join(self.out)
