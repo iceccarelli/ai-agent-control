@@ -46,6 +46,7 @@ WHAT THIS IS NOT
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import datetime as dt
 import gzip
@@ -55,6 +56,7 @@ import os
 import random
 import statistics
 import sys
+import zlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -534,6 +536,119 @@ def all_forced(rows: Sequence[Settle], hold: int, *, cost_bps: float,
                                               dt.timezone.utc).hour
         out.append(t)
     return out
+
+
+# ---------------------------------------------------------------- the cost of the capital tied up (the verdict's missing line)
+#: Capital tied up per USD of hedged notional: the spot leg paid in full (or its owned equivalent) + ~15% perp margin + a 1% buffer. This is ms_capital.MARGIN_PER_USD; a test pins the two equal
+#: (this module is pure research arithmetic and does not import the capital book).
+CAPITAL_PER_NOTIONAL = 1.16
+#: the long hold the verdict quotes (51 prints = 17 days at 8h)
+HOLD_LONG_PRINTS = 51
+#: What the cash series IS: a lender's floor on the cost of money on another venue. It is NOT the owner's own opportunity cost, which is unknown; it is the like-for-like USD-risk alternative.
+CASH_BENCHMARK_LABEL = "OKX_USDT_LENDING_1H_LENDER_FLOOR_NOT_OWNER_OPPORTUNITY_COST"
+_HOUR_MS = 3_600_000
+_DAY_MS = 86_400_000
+COVERAGE_MIN = 0.95
+#: more than this share of a hold's entries without a cash rate and the cost of capital is UNKNOWN for that hold: the entries that remain are a selection, not the whole history
+MAX_CASH_UNKNOWN_SHARE = 0.02
+
+
+class CashCurve:
+    """Point-in-time annual cash rate (a fraction: 0.035 = 3.5%/yr) from an hourly series. ``mean_apr`` answers for an interval or says None when the series does not cover it:
+    an unknown cost of capital is NEVER zero, the entry is excluded and counted by the caller."""
+
+    def __init__(self, points: Sequence[Tuple[int, float]]):
+        pts = sorted((int(t), float(v)) for t, v in points if v is not None and math.isfinite(float(v)))
+        self.ts = [t for t, _ in pts]
+        self._cum = [0.0]
+        for _, v in pts:
+            self._cum.append(self._cum[-1] + v)
+
+    def __bool__(self) -> bool:
+        return bool(self.ts)
+
+    def first_ms(self) -> Optional[int]:
+        return self.ts[0] if self.ts else None
+
+    def last_ms(self) -> Optional[int]:
+        return self.ts[-1] if self.ts else None
+
+    def mean_apr(self, start_ms: int, end_ms: int) -> Optional[float]:
+        if not self.ts or end_ms < start_ms or start_ms < self.ts[0] or end_ms > self.ts[-1] + _HOUR_MS:
+            return None
+        lo, hi = bisect.bisect_left(self.ts, start_ms), bisect.bisect_right(self.ts, end_ms)
+        n = hi - lo
+        # a hole in the series must not be filled with a neighbour's rate: require ~the number of hourly samples the interval spans (a hole of up to 5% of the hold is averaged over; more is UNKNOWN)
+        if n < 1 or n < COVERAGE_MIN * ((end_ms - start_ms) / _HOUR_MS):
+            return None
+        return (self._cum[hi] - self._cum[lo]) / n
+
+
+def load_cash_curve(repo: str) -> CashCurve:
+    """The repo's own cash series (OKX USDT lending, hourly). Empty when the file is absent or unreadable: every capital-cost figure is then UNKNOWN, never zero."""
+    path = os.path.join(repo, OKX_LENDING)
+    if not os.path.exists(path):
+        return CashCurve([])
+    pts: List[Tuple[int, float]] = []
+    try:
+        for r in _rows(path):
+            try:
+                ts = int(r["ts"]) if r.get("ts") else _parse_utc(r["utc"])
+                pts.append((ts, float(r["rate_annual"])))
+            except (KeyError, ValueError, TypeError):
+                continue
+    except (OSError, ValueError, csv.Error, EOFError, zlib.error):     # a truncated or corrupt archive is "unreadable", not a crash: every capital-cost figure is then UNKNOWN
+        return CashCurve([])
+    return CashCurve(pts)
+
+
+def on_capital(entries: Sequence[Dict[str, Any]], curve: CashCurve, *, capital_factor: float = CAPITAL_PER_NOTIONAL) -> Tuple[List[Dict[str, Any]], int]:
+    """Re-express forced-hold entries (net bps of NOTIONAL, zero capital cost) as the return on the capital tied up, net of what that capital earns as cash over the same hold.
+
+    ``excess_over_cash_bps_of_capital`` = net_bps / capital_factor - mean_cash_apr * hold_days / 365 * 1e4. Entries the cash series cannot cover are dropped and COUNTED (second value): they are
+    unknown, not free. Pure; the inputs' own fields are kept."""
+    out: List[Dict[str, Any]] = []
+    unknown = 0
+    f = float(capital_factor)
+    if not (f > 0 and math.isfinite(f)):
+        raise ValueError("capital_factor must be positive and finite")
+    for e in entries:
+        apr = curve.mean_apr(e["ms"], e["exit_ms"])
+        if apr is None:
+            unknown += 1
+            continue
+        days = (e["exit_ms"] - e["ms"]) / _DAY_MS
+        cash = apr * days / 365.0 * 1e4
+        net_cap = e["net_bps"] / f
+        out.append({**e, "cash_apr": apr, "cash_bps_of_capital": cash, "net_bps_on_capital": net_cap, "excess_over_cash_bps_of_capital": net_cap - cash})
+    return out, unknown
+
+
+def excess_summary(entries: Sequence[Dict[str, Any]], unknown: int, *, hold: int) -> Dict[str, Any]:
+    """The summary the verdict reads: nominal (zero capital cost, notional), on capital, cash, and the EXCESS over cash, with a moving-block interval and the entry-year split."""
+    ex = [e["excess_over_cash_bps_of_capital"] for e in entries]
+    total = len(entries) + int(unknown)
+    share = (int(unknown) / total) if total else 1.0
+    if not entries or share > MAX_CASH_UNKNOWN_SHARE:                 # too little of the history has a cash rate: what remains is a selection, so the capital cost is UNKNOWN for this hold, never a number
+        return {"n": len(entries), "n_cash_unknown": int(unknown), "hold_days": hold / PRINTS_PER_DAY, "cash_coverage_ok": False, "cash_unknown_share": share,
+                "mean_nominal_net_bps_of_notional": None, "mean_net_bps_on_capital": None, "mean_cash_bps_of_capital": None, "mean_excess_over_cash_bps_of_capital": None,
+                "share_positive": None, "excess_block_ci90": None, "by_entry_year_mean_excess_bps": {}, "annualised_excess_pct_of_capital": None,
+                "annualised_note": "UNKNOWN: the cash series does not cover enough of the history"}
+    s = summarise(ex)
+    by_year: Dict[str, List[float]] = {}
+    for e in entries:
+        by_year.setdefault(str(_year(e["ms"])), []).append(e["excess_over_cash_bps_of_capital"])
+    days = hold / PRINTS_PER_DAY
+    mean = s.get("mean")
+    return {"n": s.get("n", 0), "n_cash_unknown": unknown, "hold_days": days, "cash_coverage_ok": True, "cash_unknown_share": share,
+            "mean_nominal_net_bps_of_notional": statistics.fmean(e["net_bps"] for e in entries) if entries else None,
+            "mean_net_bps_on_capital": statistics.fmean(e["net_bps_on_capital"] for e in entries) if entries else None,
+            "mean_cash_bps_of_capital": statistics.fmean(e["cash_bps_of_capital"] for e in entries) if entries else None,
+            "mean_excess_over_cash_bps_of_capital": mean, "share_positive": s.get("share_positive"),
+            "excess_block_ci90": block_bootstrap_mean(ex, block=max(2 * hold, 2)) if len(ex) >= 4 * max(hold, 1) else None,
+            "by_entry_year_mean_excess_bps": {y: statistics.fmean(v) for y, v in sorted(by_year.items())},
+            "annualised_excess_pct_of_capital": None if mean is None else mean / days * 365.0 / 100.0,
+            "annualised_note": "EXTRAPOLATION of the mean per-entry excess to a year; overlapping in-sample entries, not a forecast"}
 
 
 def gated_sequence(rows: Sequence[Settle], hold: int, *, rt_gate_bps: float,

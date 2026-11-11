@@ -85,7 +85,8 @@ def test_btc_carry_numbers_come_from_the_committed_corpus_and_say_so(report):
     short = [m for m in e["unconditional_forced_hold"] if m["hold_prints"] <= 3 and m["scenario"] == "TAKER_FEES_ONLY"]
     assert all(m["summary"]["mean"] < 0 for m in short)
     r = rowof(report, "btcusdt_funding_carry_overlay")
-    assert r["readiness_verdict"] == "INSUFFICIENT_DATA" and r["edge_vs_costs"]["policies"]["single_print_harvest"] == "REJECTED"
+    assert r["readiness_verdict"] == "REJECTED" and r["edge_vs_costs"]["policies"]["single_print_harvest"] == "REJECTED"     # every policy loses after costs or to cash on the capital it ties up
+    assert r["edge_vs_costs"]["policies"]["long_hold_vs_cash"] == "REJECTED" and any("EXCESS over cash" in x for x in r["readiness_reasons"])
     assert any("out-of-sample" in x for x in r["readiness_reasons"])
 
 

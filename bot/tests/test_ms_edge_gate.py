@@ -135,3 +135,56 @@ def test_a_settlement_that_already_happened_or_is_exactly_now_is_not_inside_the_
         v = EG.evaluate_edge(inputs("0.0100", next_funding_ms=nxt))
         assert v.session_class == EG.REJECTED and v.reasons == ("NO_SETTLEMENT_INSIDE_THE_HOLD",), nxt
     assert EG.evaluate_edge(inputs("0.0100", next_funding_ms=NOW + 720_000)).settlements_in_hold == 1       # exactly at the end of the hold: inside
+
+
+# ---------------------------------------------------------------- the verdict's "now" must not precede the data it prices (a real clock sampled BEFORE the reads made every book look like it came from the future)
+def _stale_perp_spot(v):
+    return [r for r in v.reasons if "STALE_BOOK" in r]
+
+
+def test_a_book_stamped_slightly_ahead_of_the_callers_earlier_clock_reading_is_not_stale(w):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    earlier = w.clock.now() - 500                                                              # the caller read its clock 500 ms before the venue read: the books are stamped AFTER it
+    inp = EG.collect(_ex(w), "BTCUSDT", D("375"), 720, D("0.0100"), w.clock.now() + 600_000, earlier)
+    assert inp.now_ms >= max(inp.perp_book.ts_ms, inp.spot_book.ts_ms) and inp.fee_observed_ms == inp.now_ms
+    v = EG.evaluate_edge(inp)
+    assert not _stale_perp_spot(v) and v.session_class != EG.INCONCLUSIVE, v.reasons
+
+
+def test_a_clock_callable_supplies_the_reading_after_the_last_read(w):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    stale_arg = w.clock.now() - 100
+    inp = EG.collect(_ex(w), "BTCUSDT", D("375"), 720, D("0.0100"), w.clock.now() + 600_000, stale_arg, clock=w.clock.now)
+    assert inp.now_ms == w.clock.now() and not _stale_perp_spot(EG.evaluate_edge(inp))
+
+
+def test_a_book_from_beyond_the_skew_bound_is_still_refused(w):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    far_earlier = w.clock.now() - (EG.FUTURE_BOOK_TOLERANCE_MS + 3000)                          # a clock this far from the venue is not trusted
+    inp = EG.collect(_ex(w), "BTCUSDT", D("375"), 720, D("0.0100"), w.clock.now() + 600_000, far_earlier)
+    assert inp.now_ms == far_earlier
+    v = EG.evaluate_edge(inp)
+    assert _stale_perp_spot(v) and v.session_class == EG.INCONCLUSIVE
+
+
+def test_an_old_book_is_still_stale(w):
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    inp = EG.collect(_ex(w), "BTCUSDT", D("375"), 720, D("0.0100"), w.clock.now() + 600_000, w.clock.now() + EG.MAX_BOOK_AGE_MS + 60_000)
+    v = EG.evaluate_edge(inp)
+    assert _stale_perp_spot(v) and v.session_class == EG.INCONCLUSIVE
+
+
+# ---------------------------------------------------------------- what the EXECUTOR's own gate asks of the funding, against the BTC history (the policy research evaluates is not the policy the executor runs)
+def test_no_settlement_in_the_committed_btc_history_would_open_the_executors_profit_gate():
+    """The autopilot prices ONE settlement held at most ~1 h with the account's taker tier on BOTH legs, so it needs ~53 bps of funding in a single print. The committed Bybit BTC corpus (4,500
+    settlements, 2022-2026) has a maximum print of ~11.3 bps: PROFIT_SEEKING sessions are unreachable on BTC, and the +20 bps research figure belongs to a 17-day hold the executor never runs. This is
+    a tripwire: if a legitimate change to the gate makes it pass, MONEY_MISSION.md's statement must be revisited, not this test silently edited."""
+    import opportunity_map as OM
+    base = EG.evaluate_edge(inputs("0.0001"))
+    assert base.required_funding_bps is not None
+    required = float(D(str(base.required_funding_bps)))
+    rows = OM.load_bybit(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    best = max(r.rate_bps for r in rows)
+    assert len(rows) > 4000 and best < 12.0                                    # the corpus facts the claim rests on
+    assert 40.0 < required < 70.0, required                                    # ~31 bps taker fees both legs + impact + basis + hurdle, scaled by the funding haircut
+    assert sum(1 for r in rows if r.rate_bps >= required) == 0

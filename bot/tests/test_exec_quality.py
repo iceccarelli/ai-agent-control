@@ -354,3 +354,27 @@ def test_a_planned_entry_leg_the_engine_never_sent_is_in_the_record_and_the_grou
     assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
     g = _quality(w)["group"]
     assert g["entry_legs_planned"] == 2 and g["entry_legs_filled"] == 1 and g["all_entry_legs_filled"] is False and g["attempt_completed"] is True
+
+
+# ------------------------------------------------------------------ a stale reference is not the market the order met
+def test_a_stale_reference_quote_makes_the_cost_unknown_never_a_number():
+    old = {**REF, "age_ms_at_send": 3_600_000}                                   # the quote is an hour old
+    r = leg("Buy", [fill(1, "1", "100.20", "0.05")], ref=old, qty="1")
+    assert "reference_stale" in r["unknown"] and r["cost"]["price_vs_mid_usd"] is None and r["cost"]["total_usd"] is None
+    assert r["fills"]["vwap"] == "100.20000000"                                  # what DID happen is still recorded
+    fresh = leg("Buy", [fill(1, "1", "100.20", "0.05")], ref={**REF, "age_ms_at_send": 4_999}, qty="1")
+    assert "reference_stale" not in fresh["unknown"] and D(fresh["cost"]["total_usd"]) > 0
+    over = leg("Buy", [fill(1, "1", "100.20", "0.05")], ref={**REF, "age_ms_at_send": 5_001}, qty="1")
+    assert "reference_stale" in over["unknown"]                                  # the entry bound is 5 s
+    ex = leg("Sell", [fill(1, "1", "100.10")], ref={**REF, "age_ms_at_send": 30_000}, qty="1", kind="EXIT", reduce=True)
+    assert "reference_stale" not in ex["unknown"]                                # an exit may follow a hold: 60 s
+    ex2 = leg("Sell", [fill(1, "1", "100.10")], ref={**REF, "age_ms_at_send": 61_000}, qty="1", kind="EXIT", reduce=True)
+    assert "reference_stale" in ex2["unknown"]
+
+
+def test_a_blank_venue_fee_is_unknown_not_a_measured_zero():
+    row = {**fill(1, "1", "100.20"), "fee_usd": 0.0, "fee_signed_usd": None, "fee_known": False}      # what the executor now emits for a Trade row with no execFee
+    r = leg("Buy", [row], qty="1")
+    assert "fee" in r["unknown"] and r["cost"]["total_usd"] is None and r["fee"]["usd_signed"] is None
+    zero = leg("Buy", [{**fill(2, "1", "100.20"), "fee_usd": 0.0, "fee_signed_usd": 0.0, "fee_known": True}], qty="1")
+    assert "fee" not in zero["unknown"] and D(zero["cost"]["fee_usd"]) == 0            # a fee the venue STATED as zero is still a measured zero

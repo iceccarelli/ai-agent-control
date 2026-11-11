@@ -127,6 +127,7 @@ def test_the_unwind_engages_the_holders_kill_switch_waits_and_then_verifies_flat
     rc = w.run("reconcile", "--unwind", "--confirm-plan-digest", d)
     assert rc == 0, w.text()
     assert os.path.exists(os.path.join(holder_dir, "MS_KILL")) and "kill switch was engaged" in w.text() and "the holder has finished" in w.text()
+    assert open(os.path.join(holder_dir, S.FILES["owner_unwind"])).read() == S.OWNER_UNWIND_KILL_REASON      # the autopilot reads this to stop instead of re-arming
     assert w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
     assert not holder.held
 

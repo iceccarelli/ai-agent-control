@@ -46,10 +46,16 @@ def test_committed_corpus_runs_the_btc_row_labelled_in_sample_and_every_candidat
     assert b["label"] == "COMMITTED_CORPUS_IN_SAMPLE" and "COMMITTED_CORPUS_IN_SAMPLE" in b["net_edge"]["basis"]
     pol = {p["policy"]: p for p in b["policies"]}
     assert pol["unconditional_1_print_hold"]["verdict"] == "REJECTED" and pol["unconditional_1_print_hold"]["mean_net_bps"] == pytest.approx(-10.78, abs=0.05)
-    assert pol["unconditional_51_print_hold"]["mean_net_bps"] == pytest.approx(20.2, abs=0.05) and pol["unconditional_51_print_hold"]["verdict"] == "INSUFFICIENT_DATA"
-    assert pol["unconditional_51_print_hold"]["latest_year_mean_net_bps"] < 0                       # the regime that pays is not the current one
+    p51 = pol["unconditional_51_print_hold"]
+    assert p51["mean_net_bps"] == pytest.approx(20.2, abs=0.05)                                      # nominal: bps of NOTIONAL at ZERO capital cost (unchanged, still reported)
+    assert p51["mean_excess_over_cash_bps_of_capital"] == pytest.approx(-5.75, abs=0.05)             # on the 1.16x capital it ties up, against the repo's own cash series
+    assert p51["verdict"] == "REJECTED" and "does not beat the cash alternative" in p51["note"]      # a positive nominal net that loses to cash is not INSUFFICIENT_DATA
+    assert p51["latest_year_mean_net_bps"] < 0                                                       # the regime that pays is not the current one
     assert pol["production_gated_sequence"]["trailing_365d_mean_net_bps"] == pytest.approx(-4.16, abs=0.05)
-    assert b["verdict"] == "INSUFFICIENT_DATA" and b["readiness_level"] == "NONE"
+    assert pol["production_gated_sequence"]["mean_excess_over_cash_bps_of_capital"] < 0 and pol["production_gated_sequence"]["verdict"] == "REJECTED"
+    assert b["verdict"] == "REJECTED" and b["readiness_level"] == "NONE"
+    assert b["net_edge"]["value_bps"] == pytest.approx(-5.75, abs=0.05) and b["nominal_net_bps_zero_capital_cost"] == pytest.approx(20.2, abs=0.05)
+    assert "EXCESS over cash" in b["net_edge"]["basis"] and "ZERO capital cost" in b["net_edge"]["basis"]
     assert any("REJECTED policy" in r for r in b["rejection_reasons"])
 
 
@@ -139,10 +145,27 @@ def _mutant(old, new):
     return mod
 
 
-def test_mutation_a_losing_policy_not_rejected_is_caught(tmp_path):
-    m = _mutant('        rejected = mean is not None and mean < 0', '        rejected = False')
+def test_mutation_a_losing_policy_not_rejected_is_caught(tmp_path, monkeypatch):
+    """With the cash series available the cash rule also rejects every nominally losing policy (a nominal loss is a loss to cash), so the NOMINAL rule is exercised where it still stands alone:
+    when the cash series is unknown."""
+    monkeypatch.setattr(CR.OM, "load_cash_curve", lambda repo: CR.OM.CashCurve([]))
+    m = _mutant('        lost_nominal = mean is not None and mean < 0', '        lost_nominal = False')
     econ = CR.btc_carry_economics()
-    assert not any(p["verdict"] == "REJECTED" for p in m.btc_policies(econ)) and any(p["verdict"] == "REJECTED" for p in CC_.btc_policies(econ))
+    assert econ["on_capital_after_cash"]["status"] == CR.UNKNOWN
+    assert not any(p["verdict"] == "REJECTED" and p["mean_net_bps"] < 0 for p in m.btc_policies(econ)) and any(p["verdict"] == "REJECTED" and p["mean_net_bps"] < 0 for p in CC_.btc_policies(econ))
+
+
+def test_mutation_dropping_the_cash_rejection_is_caught(tmp_path):
+    """A policy positive on notional that loses to cash on the capital it ties up must be REJECTED; the 51-print hold is exactly that case."""
+    econ = CR.btc_carry_economics()
+    real = {p["policy"]: p for p in CC_.btc_policies(econ)}["unconditional_51_print_hold"]
+    assert real["mean_net_bps"] > 0 and real["verdict"] == "REJECTED"
+    for old, new in (('        lost_to_cash = (not lost_nominal) and excess is not None and excess < 0', '        lost_to_cash = False'),
+                     ('        lost_to_cash = (not lost_nominal) and excess is not None and excess < 0', '        lost_to_cash = (not lost_nominal) and excess is not None and excess < -1e9'),
+                     ('    g_cash_lost = (not g_nominal_lost) and g_excess is not None and g_excess < 0', '    g_cash_lost = False')):
+        m = _mutant(old, new)
+        got = {p["policy"]: p for p in m.btc_policies(econ)}
+        assert got["unconditional_51_print_hold"]["verdict"] == "INSUFFICIENT_DATA" or got["production_gated_sequence"]["verdict"] == "INSUFFICIENT_DATA", old + " -> " + new
 
 
 def test_mutation_a_forced_winner_is_caught(tmp_path):
@@ -166,3 +189,39 @@ def test_mutation_inflating_rerun_is_caught(tmp_path):
     _reset()
     assert m.run_competition(ledger_dir=str(tmp_path))["results"] and \
         [r for r in m.run_competition(ledger_dir=str(tmp_path))["results"] if r["name"] == "cash_and_carry"][0]["multiple_testing"]["n_variants_counted"] > len(CR.HOLDS_PRINTS)
+
+
+def test_without_a_cash_series_nothing_is_rejected_for_cash_and_the_gap_is_stated(tmp_path, monkeypatch):
+    """An unknown cost of capital is not zero and is not a rejection: the old nominal reading stays, labelled CASH_UNKNOWN."""
+    _reset()
+    monkeypatch.setattr(CR.OM, "load_cash_curve", lambda repo: CR.OM.CashCurve([]))
+    rep = CC_.run_competition(ledger_dir=str(tmp_path))
+    b = row(rep, "cash_and_carry")
+    p51 = {p["policy"]: p for p in b["policies"]}["unconditional_51_print_hold"]
+    assert p51["verdict"] == "INSUFFICIENT_DATA" and p51["mean_excess_over_cash_bps_of_capital"] is None and "CASH_UNKNOWN" in p51["note"]
+    assert b["verdict"] == "INSUFFICIENT_DATA" and "CASH_UNKNOWN" in b["net_edge"]["basis"] and "nominal_net_bps_zero_capital_cost" not in b
+    econ = CR.btc_carry_economics()
+    assert econ["on_capital_after_cash"]["status"] == CR.UNKNOWN and "CASH_SERIES_UNAVAILABLE" in econ["on_capital_after_cash"]["reason"]
+    assert any("CASH_UNKNOWN" in r for r in CR._carry_verdict(econ)[1])
+
+
+def test_the_readiness_and_competition_verdicts_agree_on_the_btc_carry_candidates(committed):
+    """One rule, two tools: a candidate every policy of which loses after costs or to cash is REJECTED in both; they may never disagree on the same evidence."""
+    rep, _ = committed
+    base = CR.build_report()
+    comp = row(rep, "cash_and_carry")["verdict"]
+    assert comp == "REJECTED"
+    for n in ("cash_and_carry", "btcusdt_funding_carry_overlay"):
+        r = next(x for x in base["candidates"] if x["name"] == n)
+        assert r["readiness_verdict"] == comp, (n, r["readiness_verdict"], r["readiness_reasons"][-3:])
+
+
+def test_a_short_cash_series_does_not_crash_the_verdict_and_is_stated_unknown(monkeypatch):
+    monkeypatch.setattr(CR.OM, "load_cash_curve", lambda repo: CR.OM.CashCurve([(1_659_369_600_000 + k * 3_600_000, 0.04) for k in range(24 * 5)]))      # five days of cash rate
+    econ = CR.btc_carry_economics()
+    assert econ["on_capital_after_cash"]["status"] == "COMPUTED"
+    assert econ["on_capital_after_cash"]["classes"][CR.CAP_OVERLAY]["holds"]["51"]["mean_excess_over_cash_bps_of_capital"] is None
+    verdict, reasons, policies = CR._carry_verdict(econ)                                         # used to raise TypeError formatting None
+    assert verdict == "INSUFFICIENT_DATA" and any("CASH_UNKNOWN" in x for x in reasons) and policies["long_hold_vs_cash"] == CR.UNKNOWN
+    p51 = {p["policy"]: p for p in CC_.btc_policies(econ)}["unconditional_51_print_hold"]
+    assert p51["verdict"] == "INSUFFICIENT_DATA" and "CASH_UNKNOWN" in p51["note"]

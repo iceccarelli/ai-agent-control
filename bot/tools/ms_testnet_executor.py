@@ -497,6 +497,7 @@ class TestnetExecutor:
             if not any(u["exec_id"] == eid for u in self.unattributed):
                 self.unattributed.append(row)
             return
+        fee_blank = r.get("execFee") in (None, "")                       # a Trade row with no fee stated is an UNKNOWN fee, never a measured zero (the ledger and the quality record see it as unknown)
         qty, px, fee = _d(r["execQty"], "execQty"), _d(r["execPrice"], "execPrice"), _d(r.get("execFee") or "0", "execFee")
         side, sym = r["side"], r["symbol"]
         if not link:                                                    # a trade under no client link id: SURFACED, never booked as our fill
@@ -516,7 +517,7 @@ class TestnetExecutor:
             fee_signed = fee
         out.append({"fill_id": eid, "link_id": link, "qty": float(qty), "price": float(px), "fee_usd": float(max(fee, D(0))), "fee_ccy": QUOTE,
                     "liquidity": "MAKER" if r.get("isMaker") in (True, "true") else "TAKER", "ts_ms": int(r["execTime"]), "symbol": sym, "category": cat, "side": side,
-                    "prov": "MEASURED", "fee_signed_usd": float(fee_signed), "fee_rate": r.get("feeRate") if r.get("feeRate") not in (None, "") else None,
+                    "prov": "UNKNOWN" if fee_blank else "MEASURED", "fee_signed_usd": None if fee_blank else float(fee_signed), "fee_known": not fee_blank, "fee_rate": r.get("feeRate") if r.get("feeRate") not in (None, "") else None,
                     "fee_ccy_venue": fee_ccy, "is_maker_reported": r.get("isMaker") is not None})
 
     def funding_history(self, symbol: str, start_ms: int, end_ms: int) -> Optional[List[Dict[str, Any]]]:

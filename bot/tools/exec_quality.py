@@ -54,6 +54,10 @@ def _i(x: Any) -> Optional[int]:
         return None
 
 
+#: the oldest reference quote a cost may be measured against, by order kind (ms). An entry is priced against the quote seen as it left; an exit may follow a hold, so it gets a longer bound.
+REFERENCE_MAX_AGE_MS = {"ENTRY": 5_000, "EXIT": 60_000}
+
+
 def normalise_fill(x: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """One venue execution as the canonical dict, or None when it has no id / quantity / price (a row we cannot use is dropped, never guessed). ``liquidity`` is MAKER / TAKER only when the venue
     said so, else None. ``fee`` is the SIGNED venue fee in USD (None when absent)."""
@@ -61,7 +65,7 @@ def normalise_fill(x: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     qty, px = _d(x.get("qty")), _d(x.get("price"))
     if not fid or qty is None or px is None or qty <= 0 or px <= 0:
         return None
-    fee = _d(x.get("fee_signed_usd")) if x.get("fee_signed_usd") is not None else _d(x.get("fee_usd"))
+    fee = None if x.get("fee_known") is False else (_d(x.get("fee_signed_usd")) if x.get("fee_signed_usd") is not None else _d(x.get("fee_usd")))      # a blank venue fee is UNKNOWN, never zero
     liq = x.get("liquidity")
     return {"fill_id": str(fid), "qty": qty, "price": px, "fee": fee, "fee_ccy": x.get("fee_ccy") or UNKNOWN,
             "fee_rate": _d(x.get("fee_rate")), "liquidity": liq if liq in ("MAKER", "TAKER") else None, "ts_ms": _i(x.get("ts_ms")),
@@ -106,6 +110,10 @@ def leg_quality(*, link_id: str, group_id: str, leg_id: str, kind: str, candidat
     mid = ((bid + ask) / 2) if (bid is not None and ask is not None and bid > 0 and ask >= bid) else None
     if ref is None or mid is None:
         unknown.append("reference_quote")
+    age = _i((ref or {}).get("age_ms_at_send"))
+    if mid is not None and age is not None and age > REFERENCE_MAX_AGE_MS.get(str(kind), REFERENCE_MAX_AGE_MS["ENTRY"]):
+        mid = None                                                      # a quote that old is not the market the order met: the cost against it is UNKNOWN, never a number
+        unknown.append("reference_stale")
     cost_mid = walk = half = None
     slip_mid_bps = slip_touch_bps = None
     if filled > 0 and vwap is not None and sgn is not None and mid is not None:
