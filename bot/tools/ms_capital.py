@@ -284,7 +284,10 @@ class CapitalBook:
                 excess = delta                                          # nothing verifiable explains a gain: it does not size anything
                 status = "UNVERIFIED_GAIN" if delta > tol else "SETTLED"
             else:
-                credited = min(delta, max(known, D(0)))
+                if p.get("funding_was_read") and known < 0:
+                    credited = known                                    # the ledger saw EVERY component (funding included) and the session LOST: an undeclared inflow that lifted the cash does not erase it
+                else:
+                    credited = min(delta, max(known, D(0)))
                 excess = delta - credited
                 if p.get("funding_was_read") and abs(delta - known) > tol:
                     status = "UNEXPLAINED_CASH"

@@ -400,3 +400,36 @@ def test_the_allocators_margin_per_usd_is_the_plans_own_capital_for_every_levera
         per_usd = EM.hedged_pair_capital_usd(1, lev).value
         a = alloc(available_usdt=per_usd * 100, leverage=lev)
         assert a.notional == D("100.00") and a.binding == "MARGIN", lev
+
+
+# ---------------------------------------------------------------- an undeclared inflow must not erase a loss the ledger saw WHOLE
+def test_a_loss_the_ledger_saw_whole_is_debited_even_when_an_undeclared_inflow_lifts_the_cash(tmp_path):
+    """Funding was READ, so the ledger's known net is every component: a loss of 0.40. A +100 USDT top-up that nobody declared lifts the wallet, which used to book NOTHING (credited 0, streak 0): the
+    loss-streak and drawdown stops were evadable by an unannounced faucet transfer. The cash is still UNEXPLAINED (an ALERT upstream); the known loss is booked."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-0.40", True, True)
+    r = b.settle("10100")
+    assert r["status"] == "UNEXPLAINED_CASH" and D(r["credited_usd"]) == D("-0.40")
+    assert D(r["unverified_excess_usd"]) == D("100.40")                                  # the whole unexplained inflow stays visible as excess, never sizes anything
+    assert b.load()["loss_streak"] == 1 and b.basis() == D("9999.60") and b.report()["verified_losses_usd"] == "-0.40"
+
+
+def test_with_funding_unread_a_cash_rise_is_not_read_as_an_inflow_that_hid_a_loss(tmp_path):
+    """Funding NOT read: the ledger's known net lacks the funding income, so a negative known with a rising wallet may simply be funding the book never saw. The book cannot tell the two apart, so it books
+    nothing (the existing, conservative behaviour: no gain credited, no phantom loss) and says UNVERIFIED_EXCESS. Stated limit, not a claim of detection."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-0.40", False, True)
+    r = b.settle("10000.60")
+    assert r["status"] == "UNVERIFIED_EXCESS" and D(r["credited_usd"]) == 0 and b.load()["loss_streak"] == 0
+
+
+def test_a_known_gain_and_a_plain_loss_are_booked_exactly_as_before(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", "1.00", True, True)
+    assert b.settle("10001")["status"] == "SETTLED" and b.basis() == D("10001")
+    b.park("s2", "10001", "-2.00", True, True)
+    r = b.settle("9999")
+    assert D(r["credited_usd"]) == D("-2.00") and b.load()["loss_streak"] == 1
