@@ -10,6 +10,7 @@ removes whole old days without breaking the chain of the rest.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -181,3 +182,74 @@ def test_infinity_is_a_config_error_not_an_overflow():
     import config as C
     with pytest.raises(C.ConfigError):
         C.load({"MARKET_FEED_RETENTION_DAYS": "inf"})
+
+
+# ---------------------------------------------------------------- a STALLED store (volume below the write reserve) must be able to recover at the day boundary
+def test_a_stalled_store_follows_the_wall_clock_by_one_day_and_only_then(tmp_path, monkeypatch):
+    """Not stalled: the cutoff is bounded by the newest segment (the existing guard). Stalled: the day that is now past retention is dropped, which frees space."""
+    store = _three_days(str(tmp_path / "md"))                                         # segments 4, 5, 6 Nov; the log's newest day is the 6th
+    now = BASE + 3 * DAY + 5_000                                                      # the wall clock is already in 7 Nov (the log could not open that segment)
+    monkeypatch.setattr(store, "low_space", lambda: False)
+    assert store.apply_retention(now, 2) == [] and store.segments() == ["md-20261104.db", "md-20261105.db", "md-20261106.db"]
+    monkeypatch.setattr(store, "low_space", lambda: True)
+    assert store.apply_retention(now, 2) == ["md-20261104.db"]                        # 4 Nov is past retention (7 Nov - 2 days = 5 Nov): dropped
+    assert store.segments() == ["md-20261105.db", "md-20261106.db"] and store.verify() == []   # the retained log still verifies from its checkpoint
+    assert store.apply_retention(now, 2) == []                                        # idempotent: nothing inside the window is ever removed
+
+
+def test_a_stalled_store_with_a_clock_stepped_far_ahead_loses_at_most_one_extra_segment(tmp_path, monkeypatch):
+    store = _three_days(str(tmp_path / "md"))
+    monkeypatch.setattr(store, "low_space", lambda: True)
+    removed = store.apply_retention(BASE + 400 * DAY, 1)                              # a clock 400 days ahead while the volume is full
+    assert removed == ["md-20261104.db", "md-20261105.db"]                            # the policy would have removed only the 4th: ONE extra segment, never the log
+    assert store.segments() == ["md-20261106.db"] and store.verify() == []
+    assert store.apply_retention(BASE + 400 * DAY, 1) == []                           # the newest segment is never touched
+
+
+def _simulate_volume(tmp_path, *, label, stalled_aware, vol=5.0, daily=1.5, days=9, retention=2):
+    """The REAL MarketStore on a fake-capacity volume (1 MB == 1 GB). Hourly: write, then the maintenance thread's apply_retention; the emergency prune is default-deny (as deployed)."""
+    import random
+    unit = 1_000_000
+    d = str(tmp_path / label)
+    store = ST.MarketStore(d, commit_every=50, environment="mainnet", min_free_bytes=int(0.537 * unit))
+    other = int(0.05 * unit)
+
+    def used():
+        return sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)) + other
+    store.free_bytes = lambda: max(0, int(vol * unit) - used())
+    if not stalled_aware:
+        store.low_space = lambda: False                                                # the old behaviour: the newest-segment bound always applies
+    rnd = random.Random(1)
+    base = 1_793_750_400_000                                                           # 2026-11-04 00:00 UTC
+    per_row = int(daily * unit / 24 / 20)
+    probe = rnd.randbytes(10_000).hex()
+    ratio = len(ST._compress(probe.encode())) / len(probe)                             # the compressed size of random hex: calibrate the on-disk bytes per row to the target
+    pay_len = max(1, int((per_row - 90) / ratio))
+    written_per_day = {}
+    for h in range(days * 24):
+        now = base + h * 3_600_000
+        for k in range(20):
+            store._free_checked_at = float("-inf")
+            try:
+                store.append(ST.FRAME, wall_ms=now + k * 1000, mono_s=float(h * 100 + k), category="linear", conn_id="l-1", topic="",
+                             payload=rnd.randbytes(pay_len // 2 + 1).hex()[:pay_len])
+                written_per_day[h // 24] = written_per_day.get(h // 24, 0) + 1
+            except ST.StoreError:
+                pass
+        store.flush()
+        if store._conn:
+            store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        store.apply_retention(now + 3_599_000, retention)
+    store.close()
+    return written_per_day
+
+
+def test_a_recorder_on_a_volume_that_fits_the_retention_only_barely_recovers_instead_of_stalling_for_good(tmp_path):
+    """Reproduced with the real store (a 5 GB volume, 1.5 GB/day, retention 2: the documented case): before the fix the recorder wrote nothing from the day it first hit the reserve, for ever; now the
+    day that falls out of retention is dropped at the next day boundary and writes resume."""
+    stuck = _simulate_volume(tmp_path, label="old", stalled_aware=False)
+    assert all(stuck.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), stuck                                 # the permanent stall: nothing written after the reserve was first hit
+    ok = _simulate_volume(tmp_path, label="new", stalled_aware=True)
+    assert all(ok.get(day, 0) > 0 for day in (3, 4, 5, 6, 7, 8)), ok                                      # every later day records something again
+    # an UNDER-SIZED volume (this one is below the 5.6 GB the size model asks for) still loses data near each daily low: the fix turns a permanent stall into gaps, it does not make a small volume big enough
+    assert sum(ok.values()) > sum(stuck.values()) and min(ok[d] for d in (5, 8)) < 480
