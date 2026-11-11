@@ -19,7 +19,7 @@ import json
 import os
 import sys
 from decimal import Decimal as D
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BOT not in sys.path:
@@ -225,7 +225,13 @@ def fee_from_venue(rows: Sequence[Mapping[str, Any]], symbol: str) -> Optional[T
     return None
 
 
-def collect(ex: Any, symbol: str, notional_usd: D, hold_s: int, funding_rate: D, next_funding_ms: int, now_ms: int, leverage: int = 1) -> EdgeInputs:
+#: A book stamped by the venue may be a little AHEAD of the local clock reading that precedes the reads (read latency, host/venue skew; the session tool refuses a host more than 2 s off the venue). The
+#: verdict is then evaluated at the data's own time instead of being refused as a book "from the future" (``STALE_BOOK``), which on a real clock made every verdict INCONCLUSIVE. Beyond the bound the
+#: book stays refused: a clock that far off is not trusted.
+FUTURE_BOOK_TOLERANCE_MS = 2000
+
+
+def collect(ex: Any, symbol: str, notional_usd: D, hold_s: int, funding_rate: D, next_funding_ms: int, now_ms: int, leverage: int = 1, clock: Optional[Callable[[], Any]] = None) -> EdgeInputs:
     """The venue reads behind an EdgeInputs, through a TestnetExecutor-like ``ex`` (``_get`` only: public instruments/books plus ONE signed fee-rate read that may be refused by the
     key's permissions: then the fee tier is ASSUMED and the verdict cannot be a PROFIT_CANDIDATE)."""
     def rows(cat: str) -> Sequence[Mapping[str, Any]]:
@@ -243,4 +249,12 @@ def collect(ex: Any, symbol: str, notional_usd: D, hold_s: int, funding_rate: D,
         observed = now_ms if (perp_fee and spot_fee) else None
     except Exception:                                                           # noqa: BLE001 - any refusal/permission/transport problem: the fee tier stays ASSUMED
         perp_fee = spot_fee = None
-    return EdgeInputs(symbol, notional_usd, now_ms, funding_rate, next_funding_ms, hold_s, perp_row, spot_row, perp_book, spot_book, leverage, perp_fee, spot_fee, observed)
+        observed = None
+    # the verdict's "now" is the clock AFTER the last read (a caller's earlier reading can only be older than the books it is about to price), and never earlier than the newest book within the bound
+    now = max(int(now_ms), int(clock())) if clock is not None else int(now_ms)
+    newest = max(int(perp_book.ts_ms), int(spot_book.ts_ms))
+    if 0 < newest - now <= FUTURE_BOOK_TOLERANCE_MS:
+        now = newest
+    if observed is not None:
+        observed = now
+    return EdgeInputs(symbol, notional_usd, now, funding_rate, next_funding_ms, hold_s, perp_row, spot_row, perp_book, spot_book, leverage, perp_fee, spot_fee, observed)

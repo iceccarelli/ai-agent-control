@@ -348,3 +348,66 @@ class TestTheToolStaysReadOnlyAndOffline:
     def test_a_backwards_window_is_a_usage_error(self):
         with pytest.raises(SystemExit):
             om.main(["--repo", BOT, "--discovery-start", "10", "--discovery-end", "5"])
+
+
+# ---------------------------------------------------------------- the cost of the capital tied up (a verdict that charges no capital is the most favourable denominator there is)
+def _flat_cash(apr, start, hours):
+    return om.CashCurve([(start + k * 3_600_000, apr) for k in range(hours)])
+
+
+def test_capital_per_notional_is_the_capital_books_own_allowance():
+    import ms_capital
+    assert om.CAPITAL_PER_NOTIONAL == float(ms_capital.MARGIN_PER_USD)
+
+
+def test_on_capital_is_hand_computed_and_the_cash_term_is_charged():
+    rows = series([2.0] * 6)                                    # four 2 bps prints inside a 3-print hold, flat price, zero basis
+    ent = om.all_forced(rows, 3, cost_bps=3.0)
+    assert ent[0]["net_bps"] == pytest.approx(3.0)              # 3 prints x 2 bps - 3 bps round trip, bps of NOTIONAL, zero capital cost
+    cur = _flat_cash(0.05, T0 - 3_600_000, 24 * 5)
+    oc, unknown = om.on_capital(ent, cur)                       # factor 1.16
+    assert unknown == 0 and len(oc) == len(ent)
+    cash_bps = 0.05 * 1.0 / 365.0 * 1e4                         # 24h hold at 5%/yr on capital
+    assert oc[0]["cash_bps_of_capital"] == pytest.approx(cash_bps)
+    assert oc[0]["net_bps_on_capital"] == pytest.approx(3.0 / 1.16)
+    assert oc[0]["excess_over_cash_bps_of_capital"] == pytest.approx(3.0 / 1.16 - cash_bps)
+    # mutation guards: the figure moves the right way with each input, so dropping any of the three terms fails here
+    hi, _ = om.on_capital(ent, _flat_cash(0.10, T0 - 3_600_000, 24 * 5))
+    assert hi[0]["excess_over_cash_bps_of_capital"] < oc[0]["excess_over_cash_bps_of_capital"]
+    big, _ = om.on_capital(ent, cur, capital_factor=2.0)
+    assert big[0]["net_bps_on_capital"] < oc[0]["net_bps_on_capital"]
+    free, _ = om.on_capital(ent, _flat_cash(0.0, T0 - 3_600_000, 24 * 5))
+    assert free[0]["excess_over_cash_bps_of_capital"] == pytest.approx(3.0 / 1.16)
+    with pytest.raises(ValueError):
+        om.on_capital(ent, cur, capital_factor=0.0)
+
+
+def test_an_unknown_cost_of_capital_is_dropped_and_counted_never_zero():
+    rows = series([2.0] * 8)
+    ent = om.all_forced(rows, 3, cost_bps=3.0)
+    assert om.on_capital(ent, om.CashCurve([])) == ([], len(ent))                                   # no series at all
+    late = om.CashCurve([(T0 + 40 * 3_600_000, 0.05)])                                              # series starts after every entry
+    assert om.on_capital(ent, late) == ([], len(ent))
+    # a hole in the series is not filled with a neighbour's rate
+    pts = [(T0 - 3_600_000 + k * 3_600_000, 0.05) for k in range(24 * 5)]
+    holed = om.CashCurve([p for p in pts if not (T0 + 2 * 3_600_000 <= p[0] < T0 + 30 * 3_600_000)])
+    assert holed.mean_apr(T0, T0 + 24 * 3_600_000) is None
+    assert om.CashCurve(pts).mean_apr(T0, T0 + 24 * 3_600_000) == pytest.approx(0.05)
+    assert om.CashCurve(pts).mean_apr(T0 + 24 * 3_600_000, T0) is None                              # reversed interval
+
+
+def test_the_committed_btc_carry_on_capital_after_cash_reproduces_the_audit_numbers():
+    rows = om.load_bybit(BOT)
+    cur = om.load_cash_curve(BOT)
+    assert cur and om._iso(cur.first_ms()).startswith("2021-12-14")
+    ov, unk = om.on_capital(om.all_forced(rows, 51, cost_bps=11.4), cur)
+    s = om.excess_summary(ov, unk, hold=51)
+    assert s["mean_nominal_net_bps_of_notional"] == pytest.approx(20.2, abs=0.05)          # the number every other report quotes: zero capital cost
+    assert s["mean_net_bps_on_capital"] == pytest.approx(17.41, abs=0.05)
+    assert s["mean_excess_over_cash_bps_of_capital"] == pytest.approx(-5.75, abs=0.05)     # ... and what it is against the cash alternative
+    assert s["annualised_excess_pct_of_capital"] == pytest.approx(-1.23, abs=0.02)
+    assert s["excess_block_ci90"][1] < 0                                                     # the interval excludes zero on the losing side
+    y = s["by_entry_year_mean_excess_bps"]
+    assert y["2023"] > 0 and all(y[k] < 0 for k in ("2022", "2024", "2025", "2026"))       # the one paying regime is the one that is over
+    aq, unk2 = om.on_capital(om.all_forced(rows, 51, cost_bps=31.4), cur)
+    assert om.excess_summary(aq, unk2, hold=51)["mean_excess_over_cash_bps_of_capital"] == pytest.approx(-22.99, abs=0.05)

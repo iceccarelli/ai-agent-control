@@ -871,3 +871,21 @@ def test_without_a_usd_value_in_the_wallet_read_the_baseline_falls_back_to_the_s
     world.fake.book["BTCUSDT"]["mark"] = "59900.5"
     world.fake.book["BTCUSDT"]["spot_mark"] = "59900.5"
     assert run.ex.account_state(run.baseline)["equity_usd"] == pytest.approx(e0)
+
+
+# ---------------------------------------------------------------- a Trade row with no fee stated is an UNKNOWN fee, never a measured zero
+@pytest.mark.parametrize("blank", ["", None])
+def test_a_blank_execfee_on_a_trade_row_is_surfaced_as_an_unknown_fee_not_a_measured_zero(w, blank):
+    client, _t = TT.build_client(TT.TestnetCredentials.from_mapping(w.env), w.fake)
+    ex = TE.TestnetExecutor(client, symbols=["BTCUSDT"], spot_symbols=["BTCUSDT"], clock_ms=w.clock.now, kill_reader=lambda: (False, "t"))
+    row = {"execId": "X1", "orderId": "O1", "orderLinkId": "g1-p", "symbol": "BTCUSDT", "category": "linear", "side": "Sell", "execQty": "0.01", "execPrice": "60000", "execFee": blank,
+           "feeCurrency": "USDT", "isMaker": False, "execTime": str(w.clock.now()), "execType": "Trade"}
+    if blank is None:
+        row.pop("execFee")
+    w.fake.execs = [row]
+    fills = [x for x in ex.venue_state()["executions"] if x["link_id"] == "g1-p"]
+    assert len(fills) == 1 and fills[0]["fee_known"] is False and fills[0]["fee_signed_usd"] is None and fills[0]["prov"] == "UNKNOWN"
+    stated = dict(row, execId="X2", orderLinkId="g1-q", execFee="0")
+    w.fake.execs = [stated]
+    z = [x for x in ex.venue_state()["executions"] if x["link_id"] == "g1-q"][0]
+    assert z["fee_known"] is True and z["fee_signed_usd"] == 0.0 and z["prov"] == "MEASURED"      # a fee the venue STATED as zero is still measured

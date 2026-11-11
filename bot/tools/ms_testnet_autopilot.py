@@ -309,7 +309,7 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
         return done("SKIP_NO_OPPORTUNITY", [reason])                  # no hold across a settlement is possible now: there is nothing to price
     hold_for_edge = hold_s or int(math.ceil(secs)) + EXIT_MARGIN_S
     try:
-        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()))
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, notional, hold_for_edge, D(str(rate)), nxt, int(clock()), clock=clock)
         verdict = EG.evaluate_edge(inp)
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return done("WAIT_FOR_DATA", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
@@ -429,7 +429,7 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
         return _res("SKIPPED", [reason], funding_bps=rate * 1e4)
     on_state("RESEARCHING", "edge_gate")
     try:                                                              # the ECONOMICS gate: expected NET edge on the one economic model, from the venue's own rows, books and fee tier
-        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()))
+        inp = EG.collect(_executor(env, inner, clock, sym), sym, D(str(g["max_notional_usd"])), hold_s, D(str(rate)), nxt, int(clock()), clock=clock)
         verdict = EG.evaluate_edge(inp)
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return _res("ERROR", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
@@ -564,6 +564,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     summary = {"state_dir": d, "plan_digest": digest, "hold_s": hold_s, "funding_bps": rate * 1e4, "flat_verified": rec.get("flat_verified"), "orders": len(rec.get("orders", [])),
                "net": rec.get("net"), "exit_code": rc, "tail": lines[-4:], "session_class": session_class, "edge": verdict.as_dict(), "revoked_reason": watch["reason"]}
     on_state("RECONCILING", "session_ended")
+    if owner_unwind_alert(d, engine_root, clock):
+        summary["owner_emergency_unwind"] = True
     net = rec.get("net") or {}
     fees, price, fund = (CC._d(net.get(k)) for k in ("fees_usd", "price_pnl_usd", "funding_usd"))
     known = None if (fees is None or price is None) else price - fees + (fund or D(0))
@@ -589,6 +591,24 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if rc == S.EXIT_REFUSED:
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
+
+
+def owner_unwind_alert(session_dir: str, engine_root: str, clock: Callable[[], int]) -> bool:
+    """The owner's ``reconcile --unwind`` took this session over (it engaged the session's kill file with its own reason). The session has unwound and verified flat, but the OWNER has just declared an
+    emergency: the loop must not start the next session after its cooldown as if nothing happened. A persistent ALERT (cleared only by the owner) stops it. True when the alert was set."""
+    try:
+        with open(os.path.join(session_dir, S.FILES["kill"]), "r", encoding="utf-8", errors="replace") as fh:
+            reason = fh.read(512)
+    except OSError:
+        return False
+    if S.OWNER_UNWIND_KILL_REASON not in reason:
+        return False
+    try:
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "OWNER_EMERGENCY_UNWIND", "state_dir": session_dir,
+                                                         "detail": "the owner's reconcile --unwind took over this session; no further session starts until this ALERT is cleared on purpose"})
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------------------------------- authority can be REVOKED while a session is running

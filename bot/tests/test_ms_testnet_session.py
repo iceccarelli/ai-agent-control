@@ -786,3 +786,40 @@ def test_the_baseline_the_session_traded_with_is_persisted_and_reloaded_not_the_
     ctx = S.Ctx(a, w.env, w.fake, w.clock.now, w.clock.sleep, lambda _p: "", w.out.append)
     run = S.Run(ctx, w.plan_doc(), S._load_capability_manifest()[0])
     assert run.baseline == {"spot:BTCUSDT": 0.2} and w.plan_doc()["spot_baseline"]["spot:BTCUSDT"] == 0.1
+
+
+# ---------------------------------------------------------------- an EXIT whose create call fails twice must not wedge the group beyond the owner's confirmed unwind
+_EXIT_TARGETS = {"exit-perp": lambda b: b.get("reduceOnly") is True,
+                 "exit-spot": lambda b: b.get("category") == "spot" and b.get("side") == "Sell"}
+
+
+@pytest.mark.parametrize("fault", ["timeout", "http500", "malformed"])
+@pytest.mark.parametrize("target", ["exit-perp", "exit-spot"])
+def test_a_wedged_exit_leg_is_closed_out_by_the_confirmed_unwind_and_the_account_ends_flat(w, target, fault):
+    """Two consecutive create failures on the EXIT (the send and its one idempotent resend) leave the leg SENT/UNKNOWN; the engine sends no further exit while any leg is unresolved, and the
+    unwind used to close out only stuck ENTRY legs, so the documented emergency tool could not flatten a naked spot long or an open hedge. Reproduced before the fix for every case."""
+    d = _ready(w)
+    w.fake.inject(CREATE, fault, times=2, match=_EXIT_TARGETS[target])
+    assert w.execute(d) != 0                                                                   # the session cannot flatten: the exit never got an answer
+    assert w.record()["flat_verified"] is not True
+    exposure = {k: v["size"] for k, v in w.fake.positions.items() if v["size"] != 0}
+    assert exposure or w.fake.wallet.get("BTC", D(0)) != D(0)                                 # the account really holds something that must be closed
+    w.fake.faults.clear()                                                                       # the venue is healthy again
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert "UNRESOLVED EXIT LEG" in w.text()                                                    # the tool says what it found and what it did
+    rec = w.record()
+    assert rec["flat_verified"] is True and S.record_refusals(rec) == []
+    assert all(p["size"] == 0 for p in w.fake.positions.values())
+    assert w.fake.wallet.get("BTC", D(0)) == D(0)                                               # no orphan spot long either
+
+
+def test_an_unwind_does_not_close_out_an_exit_leg_the_venue_may_still_hold(w):
+    """The close-out needs the venue's COMPLETE read to have no order under the link; an exit order that DID reach the venue is adopted, never re-created."""
+    d = _ready(w)
+    w.fake.inject(CREATE, "lose_response", times=1, match=_EXIT_TARGETS["exit-perp"])           # the request EXECUTES, the answer is lost
+    w.execute(d)
+    w.fake.faults.clear()
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert "UNRESOLVED EXIT LEG" not in w.text()
+    assert all(p["size"] == 0 for p in w.fake.positions.values())
+    assert max(w.fake.create_calls.values()) == 1 or all(c <= 2 for c in w.fake.create_calls.values())

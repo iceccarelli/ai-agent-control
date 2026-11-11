@@ -516,7 +516,8 @@ def btc_carry_economics(repo: str = os.path.dirname(BOT)) -> Dict[str, Any]:
         for e in OM.all_forced(rows, h, cost_bps=tk):
             by.setdefault(OM._year(e["ms"]), []).append(e["net_bps"])
         long_by_year[f"{h}_prints"] = {str(y): statistics.fmean(v) for y, v in sorted(by.items())}
-    return {"long_hold_by_year_mean_net_bps": long_by_year, "long_hold_cost_bps": tk,
+    cap = _on_capital_after_cash(rows, c, tk, seq)
+    return {"on_capital_after_cash": cap, "long_hold_by_year_mean_net_bps": long_by_year, "long_hold_cost_bps": tk,
             "basis": f"{LABEL_CORPUS}: {OM.BYBIT_DIR}, {len(rows)} Bybit BTCUSDT 8h settlements {OM._iso(rows[0].ms)}..{OM._iso(last)}; funding interval 8h ONLY",
             "cost_constants": c, "scenarios_round_trip_bps": sc,
             "unconditional_forced_hold": mat,
@@ -529,6 +530,35 @@ def btc_carry_economics(repo: str = os.path.dirname(BOT)) -> Dict[str, Any]:
                                  "arithmetic_only": "interval does not change the carry per day: required funding bps/day = round_trip_bps / hold_days; per print = bps/day x interval_min / 1440"},
             "breakeven_bps_per_day": {name: {f"{h}_prints": cost / (h / CC.FUNDING_PERIODS_PER_DAY) for h in HOLDS_PRINTS} for name, cost in sc.items()},
             "label": LABEL_CORPUS}
+
+
+CAP_OVERLAY = "overlay_owned_spot"
+CAP_ACQUIRE = "acquire_spot_perp"
+
+
+def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_cost_bps: float, gated: Mapping[str, Any]) -> Dict[str, Any]:
+    """The BTC carry re-expressed as a return on the CAPITAL TIED UP, net of the cash that capital would earn. Every other number in this report is bps of NOTIONAL with zero capital cost, which
+    is the most favourable denominator there is: a hedged position that does not beat USD cash is not a money-maker however positive its notional net. The cash series is the repo's own OKX USDT
+    lending history (a lender's floor, not the owner's opportunity cost) and a hold the series cannot cover is UNKNOWN and dropped, never free."""
+    curve = OM.load_cash_curve(BOT)
+    base = {"capital_per_notional": OM.CAPITAL_PER_NOTIONAL,
+            "capital_basis": "spot leg (paid, or owned and so forgone) + ~15% perp margin + 1% buffer per USD of notional (ms_capital.MARGIN_PER_USD)",
+            "cash_series": {"source": OM.OKX_LENDING, "label": OM.CASH_BENCHMARK_LABEL, "first_utc": OM._iso(curve.first_ms()), "last_utc": OM._iso(curve.last_ms())}, "label": LABEL_CORPUS}
+    if not curve:
+        return {**base, "status": UNKNOWN, "reason": "CASH_SERIES_UNAVAILABLE: no cost of capital can be applied; the notional figures elsewhere in this report carry NO capital cost and are not a return on capital"}
+    classes = {CAP_OVERLAY: overlay_cost_bps, CAP_ACQUIRE: float(c["spot_perp_round_trip_total_bps"])}
+    out: Dict[str, Any] = {}
+    for cls, cost in classes.items():
+        holds: Dict[str, Any] = {}
+        for h in HOLDS_PRINTS:
+            ent, unk = OM.on_capital(OM.all_forced(rows, h, cost_bps=cost), curve)
+            holds[str(h)] = OM.excess_summary(ent, unk, hold=h)
+        out[cls] = {"round_trip_bps": cost, "holds": holds}
+    gt, gunk = OM.on_capital(list(gated["trades"]), curve)
+    gs = OM.excess_summary(gt, gunk, hold=OM.HOLD_PRINTS)
+    return {**base, "status": "COMPUTED", "classes": out, "gated_sequential_overlay": gs,
+            "reading": "mean_excess_over_cash_bps_of_capital below zero = the position earns LESS than the cash alternative on the capital it ties up, after every modelled cost; "
+                       "the nominal bps-of-notional figures elsewhere in this report do not charge that capital"}
 
 
 def _carry_verdict(econ: Mapping[str, Any]) -> Tuple[str, List[str], Dict[str, Any]]:
@@ -551,6 +581,17 @@ def _carry_verdict(econ: Mapping[str, Any]) -> Tuple[str, List[str], Dict[str, A
                        f"{g['trailing_365d_mean_net_bps'] if g['trailing_365d_mean_net_bps'] is None else round(g['trailing_365d_mean_net_bps'], 2)} bps [{LABEL_CORPUS}; gate tuned on this corpus]")
     reasons.append("unconditional 51-print (17d) hold by entry year (net bps at the same cost, the edge is a regime, not a constant): "
                    + ", ".join(f"{y}: {v:.1f}" for y, v in econ["long_hold_by_year_mean_net_bps"]["51_prints"].items()) + f" [{LABEL_CORPUS}]")
+    cap = econ.get("on_capital_after_cash") or {}
+    if cap.get("status") == "COMPUTED":
+        o = cap["classes"][CAP_OVERLAY]["holds"][str(OM.HOLD_LONG_PRINTS)]
+        a = cap["classes"][CAP_ACQUIRE]["holds"][str(OM.HOLD_LONG_PRINTS)]
+        ci = o["excess_block_ci90"]
+        reasons.append(f"ON CAPITAL, AFTER CASH (capital {cap['capital_per_notional']}x notional; cash = {cap['cash_series']['label']}): the {OM.HOLD_LONG_PRINTS}-print hold's nominal net "
+                       f"{o['mean_nominal_net_bps_of_notional']:.1f} bps of notional is {o['mean_net_bps_on_capital']:.1f} bps on capital and {o['mean_excess_over_cash_bps_of_capital']:.1f} bps EXCESS over cash "
+                       f"(overlay; block-CI90 {None if ci is None else [round(x, 1) for x in ci]}, {o['annualised_excess_pct_of_capital']:.2f}%/yr extrapolated; acquire "
+                       f"{a['mean_excess_over_cash_bps_of_capital']:.1f} bps) [{LABEL_CORPUS}]")
+    else:
+        reasons.append("CASH_UNKNOWN: the cost of capital could not be applied; every net figure above is bps of NOTIONAL with ZERO capital cost, not a return on capital")
     reasons.append("no out-of-sample settlement exists in the repo; no price-leg/basis residual beyond the 4h-bar basis shed; no L2 depth: INSUFFICIENT_DATA is the ceiling")
     policies = {"single_print_harvest": "REJECTED" if neg_single else UNKNOWN, "gated_policy": "INSUFFICIENT_DATA"}
     return "INSUFFICIENT_DATA", reasons, policies

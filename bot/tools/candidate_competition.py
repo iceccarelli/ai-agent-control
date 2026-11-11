@@ -81,6 +81,9 @@ def btc_policies(econ: Mapping[str, Any]) -> List[Dict[str, Any]]:
     tk = "TAKER_FEES_PLUS_SPREAD"
     mat = {m["hold_prints"]: m for m in econ["unconditional_forced_hold"] if m["scenario"] == tk}
     by_year = econ["long_hold_by_year_mean_net_bps"]
+    cap = econ.get("on_capital_after_cash") or {}
+    cap_ok = cap.get("status") == "COMPUTED"
+    cap_holds = ((cap.get("classes") or {}).get(CR.CAP_OVERLAY) or {}).get("holds", {}) if cap_ok else {}
     latest = lambda d: (max(d), d[max(d)]) if d else (None, None)          # noqa: E731
     out: List[Dict[str, Any]] = []
     for h, m in sorted(mat.items()):
@@ -89,17 +92,31 @@ def btc_policies(econ: Mapping[str, Any]) -> List[Dict[str, Any]]:
         ly, lv = latest(by_year.get(key, {}))
         mean = s.get("mean")
         ci = m.get("mean_block_ci90")
-        rejected = mean is not None and mean < 0
+        ch = cap_holds.get(str(h)) or {}
+        excess = ch.get("mean_excess_over_cash_bps_of_capital")
+        lost_nominal = mean is not None and mean < 0
+        lost_to_cash = (not lost_nominal) and excess is not None and excess < 0
+        rejected = lost_nominal or lost_to_cash
         out.append({"policy": f"unconditional_{h}_print_hold", "hold_prints": h, "mean_net_bps": mean, "n_overlapping_entries": s.get("n"), "mean_block_ci90": ci,
+                    "mean_excess_over_cash_bps_of_capital": excess, "excess_block_ci90": ch.get("excess_block_ci90"), "mean_net_bps_on_capital": ch.get("mean_net_bps_on_capital"),
+                    "n_cash_unknown": ch.get("n_cash_unknown"), "annualised_excess_pct_of_capital": ch.get("annualised_excess_pct_of_capital"),
                     "latest_year": ly, "latest_year_mean_net_bps": lv, "label": CORPUS_LABEL,
                     "verdict": "REJECTED" if rejected else "INSUFFICIENT_DATA",
-                    "note": ("loses after costs over the whole corpus" if rejected else
-                             ("in-sample positive, regime dependent" + (f"; latest year {ly}: {lv:.1f} bps" if lv is not None and lv <= 0 else "")))})
+                    "note": ("loses after costs over the whole corpus" if lost_nominal else
+                             (f"positive on notional ({mean:.1f} bps, ZERO capital cost) but {excess:.1f} bps EXCESS over cash on the capital it ties up: it does not beat the cash alternative" if lost_to_cash else
+                              ("in-sample positive, regime dependent" + (f"; latest year {ly}: {lv:.1f} bps" if lv is not None and lv <= 0 else "")
+                               + ("" if cap_ok else "; CASH_UNKNOWN: no cost of capital applied"))))})
     g = econ["gated_sequential_taker"]
+    gc = cap.get("gated_sequential_overlay") if cap_ok else None
+    g_excess = (gc or {}).get("mean_excess_over_cash_bps_of_capital")
+    g_nominal_lost = g["mean_net_bps"] is not None and g["mean_net_bps"] < 0
+    g_cash_lost = (not g_nominal_lost) and g_excess is not None and g_excess < 0
     out.append({"policy": "production_gated_sequence", "hold_prints": g["hold_prints"], "mean_net_bps": g["mean_net_bps"], "n_overlapping_entries": g["n"], "trailing_365d_mean_net_bps": g["trailing_365d_mean_net_bps"],
-                "trailing_365d_n": g["trailing_365d_n"], "label": CORPUS_LABEL + " (gate constants tuned on this corpus)",
-                "verdict": "REJECTED" if g["mean_net_bps"] is not None and g["mean_net_bps"] < 0 else "INSUFFICIENT_DATA",
-                "note": f"trailing 365d mean {g['trailing_365d_mean_net_bps']:.1f} bps over n={g['trailing_365d_n']}" if g["trailing_365d_mean_net_bps"] is not None else "no trailing trades"})
+                "trailing_365d_n": g["trailing_365d_n"], "mean_excess_over_cash_bps_of_capital": g_excess, "excess_block_ci90": (gc or {}).get("excess_block_ci90"),
+                "label": CORPUS_LABEL + " (gate constants tuned on this corpus)",
+                "verdict": "REJECTED" if (g_nominal_lost or g_cash_lost) else "INSUFFICIENT_DATA",
+                "note": ((f"positive on notional ({g['mean_net_bps']:.1f} bps, ZERO capital cost) but {g_excess:.1f} bps EXCESS over cash on the capital it ties up; " if g_cash_lost else "")
+                         + (f"trailing 365d mean {g['trailing_365d_mean_net_bps']:.1f} bps over n={g['trailing_365d_n']}" if g["trailing_365d_mean_net_bps"] is not None else "no trailing trades"))})
     return out
 
 
@@ -211,8 +228,21 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
             kept = [p for p in pols if p["verdict"] != "REJECTED"]
             verdict = "REJECTED" if pols and not kept else "INSUFFICIENT_DATA"
             best = max((p for p in pols if p.get("mean_net_bps") is not None), key=lambda p: p["mean_net_bps"])
-            net, net_basis = best["mean_net_bps"], f"{CORPUS_LABEL}: best policy {best['policy']} at taker + ASSUMED spread (11.4 bps round trip); in-sample, regime dependent"
-            reasons = [f"REJECTED policy {p['policy']}: mean net {p['mean_net_bps']:.1f} bps after costs ({p['note']})" for p in lost] + \
+            nominal = best["mean_net_bps"]
+            with_cash = [p for p in pols if p.get("mean_excess_over_cash_bps_of_capital") is not None]
+            if with_cash:
+                # the headline is the EXCESS over cash on the capital tied up (the like-for-like USD-risk alternative), never the notional figure that charges no capital
+                bx = max(with_cash, key=lambda p: p["mean_excess_over_cash_bps_of_capital"])
+                net = bx["mean_excess_over_cash_bps_of_capital"]
+                net_basis = (f"{CORPUS_LABEL}: best policy {bx['policy']}: EXCESS over cash on 1.16x capital (OKX USDT lending, a lender's floor, not the owner's cost) after taker + ASSUMED spread "
+                             f"(11.4 bps round trip); the nominal best is {nominal:.1f} bps of NOTIONAL at ZERO capital cost; in-sample, regime dependent")
+                extra["nominal_net_bps_zero_capital_cost"] = nominal
+            else:
+                net, net_basis = nominal, (f"{CORPUS_LABEL}: best policy {best['policy']} at taker + ASSUMED spread (11.4 bps round trip), bps of NOTIONAL with ZERO capital cost "
+                                           "(CASH_UNKNOWN: the cost of capital could not be applied); in-sample, regime dependent")
+            reasons = [f"REJECTED policy {p['policy']}: mean net {p['mean_net_bps']:.1f} bps of notional" + (f", excess over cash {p['mean_excess_over_cash_bps_of_capital']:.1f} bps of capital"
+                                                                                                         if p.get("mean_excess_over_cash_bps_of_capital") is not None else "")
+                       + f" ({p['note']})" for p in lost] + \
                       [f"not rejected but not a pass: {p['policy']}: mean net {p['mean_net_bps']:.1f} bps ({p['note']})" for p in kept] + \
                       ["no out-of-sample settlement exists in the repo; the gate constants were tuned on this corpus"]
             mt = btc_multiple_testing(econ, ldir)

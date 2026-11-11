@@ -793,6 +793,12 @@ class Run:
         g = self.engine.groups.get(self.gid) if self.engine else None
         return [l.link for l in (g.entry_legs() if g else []) if l.status in (EX.SENT, EX.UNKNOWN)]
 
+    def unresolved_exits(self) -> List[str]:
+        """EXIT legs still SENT/UNKNOWN: an exit whose create call failed (timeout, 5xx, malformed answer) twice (the original send and its one idempotent resend) is neither live nor rejected, and while
+        any leg is in that state the engine sends NO new exit link: the group is wedged with whatever exposure it holds. Only the owner's confirmed unwind may close such a leg out."""
+        g = self.engine.groups.get(self.gid) if self.engine else None
+        return [l.link for l in (g.exit_legs() if g else []) if l.status in (EX.SENT, EX.UNKNOWN)]
+
     def state(self) -> str:
         g = self.engine.groups.get(self.gid) if self.engine else None
         return g.state.value if g else "NONE"
@@ -1202,6 +1208,10 @@ def cmd_reconcile(ctx: Ctx) -> int:
 KILL_HONOURING_ROLES = ("execute", "unwind", "reconcile")
 
 
+#: written into the holder's kill file by the owner's emergency unwind; the autopilot recognises it and STOPS (an ALERT marker) instead of re-arming after its cooldown
+OWNER_UNWIND_KILL_REASON = "reconcile --unwind handover"
+
+
 def _hand_over_unwind(ctx: Ctx, plan: Mapping[str, Any], lock: "XL.ExecutorLock", holder: Optional[Mapping[str, Any]]) -> bool:
     """The account lock is held by a running session and the owner asked for an emergency unwind. Engage THAT session's kill switch (it cancels entries, unwinds reduce-only and verifies flat, itself),
     then wait a bounded time for the lock. True once this process holds it; False (and a message naming who to stop) when the holder does not let go or cannot be handed over to."""
@@ -1228,12 +1238,12 @@ def _hand_over_unwind(ctx: Ctx, plan: Mapping[str, Any], lock: "XL.ExecutorLock"
         return False
     kill = os.path.join(os.path.realpath(sd), FILES["kill"])
     try:
-        created = AD.engage_kill_switch(kill, "reconcile --unwind handover")
+        created = AD.engage_kill_switch(kill, OWNER_UNWIND_KILL_REASON)
     except OSError as exc:
         ctx.out(f"unwind NOT started: the holder's kill switch could not be engaged ({type(exc).__name__}). Stop pid {holder['pid']} by hand, then run this again. Nothing was sent.")
         return False
     ctx.out(f"the account lock is held by {holder['role']} pid {holder['pid']} ({sd}): its kill switch was {'engaged' if created else 'already engaged'} so IT unwinds reduce-only (one writer). "
-            "Waiting for it to finish; the kill file stays engaged until you remove it on purpose.")
+            "Waiting for it to finish; the kill file stays engaged until you remove it on purpose. An autopilot holder stops with an ALERT when its session ends: clear it only when you mean trading to resume.")
     deadline = int(ctx.clock()) + (int(plan["timing"]["exit_wait_s"]) + 60) * 1000
     while int(ctx.clock()) < deadline:
         if lock.try_acquire():
@@ -1258,18 +1268,22 @@ def _reconcile_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any], 
     run.feed_ledger()
     run.bookkeep()
     stuck = run.unresolved_entries()
+    stuck_exits = run.unresolved_exits()
     g = eng.groups.get(run.gid)
     unsent = [l.leg_id for l in run.group_plan.legs if g is not None and l.leg_id not in g.legs]
     if unsent and g is not None and g.legs:                             # the crash came between two legs: the engine only knows legs that were sent, so it can call a one-legged group HEDGED
         ctx.out(f"UNSENT PLAN LEG(S) {unsent}: they were never sent, so the group is NOT hedged whatever its state says; they are not sent now. Unwind with --unwind --confirm-plan-digest.")
     for link in stuck:
         ctx.out(f"UNRESOLVED ENTRY LEG {link}: no venue order is known for it; it is NOT re-sent (a new entry needs the full execute gates)")
+    for link in stuck_exits:
+        ctx.out(f"UNRESOLVED EXIT LEG {link}: its create call never got an answer and no more resends are allowed, so the group sends no further exit; only reconcile --unwind --confirm-plan-digest "
+                "closes it out (when the venue's COMPLETE read has no order under it) and sends a fresh reduce-only exit")
     if run.start_ms is not None and int(ctx.clock()) - run.start_ms >= run.lifecycle_ms and run.state() not in ("CLOSED", "FAILED"):
         ctx.out("LIFECYCLE_EXCEEDED: the session is past its lifecycle bound; unwind required (reconcile --unwind --confirm-plan-digest)")
     if ctx.args.unwind and run.state() not in ("CLOSED", "FAILED"):
         view = run.last_view
-        for link in stuck:                                              # a leg the venue (COMPLETE read) has no order for never existed there: close it out so the unwind can proceed
-            if view and view.get("complete") and link not in view["orders"]:
+        for link in stuck + stuck_exits:                                # a leg the venue (COMPLETE read) has no order for never existed there: close it out so the unwind can proceed (an exit leg left
+            if view and view.get("complete") and link not in view["orders"]:   # SENT/UNKNOWN would otherwise wedge the group for good: the engine sends no exit while any leg is unresolved)
                 eng.on_order_done(run.gid, link.split("-", 1)[1], int(ctx.clock()))
         cleared = eng.clear_exit_halt(run.gid, int(ctx.clock()))       # the owner's CONFIRMED unwind is the one thing allowed to lift an exit halt (journalled): a halted group would otherwise send no exit
         if cleared:

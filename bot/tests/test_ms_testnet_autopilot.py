@@ -1615,3 +1615,35 @@ def test_the_capital_command_on_a_corrupt_book_explains_instead_of_a_traceback(t
     assert AP.main(["capital", "--root", str(tmp_path)], env={}) == 2
     err = capsys.readouterr().err
     assert "unreadable" in err and "move it aside DELIBERATELY" in err and (tmp_path / "capital.json").read_text() == "{corrupt"
+
+
+# ---------------------------------------------------------------- the owner's emergency unwind must STOP the loop, not just the session
+def test_the_owners_unwind_handover_stops_the_loop_with_an_alert_instead_of_rearming(w, tmp_path):
+    root = tmp_path / "ap"
+
+    def handover(n):                                                   # what `reconcile --unwind` leaves in the holder's session dir while the session runs
+        dirs = AP.session_dirs(str(w.tmp / "auto"))
+        if n == 3 and dirs:
+            AD.engage_kill_switch(os.path.join(dirs[-1], "MS_KILL"), S.OWNER_UNWIND_KILL_REASON)
+    res = revoke_cycle(w, root, handover)
+    assert res["flat_verified"] is True and res["owner_emergency_unwind"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+    eng = ES.EngineState(str(root), w.clock.now)
+    assert eng.has("ALERT") and eng.read("ALERT")["code"] == "OWNER_EMERGENCY_UNWIND"
+
+
+def test_the_autopilots_own_revocation_is_not_an_owner_emergency(w, tmp_path):
+    root = tmp_path / "ap"
+    res = revoke_cycle(w, root, lambda n: ES.EngineState(str(root), w.clock.now).set("STOP", {"by": "owner"}) if n == 3 else None)
+    assert res["revoked_reason"] == "STOP" and "owner_emergency_unwind" not in res and not ES.EngineState(str(root), w.clock.now).has("ALERT")
+
+
+def test_owner_unwind_alert_recognises_only_the_handover_reason(tmp_path):
+    clock = lambda: 1_800_000_000_000                                   # noqa: E731
+    eng = str(tmp_path / "eng")
+    d = tmp_path / "session"
+    d.mkdir()
+    assert AP.owner_unwind_alert(str(d), eng, clock) is False                                          # no kill file
+    (d / "MS_KILL").write_text("KILL_SWITCH")                                                          # the autopilot's own kill
+    assert AP.owner_unwind_alert(str(d), eng, clock) is False and not ES.EngineState(eng, clock).has("ALERT")
+    (d / "MS_KILL").write_text(S.OWNER_UNWIND_KILL_REASON)
+    assert AP.owner_unwind_alert(str(d), eng, clock) is True and ES.EngineState(eng, clock).has("ALERT")
