@@ -554,3 +554,28 @@ def test_an_unverified_zero_fee_is_flagged_but_a_measured_zero_fee_is_not():
     priced = RP.LocalLedger()
     priced.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=0.055, prov="SIMULATED"))
     assert priced.pnl()["fee_flags"] == []
+
+
+def test_adds_in_the_same_direction_move_the_average_cost_for_longs_and_shorts():
+    """Unmarked, a position is valued at its AVERAGE cost, so the only P&L is the fees (the same-direction add path: weighted by the absolute open quantity)."""
+    for side, sign in (("Buy", 1.0), ("Sell", -1.0)):
+        led = RP.LocalLedger()
+        led.record_fill(_fill(1, side, 10.0, 100.0, fee=0.5, prov="MEASURED"))
+        led.record_fill(_fill(2, side, 10.0, 110.0, fee=0.5, prov="MEASURED"))          # average 105
+        p = led.pnl()
+        assert "MARK_MISSING:XUSDT" in p["flags"] and p["net"] == pytest.approx(-1.0), side      # fees only: no phantom gain or loss from the unknown mark
+        assert p["unrealised"] == pytest.approx(sign * 20.0 * 105.0)
+
+
+def test_an_unverified_rebate_is_flagged_like_the_canonical_ledger_does():
+    led = RP.LocalLedger()
+    led.record_fill(_fill(1, "Buy", 1.0, 100.0, fee=-0.5, prov="SIMULATED"))
+    assert "FEE_REBATE_UNVERIFIED" in led.pnl()["fee_flags"]
+
+
+def test_the_report_carries_the_unknown_input_flags_so_a_consumer_cannot_miss_them():
+    r = go(c=cfg(end_ms=T0 + 5 * D, hold_ms=10 * D))
+    assert RP.build_report([r])["pnl"]["unknown_input_flags"] == []                        # a complete, priced replay has none
+    r.pnl["flags"] = list(r.pnl.get("flags") or []) + ["MARK_MISSING:XUSDT"]
+    r.pnl["fee_flags"] = ["ZERO_FEE_UNVERIFIED"]
+    assert RP.build_report([r])["pnl"]["unknown_input_flags"] == ["MARK_MISSING:XUSDT", "ZERO_FEE_UNVERIFIED"]

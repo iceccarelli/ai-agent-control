@@ -1385,18 +1385,46 @@ def test_a_short_capture_shows_the_modelled_scenario_apart_and_the_competition_h
     assert summary["families"][CR.FAMILY_SPREAD]["descriptive_best_in_sample_net_bps"] == pytest.approx(taker_mean)
 
 # ---------------------------------------------------------------- reject-only early rejection (a clear loser is not kept waiting for 50 independent observations; nothing is ever promoted by it)
-def test_early_rejection_needs_a_significantly_negative_mean_and_enough_independent_observations():
+def test_the_early_rejection_constants_are_the_pre_registered_ones():
+    """Pinned: a change to a threshold is a change to a pre-registered rule and must be a deliberate edit of this test and of MONEY_MISSION.md, not a tuning."""
+    assert CR.REJECT_EARLY_MIN_INDEPENDENT == 12 and CR.REJECT_EARLY_ALPHA == 0.01
+
+
+def test_early_rejection_needs_a_significantly_negative_mean_enough_independent_observations_and_an_interval_wholly_below_zero():
     rnd = random.Random(5)
     loser = [-30.0 + rnd.gauss(0, 10.0) for _ in range(30)]
-    e = CR.early_rejection(RH.significance(loser, ci=False))
-    assert e is not None and e["mean_bps"] < -25 and e["p_lower"] <= CR.REJECT_EARLY_ALPHA and e["independent_observations"] >= CR.REJECT_EARLY_MIN_INDEPENDENT
+    e = CR.early_rejection(RH.significance(loser))
+    assert e is not None and e["mean_bps"] < -25 and e["p_lower"] <= CR.REJECT_EARLY_ALPHA and e["independent_observations"] >= CR.REJECT_EARLY_MIN_INDEPENDENT and e["ci_hi_bps"] < 0
     winner = [30.0 + rnd.gauss(0, 10.0) for _ in range(30)]
-    assert CR.early_rejection(RH.significance(winner, ci=False)) is None                     # a positive family is never rejected by it
+    assert CR.early_rejection(RH.significance(winner)) is None                               # a positive family is never rejected by it
     noisy = [-3.0 + rnd.gauss(0, 60.0) for _ in range(30)]
-    assert CR.early_rejection(RH.significance(noisy, ci=False)) is None                      # negative but not significantly
-    assert CR.early_rejection(RH.significance(loser[:6], ci=False)) is None                  # too few observations: no claim
-    assert CR.early_rejection({"mean": None, "t": None, "p_one_sided": 1.0, "independent_observations": 0}) is None
-    assert CR.early_rejection({"mean": -5.0, "t": None, "p_one_sided": 1.0, "independent_observations": 40}) is None      # no t (zero variance / ESS < 3): no claim
+    assert CR.early_rejection(RH.significance(noisy)) is None                                # negative but not significantly
+    assert CR.early_rejection(RH.significance(loser[:6])) is None                            # too few observations: no claim
+    # a lower-tail p between 0.01 and 0.05 is NOT enough (the alpha is 0.01): standardise fixed noise (a seed whose ESS clears the floor), then lower the mean until the lower-tail p enters that band
+    found = False
+    for seed in range(1, 80):
+        rng = random.Random(seed)
+        z = [rng.gauss(0, 1) for _ in range(30)]
+        zm = sum(z) / 30.0
+        zs = (sum((v - zm) ** 2 for v in z) / 29.0) ** 0.5
+        z = [(v - zm) / zs for v in z]
+        for k in range(1, 300):
+            st = RH.significance([-0.01 * k + v for v in z])
+            if 0.01 < 1.0 - st["p_one_sided"] <= 0.05 and st["independent_observations"] >= CR.REJECT_EARLY_MIN_INDEPENDENT:
+                assert CR.early_rejection(st) is None               # significant at 5%, even with the ESS floor met and a negative mean: not enough
+                found = True
+                break
+        if found:
+            break
+    assert found, "no fixture landed in the 0.01 < p_lower <= 0.05 band with enough independent observations"
+    ok = RH.significance(loser)
+    assert CR.early_rejection({**ok, "independent_observations": CR.REJECT_EARLY_MIN_INDEPENDENT - 1}) is None      # n >= 8 rows but too few INDEPENDENT ones
+    assert CR.early_rejection({**ok, "ci": None}) is None and CR.early_rejection({**ok, "ci": {"status": "TOO_FEW", "hi": -1.0}}) is None      # no usable second method
+    assert CR.early_rejection({**ok, "ci": {"status": "OK", "hi": 0.5}}) is None                                          # the interval does not exclude zero
+    # fail closed on malformed or non-finite input (nan > alpha is False, so an unguarded comparison would have returned evidence)
+    nan = float("nan")
+    assert CR.early_rejection({**ok, "t": nan, "p_one_sided": nan}) is None and CR.early_rejection({**ok, "mean": nan}) is None and CR.early_rejection({**ok, "t": None}) is None
+    assert CR.early_rejection({"mean": "x"}) is None and CR.early_rejection({}) is None
 
 
 def test_a_family_that_clearly_loses_after_costs_is_rejected_from_a_short_capture_but_a_winner_is_never_promoted(tmp_path, monkeypatch):
@@ -1408,6 +1436,7 @@ def test_a_family_that_clearly_loses_after_costs_is_rejected_from_a_short_captur
     lose = CR.evaluate_family(_world(520, seed=2, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "a.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
     assert lose["status"] == "WALK_FORWARD_DONE" and lose["oos_independent_observations"] < 50       # far below the promotion floor ...
     assert lose["verdict"] == "REJECTED" and lose["reject_early"]["p_lower"] <= CR.REJECT_EARLY_ALPHA and "REJECTED_EARLY" in lose["reason"]      # ... and still a decision
+    assert lose["reject_early_suppressed_by_cap"] is False
     monkeypatch.setattr(CR, "family_costs", real)
     RH._FAMILY_HIGH_WATER.clear()
     RH._PATH_HIGH_WATER.clear()
@@ -1432,3 +1461,30 @@ def test_mutation_without_the_early_rule_a_clear_loser_stays_insufficient(tmp_pa
     monkeypatch.setattr(CR, "family_costs", lambda kind: {k: ({**v, "bps": 500.0} if k == "taker" else v) for k, v in real(kind).items()})
     out = CR.evaluate_family(_world(520, seed=2, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "m.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
     assert out["verdict"] == "INSUFFICIENT_DATA"                                                    # the rule is what turns the same evidence into a decision
+
+
+def test_an_unpriced_terminal_exit_cap_wins_over_the_early_rule_in_the_family_path(tmp_path, monkeypatch):
+    """The caps (unknown terminal losses) still mean 'neither a pass nor a rejection can be claimed': the early rule must not override them. Reproduced by mutating the order in the copy."""
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    real_costs, real_run = CR.family_costs, CR.run_family_variant
+    monkeypatch.setattr(CR, "family_costs", lambda kind: {k: ({**v, "bps": 500.0} if k == "taker" else v) for k, v in real_costs(kind).items()})
+
+    def with_unpriced(*a, **k):
+        r = real_run(*a, **k)
+        r["terminal_exit_unpriced_legs"] = list(r["terminal_exit_unpriced_legs"]) + [{"symbol": "XUSDT", "t": 1, "reason": "no_settlement_price"}]
+        return r
+    monkeypatch.setattr(CR, "run_family_variant", with_unpriced)
+    out = CR.evaluate_family(_world(520, seed=2, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "u.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert out["status"] == "WALK_FORWARD_DONE" and out["terminal_exit_unpriced"] >= 1
+    assert out["verdict"] == "INSUFFICIENT_DATA" and out["reject_early"] is None and out["reject_early_suppressed_by_cap"] is True and "REJECTED_EARLY" not in out["reason"]
+
+
+def test_the_competition_row_says_when_a_family_was_rejected_early_and_on_how_many_observations():
+    import candidate_competition as CCmp
+    fam = {"verdict": "REJECTED", "status": "WALK_FORWARD_DONE", "is_carry": False, "independent_holding_rows": 35, "oos_mean_total_bps_per_row": -300.0, "oos_independent_observations": 28,
+           "reject_early": {"rule": "x"}, "reason": "perp-only ... | REJECTED_EARLY: x"}
+    out = CCmp._xs_summary({"status": "EVALUATED", "evaluation": {"families": {"F": fam}}})
+    assert out["families"]["F"]["rejected_early"] is True and out["families"]["F"]["oos_independent_observations"] == 28
+    out2 = CCmp._xs_summary({"status": "EVALUATED", "evaluation": {"families": {"F": {**fam, "reject_early": None}}}})
+    assert out2["families"]["F"]["rejected_early"] is False

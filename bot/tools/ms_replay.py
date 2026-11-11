@@ -163,6 +163,7 @@ class LocalLedger:
         avg: Dict[str, float] = {}                                 # average entry price of the open quantity per key (average-cost accounting)
         fees = 0.0
         zero_fee_unverified = False
+        rebate_unverified = False
         for f in self.fills:
             s = 1.0 if f.side == "Buy" else -1.0
             cash -= s * f.qty * f.price
@@ -177,6 +178,8 @@ class LocalLedger:
             fees += f.fee_usd
             if f.fee_usd == 0 and f.prov != "MEASURED":
                 zero_fee_unverified = True                       # a free fill nobody measured is not a free fill (the canonical ledger books the fee as unknown)
+            if f.fee_usd < 0:
+                rebate_unverified = True                         # a rebate is never assumed (the canonical ledger books that fee as unknown)
         unreal_mtm = 0.0
         mid_fallback = False
         missing_marks: List[str] = []
@@ -204,7 +207,7 @@ class LocalLedger:
                 "realised": price_leg if flat else cash + self.taker_slip, "unrealised": 0.0 if flat else unreal_mtm, "net": price_leg + funding - fees - slippage,
                 "unknown_funding_events": self.unknown_funding, "valuation": "MID_FALLBACK" if mid_fallback else "EXIT_SIDE",
                 "flags": (["MID_FALLBACK"] if mid_fallback else []) + [f"MARK_MISSING:{k}" for k in sorted(missing_marks)],
-                "fee_flags": ["ZERO_FEE_UNVERIFIED"] if zero_fee_unverified else []}
+                "fee_flags": (["ZERO_FEE_UNVERIFIED"] if zero_fee_unverified else []) + (["FEE_REBATE_UNVERIFIED"] if rebate_unverified else [])}
 
 
 # ------------------------------------------------------------------ the world: point-in-time lookups over the series
@@ -1058,7 +1061,8 @@ def build_report(results: Sequence[ReplayResult], *, trials_total: Optional[int]
         "schema": "ms_replay_report/1", "variant_id": cfg0.variant_id, "spec_digest": cfg0.spec_digest, "mode": "REPLAY_SIMULATED_TRANSPORT",
         "window": {"start_ms": min(r.cfg.start_ms for r in results), "end_ms": max(r.cfg.end_ms for r in results), "step_ms": cfg0.step_ms, "n_windows": len(results)},
         "pnl": {"gross_usd": tot["price_leg"] + tot["funding"], "net_usd": tot["net"], "fees_usd": tot["fees"], "funding_usd": tot["funding"], "price_leg_usd": tot["price_leg"],
-                "valuation": valuation, "slippage_usd": tot["slippage"], "taker_slippage_usd": tot["taker_slippage"], "adverse_selection_usd": tot["adverse_selection"],
+                "valuation": valuation, "unknown_input_flags": sorted({f for r in results for f in (list(r.pnl.get("flags") or []) + list(r.pnl.get("fee_flags") or [])) if f != "MID_FALLBACK"}),
+                "slippage_usd": tot["slippage"], "taker_slippage_usd": tot["taker_slippage"], "adverse_selection_usd": tot["adverse_selection"],
                 "note": "ONE net definition: net = gross - fees - slippage with gross = price leg AT MID + funding; slippage = taker walk + adverse selection, each charged exactly once. The "
                         "taker walk is already inside the fill prices (the price leg adds it back to reach mid, then it is subtracted as slippage); adverse selection is a modelled post-fill "
                         "markout that is in NO fill price, so it is subtracted here and only here. Fees are subtracted once. Funding is credited/debited at the actual settlement timestamp"},
