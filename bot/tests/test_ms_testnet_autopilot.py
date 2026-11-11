@@ -1659,3 +1659,37 @@ def test_the_owner_marker_is_recognised_even_when_the_kill_file_already_holds_an
     assert AP.owner_unwind_alert(str(d), eng, clock) is False
     (d / S.FILES["owner_unwind"]).write_text(S.OWNER_UNWIND_KILL_REASON)
     assert AP.owner_unwind_alert(str(d), eng, clock) is True and ES.EngineState(eng, clock).has("ALERT")
+
+
+# ---------------------------------------------------------------- the settlement is re-checked when the first entry leaves (a slow session must not enter after the print)
+def _slow_world_before_settlement(w, monkeypatch, settle_in_s, round_trip_s):
+    t0 = w.clock.now()
+    t_settle = t0 + settle_in_s * 1000
+    w.fake.funding_rate = "0.0020"                                                         # 20 bps: clears the owner's floor
+    monkeypatch.setattr(type(w.fake), "funding_in_ms", property(lambda s: t_settle - s.now_ms(), lambda s, v: None), raising=False)     # an ABSOLUTE settlement time, not a sliding one
+    orig = w.fake.request
+    slow_paths = {"/v5/account/wallet-balance", "/v5/position/list", "/v5/order/realtime", "/v5/execution/list", "/v5/order/create", "/v5/position/set-leverage", "/v5/market/time"}
+
+    def slow(method, url, **k):
+        if url.split("?")[0].split("bybit.com")[-1] in slow_paths:
+            w.clock.t += round_trip_s * 1000                                                 # a slow venue round trip on the session's own reads
+        return orig(method, url, **k)
+    w.fake.request = slow
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
+    return t_settle
+
+
+def test_a_session_slowed_past_the_margin_does_not_enter_after_the_settlement(w, tmp_path, monkeypatch):
+    t_settle = _slow_world_before_settlement(w, monkeypatch, settle_in_s=100, round_trip_s=3)
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(tmp_path / "ap"))
+    trades = [e for e in w.fake.execs if e.get("execType", "Trade") == "Trade"]
+    assert not any(int(e["execTime"]) > t_settle for e in trades), "an entry filled AFTER the settlement: all fees, no funding"
+    assert not trades and not [r for r in w.fake.requests if r[1] == "/v5/order/create"], res          # the first entry was refused at order time: nothing was sent
+    assert res["result"] != "DONE" or res.get("orders") == 0
+
+
+def test_a_session_with_time_to_spare_still_enters_across_the_settlement(w, tmp_path, monkeypatch):
+    _slow_world_before_settlement(w, monkeypatch, settle_in_s=300, round_trip_s=1)
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(tmp_path / "ap"))
+    assert res["result"] == "DONE" and res["flat_verified"] is True and res["orders"] > 0               # positive control: the guard does not stop a session with time left
