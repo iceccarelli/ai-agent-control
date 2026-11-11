@@ -497,7 +497,7 @@ def test_a_volume_that_stays_within_one_day_of_the_write_reserve_warns_before_th
     alerts = RA.evaluate(text(*_free_rows(5000, 1400, 1300, 1200)), NOW)
     assert "recorder_disk_low" in _keys(alerts) and "recorder_down" not in _keys(alerts)          # still RECORDING: this is the notice, not the failure
     msg = next(a for a in alerts if a.key == "recorder_disk_low")
-    assert msg.severity == RA.WARNING and "1200 MiB" in msg.text and "does NOT recover by itself" in msg.text and "fly volumes list" in msg.text
+    assert msg.severity == RA.WARNING and "1200 MiB" in msg.text and "only if the volume holds the retained days plus the reserve" in msg.text and "fly volumes list" in msg.text
 
 
 def test_a_briefly_low_or_comfortable_volume_does_not_warn():

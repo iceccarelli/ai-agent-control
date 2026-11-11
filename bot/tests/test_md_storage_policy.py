@@ -10,6 +10,7 @@ removes whole old days without breaking the chain of the rest.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -181,3 +182,125 @@ def test_infinity_is_a_config_error_not_an_overflow():
     import config as C
     with pytest.raises(C.ConfigError):
         C.load({"MARKET_FEED_RETENTION_DAYS": "inf"})
+
+
+# ---------------------------------------------------------------- a STALLED store (volume below the write reserve) must be able to recover at the day boundary
+def _stall(store, *, free=10, reserve=1000):
+    """The volume is below the write reserve (the state the live recorder is in)."""
+    store.min_free_bytes = reserve
+    store.free_bytes = lambda: free
+
+
+def _four_days(directory):
+    store = ST.MarketStore(directory, commit_every=1, environment="mainnet")
+    for i in range(4):
+        for j in range(3):
+            store.append(ST.FRAME, wall_ms=BASE + i * DAY + j * 1000, mono_s=float(i * 10 + j), category="spot", payload=f'{{"d":{i},"j":{j}}}')
+    return store
+
+
+def test_a_stalled_store_follows_the_wall_clock_by_one_day_and_only_then(tmp_path):
+    """Not stalled: the cutoff is bounded by the newest segment (the existing guard). Stalled: the day that is now past retention is dropped, which frees space."""
+    store = _three_days(str(tmp_path / "md"))                                         # segments 4, 5, 6 Nov; the log's newest day is the 6th
+    now = BASE + 3 * DAY + 5_000                                                      # the wall clock is already in 7 Nov (the log could not open that segment)
+    store.min_free_bytes, store.free_bytes = 1000, lambda: 10_000                      # healthy: free space above the reserve
+    assert store.apply_retention(now, 2) == [] and store.segments() == ["md-20261104.db", "md-20261105.db", "md-20261106.db"]
+    _stall(store)
+    assert store.apply_retention(now, 2) == ["md-20261104.db"]                        # 4 Nov is past retention (7 Nov - 2 days = 5 Nov): dropped
+    assert store.segments() == ["md-20261105.db", "md-20261106.db"] and store.verify() == []   # the retained log still verifies from its checkpoint
+    assert store.apply_retention(now, 2) == []                                        # idempotent: nothing inside the window is ever removed
+
+
+def test_a_stalled_store_with_a_clock_stepped_far_ahead_loses_at_most_one_extra_segment(tmp_path):
+    """Bounded: 4 segments, retention 2, a clock 400 days ahead. The policy bound (newest day - 2) would remove only the 4th; stalled, exactly ONE more (the 5th) goes, never the log."""
+    store = _four_days(str(tmp_path / "md"))                                          # 4, 5, 6, 7 Nov
+    _stall(store)
+    assert store.apply_retention(BASE + 400 * DAY, 2) == ["md-20261104.db", "md-20261105.db"]
+    assert store.segments() == ["md-20261106.db", "md-20261107.db"] and store.verify() == []
+    assert store.apply_retention(BASE + 400 * DAY, 2) == []                           # the newest segment is never touched, and the slack does not apply twice
+    healthy = _four_days(str(tmp_path / "md2"))
+    healthy.min_free_bytes, healthy.free_bytes = 1000, lambda: 10_000
+    assert healthy.apply_retention(BASE + 400 * DAY, 2) == ["md-20261104.db"]         # the same clock on a healthy volume removes only what the policy always did
+
+
+def test_a_failed_free_space_look_never_enables_a_deletion(tmp_path):
+    """The WRITER treats a failed look as 'low' (never assume room); the RETENTION must treat it as 'not stalled' (an error must never enable a deletion)."""
+    store = _three_days(str(tmp_path / "md"))
+    store.min_free_bytes = 1000
+
+    def boom():
+        raise OSError("statvfs failed")
+    store.free_bytes = boom
+    assert store.low_space() is True                                                  # the writer's reading is unchanged
+    assert store.apply_retention(BASE + 3 * DAY + 5_000, 2) == [] and len(store.segments()) == 3
+
+
+def _simulate_volume(tmp_path, *, label, stalled_aware, vol=5.0, daily=1.5, days=9, retention=2):
+    """The REAL MarketStore on a fake-capacity volume (1 MB == 1 GB). Hourly: write, then the maintenance thread's apply_retention; the emergency prune is default-deny (as deployed).
+    ``daily`` is a NOMINAL rate: the measured on-disk size of a full day here is about 1.9 units (the size model's inputs are therefore 1.9, not 1.5)."""
+    import random
+    unit = 1_000_000
+    d = str(tmp_path / label)
+    store = ST.MarketStore(d, commit_every=50, environment="mainnet", min_free_bytes=int(0.537 * unit))
+    other = int(0.05 * unit)
+
+    def used():
+        return sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)) + other
+    store.free_bytes = lambda: max(0, int(vol * unit) - used())
+    if not stalled_aware:                                                              # the old behaviour: the newest-segment bound always applies (no stall slack)
+        real_apply = store.apply_retention
+        store.apply_retention = lambda now_ms, retention_days: real_apply(now_ms, retention_days) if not store.low_space() else _old_apply(store, now_ms, retention_days)
+    rnd = random.Random(1)
+    base = 1_793_750_400_000                                                           # 2026-11-04 00:00 UTC
+    per_row = int(daily * unit / 24 / 20)
+    probe = rnd.randbytes(10_000).hex()
+    ratio = len(ST._compress(probe.encode())) / len(probe)                             # the compressed size of random hex: calibrate the on-disk bytes per row to the target
+    pay_len = max(1, int((per_row - 90) / ratio))
+    written_per_day = {}
+    for h in range(days * 24):
+        now = base + h * 3_600_000
+        for k in range(20):
+            store._free_checked_at = float("-inf")
+            try:
+                store.append(ST.FRAME, wall_ms=now + k * 1000, mono_s=float(h * 100 + k), category="linear", conn_id="l-1", topic="",
+                             payload=rnd.randbytes(pay_len // 2 + 1).hex()[:pay_len])
+                written_per_day[h // 24] = written_per_day.get(h // 24, 0) + 1
+            except ST.StoreError:
+                pass
+        store.flush()
+        if store._conn:
+            store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        store.apply_retention(now + 3_599_000, retention)
+    store.close()
+    return written_per_day
+
+
+def _old_apply(store, now_ms, retention_days):
+    """apply_retention exactly as it was before the stall slack (the cutoff bounded by the newest segment on disk, always)."""
+    from datetime import datetime, timezone
+    if retention_days <= 0:
+        return []
+    cutoff = ST._utc_day(int(now_ms) - int(retention_days) * 86_400_000)
+    segs = store.segments()
+    if segs:
+        newest_ms = int(datetime.strptime(segs[-1][3:11], "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()) * 1000
+        cutoff = min(cutoff, ST._utc_day(newest_ms - int(retention_days) * 86_400_000))
+    return store.prune_segments_before(cutoff)
+
+
+def test_a_volume_that_holds_the_retained_days_plus_the_reserve_recovers_instead_of_stalling_for_good(tmp_path):
+    """Reproduced with the real store. A full day measures about 1.9 units here, so retention 2 needs about 2 x 1.9 + 0.05 + 0.537 = 4.4 units: a 5.0 volume qualifies but is below the 6.5 the size
+    model asks for (3 x 1.9 x 1.042 + 0.59), so it loses most of every third day. Before the fix the recorder wrote nothing from the day it first hit the reserve, for ever; now the day that falls out
+    of retention is dropped at the next day boundary and writes resume."""
+    stuck = _simulate_volume(tmp_path, label="old", stalled_aware=False)
+    assert all(stuck.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), stuck                                 # the permanent stall: nothing written after the reserve was first hit
+    ok = _simulate_volume(tmp_path, label="new", stalled_aware=True)
+    assert all(ok.get(day, 0) > 0 for day in (3, 4, 5, 6, 7, 8)), ok                                      # every later day records something again
+    assert sum(ok.values()) > sum(stuck.values()) and min(ok[d] for d in (5, 8)) < 480                    # but a volume below the size model's figure still loses most of some days
+
+
+def test_below_the_retained_days_plus_the_reserve_the_stall_is_still_permanent_and_the_owner_must_extend_the_volume(tmp_path):
+    """The limit, stated by a test: the fix frees at most one segment per day boundary and never the newest, so a volume that cannot hold the retained days plus the reserve still stalls for good."""
+    for vol in (1.0, 3.0):
+        got = _simulate_volume(tmp_path, label=f"small{vol}", stalled_aware=True, vol=vol)
+        assert all(got.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), (vol, got)

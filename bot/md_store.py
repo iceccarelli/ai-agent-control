@@ -382,10 +382,27 @@ class MarketStore:
         cutoff = _utc_day(int(now_ms) - int(retention_days) * 86_400_000)
         # A wall clock that jumps forward must not delete everything: the cutoff is also
         # bounded by the newest segment already on disk (the log's own idea of "now").
+        # One exception, bounded to ONE day: while the volume is below the write reserve the log
+        # cannot open the next day's segment, so its own idea of "now" stops advancing and the
+        # newest-segment bound would keep every retained day forever (a stalled recorder could not
+        # recover by itself: the day that is now past retention is never dropped, so space is never
+        # freed, so writes never resume). A stalled store may therefore follow the wall clock by one
+        # day beyond its newest segment: at most ONE extra segment (the one expiring at the next day
+        # boundary) is dropped, even for a clock stepped years ahead; never a segment inside the
+        # retention window measured from the wall clock, and only while stalled. A failed free-space
+        # look is NOT "stalled" here (unlike the writer, which treats it as low): an error must never
+        # enable a deletion.
         segs = self.segments()
         if segs:
             newest_ms = int(datetime.strptime(segs[-1][3:11], "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()) * 1000
-            cutoff = min(cutoff, _utc_day(newest_ms - int(retention_days) * 86_400_000))
+            stalled = False
+            if self.min_free_bytes:
+                try:
+                    stalled = self.free_bytes() < self.min_free_bytes
+                except OSError:
+                    stalled = False
+            slack_ms = 86_400_000 if stalled else 0
+            cutoff = min(cutoff, _utc_day(newest_ms + slack_ms - int(retention_days) * 86_400_000))
         return self.prune_segments_before(cutoff)
 
     def _commit_locked(self) -> None:
