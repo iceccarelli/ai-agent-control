@@ -262,7 +262,7 @@ def authority_snapshot(now_ms: int, env: Mapping[str, str]) -> Dict[str, Any]:
 
 
 def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, symbol: Optional[str] = None, notional_usd: Any = None,
-                      min_funding_bps: Any = None) -> Dict[str, Any]:
+                      min_funding_bps: Any = None, book_root: Optional[str] = None) -> Dict[str, Any]:
     """The moment-of-decision economics, with NO execution authority: no grant, no capability, no lease, no state directory, no order, nothing written.
 
     It reads the venue's public rows, books and funding, the signed fee-rate (when the dedicated credentials exist; otherwise the fee tier stays ASSUMED and the verdict can never be a
@@ -280,7 +280,8 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
 
     def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
         res = _res("EVALUATED", why, decision=decision, **{**base, **kw})
-        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD)
+        res["decision_record"] = EL.decision_record(res, code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD,
+                                                    **_decision_context(book_root or DEFAULT_ROOT, res.get("owner_funding_floor_bps"), gv.get("max_notional_usd")))
         return res
     if not re.fullmatch(r"[A-Z0-9]{3,20}", str(sym)):
         return done("WAIT_FOR_DATA", ["SYMBOL_INVALID"])
@@ -312,7 +313,7 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, StopIteration, KeyError, IndexError, ValueError, TypeError, ArithmeticError) as exc:
         return done("WAIT_FOR_DATA", [f"EDGE_INPUTS_UNAVAILABLE:{type(exc).__name__}"])
     edge = verdict.as_dict()
-    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms))
+    base.update(hold_s=hold_for_edge, edge=edge, inputs_digest=inp.digest(), observed_ms=int(inp.now_ms), inputs=inp.summary(), next_settlement_ms=int(nxt))
     if verdict.session_class == EG.PROFIT_CANDIDATE and go:
         return done("ELIGIBLE_FOR_OWNER_TESTNET_DECISION", [reason, "ECONOMICS_CLEAR_THE_HURDLE: eligibility is not authority; see authority_gaps"], session_class="PROFIT_SEEKING")
     if verdict.session_class == EG.REJECTED:
@@ -320,6 +321,22 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     if verdict.session_class == EG.PROFIT_CANDIDATE:                  # economics clear, the owner's own funding floor does not
         return done("SKIP_NO_OPPORTUNITY", [reason], session_class=None)
     return done("INCONCLUSIVE", [f"EDGE_{verdict.session_class}"] + list(verdict.reasons)[:4], session_class=None)
+
+
+def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) -> Dict[str, Any]:
+    """The pieces of a decision record that are not market inputs: the policy limits in force, the capital book's state (read only; NO_CAPITAL_BOOK when it has never been written) and the venue."""
+    limits = {"per_session_loss_ceiling_usd": str(AD.MAX_LOSS_CEILING_USD), "aggregate_notional_ceiling_usd": str(AD.AGGREGATE_CEILING_USD), "drawdown_stop_usd": str(CC.DRAWDOWN_STOP_USD),
+              "min_net_edge_bps": str(EG.MIN_NET_EDGE_BPS), "funding_haircut": str(EG.FUNDING_HAIRCUT), "owner_funding_floor_bps": floor, "grant_max_notional_usd": grant_max,
+              "entries_stop_at_consecutive_losses": CC.LOSS_STREAK_STOP, "size_halved_at_consecutive_losses": CC.LOSS_STREAK_HALF}
+    portfolio: Dict[str, Any] = {"status": "NO_CAPITAL_BOOK"}
+    try:
+        if root and os.path.exists(os.path.join(root, "capital.json")):
+            r = CC.CapitalBook(root).report()
+            portfolio = {"status": "BOOK", "sizing_basis_usd": r.get("sizing_basis_usd"), "verified_result_usd": r.get("verified_realised_usd"), "lifecycles_settled": r.get("lifecycles_settled"),
+                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "pending_session": bool(r.get("pending"))}
+    except Exception:                                              # noqa: BLE001 - an unreadable book is stated, never guessed
+        portfolio = {"status": "BOOK_UNREADABLE"}
+    return {"risk_limits": limits, "portfolio": portfolio, "venue": {"id": "testnet", "host": S._venues.get("testnet").host, "scope": "TESTNET_FAKE_MONEY"}}
 
 
 def _decision_dir_refusal(directory: str) -> Optional[str]:
@@ -364,7 +381,8 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
              on_state: Callable[[str, str], None] = _noop_state, on_event: Callable[..., None] = _noop_event, dry_run: bool = False, **_ignored: Any) -> Dict[str, Any]:
     clock = clock or (lambda: int(time.time() * 1000))
     if dry_run:                                                       # the owner's read-only `evaluate`: economics only, BEFORE any authority check (it needs none and must never create any)
-        return evaluate_readonly(env, inner=inner, clock=clock, symbol=_ignored.get("symbol"), notional_usd=_ignored.get("notional_usd"), min_funding_bps=_ignored.get("min_funding_bps"))
+        return evaluate_readonly(env, inner=inner, clock=clock, symbol=_ignored.get("symbol"), notional_usd=_ignored.get("notional_usd"), min_funding_bps=_ignored.get("min_funding_bps"),
+                                book_root=engine_root or state_root)
     sleep = sleep or time.sleep
     now = int(clock())
     on_state("DATA_CHECK", "cycle_start")
@@ -397,8 +415,9 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     session_class, why_not = classify_session(verdict, D(str(rate)), g)
     drec = EL.decision_record({"decision": "SESSION_" + str(session_class), "symbol": sym, "notional_usd": str(g["max_notional_usd"]), "owner_funding_floor_bps": g["min_funding_bps"],
                                "funding_bps": rate * 1e4, "hold_s": hold_s, "why": why_not, "edge": verdict.as_dict(), "inputs_digest": inp.digest(), "observed_ms": inp.now_ms,
-                               "authority": {"candidate_id": manifest.get("candidate_id"), "spec_digest": manifest.get("spec_digest")}}, code_sha=env.get("GIT_SHA"),
-                              margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD)
+                               "inputs": inp.summary(), "next_settlement_ms": int(nxt), "authority": {"candidate_id": manifest.get("candidate_id"), "spec_digest": manifest.get("spec_digest")}},
+                              code_sha=env.get("GIT_SHA"), margin_per_usd=CC.MARGIN_PER_USD, loss_cap_usd=AD.MAX_LOSS_CEILING_USD,
+                              **_decision_context(engine_root or DEFAULT_ROOT, g["min_funding_bps"], g["max_notional_usd"]))
     did = drec["decision_id"]                                         # the SAME record shape the read-only evaluation produces: a session is traceable to the decision that preceded it
     if session_class is None:
         return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict(), decision_id=did)
@@ -445,8 +464,12 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     pf = ES.read_json(os.path.join(d, "preflight.json")) or {}
     book = CC.CapitalBook(engine_root)
     usdt_now = pf.get("usdt")
-    book.ensure_baseline(usdt_now)
-    settled = book.settle(usdt_now)                                   # what the venue's cash REALLY did since the last verified-flat session (losses in full; gains only as far as explained)
+    try:
+        book.load()                                                   # a book that exists but cannot be read is NOT a fresh book: refuse before any order (the file stays as evidence)
+        book.ensure_baseline(usdt_now)
+        settled = book.settle(usdt_now)
+    except CC.BookUnreadable as exc:
+        return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])      # (settle = what the venue's cash REALLY did since the last verified-flat session: losses in full, gains only as far as explained)
     if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
         emit(EL.capital_settled(settled))
         ES.EngineState(engine_root, clock).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED", "session_id": settled.get("session_id"), "delta_usd": settled.get("delta_usd")})
@@ -1184,7 +1207,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "evaluate":
-        res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps)
+        res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps, engine_root=getattr(a, "root", None))
         if a.record_to and isinstance(res.get("decision_record"), dict):
             res["recorded"] = record_decision(a.record_to, res["decision_record"], clock())
         print(json.dumps(res, indent=2, sort_keys=True, default=str))

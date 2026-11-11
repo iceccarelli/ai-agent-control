@@ -130,7 +130,8 @@ def capital_book(report: Mapping[str, Any]) -> Event:
     return ("DAILY_PNL", "CAPITAL_BOOK", p)
 
 
-def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None, margin_per_usd: Optional[Any] = None, loss_cap_usd: Optional[Any] = None) -> Dict[str, Any]:
+def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None, margin_per_usd: Optional[Any] = None, loss_cap_usd: Optional[Any] = None,
+                    risk_limits: Optional[Mapping[str, Any]] = None, portfolio: Optional[Mapping[str, Any]] = None, venue: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The REPRODUCIBLE record of one moment-of-decision evaluation (pure). ``decision_id`` is a hash of everything that determined the answer: the digest of the market INPUTS (books,
     instrument rows, funding observation, fee tiers), the verdict digest, the decision, the size, the owner's floor, the candidate and the code revision. The same inputs and code give the same
     id and the same decision; a different market state, fee tier, size or code can never share one. Full digests stay in the local result; the evidence payload carries 16-hex references.
@@ -139,7 +140,8 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
     auth = result.get("authority") if isinstance(result.get("authority"), Mapping) else {}
     cand = {"candidate_id": auth.get("candidate_id"), "spec_ref": ref16(auth.get("spec_digest"))} if auth.get("candidate_id") else None
     core = {"inputs": result.get("inputs_digest"), "edge": None if edge is None else edge.get("digest"), "decision": result.get("decision"), "symbol": result.get("symbol"),
-            "notional": result.get("notional_usd"), "floor": result.get("owner_funding_floor_bps"), "candidate": cand, "code": code_sha}
+            "notional": result.get("notional_usd"), "floor": result.get("owner_funding_floor_bps"), "candidate": cand, "code": code_sha,
+            "portfolio": None if portfolio is None else json.dumps(dict(portfolio), sort_keys=True, default=str), "venue": None if venue is None else json.dumps(dict(venue), sort_keys=True, default=str)}
     did = "dec_" + hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
     assumed = [str(a) for a in (edge or {}).get("assumed_inputs", [])]
     notional = result.get("notional_usd")
@@ -155,6 +157,34 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
                        "costs_bps": {str(k)[:30]: num(v) for k, v in dict(edge.get("costs_bps", {})).items()}, "assumed_inputs": assumed[:10],
                        "settlements_in_hold": edge.get("settlements_in_hold"), "edge_ref": ref16(edge.get("digest"))}
         rec["fee_tier"] = "ASSUMED" if any("fee" in a.lower() for a in assumed) else "MEASURED"
+    rec["venue"] = None if venue is None else {str(k)[:20]: str(v)[:60] for k, v in dict(venue).items()}
+    ms = result.get("observed_ms")
+    if isinstance(ms, int) and ms > 0:
+        import datetime as _dt
+        rec["observed_utc"] = _dt.datetime.fromtimestamp(ms / 1000.0, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    inp = result.get("inputs") if isinstance(result.get("inputs"), Mapping) else None
+    if inp is not None:
+        rec["market_inputs"] = {str(k)[:40]: (v if isinstance(v, int) and not isinstance(v, bool) else None if v is None else str(v)[:40]) for k, v in dict(inp).items()}
+        ages = [v for k, v in inp.items() if k.endswith("_book_age_ms") and isinstance(v, int)]
+        rec["data_freshness_ms"] = {"oldest_book_age": max(ages) if ages else None, "inputs_observed_ms": inp.get("observed_ms")}
+    rec["settlement"] = {"next_ms": result.get("next_settlement_ms"), "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "rate_bps": num(result.get("funding_bps")),
+                         "settlements_in_hold": (edge or {}).get("settlements_in_hold") if edge is not None else None}
+    if edge is not None:
+        try:                                                                       # the SCENARIOS, all arithmetic on the verdict's own declared inputs (labelled as such)
+            costs = [D(str(v)) for v in dict(edge.get("costs_bps", {})).values() if v is not None]
+            known = len(costs) == len(dict(edge.get("costs_bps", {}))) and bool(costs)
+            n, rate = int(edge.get("settlements_in_hold") or 0), D(str(result.get("funding_bps")))
+            total_cost = sum(costs, D(0))
+            rec["scenarios"] = {"label": "ARITHMETIC_ON_DECLARED_INPUTS", "gross_expected_funding_bps": num(rate * n), "total_cost_bps": num(total_cost) if known else None,
+                                "gross_before_haircut_net_bps": num(rate * n - total_cost) if known else None,
+                                "conservative_expected_net_bps": num(edge.get("net_edge_bps")), "conservative_basis": "the economic model's own funding haircut and hurdle (net_edge_bps)",
+                                "stress_half_funding_net_bps": num(rate * n / 2 - total_cost) if known else None, "required_funding_bps": num(edge.get("required_funding_bps"))}
+        except (ArithmeticError, ValueError, TypeError):                           # noqa: BLE001
+            rec["scenarios"] = {"label": "ARITHMETIC_ON_DECLARED_INPUTS", "unavailable": True}
+    if risk_limits is not None:
+        rec["risk_limits"] = {str(k)[:40]: (v if isinstance(v, (int, float)) and not isinstance(v, bool) else None if v is None else str(v)[:40]) for k, v in dict(risk_limits).items()}
+    if portfolio is not None:
+        rec["portfolio_context"] = {str(k)[:40]: (v if isinstance(v, (int, float, bool)) else None if v is None else str(v)[:40]) for k, v in dict(portfolio).items()}
     if notional is not None and margin_per_usd is not None:
         try:
             rec["capital_required_usd"] = num(D(str(notional)) * D(str(margin_per_usd)), 2)

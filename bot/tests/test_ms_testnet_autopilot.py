@@ -1417,3 +1417,56 @@ def test_a_decision_record_is_refused_inside_the_repository_the_state_dir_or_the
     os.symlink(AP.BOT, str(link))
     assert AP.record_decision(str(link / "ev2"), rec, w.clock.now()).startswith("REFUSED:DIRECTORY_INSIDE_")        # a symlink does not smuggle it in
     assert AP.record_decision(str(tmp_path / "fine"), rec, w.clock.now()) == "STORED"
+
+
+def test_the_decision_record_carries_every_field_the_owner_needs_and_the_scenarios_are_exact_arithmetic(tmp_path, monkeypatch):
+    from decimal import Decimal as D
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    res = _evaluate(w, notional_usd="200")
+    r = res["decision_record"]
+    for k in ("decision_id", "observed_utc", "code_sha", "inputs_ref", "candidate", "venue", "settlement", "market_inputs", "fee_tier", "edge", "scenarios", "capital_required_usd",
+              "risk_limits", "worst_credible_loss_usd", "portfolio_context", "authority_gaps", "data_freshness_ms", "decision", "reasons", "symbol", "notional_usd", "observed_ms"):
+        assert k in r, k
+    assert r["observed_utc"].endswith("Z") and r["venue"]["id"] == "testnet" and r["portfolio_context"]["status"] == "NO_CAPITAL_BOOK"
+    mi = r["market_inputs"]
+    assert mi["perp_bid"] and mi["perp_ask"] and mi["spot_bid"] and mi["spot_ask"] and mi["perp_depth_usd_within_10bps"] is not None and mi["perp_book_age_ms"] is not None
+    assert r["data_freshness_ms"]["oldest_book_age"] is not None and r["settlement"]["next_ms"] and r["settlement"]["rate_bps"]
+    rl = r["risk_limits"]
+    assert rl["per_session_loss_ceiling_usd"] and D(rl["aggregate_notional_ceiling_usd"]) == 500 and rl["min_net_edge_bps"] and rl["funding_haircut"] == "0.30" and rl["entries_stop_at_consecutive_losses"] == 4
+    sc = r["scenarios"]
+    assert sc["label"] == "ARITHMETIC_ON_DECLARED_INPUTS"
+    n, rate = res["edge"]["settlements_in_hold"], D(str(res["funding_bps"])).quantize(D("0.0001"))
+    cost = sum(D(str(v)) for v in res["edge"]["costs_bps"].values())
+    assert D(sc["gross_expected_funding_bps"]) == (rate * n).quantize(D("0.0001")) and D(sc["total_cost_bps"]) == cost.quantize(D("0.0001"))
+    assert abs(D(sc["stress_half_funding_net_bps"]) - (rate * n / 2 - cost)) < D("0.001") and abs(D(sc["gross_before_haircut_net_bps"]) - (rate * n - cost)) < D("0.001")
+    assert D(sc["conservative_expected_net_bps"]) == D(str(res["edge"]["net_edge_bps"])).quantize(D("0.0001")) and D(sc["conservative_expected_net_bps"]) <= D(sc["gross_before_haircut_net_bps"])
+    # reproducible: the same inputs and code give the same identity, and the decision needs no grant, capability or lease
+    _measured_world(w)
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] == r["decision_id"] and "UNATTENDED_GRANT" in r["authority_gaps"]
+
+
+def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_book_is_stated(tmp_path, monkeypatch):
+    import ms_capital as CC
+    ctx = AP._decision_context(str(tmp_path / "none"), 1.0)
+    assert ctx["portfolio"] == {"status": "NO_CAPITAL_BOOK"} and ctx["venue"]["scope"] == "TESTNET_FAKE_MONEY"
+    root = tmp_path / "book"
+    b = CC.CapitalBook(str(root))
+    b.ensure_baseline("10000")
+    ctx2 = AP._decision_context(str(root), 1.0)
+    assert ctx2["portfolio"]["status"] == "BOOK" and ctx2["portfolio"]["halted"] in (False, None)
+    base = {"decision": "REJECT_UNECONOMIC", "symbol": "BTCUSDT", "notional_usd": "200", "inputs_digest": "d" * 64, "observed_ms": 1_794_312_000_000, "edge": None}
+    a = EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"]
+    assert a == EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"] and a != EL.decision_record(base, code_sha="c" * 40, **ctx2)["decision_id"]
+    (root / "capital.json").write_text("{broken")
+    assert AP._decision_context(str(root), 1.0)["portfolio"]["status"] == "BOOK_UNREADABLE"
+
+
+def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w):
+    _profit_world(w)
+    root = w.tmp / "eng_corrupt"
+    os.makedirs(root)
+    (root / "capital.json").write_text("{corrupt")
+    res, _got = _collect(w, eng_name="eng_corrupt")
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
+    assert (root / "capital.json").read_text() == "{corrupt" and not w.requests_to("/v5/order/create")

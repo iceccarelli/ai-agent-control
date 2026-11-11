@@ -355,10 +355,17 @@ class FakeBybitTestnet:
         sgn = 1 if side == "Buy" else -1
         if cat == "linear":
             p = self.positions.setdefault(sym, {"size": D(0), "avg": D(0)})
-            p["size"] += sgn * qty
-            p["avg"] = px
-            if p["size"] == 0:
+            old = p["size"]
+            new_size = old + sgn * qty
+            if old != 0 and (old > 0) != (sgn > 0):                  # a REDUCING fill realises P&L into the wallet, as the venue does (the perp's price leg is cash once closed)
+                self.wallet["USDT"] += (px - p["avg"]) * min(abs(old), qty) * (1 if old > 0 else -1)
+            if new_size == 0:
                 p["avg"] = D(0)
+            elif old == 0 or (old > 0) == (sgn > 0):
+                p["avg"] = (abs(old) * p["avg"] + qty * px) / abs(new_size)
+            else:
+                p["avg"] = p["avg"] if abs(new_size) < abs(old) else px     # partial close keeps the entry price; a flip re-opens at the fill price
+            p["size"] = new_size
             fee, fee_ccy = qty * px * (self.taker_rate if taker else self.maker_rate), "USDT"
             self.wallet["USDT"] -= fee
         else:

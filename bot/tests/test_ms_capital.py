@@ -3,6 +3,8 @@ import os
 import sys
 from decimal import Decimal as D
 
+import pytest
+
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [BOT, os.path.join(BOT, "tools")]
 import ms_capital as C  # noqa: E402
@@ -205,10 +207,11 @@ def test_drawdown_is_measured_from_the_verified_peak_and_the_report_is_labelled_
     assert r["wins"] == 1 and r["losses"] == 1 and r["profit_factor"] == "1.67" and "TESTNET SIMULATION" in r["label"]
 
 
-def test_a_corrupt_book_file_reads_as_empty_not_as_money(tmp_path):
+def test_a_corrupt_book_file_is_refused_not_read_as_empty_money(tmp_path):
+    """Was: a corrupt file read as an empty book (zero notional). A fresh-looking book also resets the baseline, the loss streak and the halt flag, so it now REFUSES (see the BookUnreadable test)."""
     (tmp_path / "capital.json").write_text("{not json")
-    b = book(tmp_path)
-    assert b.basis() is None and alloc(basis=b.basis(), start_cash=None).notional == D(0)
+    with pytest.raises(C.BookUnreadable):
+        book(tmp_path).basis()
 
 
 # ================================================================ round two: findings from the independent accounting review (verified in code first)
@@ -342,3 +345,23 @@ def test_halt_and_drawdown_acknowledgements_are_reachable_only_from_the_owner_cl
                         offenders.append((fn, node.name, sub.attr))
     offenders = [o for o in offenders if o[0] != "ms_capital.py"]
     assert offenders == [], offenders
+
+
+def test_a_present_but_unreadable_book_is_not_a_fresh_book_and_is_left_untouched(tmp_path):
+    """A corrupted or tampered capital.json used to load as a FRESH book: the baseline, the loss streak and the halt flag all reset. It must refuse, and keep the file as evidence."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    b.park("s1", "10000", None, False, True)
+    b.settle("9990")
+    assert b.load()["loss_streak"] == 1
+    for junk in ("{broken", "[]", _json.dumps({"schema": "something/else"}), ""):
+        with open(b.path, "w", encoding="utf-8") as fh:
+            fh.write(junk)
+        with pytest.raises(C.BookUnreadable):
+            b.load()
+        for call in (lambda: b.ensure_baseline("10000"), lambda: b.settle("10000"), lambda: b.park("s2", "10000", None, False, True), b.report):
+            with pytest.raises(C.BookUnreadable):
+                call()
+        assert open(b.path, encoding="utf-8").read() == junk                  # never overwritten
+    os.unlink(b.path)
+    assert book(tmp_path).load()["loss_streak"] == 0                           # only a MISSING file is a fresh book
