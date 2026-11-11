@@ -11,6 +11,11 @@ import exec_evidence as XE  # noqa: E402
 import legacy_executor_guard as LG  # noqa: E402
 import unattended_drill as UD  # noqa: E402
 
+@pytest.fixture(autouse=True)
+def _private_lock_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("MS_EXECUTOR_LOCK_PATH", str(tmp_path / "locks" / "ms_executor.lock"))        # the guarded parent also takes the LOCAL account lock: never touch the real HOME
+
+
 OWNER = "11111111-2222-3333-4444-555555555555"
 ENV = {"SUPABASE_URL": "https://abcdefgh.supabase.co", "SUPABASE_SERVICE_ROLE_KEY": "k" * 30, "SUPABASE_OWNER_ID": OWNER, "FLY_MACHINE_ID": "m1"}
 
@@ -152,7 +157,7 @@ def test_the_guard_module_can_reach_no_exchange_by_construction():
     src = open(os.path.join(BOT, "tools", "legacy_executor_guard.py"), encoding="utf-8").read()
     tree = ast.parse(src)
     top = {n.names[0].name.split(".")[0] for n in tree.body if isinstance(n, ast.Import)} | {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom) and n.module}
-    assert top <= {"__future__", "uuid", "typing"}, top                                              # exec_evidence is imported lazily, inside acquire()
+    assert top <= {"__future__", "uuid", "typing", "os", "sys", "time"}, top                                              # exec_evidence is imported lazily, inside acquire()
     low = src.lower()
     assert "bybit" not in low.replace("order-capable", "") or "api.bybit" not in low
     assert "place_order" not in low and "environ" not in low
@@ -182,7 +187,7 @@ def test_manual_execute_is_refused_while_the_autopilot_holds_the_lease_and_runs_
     autopilot.release()
     seen = []
 
-    def run(argv, env):
+    def run(argv, env, sleep=None):
         seen.append(server.holder)                                  # the lease is HELD while the order-capable run executes
         return 0
     assert MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=run) == 0
@@ -192,7 +197,7 @@ def test_manual_execute_is_refused_while_the_autopilot_holds_the_lease_and_runs_
 def test_manual_execute_releases_the_lease_even_when_the_run_raises():
     server = FakeServer()
 
-    def boom(argv, env):
+    def boom(argv, env, sleep=None):
         raise RuntimeError("venue exploded")
     with pytest.raises(RuntimeError):
         MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=boom)

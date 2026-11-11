@@ -609,14 +609,23 @@ def _loop(root: str, *, env: Mapping[str, str], max_runs: int,
 def guarded_run_once(run_dir: str, *, env: Mapping[str, str], acquire: Callable[..., Any] = None, **kw: Any) -> int:
     """The order-capable entry point the CLI uses: ONE armed run under the shared single-writer lease (legacy_executor_guard). Refused (nothing sent) without it; released in ``finally``."""
     import legacy_executor_guard as LG
+    import ms_executor_lock as XL
     handle, why = (acquire or LG.acquire)(env)
     if handle is None:
         os.makedirs(run_dir, exist_ok=True)
         _say(run_dir, "refusing to place any order: " + why)
         return EXIT_REFUSED
+    path = XL.resolve_path(env)
+    lock = XL.ExecutorLock(path, role="legacy-drill", state_dir=run_dir, now_ms=int(time.time() * 1000))
+    if not lock.try_acquire():                                         # the local single-writer lock too: its note is how the armed drill child recognises ITS parent
+        handle.release()
+        os.makedirs(run_dir, exist_ok=True)
+        _say(run_dir, "refusing to place any order: another order-capable process holds the account lock")
+        return EXIT_REFUSED
     try:
-        return run_once(run_dir, env=env, **kw)
+        return run_once(run_dir, env=dict(env, MS_EXECUTOR_LOCK_PATH=path), **kw)
     finally:
+        lock.release()
         handle.release()
 
 

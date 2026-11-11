@@ -36,6 +36,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
 
 import bybit_connection as bc  # noqa: E402
 import exec_quality as EQ  # noqa: E402
+import ms_executor_lock as XL  # noqa: E402
 import funding_settlement as FS  # noqa: E402
 import ms_accounting as AC  # noqa: E402
 import ms_authority as MA  # noqa: E402
@@ -1044,6 +1045,23 @@ def cmd_execute(ctx: Ctx) -> int:
         ctx.out("execute REFUSED (no network call was made): " + "; ".join(why))
         return EXIT_REFUSED
     assert plan is not None and manifest is not None
+    lock = _account_lock(ctx, "execute")
+    if not lock.try_acquire():
+        h = XL.read_holder(lock.path)
+        ctx.out("execute REFUSED (no network call was made): another order-capable session holds the account lock" + (f" ({h['role']}, pid {h['pid']}, {h['state_dir']})" if h else "")
+                + "; two writers on one account are never allowed. If an exit is needed use: reconcile --unwind --confirm-plan-digest <digest>")
+        return EXIT_REFUSED
+    try:
+        return _execute_locked(ctx, plan, manifest)
+    finally:
+        lock.release()
+
+
+def _account_lock(ctx: Ctx, role: str) -> "XL.ExecutorLock":
+    return XL.ExecutorLock(XL.lock_path(AD.DEFAULT_CAPABILITY_PATH), role=role, state_dir=ctx.dir, now_ms=int(ctx.clock()))
+
+
+def _execute_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any]) -> int:
     rec = load_record(ctx)
     rec["confirmation"] = {"state": "CONFIRMED", "plan_digest_confirmed": plan["plan_digest"]}
     if getattr(ctx.args, "unattended", False):                          # provenance that the record schema (and the control centre) do not carry: who authorised it, and that no human typed the digest
@@ -1132,6 +1150,43 @@ def cmd_reconcile(ctx: Ctx) -> int:
         ctx.out("reconcile REFUSED (no network call was made): " + "; ".join(why))
         return EXIT_REFUSED
     assert manifest is not None
+    lock = _account_lock(ctx, "unwind" if ctx.args.unwind else "reconcile")
+    if not lock.try_acquire():
+        h = XL.read_holder(lock.path)
+        if not ctx.args.unwind:
+            ctx.out("reconcile REFUSED (nothing was sent): an order-capable session holds the account lock" + (f" ({h['role']}, pid {h['pid']}, {h['state_dir']})" if h else "")
+                    + "; a reconcile can cancel a live leg and must not interleave with the session that owns the journal. For an emergency exit use --unwind --confirm-plan-digest.")
+            return EXIT_REFUSED
+        if not _hand_over_unwind(ctx, plan, lock, h):                  # the emergency exit: the holder (the ONLY journal writer) is told to unwind; we wait for the lock, never run a second writer
+            return EXIT_FAIL
+    try:
+        return _reconcile_locked(ctx, plan, manifest, rec)
+    finally:
+        lock.release()
+
+
+def _hand_over_unwind(ctx: Ctx, plan: Mapping[str, Any], lock: "XL.ExecutorLock", holder: Optional[Mapping[str, Any]]) -> bool:
+    """The account lock is held by a running session and the owner asked for an emergency unwind. Engage THAT session's kill switch (it cancels entries, unwinds reduce-only and verifies flat, itself),
+    then wait a bounded time for the lock. True once this process holds it; False (and a message naming who to stop) when the holder does not let go."""
+    if not holder or not os.path.isdir(holder["state_dir"]):
+        ctx.out("unwind NOT started: the account lock is held but its holder cannot be identified (no readable note). Stop the order-capable process (autopilot-ctl drain / stop the app), then run this again. "
+                "Nothing was sent; no second writer was started.")
+        return False
+    kill = os.path.join(holder["state_dir"], FILES["kill"])
+    created = AD.engage_kill_switch(kill, "reconcile --unwind handover")
+    ctx.out(f"the account lock is held by {holder['role']} pid {holder['pid']} ({holder['state_dir']}): its kill switch was {'engaged' if created else 'already engaged'} so IT unwinds reduce-only (one writer). "
+            "Waiting for it to finish; the kill file stays engaged until you remove it on purpose.")
+    deadline = int(ctx.clock()) + (int(plan["timing"]["exit_wait_s"]) + 60) * 1000
+    while int(ctx.clock()) < deadline:
+        if lock.try_acquire():
+            ctx.out("the holder has finished: reconciling against the venue")
+            return True
+        ctx.sleep(2.0)
+    ctx.out(f"unwind handover TIMED OUT: pid {holder['pid']} still holds the lock. Stop that process, then run this again. Nothing was sent by this command.")
+    return False
+
+
+def _reconcile_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any], rec: Dict[str, Any]) -> int:
     ctx.plan_poll = plan["timing"]["poll_s"]
     try:
         run = Run(ctx, plan, manifest)
@@ -1158,6 +1213,9 @@ def cmd_reconcile(ctx: Ctx) -> int:
         for link in stuck:                                              # a leg the venue (COMPLETE read) has no order for never existed there: close it out so the unwind can proceed
             if view and view.get("complete") and link not in view["orders"]:
                 eng.on_order_done(run.gid, link.split("-", 1)[1], int(ctx.clock()))
+        cleared = eng.clear_exit_halt(run.gid, int(ctx.clock()))       # the owner's CONFIRMED unwind is the one thing allowed to lift an exit halt (journalled): a halted group would otherwise send no exit
+        if cleared:
+            ctx.out(f"group halt '{cleared}' lifted by the confirmed unwind (journalled); exits are reduce-only")
         eng.request_exit(run.gid, int(ctx.clock()), "RECONCILE_UNWIND")
         _drive(ctx, run, rec, ("CLOSED", "FAILED"), plan["timing"]["exit_wait_s"])
     run.snapshot_record(rec, final=True)
@@ -1263,25 +1321,44 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str
     return {"preflight": cmd_preflight, "plan": cmd_plan, "execute": cmd_execute, "reconcile": cmd_reconcile, "status": cmd_status, "assess": cmd_assess}[a.cmd](ctx)
 
 
+LEASE_TTL_S = 120            # short on purpose: a crashed manual run frees the account in two minutes, and a live one renews far more often than that
+LEASE_RENEW_EVERY_S = 30.0
+
+
 def guarded_main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[str, str]] = None, acquire: Optional[Callable[..., Any]] = None,
-                 run: Optional[Callable[..., int]] = None) -> int:
+                 run: Optional[Callable[..., int]] = None, monotonic: Optional[Callable[[], float]] = None, real_sleep: Optional[Callable[[float], None]] = None) -> int:
     """The OWNER'S command-line entry point. ``execute`` places Testnet orders, so it takes THE shared single-writer lease first (the autopilot holds the same one; a second order-capable
-    process on the account would be a second hedge) and releases it in ``finally``; refused (nothing sent) when the lease is not configured, is held by another executor, or does not answer.
-    Every other command is read-only and runs as before. The autopilot calls ``main`` directly while it already holds the lease, so it is not double-locked."""
+    process on the account would be a second hedge), RENEWS it from its own sleep hook for as long as the session runs (the server caps a lease at 3600 s and a plan may run for hours), and
+    releases it in ``finally``. When a renewal cannot be proven the session's kill switch is engaged: entries stop, the hedge unwinds reduce-only and flat is verified (a lost lease never abandons a
+    hedge). Refused (nothing sent) when the lease is not configured, is held by another executor, or does not answer. Every other command is read-only (or the lease-free protective unwind) and
+    runs as before. The autopilot calls ``main`` directly while it already holds the lease, so it is not double-locked."""
     import time as _time
     argv_l = list(argv) if argv is not None else sys.argv[1:]
     environ = dict(env if env is not None else os.environ)
     run = run or main
-    cmd = _parser().parse_args(argv_l).cmd
-    if cmd != "execute":
+    parsed = _parser().parse_args(argv_l)
+    if parsed.cmd != "execute":
         return run(argv_l, env=environ)
     import legacy_executor_guard as LG
-    handle, why = (acquire or LG.acquire)(environ)
+    handle, why = (acquire or (lambda e: LG.acquire(e, ttl_seconds=LEASE_TTL_S, service="manual-session")))(environ)
     if handle is None:
         print("execute REFUSED (no order was sent): " + why)
         return EXIT_REFUSED
+    mono, rsleep = monotonic or _time.monotonic, real_sleep or _time.sleep
+    last = {"t": mono(), "lost": False}
+    kill_path = os.path.join(os.path.abspath(os.path.expanduser(parsed.state_dir)), FILES["kill"])
+
+    def sleep(seconds: float) -> None:
+        rsleep(seconds)
+        if mono() - last["t"] >= LEASE_RENEW_EVERY_S:
+            last["t"] = mono()
+            if not handle.renew() and not last["lost"]:
+                last["lost"] = True
+                AD.engage_kill_switch(kill_path, "executor lease could not be renewed")
+                print("EXECUTOR LEASE LOST: the session's kill switch was engaged (entries stop, the hedge unwinds reduce-only).")
+
     try:
-        return run(argv_l, env=environ)
+        return run(argv_l, env=environ, sleep=sleep)
     finally:
         handle.release()
 

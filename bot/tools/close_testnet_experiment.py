@@ -2515,4 +2515,5 @@ def main(argv: Optional[List[str]] = None, *,
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import legacy_executor_guard as _LG
+    raise SystemExit(_LG.run_guarded_cli(main, env=os.environ))

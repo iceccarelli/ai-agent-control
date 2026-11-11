@@ -512,6 +512,19 @@ class ExecutionEngine:
         self._settle(g, now_ms)
         return g.state
 
+    def clear_exit_halt(self, group_id: str, now_ms: int) -> Optional[str]:
+        """The owner's CONFIRMED emergency unwind lifts a halt that would otherwise stop every exit order (repeated exit rejections, a position the venue still shows). Journalled as a HALT_GROUP with an
+        empty reason, so the chain shows who lifted what and when. Halts that are not exit halts (a conflicting order id, an instrument halt) are NOT lifted: returns the reason lifted, or None."""
+        g = self.groups.get(group_id)
+        if g is None or not g.halted_reason:
+            return None
+        why = g.halted_reason
+        if why == "EXIT_ORDERS_REJECTED" or why.startswith("NOT_FLAT_ON_VENUE"):
+            self._emit("HALT_GROUP", group_id, now_ms, {"reason": ""})
+            self._settle(g, now_ms)
+            return why
+        return None
+
     # ---------------------------------------------------------------- public: external events
     def halt_new_exposure(self, reason: str, now_ms: int) -> None:
         if reason not in self.halts:

@@ -1731,6 +1731,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"REFUSED: the drill kill file is engaged ({stop_why}); a human removes it before anything is armed.", file=sys.stderr)
             return 2
 
+    release_writer: Optional[Callable[[], None]] = None
+    if args.arm:
+        release_writer, writer_why = single_writer_guard(os.environ)
+        if release_writer is None:
+            print(f"REFUSED: {writer_why}", file=sys.stderr)
+            return 2
+
     if args.arm:
         # an interrupt closes the pair and writes the report; a second one
         # while that happens is ignored (it would leave the short open)
@@ -1755,40 +1762,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"interrupted ({exc}) before any order could have been "
                   "sent (during setup); no report was produced.",
                   file=sys.stderr)
+            if release_writer is not None:
+                release_writer()
             return 130
         print(f"INTERRUPTED ({exc}): the pair was closed through the engine "
               "and the report written; the venue state is below.",
               file=sys.stderr)
+    if release_writer is not None:
+        release_writer()
     stamp_capture_tail(report, args.evidence_path, args.out)
     _print_report(report, args)
     return drill_exit_code(report, hold=plan is not None)
 
 
-def stamp_capture_tail(report: Dict[str, Any], evidence_path: str,
-                       out: str = "") -> None:
-    """Record where the evidence chain ENDS (`head_hash`, `records`) in the
-    report, so `tools/evidence_reconcile.py --expect-head-hash/--expect-records`
-    can tell a cut tail from the real end. A hash chain cannot show its own end
-    was removed. Never raises: the drill's verdict does not depend on it, and a
-    file that cannot be read simply leaves the report without the fields."""
-    capture = report.get("evidence_capture")
-    if not evidence_path or not isinstance(capture, dict):
-        return
-    try:
-        with open(evidence_path, encoding="utf-8") as handle:
-            lines = [ln for ln in handle if ln.strip()]
-        head = str(json.loads(lines[-1]).get("record_hash", "")) if lines else ""
-    except (OSError, ValueError, AttributeError):
-        return
-    if not head:
-        return
-    capture["head_hash"], capture["records"] = head, len(lines)
-    if out:
-        try:
-            with open(out, "w", encoding="utf-8") as handle:
-                json.dump(report, handle, indent=2, default=str)
-        except OSError:
-            pass
+def single_writer_guard(env: Any) -> Tuple[Optional[Callable[[], None]], str]:
+    """``--arm`` opens a hedge on the Testnet account, so it takes the SAME single-writer authority as the autopilot and the manual session tool (``legacy_executor_guard.single_writer``: the local
+    account lock and the shared Supabase lease, or the guarded unattended-drill parent that holds both). (release, "") when it may proceed, (None, reason) when it may not: nothing is sent."""
+    import legacy_executor_guard as LG
+    return LG.single_writer(env)
 
 
 class InterruptGuard:

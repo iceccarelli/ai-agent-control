@@ -37,7 +37,7 @@ COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/carry_performance.py tools/owner_policy_check.py \
      tools/execution_samples_report.py tools/market_recorder.py tools/md_seal.py tools/runner_supervisor.py tools/capacity_summary.py \
      tools/profitability_report.py tools/state_backup.py tools/anchor_archive.py \
-     tools/legacy_executor_guard.py tools/exec_evidence.py tools/supabase_sync.py tools/account_review.py tools/carry_prospective.py \
+     tools/legacy_executor_guard.py tools/ms_executor_lock.py tools/exec_evidence.py tools/supabase_sync.py tools/account_review.py tools/carry_prospective.py \
      tools/carry_teardown.py tools/deflated_sharpe.py tools/hypothesis_registry.py tools/strategy_verdict.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
