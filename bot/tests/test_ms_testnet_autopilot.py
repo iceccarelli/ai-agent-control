@@ -1433,7 +1433,7 @@ def test_the_decision_record_carries_every_field_the_owner_needs_and_the_scenari
     assert mi["perp_bid"] and mi["perp_ask"] and mi["spot_bid"] and mi["spot_ask"] and mi["perp_depth_usd_within_10bps"] is not None and mi["perp_book_age_ms"] is not None
     assert r["data_freshness_ms"]["oldest_book_age"] is not None and r["settlement"]["next_ms"] and r["settlement"]["rate_bps"]
     rl = r["risk_limits"]
-    assert rl["per_session_loss_ceiling_usd"] and D(rl["aggregate_notional_ceiling_usd"]) == 500 and rl["min_net_edge_bps"] and rl["funding_haircut"] == "0.30" and rl["entries_stop_at_consecutive_losses"] == 4
+    assert rl["per_session_loss_ceiling_usd"] and D(rl["aggregate_notional_ceiling_usd"]) == 500 and rl["min_net_edge_bps"] and D(rl["funding_haircut"]) == D("0.30") and rl["entries_stop_at_consecutive_losses"] == 4
     sc = r["scenarios"]
     assert sc["label"] == "ARITHMETIC_ON_DECLARED_INPUTS"
     n, rate = res["edge"]["settlements_in_hold"], D(str(res["funding_bps"])).quantize(D("0.0001"))
