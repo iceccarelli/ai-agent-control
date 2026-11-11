@@ -92,7 +92,8 @@ MAINNET_STALL_CYCLES = 6
 #: Cycles in a row, among those that report on the recorder, with it not RECORDING.
 RECORDER_DOWN_CYCLES = 3
 #: EARLY WARNING for the failure that stopped the live recorder: the market-data store refuses to write below a 512 MiB free-space reserve and cannot recover by itself (age retention is bounded by the
-#: newest segment on disk, a refused write never opens the next day's segment, the emergency prune is default-deny). The level is the reserve plus 1 GiB (about 0.7 day at the documented 1.5 GB/day):
+#: newest segment on disk, a refused write never opens the next day's segment, the emergency prune is default-deny; a bounded slack now drops the day that fell out of retention at the next UTC boundary, which
+#: only helps a volume that holds the retained days plus the reserve). The level is the reserve plus 1 GiB (about 0.7 day at the documented 1.5 GB/day):
 #: a volume sized at the documented MINIMUM for its retention has no such headroom and stays in alert for part of every day, by design; size it at least 1 GiB above the minimum (MONEY_MISSION.md).
 RECORDER_RESERVE_MB = 512
 RECORDER_FREE_WARN_MB = RECORDER_RESERVE_MB + 1024
@@ -444,7 +445,7 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
         alerts.append(Alert(
             "recorder_disk_low", WARNING,
             f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {RECORDER_RESERVE_MB} MiB write reserve). "
-            "At the reserve the recorder stops writing and does NOT recover by itself. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
+            "At the reserve the recorder stops writing; it recovers only at the next UTC day boundary and only if the volume holds the retained days plus the reserve, otherwise it stays stopped. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
             "--recorder-retention-days; see MONEY_MISSION.md (recorder size model) and RUNBOOKS section 14."))
     rising = _recorder_restarting(rows)
     if rising:

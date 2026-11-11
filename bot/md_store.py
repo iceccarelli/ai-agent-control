@@ -387,12 +387,21 @@ class MarketStore:
         # newest-segment bound would keep every retained day forever (a stalled recorder could not
         # recover by itself: the day that is now past retention is never dropped, so space is never
         # freed, so writes never resume). A stalled store may therefore follow the wall clock by one
-        # day beyond its newest segment: at most ONE extra expired segment is dropped (even for a
-        # clock stepped years ahead), never one inside the retention window, and only while stalled.
+        # day beyond its newest segment: at most ONE extra segment (the one expiring at the next day
+        # boundary) is dropped, even for a clock stepped years ahead; never a segment inside the
+        # retention window measured from the wall clock, and only while stalled. A failed free-space
+        # look is NOT "stalled" here (unlike the writer, which treats it as low): an error must never
+        # enable a deletion.
         segs = self.segments()
         if segs:
             newest_ms = int(datetime.strptime(segs[-1][3:11], "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()) * 1000
-            slack_ms = 86_400_000 if self.low_space() else 0
+            stalled = False
+            if self.min_free_bytes:
+                try:
+                    stalled = self.free_bytes() < self.min_free_bytes
+                except OSError:
+                    stalled = False
+            slack_ms = 86_400_000 if stalled else 0
             cutoff = min(cutoff, _utc_day(newest_ms + slack_ms - int(retention_days) * 86_400_000))
         return self.prune_segments_before(cutoff)
 
