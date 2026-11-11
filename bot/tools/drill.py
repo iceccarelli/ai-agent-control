@@ -1731,6 +1731,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"REFUSED: the drill kill file is engaged ({stop_why}); a human removes it before anything is armed.", file=sys.stderr)
             return 2
 
+    release_writer: Optional[Callable[[], None]] = None
+    if args.arm:
+        longest = 900.0 + ((args.max_hold_hours + args.settle_wait_hours) * 3600.0 if args.hold_for_settlement else 0.0)       # the longest this run may take: the lease must outlast it
+        release_writer, writer_why = single_writer_guard(_executor_env().guard_env(), max_runtime_s=longest)
+        if release_writer is None:
+            print(f"REFUSED: {writer_why}", file=sys.stderr)
+            return 2
+
     if args.arm:
         # an interrupt closes the pair and writes the report; a second one
         # while that happens is ignored (it would leave the short open)
@@ -1755,13 +1763,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"interrupted ({exc}) before any order could have been "
                   "sent (during setup); no report was produced.",
                   file=sys.stderr)
+            if release_writer is not None:
+                release_writer()
             return 130
         print(f"INTERRUPTED ({exc}): the pair was closed through the engine "
               "and the report written; the venue state is below.",
               file=sys.stderr)
+    if release_writer is not None:
+        release_writer()
     stamp_capture_tail(report, args.evidence_path, args.out)
     _print_report(report, args)
     return drill_exit_code(report, hold=plan is not None)
+
+
+def _executor_env() -> Any:
+    import executor_env                                             # the one reviewed reader of the guard's named variables (this module reads no environment itself)
+    return executor_env
+
+
+def single_writer_guard(env: Any, max_runtime_s: Optional[float] = None) -> Tuple[Optional[Callable[[], None]], str]:
+    """``--arm`` opens a hedge on the Testnet account, so it takes the SAME single-writer authority as the autopilot and the manual session tool (``legacy_executor_guard.single_writer``: the local
+    account lock and the shared Supabase lease, or the guarded unattended-drill parent that holds both). (release, "") when it may proceed, (None, reason) when it may not: nothing is sent."""
+    import legacy_executor_guard as LG
+    return LG.single_writer(env, max_runtime_s=max_runtime_s)
 
 
 def stamp_capture_tail(report: Dict[str, Any], evidence_path: str,

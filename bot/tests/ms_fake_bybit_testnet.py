@@ -66,6 +66,7 @@ class FakeBybitTestnet:
         self.funding_rate, self.funding_in_ms = "0.0001", 3_600_000            # the perp ticker's funding rate and the time to the next settlement (tests set these)
         self.fill_delay_ms = 0                                       # >0: a crossing order is ACCEPTED now and its fill appears only after this long (asynchronous matching, as on a real venue)
         self.pending: List[Tuple[int, str, D, D]] = []
+        self.funding_prints: Optional[List[Tuple[int, str]]] = None   # None = the public funding-history endpoint is not implemented (answers an error); a list = the settlements it reports (ts_ms, rate)
         self.reject: Dict[str, Tuple[int, str]] = {}                  # orderLinkId suffix -> (retCode, retMsg) answered INSTEAD of creating the order
 
     # ---------------------------------------------------------------- fault injection
@@ -171,6 +172,12 @@ class FakeBybitTestnet:
                 return self._err(110043, "leverage not modified")
             self.leverage[d["symbol"]] = d["buyLeverage"]
             return self._ok({})
+        if path == "/v5/market/funding/history":
+            if self.funding_prints is None:
+                return self._err(10001, "unsupported path /v5/market/funding/history")
+            lo, hi = int(q.get("startTime", 0) or 0), int(q.get("endTime", 10 ** 15) or 10 ** 15)
+            rows = [{"symbol": q.get("symbol"), "fundingRate": r, "fundingRateTimestamp": str(t)} for t, r in sorted(self.funding_prints, reverse=True) if lo <= t <= hi]
+            return self._ok({"category": q.get("category"), "list": rows[: int(q.get("limit", 200) or 200)]})
         if path == "/v5/order/create":
             return self._create(d)
         if path == "/v5/order/cancel":
@@ -348,10 +355,17 @@ class FakeBybitTestnet:
         sgn = 1 if side == "Buy" else -1
         if cat == "linear":
             p = self.positions.setdefault(sym, {"size": D(0), "avg": D(0)})
-            p["size"] += sgn * qty
-            p["avg"] = px
-            if p["size"] == 0:
+            old = p["size"]
+            new_size = old + sgn * qty
+            if old != 0 and (old > 0) != (sgn > 0):                  # a REDUCING fill realises P&L into the wallet, as the venue does (the perp's price leg is cash once closed)
+                self.wallet["USDT"] += (px - p["avg"]) * min(abs(old), qty) * (1 if old > 0 else -1)
+            if new_size == 0:
                 p["avg"] = D(0)
+            elif old == 0 or (old > 0) == (sgn > 0):
+                p["avg"] = (abs(old) * p["avg"] + qty * px) / abs(new_size)
+            else:
+                p["avg"] = p["avg"] if abs(new_size) < abs(old) else px     # partial close keeps the entry price; a flip re-opens at the fill price
+            p["size"] = new_size
             fee, fee_ccy = qty * px * (self.taker_rate if taker else self.maker_rate), "USDT"
             self.wallet["USDT"] -= fee
         else:
@@ -384,6 +398,25 @@ class FakeBybitTestnet:
 
     def inject_position(self, symbol: str, size: Any) -> None:
         self.positions[symbol] = {"size": D(str(size)), "avg": D("60000")}
+
+    def settle_funding(self, symbol: str, rate: Any, *, ts_ms: Optional[int] = None, convention: str = "H1", exec_id: Optional[str] = None, mark: Optional[Any] = None,
+                       publish_print: bool = True, credit_wallet: bool = True) -> D:
+        """The venue settles funding on the CURRENT position: cash = - signed_size * mark * rate (a short receives when the rate is positive). The wallet is credited, a ``Funding`` execution
+        row is written and (``publish_print``) the public history lists the print. ``convention`` is the UNVERIFIED sign of ``execFee`` on that row: ``H1`` fee = -cash (the Trade-row convention),
+        ``H2`` fee = +cash. Returns the cash."""
+        size = self.positions.get(symbol, {"size": D(0)})["size"]
+        m = D(str(mark)) if mark is not None else D(self.book[symbol]["mark"])
+        r = D(str(rate))
+        cash = -size * m * r
+        if credit_wallet:
+            self.wallet["USDT"] += cash
+        ts = int(ts_ms if ts_ms is not None else self.now_ms())
+        fee = -cash if convention == "H1" else cash
+        self.execs.append({"execId": exec_id or f"F{len(self.execs) + 1:06d}", "orderId": "", "orderLinkId": "", "symbol": symbol, "category": "linear", "side": "Sell" if size < 0 else "Buy",
+                           "execQty": _s(abs(size)), "execPrice": _s(m), "execFee": _s(fee), "feeCurrency": "USDT", "isMaker": False, "execTime": str(ts), "execType": "Funding", "markPrice": _s(m)})
+        if publish_print:
+            self.funding_prints = (self.funding_prints or []) + [(ts, _s(r))]
+        return cash
 
     def force_close(self, symbol: str, qty: Any) -> None:
         """The venue itself closes part of a position (liquidation/ADL): an execution under NO client link id."""

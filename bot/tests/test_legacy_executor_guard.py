@@ -11,6 +11,11 @@ import exec_evidence as XE  # noqa: E402
 import legacy_executor_guard as LG  # noqa: E402
 import unattended_drill as UD  # noqa: E402
 
+@pytest.fixture(autouse=True)
+def _private_lock_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("MS_EXECUTOR_LOCK_PATH", str(tmp_path / "locks" / "ms_executor.lock"))        # the guarded parent also takes the LOCAL account lock: never touch the real HOME
+
+
 OWNER = "11111111-2222-3333-4444-555555555555"
 ENV = {"SUPABASE_URL": "https://abcdefgh.supabase.co", "SUPABASE_SERVICE_ROLE_KEY": "k" * 30, "SUPABASE_OWNER_ID": OWNER, "FLY_MACHINE_ID": "m1"}
 
@@ -152,7 +157,55 @@ def test_the_guard_module_can_reach_no_exchange_by_construction():
     src = open(os.path.join(BOT, "tools", "legacy_executor_guard.py"), encoding="utf-8").read()
     tree = ast.parse(src)
     top = {n.names[0].name.split(".")[0] for n in tree.body if isinstance(n, ast.Import)} | {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom) and n.module}
-    assert top <= {"__future__", "uuid", "typing"}, top                                              # exec_evidence is imported lazily, inside acquire()
+    assert top <= {"__future__", "uuid", "typing", "os", "sys", "time"}, top                                              # exec_evidence is imported lazily, inside acquire()
     low = src.lower()
     assert "bybit" not in low.replace("order-capable", "") or "api.bybit" not in low
     assert "place_order" not in low and "environ" not in low
+
+
+# ---- the owner's manual `ms_testnet_session.py execute` takes the same lease (it places Testnet orders)
+import ms_testnet_session as MTS  # noqa: E402
+
+
+def _acquirer(server):
+    return lambda env: LG.acquire(env, lease_factory=factory_for(server))
+
+
+def test_manual_execute_without_a_lease_configuration_places_nothing(capsys):
+    called = []
+    rc = MTS.guarded_main(["execute"], env={}, run=lambda *a, **k: called.append(1) or 0)
+    assert rc == MTS.EXIT_REFUSED and not called
+    assert "REFUSED" in capsys.readouterr().out
+
+
+def test_manual_execute_is_refused_while_the_autopilot_holds_the_lease_and_runs_under_it_otherwise():
+    server = FakeServer()
+    autopilot = XE.LeaseClient(server, OWNER, "autopilot:m1", ttl_seconds=3600)
+    assert autopilot.acquire()
+    called = []
+    assert MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=lambda *a, **k: called.append(1) or 0) == MTS.EXIT_REFUSED and not called
+    autopilot.release()
+    seen = []
+
+    def run(argv, env, sleep=None, pre_order_check=None):
+        seen.append(server.holder)                                  # the lease is HELD while the order-capable run executes
+        return 0
+    assert MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=run) == 0
+    assert seen and seen[0] is not None and server.holder is None   # ... and released afterwards
+
+
+def test_manual_execute_releases_the_lease_even_when_the_run_raises():
+    server = FakeServer()
+
+    def boom(argv, env, sleep=None, pre_order_check=None):
+        raise RuntimeError("venue exploded")
+    with pytest.raises(RuntimeError):
+        MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=boom)
+    assert server.holder is None
+
+
+def test_read_only_session_commands_do_not_touch_the_lease():
+    def must_not_acquire(env):
+        raise AssertionError("a read-only command must not take the executor lease")
+    for cmd in ("preflight", "plan --symbol BTCUSDT --notional-usd 100", "assess", "status", "reconcile"):
+        assert MTS.guarded_main(cmd.split(), env={}, acquire=must_not_acquire, run=lambda *a, **k: 0) == 0

@@ -223,6 +223,35 @@ def _no_test_opens_the_tracked_state_database():
 
 
 @pytest.fixture(autouse=True)
+def _private_executor_lock_per_test(tmp_path, monkeypatch):
+    """The legacy armed tools take a LOCAL account lock (``ms_executor_lock``) at a path ``MS_EXECUTOR_LOCK_PATH`` names, else under the owner's real ``~/.ai-agent-control``. No test may touch the
+    real one (nor contend with another test, or with a running autopilot on a developer's machine): every test gets its own."""
+    monkeypatch.setenv("MS_EXECUTOR_LOCK_PATH", str(tmp_path / "executor_lock" / "ms_executor.lock"))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _drill_single_writer_per_test(request, monkeypatch):
+    """An armed drill takes the single-writer authority (the local account lock AND the shared Supabase lease) before it may send anything. Tests of the drill's OWN behaviour arm it without a lease
+    backend, so the guard is satisfied by default; a test OF the guard marks itself ``real_single_writer`` and sees the real function."""
+    if request.node.get_closest_marker("real_single_writer"):
+        yield
+        return
+    import sys
+    bot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for extra in (bot, os.path.join(bot, "tools")):
+        if extra not in sys.path:
+            sys.path.insert(0, extra)
+    try:
+        import drill
+    except Exception:                                               # noqa: BLE001 - a test session that cannot import the drill has nothing to patch
+        yield
+        return
+    monkeypatch.setattr(drill, "single_writer_guard", lambda env, max_runtime_s=None: ((lambda: None), ""))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _drill_entry_ledger_per_test(request, tmp_path, monkeypatch):
     """The drill claims one armed entry per UTC day in a ledger file it is told to use, and refuses when none is named. Tests that arm a drill do not
     name one, so each gets a fresh temporary ledger (no test can consume another's day). A test of the real refusal marks itself

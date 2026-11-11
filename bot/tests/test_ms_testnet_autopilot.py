@@ -1417,3 +1417,201 @@ def test_a_decision_record_is_refused_inside_the_repository_the_state_dir_or_the
     os.symlink(AP.BOT, str(link))
     assert AP.record_decision(str(link / "ev2"), rec, w.clock.now()).startswith("REFUSED:DIRECTORY_INSIDE_")        # a symlink does not smuggle it in
     assert AP.record_decision(str(tmp_path / "fine"), rec, w.clock.now()) == "STORED"
+
+
+def test_the_decision_record_carries_every_field_the_owner_needs_and_the_scenarios_are_exact_arithmetic(tmp_path, monkeypatch):
+    from decimal import Decimal as D
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    res = _evaluate(w, notional_usd="200")
+    r = res["decision_record"]
+    for k in ("decision_id", "observed_utc", "code_sha", "inputs_ref", "candidate", "venue", "settlement", "market_inputs", "fee_tier", "edge", "scenarios", "capital_required_usd",
+              "risk_limits", "worst_credible_loss_usd", "portfolio_context", "authority_gaps", "data_freshness_ms", "decision", "reasons", "symbol", "notional_usd", "observed_ms"):
+        assert k in r, k
+    assert r["observed_utc"].endswith("Z") and r["venue"]["id"] == "testnet" and r["portfolio_context"]["status"] == "NO_CAPITAL_BOOK"
+    mi = r["market_inputs"]
+    assert mi["perp_bid"] and mi["perp_ask"] and mi["spot_bid"] and mi["spot_ask"] and mi["perp_depth_usd_within_10bps"] is not None and mi["perp_book_age_ms"] is not None
+    assert r["data_freshness_ms"]["oldest_book_age"] is not None and r["settlement"]["next_ms"] and r["settlement"]["rate_bps"]
+    rl = r["risk_limits"]
+    assert rl["per_session_loss_ceiling_usd"] and D(rl["aggregate_notional_ceiling_usd"]) == 500 and rl["min_net_edge_bps"] and D(rl["funding_haircut"]) == D("0.30") and rl["entries_stop_at_consecutive_losses"] == 4
+    sc = r["scenarios"]
+    assert sc["label"] == "ARITHMETIC_ON_DECLARED_INPUTS"
+    n, rate = res["edge"]["settlements_in_hold"], D(str(res["funding_bps"])).quantize(D("0.0001"))
+    cost = sum(D(str(v)) for v in res["edge"]["costs_bps"].values())
+    assert D(sc["gross_expected_funding_bps"]) == (rate * n).quantize(D("0.0001")) and D(sc["total_cost_bps"]) == cost.quantize(D("0.0001"))
+    assert abs(D(sc["stress_half_funding_net_bps"]) - (rate * n / 2 - cost)) < D("0.001") and abs(D(sc["gross_before_haircut_net_bps"]) - (rate * n - cost)) < D("0.001")
+    assert D(sc["conservative_expected_net_bps"]) == D(str(res["edge"]["net_edge_bps"])).quantize(D("0.0001")) and D(sc["conservative_expected_net_bps"]) <= D(sc["gross_before_haircut_net_bps"])
+    # reproducible: the same inputs and code give the same identity, and the decision needs no grant, capability or lease
+    _measured_world(w)
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] == r["decision_id"] and "UNATTENDED_GRANT" in r["authority_gaps"]
+
+
+def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_book_is_stated(tmp_path, monkeypatch):
+    import ms_capital as CC
+    ctx = AP._decision_context(str(tmp_path / "none"), 1.0)
+    assert ctx["portfolio"] == {"status": "NO_CAPITAL_BOOK"} and ctx["venue"]["scope"] == "TESTNET_FAKE_MONEY"
+    root = tmp_path / "book"
+    b = CC.CapitalBook(str(root))
+    b.ensure_baseline("10000")
+    ctx2 = AP._decision_context(str(root), 1.0)
+    assert ctx2["portfolio"]["status"] == "BOOK" and ctx2["portfolio"]["halted"] in (False, None)
+    base = {"decision": "REJECT_UNECONOMIC", "symbol": "BTCUSDT", "notional_usd": "200", "inputs_digest": "d" * 64, "observed_ms": 1_794_312_000_000, "edge": None}
+    a = EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"]
+    assert a == EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"] and a != EL.decision_record(base, code_sha="c" * 40, **ctx2)["decision_id"]
+    (root / "capital.json").write_text("{broken")
+    assert AP._decision_context(str(root), 1.0)["portfolio"]["status"] == "BOOK_UNREADABLE"
+
+
+def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w):
+    _profit_world(w)
+    root = w.tmp / "eng_corrupt"
+    os.makedirs(root)
+    (root / "capital.json").write_text("{corrupt")
+    res, _got = _collect(w, eng_name="eng_corrupt")
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
+    assert (root / "capital.json").read_text() == "{corrupt" and not w.requests_to("/v5/order/create")
+
+
+def test_a_finished_session_appends_one_chained_feedback_row_and_the_quality_command_reports_it(w, capsys):
+    import evidence_chain as EC
+    _profit_world(w)
+    res, _got = _collect(w, eng_name="eng_fb")
+    assert res["result"] == "DONE", res
+    log = str(w.tmp / "eng_fb" / "exec_quality_log.jsonl")
+    rows = EC.rows_of(EC.read_lines(log)[0])
+    assert len(rows) == 1 and EC.verify(log)["ok"] and rows[0]["flat_verified"] is True and rows[0]["attempt_completed"] is True
+    assert rows[0]["total_execution_cost_bps_of_position_notional"] is not None and rows[0]["modelled_cost_bps"] is not None and rows[0]["decision_id"].startswith("dec_")
+    assert AP.main(["quality", "--root", str(w.tmp / "eng_fb")], env={}) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["sessions_logged"] == 1 and rep["log_chain_ok"] is True and rep["policy"]["verdict"] == "INSUFFICIENT_SAMPLE" and rep["model_vs_measured"]["sessions"] == 1
+    assert AP.main(["quality", "--root", str(w.tmp / "no_such_root")], env={}) == 0
+    assert json.loads(capsys.readouterr().out)["sessions_logged"] == 0                      # nothing logged: stated, not invented
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write('{"tampered": true}\n')                                                      # a broken chain is reported, not trusted
+    assert AP.main(["quality", "--root", str(w.tmp / "eng_fb")], env={}) == 1
+
+
+# ================================================================ review round: capital / decision findings (each reproduced first)
+def _collect_with_sleep(w, sleep, eng_name="eng_held"):
+    got = []
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=str(w.tmp / eng_name),
+                      on_event=lambda kind, stage, payload, n=0: got.append((kind, stage, dict(payload), n)))
+    return res, got
+
+
+def test_a_held_session_books_the_real_settlement_and_the_next_cycle_credits_exactly_what_cash_shows(w):
+    """The autopilot-level proof the review found missing: funding_was_read=True end to end. Mutating `known = price - fees + fund` (the sign of funding) must fail HERE."""
+    from decimal import Decimal as D
+    _profit_world(w)
+    start, state, real_sleep = w.clock.now(), {"done": False}, w.clock.sleep
+
+    def sleep(s):
+        real_sleep(s)
+        if not state["done"] and w.clock.now() >= start + 600_000 and any(p["size"] != 0 for p in w.fake.positions.values()):
+            w.fake.settle_funding("BTCUSDT", "0.0080", ts_ms=w.clock.now())                      # the venue pays the held short into the wallet, mid-hold
+            state["done"] = True
+    cash_before = w.fake.wallet["USDT"]
+    res1, got1 = _collect_with_sleep(w, sleep)
+    assert res1["result"] == "DONE" and state["done"], res1
+    rec = json.load(open(os.path.join(res1["state_dir"], "testnet_session.json")))
+    net = rec["net"]
+    assert net["funding_usd"] is not None and net["funding_usd"] > 1.0 and rec["flat_verified"] is True
+    f = [g for g in got1 if g[1] == "FUNDING_SETTLEMENT"]
+    assert len(f) == 1 and f[0][2]["status"] == "BOOKED_WALLET_CONFIRMED"
+    known = D(str(net["price_pnl_usd"])) - D(str(net["fees_usd"])) + D(str(net["funding_usd"]))
+    assert abs((w.fake.wallet["USDT"] - cash_before) - known) < D("1e-6")                         # the wallet agrees with the ledger to the 6th decimal
+    w.clock.sleep(1800)
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    res2, got2 = _collect(w, "eng_held")
+    ev = next(g for g in got2 if g[1] == "CAPITAL_SETTLED")
+    assert ev[2]["status"] == "SETTLED" and abs(D(ev[2]["credited_usd"]) - known) < D("0.0002") and abs(D(ev[2]["cash_change_usd"]) - known) < D("0.0002")
+
+
+def test_a_decision_record_with_a_real_git_revision_is_stored_and_identifies_the_code(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    _measured_world(w)
+    sha = "04bd8ec6e07740a2e9ef73f5ffe34b92fc99ed3b"
+    w.env = {**w.env, "GIT_SHA": sha}
+    rec = _evaluate(w, notional_usd="200")["decision_record"]
+    assert rec["code_sha"] == sha[:12]                                                       # the guard refuses a 40-hex token; the full revision is inside the id
+    assert AP.record_decision(str(tmp_path / "ob"), rec, w.clock.now()) == "STORED"
+    _measured_world(w)
+    other = _evaluate(w, notional_usd="200")["decision_record"]
+    w.env = {**w.env, "GIT_SHA": "b" * 40}
+    _measured_world(w)
+    assert _evaluate(w, notional_usd="200")["decision_record"]["decision_id"] != other["decision_id"]      # the code revision still separates decisions
+
+
+def test_two_no_data_decisions_at_different_moments_are_different_decisions_and_both_store(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, grant=False)
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 99_999_999                            # settlement far away: SKIP_NO_OPPORTUNITY (no market inputs digest at all)
+    first = _evaluate(w, notional_usd="200")["decision_record"]
+    assert first["decision"] == "SKIP_NO_OPPORTUNITY" and first["evaluated_ms"] and AP.record_decision(str(tmp_path / "ob"), first, w.clock.now()) == "STORED"
+    assert AP.record_decision(str(tmp_path / "ob"), first, w.clock.now() + 60_000) == "DUPLICATE"           # the same decision again is a duplicate, never a conflict
+    w.clock.sleep(60)
+    second = _evaluate(w, notional_usd="200")["decision_record"]
+    assert second["decision_id"] != first["decision_id"] and AP.record_decision(str(tmp_path / "ob"), second, w.clock.now()) == "STORED"
+
+
+def test_long_digit_runs_in_the_book_or_the_limits_never_make_a_record_unstorable(tmp_path):
+    import ms_capital as CC
+    root = tmp_path / "book"
+    b = CC.CapitalBook(str(root))
+    b.ensure_baseline("10000.12345678")
+    b.park("s1", "10000.12345678", "0.30000000000000004", True, True)
+    b.settle("10000.43")
+    ctx = AP._decision_context(str(root), 0.30000000000000004, "400.12345678901234")
+    base = {"decision": "REJECT_UNECONOMIC", "symbol": "BTCUSDT", "notional_usd": "200", "inputs_digest": "d" * 64, "observed_ms": 1_794_312_000_000, "edge": None}
+    rec = EL.decision_record(base, code_sha="c" * 40, **ctx)
+    XE.make_event("DECISION", {"stage": "DECISION_RECORDED", **rec}, session_id=None, occurred_at_ms=1, event_id=EL.event_id("dec", "DECISION", "x", 0))      # the real secret guard accepts it
+    assert EL.neutral("0.30000000000000004") == "0.3000" and EL.neutral("abc") == "abc" and EL.neutral(None) is None and EL.neutral(7) == 7
+
+
+def test_the_book_age_in_the_record_is_signed_never_clamped_to_look_fresh():
+    import types
+    import ms_edge_gate as EGG
+    b = types.SimpleNamespace(ts_ms=1_000_080, bids=[(100.0, 5.0)], asks=[(100.1, 5.0)])
+    assert EGG._touch_summary("perp", b, 1_000_000)["perp_book_age_ms"] == -80                 # stamped 80 ms AFTER our reading: the record says so
+    assert EGG._touch_summary("perp", b, 1_000_200)["perp_book_age_ms"] == 120
+
+
+def test_the_executed_session_records_what_the_allocator_actually_sized_next_to_the_decision(w):
+    _profit_world(w)
+    res, _got = _collect(w, "eng_exec")
+    dec = json.load(open(os.path.join(res["state_dir"], "decision.json")))
+    assert dec["decision_id"].startswith("dec_") and dec["executed"]["allocator_notional_usd"] and dec["executed"]["portfolio_after_settle"]["status"] in ("BOOK", "NO_CAPITAL_BOOK")
+    assert "evaluated at the grant's maximum size" in dec["executed"]["note"]
+
+
+def test_a_book_that_goes_bad_after_the_orders_still_emits_every_event_and_stops_all_future_entries(w, monkeypatch):
+    import ms_capital as CC
+    import ms_engine_state as ESS
+    _profit_world(w)
+
+    def bad(self, *a, **k):
+        raise CC.BookUnreadable("capital book went bad mid-session")
+    monkeypatch.setattr(CC.CapitalBook, "update_pending", bad)
+    res, got = _collect(w, "eng_bad_after")
+    stages = [g[1] for g in got]
+    assert res["result"] == "DONE" and "ORDER_VENUE_RECORD" in stages and "VENUE_FLAT_VERIFIED" in stages and "COSTS_BOOKED" in stages and "SESSION_RECONCILED" in stages
+    assert ESS.EngineState(str(w.tmp / "eng_bad_after"), w.clock.now).has("ALERT")                 # a persistent ALERT: the loop stops until the owner has looked
+
+
+def test_a_book_that_goes_bad_at_the_park_refuses_before_any_order_and_alerts(w, monkeypatch):
+    import ms_capital as CC
+    import ms_engine_state as ESS
+    _profit_world(w)
+
+    def bad(self, *a, **k):
+        raise CC.BookUnreadable("capital book went bad at the park")
+    monkeypatch.setattr(CC.CapitalBook, "park", bad)
+    res, _got = _collect(w, "eng_bad_park")
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"] and not w.requests_to("/v5/order/create")
+    assert ESS.EngineState(str(w.tmp / "eng_bad_park"), w.clock.now).has("ALERT")
+
+
+def test_the_capital_command_on_a_corrupt_book_explains_instead_of_a_traceback(tmp_path, capsys):
+    (tmp_path / "capital.json").write_text("{corrupt")
+    assert AP.main(["capital", "--root", str(tmp_path)], env={}) == 2
+    err = capsys.readouterr().err
+    assert "unreadable" in err and "move it aside DELIBERATELY" in err and (tmp_path / "capital.json").read_text() == "{corrupt"

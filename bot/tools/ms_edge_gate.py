@@ -72,6 +72,35 @@ class EdgeInputs:
         return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
 
 
+def _touch_summary(prefix: str, b: Any, now_ms: int) -> Dict[str, Any]:
+    """Top of book, spread and the dollar depth within 10 bps of the mid, as decimal strings (None for anything the book cannot give). Pure arithmetic on the book the verdict used."""
+    out: Dict[str, Any] = {f"{prefix}_bid": None, f"{prefix}_ask": None, f"{prefix}_spread_bps": None, f"{prefix}_depth_usd_within_10bps": None, f"{prefix}_book_age_ms": int(now_ms - int(b.ts_ms))}   # SIGNED: negative = the book is stamped AFTER our clock reading (venue clock ahead / a reading taken before the reads); never clamped to look fresh
+    try:
+        bid, ask = D(str(b.bids[0][0])), D(str(b.asks[0][0]))
+        mid = (bid + ask) / 2
+        band = mid * D("0.001")
+        out.update({f"{prefix}_bid": str(bid), f"{prefix}_ask": str(ask), f"{prefix}_bid_qty": str(b.bids[0][1]), f"{prefix}_ask_qty": str(b.asks[0][1]),
+                    f"{prefix}_spread_bps": str(((ask - bid) / mid * D(10000)).quantize(D("0.0001")))})
+        depth = sum((D(str(px)) * D(str(q)) for px, q in b.bids if mid - D(str(px)) <= band), D(0)) + sum((D(str(px)) * D(str(q)) for px, q in b.asks if D(str(px)) - mid <= band), D(0))
+        out[f"{prefix}_depth_usd_within_10bps"] = str(depth.quantize(D("0.01")))
+    except (IndexError, ArithmeticError, ValueError, TypeError):
+        pass                                                         # an empty or unreadable side stays None: never guessed
+    return out
+
+
+def _inputs_summary(self: "EdgeInputs") -> Dict[str, Any]:
+    """The market observation behind a verdict, readable without the full digest: both books' touch, spread, depth near the mid and age, the funding observation and the fee tiers' origin."""
+    out: Dict[str, Any] = {"observed_ms": int(self.now_ms), "funding_rate_bps": str((self.funding_rate * D(10000)).quantize(D("0.0001"))), "next_funding_ms": int(self.next_funding_ms),
+                           "hold_s": int(self.hold_s), "leverage": int(self.leverage), "perp_fee_origin": "ACCOUNT_READ" if self.perp_fee is not None else "ASSUMED_PUBLISHED_VIP0",
+                           "spot_fee_origin": "ACCOUNT_READ" if self.spot_fee is not None else "ASSUMED_PUBLISHED_VIP0", "fee_observed_ms": self.fee_observed_ms}
+    out.update(_touch_summary("perp", self.perp_book, int(self.now_ms)))
+    out.update(_touch_summary("spot", self.spot_book, int(self.now_ms)))
+    return out
+
+
+EdgeInputs.summary = _inputs_summary                                  # type: ignore[attr-defined]
+
+
 @dataclasses.dataclass(frozen=True)
 class EdgeVerdict:
     session_class: str

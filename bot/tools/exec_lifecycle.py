@@ -46,6 +46,15 @@ def num(x: Any, places: int = 4) -> Optional[str]:
     return format(v.quantize(D(1).scaleb(-places)), "f")
 
 
+def neutral(v: Any) -> Any:
+    """A value safe for the evidence guard: a number-like string or float becomes a decimal rounded to 4 places (the guard refuses long digit runs such as 0.30000000000000004), anything else is a
+    short string; None and ints stay as they are."""
+    if v is None or isinstance(v, bool) or (isinstance(v, int)):
+        return v
+    n = num(v, 4)
+    return n if n is not None else str(v)[:40]
+
+
 def event_id(session_id: str, kind: str, stage: str, n: int = 0) -> str:
     """Deterministic: re-emitting the same stage of the same session is a duplicate, never a second record."""
     return f"{session_id}:{kind}:{stage}:{n}"[:200]
@@ -130,7 +139,8 @@ def capital_book(report: Mapping[str, Any]) -> Event:
     return ("DAILY_PNL", "CAPITAL_BOOK", p)
 
 
-def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None, margin_per_usd: Optional[Any] = None, loss_cap_usd: Optional[Any] = None) -> Dict[str, Any]:
+def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None, margin_per_usd: Optional[Any] = None, loss_cap_usd: Optional[Any] = None,
+                    risk_limits: Optional[Mapping[str, Any]] = None, portfolio: Optional[Mapping[str, Any]] = None, venue: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The REPRODUCIBLE record of one moment-of-decision evaluation (pure). ``decision_id`` is a hash of everything that determined the answer: the digest of the market INPUTS (books,
     instrument rows, funding observation, fee tiers), the verdict digest, the decision, the size, the owner's floor, the candidate and the code revision. The same inputs and code give the same
     id and the same decision; a different market state, fee tier, size or code can never share one. Full digests stay in the local result; the evidence payload carries 16-hex references.
@@ -138,15 +148,20 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
     edge = result.get("edge") if isinstance(result.get("edge"), Mapping) else None
     auth = result.get("authority") if isinstance(result.get("authority"), Mapping) else {}
     cand = {"candidate_id": auth.get("candidate_id"), "spec_ref": ref16(auth.get("spec_digest"))} if auth.get("candidate_id") else None
+    portfolio_n = None if portfolio is None else {str(k)[:40]: neutral(v) for k, v in dict(portfolio).items()}
     core = {"inputs": result.get("inputs_digest"), "edge": None if edge is None else edge.get("digest"), "decision": result.get("decision"), "symbol": result.get("symbol"),
-            "notional": result.get("notional_usd"), "floor": result.get("owner_funding_floor_bps"), "candidate": cand, "code": code_sha}
+            "evaluated": result.get("evaluated_ms") if result.get("observed_ms") is None else None,            # a decision with NO market observation (no data, no opportunity) is unique to its moment
+            "notional": result.get("notional_usd"), "floor": result.get("owner_funding_floor_bps"), "candidate": cand, "code": code_sha,
+            "portfolio": None if portfolio_n is None else json.dumps(portfolio_n, sort_keys=True, default=str), "venue": None if venue is None else json.dumps(dict(venue), sort_keys=True, default=str)}
     did = "dec_" + hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
     assumed = [str(a) for a in (edge or {}).get("assumed_inputs", [])]
     notional = result.get("notional_usd")
     rec: Dict[str, Any] = {
         "decision_id": did, "decision": result.get("decision"), "reasons": [str(x)[:120] for x in list(result.get("why", []))[:6]], "symbol": result.get("symbol"),
         "notional_usd": num(notional, 2), "owner_funding_floor_bps": num(result.get("owner_funding_floor_bps")), "funding_bps": num(result.get("funding_bps")),
-        "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "hold_s": result.get("hold_s"), "candidate": cand, "code_sha": code_sha,
+        "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "hold_s": result.get("hold_s"), "candidate": cand,
+        "code_sha": None if code_sha is None else str(code_sha)[:12],                                      # the guard refuses a 24+ hex token as secret-shaped; the FULL revision is inside the id hash
+        "evaluated_ms": result.get("evaluated_ms"),
         "inputs_ref": ref16(result.get("inputs_digest")), "observed_ms": result.get("observed_ms"), "data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY", "source": "LOCAL",
         "authority_gaps": [str(g)[:40] for g in list(result.get("authority_gaps", []))[:10]]}
     if edge is not None:
@@ -155,6 +170,34 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
                        "costs_bps": {str(k)[:30]: num(v) for k, v in dict(edge.get("costs_bps", {})).items()}, "assumed_inputs": assumed[:10],
                        "settlements_in_hold": edge.get("settlements_in_hold"), "edge_ref": ref16(edge.get("digest"))}
         rec["fee_tier"] = "ASSUMED" if any("fee" in a.lower() for a in assumed) else "MEASURED"
+    rec["venue"] = None if venue is None else {str(k)[:20]: str(v)[:60] for k, v in dict(venue).items()}
+    ms = result.get("observed_ms")
+    if isinstance(ms, int) and ms > 0:
+        import datetime as _dt
+        rec["observed_utc"] = _dt.datetime.fromtimestamp(ms / 1000.0, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    inp = result.get("inputs") if isinstance(result.get("inputs"), Mapping) else None
+    if inp is not None:
+        rec["market_inputs"] = {str(k)[:40]: (v if isinstance(v, int) and not isinstance(v, bool) else None if v is None else str(v)[:40]) for k, v in dict(inp).items()}
+        ages = [v for k, v in inp.items() if k.endswith("_book_age_ms") and isinstance(v, int)]
+        rec["data_freshness_ms"] = {"oldest_book_age": max(ages) if ages else None, "inputs_observed_ms": inp.get("observed_ms")}
+    rec["settlement"] = {"next_ms": result.get("next_settlement_ms"), "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "rate_bps": num(result.get("funding_bps")),
+                         "settlements_in_hold": (edge or {}).get("settlements_in_hold") if edge is not None else None}
+    if edge is not None:
+        try:                                                                       # the SCENARIOS, all arithmetic on the verdict's own declared inputs (labelled as such)
+            costs = [D(str(v)) for v in dict(edge.get("costs_bps", {})).values() if v is not None]
+            known = len(costs) == len(dict(edge.get("costs_bps", {}))) and bool(costs)
+            n, rate = int(edge.get("settlements_in_hold") or 0), D(str(result.get("funding_bps")))
+            total_cost = sum(costs, D(0))
+            rec["scenarios"] = {"label": "ARITHMETIC_ON_DECLARED_INPUTS", "gross_expected_funding_bps": num(rate * n), "total_cost_bps": num(total_cost) if known else None,
+                                "gross_before_haircut_net_bps": num(rate * n - total_cost) if known else None,
+                                "conservative_expected_net_bps": num(edge.get("net_edge_bps")), "conservative_basis": "the economic model's net edge after its 30% funding haircut and all modelled costs (net_edge_bps); the 2 bps hurdle is the pass threshold, not a deduction",
+                                "stress_half_funding_net_bps": num(rate * n / 2 - total_cost) if known else None, "required_funding_bps": num(edge.get("required_funding_bps"))}
+        except (ArithmeticError, ValueError, TypeError):                           # noqa: BLE001
+            rec["scenarios"] = {"label": "ARITHMETIC_ON_DECLARED_INPUTS", "unavailable": True}
+    if risk_limits is not None:
+        rec["risk_limits"] = {str(k)[:40]: neutral(v) for k, v in dict(risk_limits).items()}
+    if portfolio is not None:
+        rec["portfolio_context"] = dict(portfolio_n or {})
     if notional is not None and margin_per_usd is not None:
         try:
             rec["capital_required_usd"] = num(D(str(notional)) * D(str(margin_per_usd)), 2)
@@ -165,6 +208,71 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
     return rec
 
 
-def session_events(rec: Mapping[str, Any], result: str) -> List[Event]:
-    """Everything the venue and the ledger said about a finished session, in lifecycle order."""
-    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), session_reconciled(rec, result)]
+def execution_quality(doc: Optional[Mapping[str, Any]]) -> List[Event]:
+    """MEASURED per-leg and per-group execution quality (``exec_quality``) as evidence: kind COST (an existing kind: no migration), stage ``EXECUTION_QUALITY_LEG`` / ``..._GROUP``. Every number is
+    the venue's own record or arithmetic over it; a field the venue did not give is the string ``UNKNOWN`` / null and is named in ``unknown``. Venue ids are shortened to 16-hex references;
+    the same session re-emitted is the same ids and the same bytes (a duplicate, never a second record)."""
+    if not isinstance(doc, Mapping):
+        return []
+    out: List[Event] = []
+    for l in list(doc.get("legs") or [])[:12]:
+        if not isinstance(l, Mapping):
+            continue
+        c, t, f, r, cx = l.get("cost") or {}, l.get("timing") or {}, l.get("fills") or {}, l.get("reference"), l.get("cancel")
+        out.append(("COST", "EXECUTION_QUALITY_LEG", {
+            "source": "VENUE", "leg": str(l.get("leg_id"))[:12], "role": l.get("kind"), "link_ref": ref16(l.get("link_id")), "decision_id": l.get("decision_id"), "candidate_id": l.get("candidate_id"),
+            "category": (l.get("instrument") or {}).get("category"), "symbol": (l.get("instrument") or {}).get("symbol"), "side": l.get("side"), "intent": l.get("intent"),
+            "order_type": l.get("order_type"), "time_in_force": l.get("time_in_force"), "planned_qty": num(l.get("planned_qty"), 6), "planned_price": num(l.get("planned_price"), 2),
+            "reference": None if not isinstance(r, Mapping) else {"bid": num(r.get("bid"), 4), "ask": num(r.get("ask"), 4), "mid": num(r.get("mid"), 4), "at_ms": r.get("ts_ms"),
+                                                               "origin": r.get("source"), "age_ms": r.get("age_ms_at_send")},
+            "sent_ms": t.get("sent_ms"), "acked_ms": t.get("acked_ms"), "ack_latency_ms": t.get("ack_latency_ms"), "venue_created_ms": t.get("venue_created_ms"),
+            "first_fill_ms": t.get("first_fill_ms"), "last_fill_ms": t.get("last_fill_ms"), "order_to_first_fill_ms": t.get("order_to_first_fill_ms"),
+            "order_status": (l.get("order") or {}).get("status"), "order_ref": ref16((l.get("order") or {}).get("venue_order_ref")),
+            "fill_count": f.get("count"), "fill_refs": [ref16(i) for i in list(f.get("ids") or [])[:8]], "fill_qty": num(f.get("qty"), 6), "fill_vwap": num(f.get("vwap"), 4),
+            "fill_ratio": num(f.get("fill_ratio"), 4), "duplicate_events_collapsed": f.get("duplicate_events_collapsed"), "liquidity": l.get("liquidity"),
+            "fee_usd": num(c.get("fee_usd"), 6), "fee_bps": num((l.get("fee") or {}).get("bps_of_notional"), 4), "fee_rate_origin": (l.get("fee") or {}).get("rate_provenance"),
+            "price_vs_mid_usd": num(c.get("price_vs_mid_usd"), 6), "walk_vs_touch_usd": num(c.get("walk_vs_touch_usd"), 6), "half_spread_usd": num(c.get("half_spread_usd"), 6),
+            "slippage_vs_mid_bps": num(c.get("slippage_vs_mid_bps"), 4), "slippage_vs_touch_bps": num(c.get("slippage_vs_touch_bps"), 4), "cost_total_usd": num(c.get("total_usd"), 6),
+            "cost_total_bps": num(c.get("total_bps"), 4), "sign_convention": "positive = cost to us relative to the reference",
+            "cancel": None if not isinstance(cx, Mapping) else {k: cx.get(k) for k in ("sent_ms", "acked_ms", "result", "latency_ms", "fills_after_request", "fills_within_clock_tolerance")},
+            "unknown": [str(u)[:30] for u in list(l.get("unknown") or [])[:12]]}))
+    g = doc.get("group")
+    if isinstance(g, Mapping):
+        out.append(("COST", "EXECUTION_QUALITY_GROUP", {
+            "source": "VENUE", "decision_id": g.get("decision_id"), "style": g.get("style"), "planned_notional_usd": num(g.get("planned_notional_usd"), 2),
+            "pair_notional_usd": num(g.get("position_notional_usd"), 4), "legs": g.get("legs"), "entry_legs_planned": g.get("entry_legs_planned"), "entry_legs_filled": g.get("entry_legs_filled"),
+            "exit_legs": g.get("exit_legs"), "all_entry_legs_filled": g.get("all_entry_legs_filled"), "unhedged_window_ms": g.get("unhedged_window_ms"),
+            "unwind_first_fill_ms": g.get("unwind_first_fill_ms"), "unwind_last_fill_ms": g.get("unwind_last_fill_ms"),
+            "residual_qty": {str(k)[:24]: num(v, 6) for k, v in dict(g.get("residual_qty_by_instrument") or {}).items()}, "venue_flat_verified": g.get("venue_flat_verified"),
+            "attempt_completed": g.get("attempt_completed"), "cost_total_usd": num(g.get("total_execution_cost_usd"), 6),
+            "cost_total_bps_of_pair": num(g.get("total_execution_cost_bps_of_position_notional"), 4), "cost_complete": g.get("cost_complete"),
+            "unknown": [str(u)[:30] for u in list(g.get("unknown") or [])[:12]]}))
+    return out
+
+
+def funding_events(doc: Optional[Mapping[str, Any]]) -> List[Event]:
+    """Funding settlement recognition (``funding_settlement``) as evidence: kind FUNDING, one ``FUNDING_SETTLEMENT`` per settlement the hedge was held through (status, cash, the physical expectation,
+    the cash check, the venue row id as a 16-hex reference) and one ``FUNDING_RECOGNITION`` summary per symbol. ``source`` is VENUE: a booked amount is the venue's row agreeing with physics, a
+    quarantined or unknown one says so. The sign convention is UNVERIFIED and the payload says it. Nothing here is cash: realised results are settled from the wallet in the capital book."""
+    if not isinstance(doc, Mapping):
+        return []
+    out: List[Event] = []
+    for r in list(doc.get("recognitions") or [])[:4]:
+        if not isinstance(r, Mapping):
+            continue
+        for p in list(r.get("prints") or [])[:20]:
+            w = p.get("wallet") if isinstance(p.get("wallet"), Mapping) else {}
+            out.append(("FUNDING", "FUNDING_SETTLEMENT", {"source": "VENUE", "symbol": r.get("symbol"), "settlement_ms": p.get("ts_ms"), "rate": num(p.get("rate"), 8), "held_qty": num(p.get("signed_position_qty"), 6),
+                                                          "status": p.get("status"), "amount_usd": num(p.get("amount_usd"), 6) if str(p.get("status")).startswith("BOOKED") else None,          # a quarantined / mismatched row's cash is NOT an amount: it must not be summable
+                                                          "row_cash_if_h1_usd": None if str(p.get("status")).startswith("BOOKED") else num(p.get("amount_usd"), 6), "expected_usd": num(p.get("expected_usd"), 6), "row_ref": ref16(p.get("row_id")),
+                                                          "cash_check": w.get("status"), "cash_check_delta_usd": num(w.get("delta_usd"), 6), "reason": str(p.get("reason") or "")[:160] or None}))
+        out.append(("FUNDING", "FUNDING_RECOGNITION", {"source": "VENUE", "symbol": r.get("symbol"), "sign_hypothesis": r.get("sign_hypothesis"), "prints_available": r.get("prints_available"),
+                                                        "window": r.get("window"), "all_resolved": r.get("all_prints_resolved"), "booked_usd": num(r.get("booked_usd"), 6),
+                                                        "flags": [str(f)[:80] for f in list(r.get("flags") or [])[:10]], "unmatched_rows": len(r.get("unmatched_rows") or []),
+                                                        "note": "funding is UNKNOWN unless booked; realised cash is settled from the wallet, not from this"}))
+    return out
+
+
+def session_events(rec: Mapping[str, Any], result: str, quality: Optional[Mapping[str, Any]] = None, funding: Optional[Mapping[str, Any]] = None) -> List[Event]:
+    """Everything the venue and the ledger said about a finished session, in lifecycle order (``quality`` = the session's measured execution quality, ``funding`` = its settlement recognition, when written)."""
+    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), *execution_quality(quality), *funding_events(funding), session_reconciled(rec, result)]

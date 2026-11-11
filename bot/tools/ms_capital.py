@@ -104,6 +104,10 @@ def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, avail
     return Allocation(size, binding, [], detail)
 
 
+class BookUnreadable(Exception):
+    """``capital.json`` exists but is not a valid book. Entries must stop until the owner has looked (the file is left as it is)."""
+
+
 class CapitalBook:
     """Persistent record of VERIFIED cash outcomes (``capital.json`` in the engine root). Idempotent by session id; every write is atomic; every read-modify-write is under an exclusive lock."""
 
@@ -130,14 +134,21 @@ class CapitalBook:
                 "last_cash_usdt": None, "last_cash_ms": None}
 
     def load(self) -> Dict[str, Any]:
+        """The book, a fresh one ONLY when no file exists. A file that is present but unreadable, malformed or of another schema is NOT a fresh book: silently starting over would reset the baseline,
+        the loss streak and the halt flag (a corrupted or tampered file would clear a stop). It raises ``BookUnreadable`` and leaves the file untouched as evidence."""
         try:
             with open(self.path, encoding="utf-8") as fh:
                 d = json.load(fh)
-            if isinstance(d, dict) and d.get("schema") == BOOK_SCHEMA:
-                return {**self._fresh(), **d}
-        except (OSError, ValueError):
-            pass
-        return self._fresh()
+        except FileNotFoundError:
+            return self._fresh()
+        except (OSError, ValueError) as exc:
+            raise BookUnreadable(f"capital book {self.path!r} exists but cannot be read ({type(exc).__name__}); it is NOT treated as a fresh book") from None
+        if not (isinstance(d, dict) and d.get("schema") == BOOK_SCHEMA):
+            raise BookUnreadable(f"capital book {self.path!r} has an unknown schema; it is NOT treated as a fresh book")
+        missing = [k for k in ("start_cash_usd", "realised_usd", "loss_streak", "halted", "history", "pending") if k not in d]
+        if missing:                                                    # schema-valid but stripped of the state that stops entries: also NOT a fresh book
+            raise BookUnreadable(f"capital book {self.path!r} lacks {missing}; it is NOT treated as a fresh book")
+        return {**self._fresh(), **d}
 
     def _save(self, b: Mapping[str, Any]) -> None:
         ES.write_json_atomic(self.path, b)

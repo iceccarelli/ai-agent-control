@@ -62,6 +62,15 @@ class Filters:
     funding_interval_min: Optional[int]
 
 
+def _ms(x: Any) -> Optional[int]:
+    """A venue millisecond timestamp (a string of digits) as an int; anything else is None (UNKNOWN), never zero."""
+    try:
+        v = int(str(x))
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
 def _d(x: Any, what: str) -> D:
     try:
         v = D(str(x))
@@ -183,6 +192,10 @@ class TestnetExecutor:
         self.foreign_open_orders: List[str] = []
         self.last_view_ms: Optional[int] = None
         self._seen_exec: set = set()
+        #: MEASUREMENTS per order link id (local clock): what we saw and when. Pure observation: nothing here feeds a decision, a gate or a retry.
+        self.meas: Dict[str, Dict[str, Any]] = {}
+        self.wallet_samples: List[Tuple[int, str]] = []                # (local ms, USDT walletBalance) at every account read: lets a settlement be checked against the wallet's own delta
+        self._quotes: Dict[Tuple[str, str], Dict[str, Any]] = {}      # (category, symbol) -> the latest ticker quote this executor read
 
     # ---------------------------------------------------------------- reads
     def _get(self, path: str, params: Mapping[str, Any], *, signed: bool) -> Mapping[str, Any]:
@@ -278,17 +291,24 @@ class TestnetExecutor:
             ref = None
             if leg.order_type == "Market" or leg.price is None:
                 ref = self._ref_price(leg)
+            elif not exit_:
+                self._quote_row(leg.category, leg.symbol)                 # a public read for the MEASUREMENT only (entries only: an exit is never made slower)
             bad = filter_violations(f, side=leg.side, order_type=leg.order_type, qty=leg.qty, price=leg.price, ref_price=ref)
         except ExecutorError as exc:
             return Ack(link, "REJECTED", None, f"FILTERS_UNAVAILABLE:{exc}"[:160])        # nothing was sent
         if bad:
             return Ack(link, "REJECTED", None, "FILTER:" + ",".join(bad))
         body = self.body_for(leg, link)
+        m = self.meas.setdefault(link, {})
+        m["reference"] = self._reference_for(leg, int(self.clock()), fresh=not exit_)
         try:
             self.sent_creates.append(link)
+            m["sent_ms"] = int(self.clock())                           # immediately before the create request leaves
             payload = self.client._request("POST", CREATE, body=body, signed=True, retries=0)
+            m["acked_ms"] = int(self.clock())
         except bc.OrderNotSent as exc:                                 # refused LOCALLY (authority / capability): definitely not at the venue
             self.sent_creates.pop()
+            m.pop("sent_ms", None)
             return Ack(link, "REJECTED", None, ("NOT_SENT:" + str(exc))[:200])
         except bc.PermanentAPIError as exc:
             code = exc.ret_code
@@ -296,6 +316,7 @@ class TestnetExecutor:
                 return self._resolve(req)
             if code in bc.UNKNOWN_OUTCOME_RET_CODES:                   # 0 = no retCode stated (HTTP error body, garbage, proxy), 10000/170007 = timeouts
                 return self._resolve(req)
+            m["acked_ms"] = int(self.clock())                          # a definitive venue refusal IS an answer: its arrival time is a real timestamp
             return Ack(link, "REJECTED", None, f"RET:{code}:{str(exc)[:80]}")
         except bc.TransientAPIError:                                   # timeout / 5xx / rate limit / clock window: the order MAY exist
             return self._resolve(req)
@@ -306,12 +327,31 @@ class TestnetExecutor:
         return Ack(link, "ACCEPTED", oid)
 
     def _ref_price(self, leg: T.LegPlan) -> Optional[D]:
-        try:
-            r = self._get("/v5/market/tickers", {"category": leg.category, "symbol": leg.symbol}, signed=False)
-            row = r["list"][0]
-            return D(str(row["lastPrice"]))
-        except (ExecutorError, KeyError, IndexError, TypeError, ValueError, ArithmeticError):
+        row = self._quote_row(leg.category, leg.symbol)
+        if row is None:
             return None
+        try:
+            return D(str(row["lastPrice"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+
+    def _quote_row(self, category: str, symbol: str) -> Optional[Mapping[str, Any]]:
+        """One public ticker read; remembers the touch (bid1/ask1) and WHEN it was read, so an order's reference quote can be recorded. Never raises."""
+        try:
+            r = self._get("/v5/market/tickers", {"category": category, "symbol": symbol}, signed=False)
+            row = r["list"][0]
+            self._quotes[(category, symbol)] = {"bid": row.get("bid1Price"), "ask": row.get("ask1Price"), "ts_ms": int(self.clock()), "source": "TICKER_TOUCH"}
+            return row
+        except (ExecutorError, KeyError, IndexError, TypeError, ValueError, ArithmeticError, AttributeError):          # a malformed ticker row must never escape into an order send (nor slow an exit)
+            return None
+
+    def _reference_for(self, leg: T.LegPlan, now_ms: int, fresh: bool) -> Optional[Dict[str, Any]]:
+        """The quote to record against this order: for an ENTRY the ticker read just made (age 0); for an EXIT (which must never be slowed by a read) the latest quote already held, with its
+        age, or None. The record states which; an unknown reference stays unknown."""
+        q = self._quotes.get((leg.category, leg.symbol))
+        if q is None or not q.get("bid") or not q.get("ask"):
+            return None
+        return {**q, "age_ms_at_send": max(0, now_ms - int(q["ts_ms"])), "source": q["source"] if fresh else "LATEST_HELD_QUOTE"}
 
     def lookup(self, category: str, symbol: str, link: str) -> Optional[Mapping[str, Any]]:
         """The order under ``link`` (open or closed) or None when the venue answers 'no such order'. Raises ``ExecutorError`` when the venue cannot be read."""
@@ -343,8 +383,11 @@ class TestnetExecutor:
 
     def cancel_order(self, req: OrderRequest) -> str:
         body = {"category": req.leg.category, "symbol": req.leg.symbol, "orderLinkId": req.link_id}
+        m = self.meas.setdefault(req.link_id, {})
+        m["cancel_sent_ms"] = int(self.clock())
         try:
             self.client._request("POST", CANCEL, body=body, signed=True, retries=0)
+            m["cancel_acked_ms"], m["cancel_result"] = int(self.clock()), "CANCELLED"
             return "CANCELLED"
         except bc.OrderNotSent:
             raise
@@ -354,10 +397,14 @@ class TestnetExecutor:
                     row = self.lookup(req.leg.category, req.leg.symbol, req.link_id)
                 except ExecutorError:
                     raise
+                m["cancel_acked_ms"] = int(self.clock())
                 if row is None:
+                    m["cancel_result"] = "NOT_FOUND"
                     return "NOT_FOUND"
                 st = row.get("orderStatus")
-                return "TOO_LATE" if st == "Filled" else "CANCELLED" if st in CLOSED_STATUSES else "TOO_LATE"
+                res = "TOO_LATE" if st == "Filled" else "CANCELLED" if st in CLOSED_STATUSES else "TOO_LATE"
+                m["cancel_result"] = res
+                return res
             raise
         except bc.TransientAPIError:
             raise
@@ -433,30 +480,62 @@ class TestnetExecutor:
             return
         avg = r.get("avgPrice") or "0"
         out[link] = {"order_id": r["orderId"], "status": st, "filled_qty": float(_d(r.get("cumExecQty") or "0", "cumExecQty")), "avg_price": float(_d(avg, "avgPrice")),
-                     "symbol": r.get("symbol"), "category": cat, "side": r.get("side"), "qty": r.get("qty")}
+                     "symbol": r.get("symbol"), "category": cat, "side": r.get("side"), "qty": r.get("qty"),
+                     "order_type": r.get("orderType"), "tif": r.get("timeInForce"), "created_ms": _ms(r.get("createdTime")), "updated_ms": _ms(r.get("updatedTime")),
+                     "cum_fee": r.get("cumExecFee")}
 
     def _take_exec(self, r: Mapping[str, Any], cat: str, out: List[Dict[str, Any]]) -> None:
         eid = r["execId"]
         if eid in self._seen_exec or any(x["fill_id"] == eid for x in out):
             return                                                     # duplicate execution event: dropped by execId
         typ, link = r.get("execType", "Trade"), r.get("orderLinkId") or ""
+        if typ != "Trade":                                              # funding, ADL, bust, settle...: SURFACED WHOLE (the settlement recogniser needs its time, mark and fee), never booked as our fill.
+            row = {"exec_id": eid, "type": typ, "symbol": r.get("symbol"), "fee": r.get("execFee") if r.get("execFee") not in (None, "") else None,     # a blank fee stays UNKNOWN, not 0
+                   "exec_time_ms": _ms(r.get("execTime")), "side": r.get("side"), "qty": r.get("execQty"), "price": r.get("execPrice"), "mark": r.get("markPrice"),
+                   "fee_ccy": r.get("feeCurrency"), "order_id": r.get("orderId"), "category": cat}     # parsed defensively: a malformed row here must NEVER fail the whole venue read
+            self._read_unattributed.append(row)
+            if not any(u["exec_id"] == eid for u in self.unattributed):
+                self.unattributed.append(row)
+            return
         qty, px, fee = _d(r["execQty"], "execQty"), _d(r["execPrice"], "execPrice"), _d(r.get("execFee") or "0", "execFee")
         side, sym = r["side"], r["symbol"]
-        if typ != "Trade" or not link:                                  # funding, ADL, bust, settle, or a trade under no client link id: SURFACED, never booked as our fill
-            row = {"exec_id": eid, "type": typ, "symbol": sym, "fee": str(fee)}
+        if not link:                                                    # a trade under no client link id: SURFACED, never booked as our fill
+            row = {"exec_id": eid, "type": typ, "symbol": sym, "fee": str(fee), "exec_time_ms": _ms(r.get("execTime")), "side": side, "qty": r.get("execQty"), "price": r.get("execPrice"),
+                   "mark": r.get("markPrice"), "fee_ccy": r.get("feeCurrency"), "order_id": r.get("orderId"), "category": cat}
             self._read_unattributed.append(row)
             if not any(u["exec_id"] == eid for u in self.unattributed):
                 self.unattributed.append(row)
             return
         fee_ccy = r.get("feeCurrency") or QUOTE
+        fee_signed = fee
         if cat == "spot" and fee_ccy != QUOTE:                           # fee taken from the received base coin: net quantity, fee in USD at the fill price
             if side == "Buy":
                 qty = qty - fee
                 self._fee_in_qty[link] = self._fee_in_qty.get(link, D(0)) + fee
             fee = fee * px
+            fee_signed = fee
         out.append({"fill_id": eid, "link_id": link, "qty": float(qty), "price": float(px), "fee_usd": float(max(fee, D(0))), "fee_ccy": QUOTE,
                     "liquidity": "MAKER" if r.get("isMaker") in (True, "true") else "TAKER", "ts_ms": int(r["execTime"]), "symbol": sym, "category": cat, "side": side,
-                    "prov": "MEASURED"})
+                    "prov": "MEASURED", "fee_signed_usd": float(fee_signed), "fee_rate": r.get("feeRate") if r.get("feeRate") not in (None, "") else None,
+                    "fee_ccy_venue": fee_ccy, "is_maker_reported": r.get("isMaker") is not None})
+
+    def funding_history(self, symbol: str, start_ms: int, end_ms: int) -> Optional[List[Dict[str, Any]]]:
+        """The public settlement history for ``symbol`` between two times: [{ts_ms, rate}] oldest first, or None when it cannot be read COMPLETELY (a read error, a malformed row, or a page that
+        may hold more rows than were returned). None means UNKNOWN to the caller; an empty list means the venue stated there was no settlement in the window."""
+        try:
+            res = self._get("/v5/market/funding/history", {"category": "linear", "symbol": symbol, "startTime": int(start_ms), "endTime": int(end_ms), "limit": 200}, signed=False)
+            lst = res.get("list")
+            if not isinstance(lst, list) or len(lst) >= 200:
+                return None
+            out = []
+            for r in lst:
+                ts, rate = _ms(r.get("fundingRateTimestamp")), r.get("fundingRate")
+                if ts is None or rate in (None, ""):
+                    return None
+                out.append({"ts_ms": ts, "rate": str(_d(rate, "fundingRate"))})
+            return sorted(out, key=lambda e: e["ts_ms"])
+        except (ExecutorError, KeyError, TypeError, ValueError):
+            return None
 
     # ---------------------------------------------------------------- account / market reads for the authority
     def account_state(self, baseline: Optional[Mapping[str, float]] = None, open_groups: int = 0) -> Dict[str, Any]:
@@ -475,6 +554,13 @@ class TestnetExecutor:
             view_pos[sym] = {"category": "linear", "notional_usd": float(size * m * (1 if side == "Buy" else -1)), "qty": float(size)}
         w = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, signed=True)
         eq, coins = parse_wallet(w)
+        if QUOTE in coins:
+            ts, val = int(self.clock()), str(coins[QUOTE])
+            last = self.wallet_samples[-1] if self.wallet_samples else None
+            if last is None or last[1] != val or ts - last[0] >= 15_000:   # a sample when the value changes or every 15 s: an UNCHANGED wallet after a settlement is itself the evidence, and a long hold keeps the samples around EVERY settlement
+                self.wallet_samples.append((ts, val))
+                if len(self.wallet_samples) > 20_000:
+                    del self.wallet_samples[: len(self.wallet_samples) - 20_000]
         equity = float(eq)
         # THE LOSS MEASURE IS THE SESSION'S, NOT THE OWNER'S WHOLE ACCOUNT: spot the client held BEFORE the session (``baseline``) is valued at the wallet read's own implied price
         # (coin usdValue / walletBalance, the same basis as totalEquity) and taken out, so its price swings cancel exactly. Without this a $10 move in BTC on a 0.1 BTC holding

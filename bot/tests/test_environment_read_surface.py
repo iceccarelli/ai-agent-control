@@ -16,6 +16,7 @@ BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: file -> the most direct reads it may contain. Each is a narrow, named reason.
 ALLOWED = {
     "config.py": 1,                      # the loader
+    "tools/executor_env.py": 1,          # the ONE reader of the single-writer guard's five NAMED, non-exchange variables (Supabase lease location, machine id, local lock path); copies nothing else, logs nothing
     "persistence.py": 1,                 # STATE_DB_PATH bootstrap, before config
     "carry_shadow.py": 1,                # CODE_REVISION stamp
     "tools/reserved_holdout.py": 1,      # a disable switch
