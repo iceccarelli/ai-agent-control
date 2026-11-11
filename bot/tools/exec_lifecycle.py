@@ -46,6 +46,15 @@ def num(x: Any, places: int = 4) -> Optional[str]:
     return format(v.quantize(D(1).scaleb(-places)), "f")
 
 
+def neutral(v: Any) -> Any:
+    """A value safe for the evidence guard: a number-like string or float becomes a decimal rounded to 4 places (the guard refuses long digit runs such as 0.30000000000000004), anything else is a
+    short string; None and ints stay as they are."""
+    if v is None or isinstance(v, bool) or (isinstance(v, int)):
+        return v
+    n = num(v, 4)
+    return n if n is not None else str(v)[:40]
+
+
 def event_id(session_id: str, kind: str, stage: str, n: int = 0) -> str:
     """Deterministic: re-emitting the same stage of the same session is a duplicate, never a second record."""
     return f"{session_id}:{kind}:{stage}:{n}"[:200]
@@ -139,16 +148,20 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
     edge = result.get("edge") if isinstance(result.get("edge"), Mapping) else None
     auth = result.get("authority") if isinstance(result.get("authority"), Mapping) else {}
     cand = {"candidate_id": auth.get("candidate_id"), "spec_ref": ref16(auth.get("spec_digest"))} if auth.get("candidate_id") else None
+    portfolio_n = None if portfolio is None else {str(k)[:40]: neutral(v) for k, v in dict(portfolio).items()}
     core = {"inputs": result.get("inputs_digest"), "edge": None if edge is None else edge.get("digest"), "decision": result.get("decision"), "symbol": result.get("symbol"),
+            "evaluated": result.get("evaluated_ms") if result.get("observed_ms") is None else None,            # a decision with NO market observation (no data, no opportunity) is unique to its moment
             "notional": result.get("notional_usd"), "floor": result.get("owner_funding_floor_bps"), "candidate": cand, "code": code_sha,
-            "portfolio": None if portfolio is None else json.dumps(dict(portfolio), sort_keys=True, default=str), "venue": None if venue is None else json.dumps(dict(venue), sort_keys=True, default=str)}
+            "portfolio": None if portfolio_n is None else json.dumps(portfolio_n, sort_keys=True, default=str), "venue": None if venue is None else json.dumps(dict(venue), sort_keys=True, default=str)}
     did = "dec_" + hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
     assumed = [str(a) for a in (edge or {}).get("assumed_inputs", [])]
     notional = result.get("notional_usd")
     rec: Dict[str, Any] = {
         "decision_id": did, "decision": result.get("decision"), "reasons": [str(x)[:120] for x in list(result.get("why", []))[:6]], "symbol": result.get("symbol"),
         "notional_usd": num(notional, 2), "owner_funding_floor_bps": num(result.get("owner_funding_floor_bps")), "funding_bps": num(result.get("funding_bps")),
-        "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "hold_s": result.get("hold_s"), "candidate": cand, "code_sha": code_sha,
+        "seconds_to_settlement": num(result.get("seconds_to_settlement"), 1), "hold_s": result.get("hold_s"), "candidate": cand,
+        "code_sha": None if code_sha is None else str(code_sha)[:12],                                      # the guard refuses a 24+ hex token as secret-shaped; the FULL revision is inside the id hash
+        "evaluated_ms": result.get("evaluated_ms"),
         "inputs_ref": ref16(result.get("inputs_digest")), "observed_ms": result.get("observed_ms"), "data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY", "source": "LOCAL",
         "authority_gaps": [str(g)[:40] for g in list(result.get("authority_gaps", []))[:10]]}
     if edge is not None:
@@ -177,14 +190,14 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
             total_cost = sum(costs, D(0))
             rec["scenarios"] = {"label": "ARITHMETIC_ON_DECLARED_INPUTS", "gross_expected_funding_bps": num(rate * n), "total_cost_bps": num(total_cost) if known else None,
                                 "gross_before_haircut_net_bps": num(rate * n - total_cost) if known else None,
-                                "conservative_expected_net_bps": num(edge.get("net_edge_bps")), "conservative_basis": "the economic model's own funding haircut and hurdle (net_edge_bps)",
+                                "conservative_expected_net_bps": num(edge.get("net_edge_bps")), "conservative_basis": "the economic model's net edge after its 30% funding haircut and all modelled costs (net_edge_bps); the 2 bps hurdle is the pass threshold, not a deduction",
                                 "stress_half_funding_net_bps": num(rate * n / 2 - total_cost) if known else None, "required_funding_bps": num(edge.get("required_funding_bps"))}
         except (ArithmeticError, ValueError, TypeError):                           # noqa: BLE001
             rec["scenarios"] = {"label": "ARITHMETIC_ON_DECLARED_INPUTS", "unavailable": True}
     if risk_limits is not None:
-        rec["risk_limits"] = {str(k)[:40]: (v if isinstance(v, (int, float)) and not isinstance(v, bool) else None if v is None else str(v)[:40]) for k, v in dict(risk_limits).items()}
+        rec["risk_limits"] = {str(k)[:40]: neutral(v) for k, v in dict(risk_limits).items()}
     if portfolio is not None:
-        rec["portfolio_context"] = {str(k)[:40]: (v if isinstance(v, (int, float, bool)) else None if v is None else str(v)[:40]) for k, v in dict(portfolio).items()}
+        rec["portfolio_context"] = dict(portfolio_n or {})
     if notional is not None and margin_per_usd is not None:
         try:
             rec["capital_required_usd"] = num(D(str(notional)) * D(str(margin_per_usd)), 2)
@@ -250,7 +263,8 @@ def funding_events(doc: Optional[Mapping[str, Any]]) -> List[Event]:
         for p in list(r.get("prints") or [])[:20]:
             w = p.get("wallet") if isinstance(p.get("wallet"), Mapping) else {}
             out.append(("FUNDING", "FUNDING_SETTLEMENT", {"source": "VENUE", "symbol": r.get("symbol"), "settlement_ms": p.get("ts_ms"), "rate": num(p.get("rate"), 8), "held_qty": num(p.get("signed_position_qty"), 6),
-                                                          "status": p.get("status"), "amount_usd": num(p.get("amount_usd"), 6), "expected_usd": num(p.get("expected_usd"), 6), "row_ref": ref16(p.get("row_id")),
+                                                          "status": p.get("status"), "amount_usd": num(p.get("amount_usd"), 6) if str(p.get("status")).startswith("BOOKED") else None,          # a quarantined / mismatched row's cash is NOT an amount: it must not be summable
+                                                          "row_cash_if_h1_usd": None if str(p.get("status")).startswith("BOOKED") else num(p.get("amount_usd"), 6), "expected_usd": num(p.get("expected_usd"), 6), "row_ref": ref16(p.get("row_id")),
                                                           "cash_check": w.get("status"), "cash_check_delta_usd": num(w.get("delta_usd"), 6), "reason": str(p.get("reason") or "")[:160] or None}))
         out.append(("FUNDING", "FUNDING_RECOGNITION", {"source": "VENUE", "symbol": r.get("symbol"), "sign_hypothesis": r.get("sign_hypothesis"), "prints_available": r.get("prints_available"),
                                                         "window": r.get("window"), "all_resolved": r.get("all_prints_resolved"), "booked_usd": num(r.get("booked_usd"), 6),

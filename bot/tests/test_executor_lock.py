@@ -98,8 +98,14 @@ def test_a_plain_reconcile_is_refused_while_a_session_holds_the_lock(w):
 
 
 # ------------------------------------------------------------------ the emergency unwind hands over, never runs a second writer
+def _session_dir(path):
+    os.makedirs(path, exist_ok=True)
+    open(os.path.join(path, "engine_journal.jsonl"), "a").close()                         # what a real session directory holds
+    return path
+
+
 def _holder_that_releases_when_killed(w, holder_dir):
-    holder = lock_for(w, "autopilot", holder_dir)
+    holder = lock_for(w, "execute", holder_dir)
     assert holder.try_acquire()
     real_sleep = w.clock.sleep
 
@@ -115,8 +121,7 @@ def test_the_unwind_engages_the_holders_kill_switch_waits_and_then_verifies_flat
     d = ready(w)
     run, ctx, rec = begin(w)
     assert drive_full(w, run, 2) == "HEDGED"
-    holder_dir = str(tmp_path / "holder_session")
-    os.makedirs(holder_dir)
+    holder_dir = _session_dir(str(tmp_path / "holder_session"))
     holder = _holder_that_releases_when_killed(w, holder_dir)
     rc = w.run("reconcile", "--unwind", "--confirm-plan-digest", d)
     assert rc == 0, w.text()
@@ -129,9 +134,8 @@ def test_an_unwind_whose_holder_never_lets_go_exits_nonzero_and_sends_nothing(w,
     d = ready(w)
     run, ctx, rec = begin(w)
     assert drive_full(w, run, 2) == "HEDGED"
-    holder_dir = str(tmp_path / "stuck")
-    os.makedirs(holder_dir)
-    assert lock_for(w, "autopilot", holder_dir).try_acquire()
+    holder_dir = _session_dir(str(tmp_path / "stuck"))
+    assert lock_for(w, "execute", holder_dir).try_acquire()
     creates = len(w.requests_to(CREATE))
     assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == S.EXIT_FAIL
     assert "TIMED OUT" in w.text() and len(w.requests_to(CREATE)) == creates                # never a second writer
@@ -157,17 +161,53 @@ def test_the_unwind_still_needs_the_digest_even_when_it_would_hand_over(w):
 
 
 # ------------------------------------------------------------------ a halted group no longer strands the emergency exit
-def test_a_group_halted_by_exit_rejections_is_unwound_by_the_confirmed_owner_command(w):
+def test_a_group_halted_by_REAL_exit_rejections_is_unwound_by_the_confirmed_owner_command(w):
+    """Review finding: the clear used to be a no-op against a genuine halt (the rejected-exit COUNT was still >= the limit, so the very next step re-halted and sent nothing). The venue really rejects
+    every exit here, the engine really halts, and the confirmed unwind must still end flat."""
     d = ready(w)
     run, ctx, rec = begin(w)
     assert drive_full(w, run, 2) == "HEDGED"
-    run.engine._emit("HALT_GROUP", run.gid, w.clock.now(), {"reason": "EXIT_ORDERS_REJECTED"})       # the autopilot's end state after repeated exit rejections
-    assert run.engine.groups[run.gid].halted_reason == "EXIT_ORDERS_REJECTED"
+    w.fake.reject[""] = (10001, "params error")                                                    # every order (so every EXIT) is refused by the venue
+    run.engine.request_exit(run.gid, w.clock.now(), "TEST_EXIT")
+    for _ in range(40):
+        w.clock.sleep(3)
+        now = w.clock.now()
+        run.engine.step(now, market_ts_ms=now, account_ts_ms=now)
+        run.bookkeep()
+        if run.engine.groups[run.gid].halted_reason:
+            break
+    g = run.engine.groups[run.gid]
+    assert g.halted_reason == "EXIT_ORDERS_REJECTED" and sum(1 for l in g.exit_legs() if l.status == "REJECTED") >= 5
+    assert any(p["size"] != 0 for p in w.fake.positions.values())                                   # the hedge is still open
+    w.fake.reject.clear()                                                                           # the owner fixed whatever the venue disliked
     rc = w.run("reconcile", "--unwind", "--confirm-plan-digest", d)
     assert rc == 0, w.text()
     assert "lifted by the confirmed unwind" in w.text() and w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
     lines = [json.loads(l) for l in open(os.path.join(w.state_dir, "engine_journal.jsonl"))]
-    assert any(e["type"] == "HALT_GROUP" and e["body"]["reason"] == "" for e in lines)             # the chain shows who lifted it
+    lifted = [e for e in lines if e["type"] == "HALT_GROUP" and e["body"]["reason"] == ""]
+    assert lifted and lifted[-1]["body"]["exit_floor"] >= 5                                          # the chain shows who lifted it and from which rejection count
+
+
+def test_after_the_lift_exits_are_really_tried_again_and_only_NEW_rejections_count(w):
+    ready(w)
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    w.fake.reject[""] = (10001, "params error")
+    run.engine.request_exit(run.gid, w.clock.now(), "TEST_EXIT")
+    for _ in range(40):
+        w.clock.sleep(3)
+        now = w.clock.now()
+        run.engine.step(now, market_ts_ms=now, account_ts_ms=now)
+        run.bookkeep()
+        if run.engine.groups[run.gid].halted_reason:
+            break
+    g = run.engine.groups[run.gid]
+    n = sum(1 for l in g.exit_legs() if l.status == "REJECTED")
+    assert run.engine.clear_exit_halt(run.gid, w.clock.now()) == "EXIT_ORDERS_REJECTED" and g.exit_attempt_floor == n
+    m = sum(1 for l in g.exit_legs() if l.status == "REJECTED")
+    assert m - n == n >= run.engine.policy.max_exit_attempts, (n, m)                               # a FRESH budget: as many new attempts as the first halt allowed (the old count no longer re-halts at once)
+    assert g.halted_reason == "EXIT_ORDERS_REJECTED"                                               # and a venue that still refuses everything halts again, with the floor moved up
+    assert run.engine.clear_exit_halt("no-such-group", w.clock.now()) is None
 
 
 def test_only_exit_halts_are_lifted_a_conflicting_order_id_halt_stays(w):
@@ -198,7 +238,7 @@ def test_a_long_manual_run_renews_its_lease_and_releases_it_at_the_end(tmp_path,
     h = FakeHandle([True, True, True])
     t = {"now": 0.0}
 
-    def run(argv, env, sleep=None):
+    def run(argv, env, sleep=None, pre_order_check=None):
         for _ in range(4):
             t["now"] += 31.0
             sleep(1.0)
@@ -212,7 +252,7 @@ def test_a_lease_that_cannot_be_renewed_engages_the_kill_switch_once_and_the_run
     t = {"now": 0.0}
     os.makedirs(str(tmp_path / "s"))
 
-    def run(argv, env, sleep=None):
+    def run(argv, env, sleep=None, pre_order_check=None):
         for _ in range(4):
             t["now"] += 31.0
             sleep(1.0)
@@ -302,3 +342,112 @@ def test_the_guarded_parent_refuses_when_the_local_lock_is_held_and_gives_the_le
     other = XL.ExecutorLock(lockpath, role="execute", state_dir="/s", now_ms=1)
     assert other.try_acquire()
     assert UD.guarded_run_once(str(tmp_path / "r"), env={}, acquire=lambda e: (LG.Handle(lease), "")) == UD.EXIT_REFUSED and lease.released
+
+
+def _guarded_execute(w, d, acquire):
+    run = lambda argv, env, sleep=None, pre_order_check=None: S.main(argv, env=env, inner_transport=w.fake, clock_ms=w.clock.now, sleep=w.clock.sleep, input_fn=lambda _p: d,   # noqa: E731
+                                                                      out=w.out.append, pre_order_check=pre_order_check)
+    return S.guarded_main(["--state-dir", w.state_dir, "execute", "--confirm-plan-digest", d], env=w.env, acquire=acquire, run=run, monotonic=lambda: 0.0, real_sleep=lambda s: None)
+
+
+def test_a_lease_that_lapsed_during_the_prompt_is_retaken_before_the_entries_when_nobody_else_holds_it(w):
+    d = ready(w)
+    first, second = FakeHandle([False]), FakeHandle([True] * 20)                       # the lease taken at start has expired by the time the first entry is about to leave
+    handles = iter([first, second])
+    assert _guarded_execute(w, d, lambda e: (next(handles), "")) == 0
+    assert w.record()["flat_verified"] is True and len(w.requests_to(CREATE)) >= 2
+    assert first.calls == 1 and second.released is True                                # the re-taken lease is the one released at the end
+
+
+def test_a_lease_that_lapsed_and_was_taken_by_another_executor_refuses_every_entry(w):
+    d = ready(w)
+    answers = iter([(FakeHandle([False]), ""), (None, "LEASE_HELD_BY_ANOTHER_EXECUTOR")])
+    rc = _guarded_execute(w, d, lambda e: next(answers))
+    assert len(w.requests_to(CREATE)) == 0, "an ENTRY order was sent although the lease was lost to another executor"
+    assert all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+# ------------------------------------------------------------------ review round: the emergency unwind must not be refusable by lock plumbing
+def _hung_hedge(w):
+    d = ready(w)
+    run, ctx, rec = begin(w)
+    assert drive_full(w, run, 2) == "HEDGED"
+    return d
+
+
+def test_a_broken_lock_file_is_not_a_holder_the_unwind_proceeds_and_a_plain_reconcile_is_refused(w):
+    d = _hung_hedge(w)
+    path = XL.lock_path(AD.DEFAULT_CAPABILITY_PATH)
+    os.makedirs(path)                                                                       # a DIRECTORY where the lock file should be: open() fails with EISDIR
+    assert w.run("reconcile") == S.EXIT_REFUSED and "cannot be used" in w.text()
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert "WARNING: the account lock cannot be used" in w.text() and w.record()["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+
+
+def test_a_lock_error_is_distinguished_from_contention(w):
+    path = XL.lock_path(AD.DEFAULT_CAPABILITY_PATH)
+    os.makedirs(path)
+    a = lock_for(w)
+    assert not a.try_acquire() and a.error and a.error.startswith("LOCK_FILE_UNUSABLE")
+    os.rmdir(path)
+    b1, b2 = lock_for(w, "x", "/s"), lock_for(w, "y", "/t")
+    assert b1.try_acquire() and not b2.try_acquire() and b2.error is None                    # contention: no error text
+
+
+def test_a_holder_that_released_between_our_attempt_and_our_look_is_retried_not_abandoned(w, monkeypatch):
+    d = _hung_hedge(w)
+    holder = lock_for(w, "execute", "/nowhere")
+    assert holder.try_acquire()
+    calls = {"n": 0}
+    real_read = XL.read_holder
+
+    def blank_then_free(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            holder.release()                                                                # the holder lets go right after our failed attempt; its note is blank
+            return None
+        return real_read(path)
+    monkeypatch.setattr(XL, "read_holder", blank_then_free)
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    assert "had just finished" in w.text() and w.record()["flat_verified"] is True
+
+
+def test_a_legacy_holder_never_gets_a_kill_file_and_the_unwind_says_who_to_stop(w, tmp_path):
+    d = _hung_hedge(w)
+    legacy_dir = str(tmp_path / "cwd_of_a_legacy_tool")
+    os.makedirs(legacy_dir)
+    assert lock_for(w, "legacy-armed", legacy_dir).try_acquire()
+    creates = len(w.requests_to(CREATE))
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == S.EXIT_FAIL
+    assert "does not read a kill switch" in w.text() and "kill " in w.text()
+    assert os.listdir(legacy_dir) == [] and len(w.requests_to(CREATE)) == creates              # no stray MS_KILL, nothing sent
+
+
+@pytest.mark.parametrize("bad_dir", ["relative/dir", "/definitely/not/a/dir", "/tmp"])
+def test_a_note_naming_a_directory_that_is_not_a_session_dir_is_not_followed(w, tmp_path, bad_dir):
+    d = _hung_hedge(w)
+    holder = XL.ExecutorLock(XL.lock_path(AD.DEFAULT_CAPABILITY_PATH), role="execute", state_dir=bad_dir, now_ms=1)
+    assert holder.try_acquire()
+    before = set(os.listdir("/tmp")) if bad_dir == "/tmp" else None
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == S.EXIT_FAIL and "not an absolute path to a session state directory" in w.text()
+    assert not os.path.exists(os.path.join(bad_dir, "MS_KILL")) if os.path.isabs(bad_dir) else not os.path.exists("relative")
+    if before is not None:
+        assert "MS_KILL" not in set(os.listdir("/tmp")) - before
+
+
+@pytest.mark.parametrize("change", ["journal", "kill"])
+def test_state_that_changes_during_the_typed_prompt_is_rechecked_after_the_lock(w, change):
+    """Review finding: the gates ran before the (possibly minutes-long) typed prompt and the lock; a session that completed, or a kill switch engaged, in between was not seen."""
+    d = ready(w)
+
+    def prompt(_p):
+        if change == "journal":
+            open(os.path.join(w.state_dir, "engine_journal.jsonl"), "w").write("another process ran a session here\n")
+        else:
+            AD.engage_kill_switch(os.path.join(w.state_dir, "MS_KILL"), "owner stop during the prompt")
+        return d
+    before = S.entries_today(w.clock.now())
+    rc = S.main(["--state-dir", w.state_dir, "execute", "--confirm-plan-digest", d], env=w.env, inner_transport=w.fake, clock_ms=w.clock.now, sleep=w.clock.sleep, input_fn=prompt, out=w.out.append)
+    assert rc == S.EXIT_REFUSED and ("SESSION_ALREADY_EXECUTED_USE_RECONCILE" if change == "journal" else "KILL_SWITCH_ENGAGED") in w.text()
+    assert not w.requests_to(CREATE) and S.entries_today(w.clock.now()) == before          # nothing sent and no entry counted
+    assert lock_for(w, "after").try_acquire()                                              # and the lock was released

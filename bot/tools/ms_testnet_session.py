@@ -859,6 +859,11 @@ class Run:
                 legs.append(EQ.leg_quality(link_id=l.link, group_id=self.gid, leg_id=l.plan.leg_id, kind=l.kind, candidate_id=self.group_plan.candidate_id, decision_id=decision_id,
                                            plan=asdict(l.plan), ref=m.get("reference"), timing={k: m.get(k) for k in ("sent_ms", "acked_ms", "cancel_sent_ms", "cancel_acked_ms", "cancel_result")},
                                            order=order, fills=[x for x in view["executions"] if x["link_id"] == l.link]))
+            known = {l.plan.leg_id for l in g.legs.values()}
+            for lp in self.group_plan.legs:                              # PLANNED entry legs the engine never sent (a crash between two legs): they exist in the record, unfilled, so a one-legged group is never "hedged"
+                if lp.leg_id not in known:
+                    legs.append(EQ.leg_quality(link_id=f"{self.gid}-{lp.leg_id}", group_id=self.gid, leg_id=lp.leg_id, kind="ENTRY", candidate_id=self.group_plan.candidate_id, decision_id=decision_id,
+                                               plan=asdict(lp), ref=None, timing=None, order=None, fills=[]))
             doc = EQ.session_quality(legs, style=self.group_plan.style, notional_usd=self.group_plan.notional_usd, flat_verified=flat, decision_id=decision_id)
             _write_json(self.ctx.path("quality"), doc)
             return doc
@@ -887,7 +892,11 @@ class Run:
                 other = [x["ts_ms"] for x in mine if not (x["category"] == "linear" and x["symbol"] == sym)]
                 prints = self.ex.funding_history(sym, min(p["ts_ms"] for p in perp) - 1000, now) if perp else None
                 rows = [u for u in view.get("unattributed", []) if u.get("type") == "Funding" and u.get("symbol") == sym]
-                doc = FS.recognise(symbol=sym, perp_fills=perp, other_fill_ts=other, prints=prints, rows=rows, wallet_samples=samples, now_ms=now)
+                try:
+                    interval = self.ex.filters("linear", sym).funding_interval_min
+                except Exception:                                      # noqa: BLE001 - an unknown interval claims nothing
+                    interval = None
+                doc = FS.recognise(symbol=sym, perp_fills=perp, other_fill_ts=other, prints=prints, rows=rows, wallet_samples=samples, now_ms=now, interval_min=interval)
                 for a in doc["actions"]:
                     if a["action"] == "record":
                         self.ledger.record_funding(sym, int(a["ts_ms"]), a["amount_usd"], a["prov"])
@@ -1052,9 +1061,25 @@ def cmd_execute(ctx: Ctx) -> int:
                 + "; two writers on one account are never allowed. If an exit is needed use: reconcile --unwind --confirm-plan-digest <digest>")
         return EXIT_REFUSED
     try:
+        again = _state_gates(ctx, manifest)                            # the gates were evaluated BEFORE the (possibly minutes-long) typed prompt and the lock: what another process could have changed since is checked again
+        if again:
+            ctx.out("execute REFUSED (no network call was made): " + "; ".join(again))
+            return EXIT_REFUSED
         return _execute_locked(ctx, plan, manifest)
     finally:
         lock.release()
+
+
+def _state_gates(ctx: Ctx, manifest: Mapping[str, Any]) -> List[str]:
+    """The gates whose answer can change while a prompt waits: the kill switch, the entries-per-day counter and whether this state directory already ran a session."""
+    why: List[str] = []
+    if _kill(ctx)[0]:
+        why.append("KILL_SWITCH_ENGAGED")
+    if entries_today(int(ctx.clock())) >= int(manifest["bounds"]["max_entries_per_utc_day"]):
+        why.append("MAX_ENTRIES_PER_UTC_DAY_REACHED")
+    if os.path.exists(ctx.path("journal")) and os.path.getsize(ctx.path("journal")) > 0:
+        why.append("SESSION_ALREADY_EXECUTED_USE_RECONCILE")
+    return why
 
 
 def _account_lock(ctx: Ctx, role: str) -> "XL.ExecutorLock":
@@ -1152,29 +1177,62 @@ def cmd_reconcile(ctx: Ctx) -> int:
     assert manifest is not None
     lock = _account_lock(ctx, "unwind" if ctx.args.unwind else "reconcile")
     if not lock.try_acquire():
-        h = XL.read_holder(lock.path)
-        if not ctx.args.unwind:
-            ctx.out("reconcile REFUSED (nothing was sent): an order-capable session holds the account lock" + (f" ({h['role']}, pid {h['pid']}, {h['state_dir']})" if h else "")
-                    + "; a reconcile can cancel a live leg and must not interleave with the session that owns the journal. For an emergency exit use --unwind --confirm-plan-digest.")
-            return EXIT_REFUSED
-        if not _hand_over_unwind(ctx, plan, lock, h):                  # the emergency exit: the holder (the ONLY journal writer) is told to unwind; we wait for the lock, never run a second writer
-            return EXIT_FAIL
+        if lock.error is not None:                                     # the LOCK is broken (a directory at its path, EACCES, no flock): that is not a holder
+            if not ctx.args.unwind:
+                ctx.out(f"reconcile REFUSED (nothing was sent): the account lock cannot be used ({lock.error}); fix {lock.path!r}. An emergency unwind is still possible with --unwind --confirm-plan-digest.")
+                return EXIT_REFUSED
+            ctx.out(f"WARNING: the account lock cannot be used ({lock.error}), so no running session can be holding it: the emergency unwind proceeds WITHOUT the lock "
+                    f"(reduce-only exits; a holder would have failed the same way). Fix {lock.path!r} afterwards.")
+        else:
+            h = XL.read_holder(lock.path)
+            if not ctx.args.unwind:
+                ctx.out("reconcile REFUSED (nothing was sent): an order-capable session holds the account lock" + (f" ({h['role']}, pid {h['pid']}, {h['state_dir']})" if h else "")
+                        + "; a reconcile can cancel a live leg and must not interleave with the session that owns the journal. For an emergency exit use --unwind --confirm-plan-digest.")
+                return EXIT_REFUSED
+            if not _hand_over_unwind(ctx, plan, lock, h):              # the emergency exit: the holder (the ONLY journal writer) is told to unwind; we wait for the lock, never run a second writer
+                return EXIT_FAIL
     try:
         return _reconcile_locked(ctx, plan, manifest, rec)
     finally:
         lock.release()
 
 
+#: lock holders whose loop reads its state dir's kill switch (the session tool: `execute` is also what the autopilot runs in-process). A legacy tool never does, so engaging a kill file for one
+#: would only create a stray file and a pointless wait.
+KILL_HONOURING_ROLES = ("execute", "unwind", "reconcile")
+
+
 def _hand_over_unwind(ctx: Ctx, plan: Mapping[str, Any], lock: "XL.ExecutorLock", holder: Optional[Mapping[str, Any]]) -> bool:
     """The account lock is held by a running session and the owner asked for an emergency unwind. Engage THAT session's kill switch (it cancels entries, unwinds reduce-only and verifies flat, itself),
-    then wait a bounded time for the lock. True once this process holds it; False (and a message naming who to stop) when the holder does not let go."""
-    if not holder or not os.path.isdir(holder["state_dir"]):
+    then wait a bounded time for the lock. True once this process holds it; False (and a message naming who to stop) when the holder does not let go or cannot be handed over to."""
+    if holder is None:                                                 # the holder may have JUST released (its note is cleared before the descriptor closes): look again for a few seconds
+        for _ in range(20):
+            if lock.try_acquire():
+                ctx.out("the holder had just finished: reconciling against the venue")
+                return True
+            holder = XL.read_holder(lock.path)
+            if holder is not None:
+                break
+            ctx.sleep(0.25)
+    if not holder:
         ctx.out("unwind NOT started: the account lock is held but its holder cannot be identified (no readable note). Stop the order-capable process (autopilot-ctl drain / stop the app), then run this again. "
                 "Nothing was sent; no second writer was started.")
         return False
-    kill = os.path.join(holder["state_dir"], FILES["kill"])
-    created = AD.engage_kill_switch(kill, "reconcile --unwind handover")
-    ctx.out(f"the account lock is held by {holder['role']} pid {holder['pid']} ({holder['state_dir']}): its kill switch was {'engaged' if created else 'already engaged'} so IT unwinds reduce-only (one writer). "
+    sd = holder["state_dir"]
+    if holder["role"] not in KILL_HONOURING_ROLES:
+        ctx.out(f"unwind NOT started: the account lock is held by a {holder['role']} process (pid {holder['pid']}), which does not read a kill switch. Stop that process (kill {holder['pid']}), then run this again. "
+                "Nothing was sent; no file was created.")
+        return False
+    if not (os.path.isabs(sd) and os.path.isdir(sd) and (os.path.exists(os.path.join(sd, FILES["journal"])) or os.path.exists(os.path.join(sd, FILES["plan"])))):
+        ctx.out(f"unwind NOT started: the lock note names {sd!r}, which is not an absolute path to a session state directory. Stop pid {holder['pid']} by hand, then run this again. Nothing was sent.")
+        return False
+    kill = os.path.join(os.path.realpath(sd), FILES["kill"])
+    try:
+        created = AD.engage_kill_switch(kill, "reconcile --unwind handover")
+    except OSError as exc:
+        ctx.out(f"unwind NOT started: the holder's kill switch could not be engaged ({type(exc).__name__}). Stop pid {holder['pid']} by hand, then run this again. Nothing was sent.")
+        return False
+    ctx.out(f"the account lock is held by {holder['role']} pid {holder['pid']} ({sd}): its kill switch was {'engaged' if created else 'already engaged'} so IT unwinds reduce-only (one writer). "
             "Waiting for it to finish; the kill file stays engaged until you remove it on purpose.")
     deadline = int(ctx.clock()) + (int(plan["timing"]["exit_wait_s"]) + 60) * 1000
     while int(ctx.clock()) < deadline:
@@ -1340,27 +1398,39 @@ def guarded_main(argv: Optional[Sequence[str]] = None, *, env: Optional[Mapping[
     if parsed.cmd != "execute":
         return run(argv_l, env=environ)
     import legacy_executor_guard as LG
-    handle, why = (acquire or (lambda e: LG.acquire(e, ttl_seconds=LEASE_TTL_S, service="manual-session")))(environ)
+    take = acquire or (lambda e: LG.acquire(e, ttl_seconds=LEASE_TTL_S, service="manual-session"))
+    handle, why = take(environ)
     if handle is None:
         print("execute REFUSED (no order was sent): " + why)
         return EXIT_REFUSED
     mono, rsleep = monotonic or _time.monotonic, real_sleep or _time.sleep
-    last = {"t": mono(), "lost": False}
+    st = {"handle": handle, "t": mono(), "lost": False}
     kill_path = os.path.join(os.path.abspath(os.path.expanduser(parsed.state_dir)), FILES["kill"])
+
+    def before_entry() -> Optional[str]:
+        """The STRONG pre-order check (as the autopilot's): the server's own answer, asked before every ENTRY order. The typed-digest prompt can take minutes, so the lease taken at start may have
+        lapsed: if nobody else holds it, take it again; if it is held elsewhere, the entry is refused (exits are never gated)."""
+        if st["handle"].renew():
+            return None
+        fresh, why2 = take(environ)
+        if fresh is None:
+            return "EXECUTOR_LEASE_LOST:" + str(why2)[:80]
+        st["handle"] = fresh
+        return None
 
     def sleep(seconds: float) -> None:
         rsleep(seconds)
-        if mono() - last["t"] >= LEASE_RENEW_EVERY_S:
-            last["t"] = mono()
-            if not handle.renew() and not last["lost"]:
-                last["lost"] = True
+        if mono() - st["t"] >= LEASE_RENEW_EVERY_S:
+            st["t"] = mono()
+            if not st["handle"].renew() and not st["lost"]:
+                st["lost"] = True
                 AD.engage_kill_switch(kill_path, "executor lease could not be renewed")
                 print("EXECUTOR LEASE LOST: the session's kill switch was engaged (entries stop, the hedge unwinds reduce-only).")
 
     try:
-        return run(argv_l, env=environ, sleep=sleep)
+        return run(argv_l, env=environ, sleep=sleep, pre_order_check=before_entry)
     finally:
-        handle.release()
+        st["handle"].release()
 
 
 if __name__ == "__main__":

@@ -277,7 +277,7 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
     sym = symbol or (gv.get("symbols") or [None])[0] or (auth["capability_symbols"] or [None])[0] or "BTCUSDT"
     gaps = [g for g, ok in (("CAPABILITY_FILE", auth["capability"] == "VALID"), ("UNATTENDED_GRANT", auth["grant"] == "VALID"),
                             ("DEDICATED_TESTNET_CREDENTIALS", auth["credentials"]["dedicated_key_present"] and auth["credentials"]["dedicated_secret_present"])) if not ok]
-    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
+    base: Dict[str, Any] = {"data_scope": "TESTNET_DATA_NOT_MAINNET_EXPECTANCY: tickers, books and the fee tier come from the Testnet venue; this is not evidence about real-market economics", "symbol": sym, "evaluated_ms": now, "authority": auth, "authority_gaps": gaps + ["EXECUTOR_LEASE", "RISK_APPROVAL", "VENUE_FLAT_PROOF"], "read_only": True}
 
     def done(decision: str, why: Sequence[str], **kw: Any) -> Dict[str, Any]:
         res = _res("EVALUATED", why, decision=decision, **{**base, **kw})
@@ -340,6 +340,26 @@ def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) ->
     return {"risk_limits": limits, "portfolio": portfolio, "venue": {"id": "testnet", "host": S._venues.get("testnet").host, "scope": "TESTNET_FAKE_MONEY"}}
 
 
+def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir: str, exc: Exception) -> None:
+    """A present-but-invalid capital book stops ALL entries until the owner has looked (a persistent ALERT marker, like unexplained cash): the file is never reset or overwritten."""
+    try:
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "CAPITAL_BOOK_UNREADABLE", "state_dir": state_dir, "detail": str(exc)[:160]})
+    except Exception:                                                  # noqa: BLE001 - the refusal itself is already fail-closed
+        pass
+
+
+def _annotate_decision(state_dir: str, extra: Mapping[str, Any]) -> None:
+    """What the session actually did, added NEXT TO the decision record (decision.json), never into its id: the decision was evaluated at the grant's size and the book as it stood; the allocator then
+    sized the session from the settled book."""
+    try:
+        path = os.path.join(state_dir, "decision.json")
+        doc = ES.read_json(path)
+        if isinstance(doc, dict):
+            S._write_json(path, {**doc, "executed": dict(extra)})
+    except Exception:                                                  # noqa: BLE001 - evidence only
+        pass
+
+
 def _decision_dir_refusal(directory: str) -> Optional[str]:
     """A decision record is evidence, never state: refuse a directory that is (or is inside) the repository, the bot's state directory or the owner's engine/authority root (realpath, so a
     symlink cannot smuggle it in). Writing evidence files next to a grant or capability would also muddy what the owner's file-integrity checks see."""
@@ -365,7 +385,7 @@ def record_decision(directory: str, record: Mapping[str, Any], at_ms: int) -> st
         ob = XE.Outbox(directory)
         before = ob.pending
         ob.append("DECISION", {"stage": "DECISION_RECORDED", **record}, session_id=None, event_id=EL.event_id("decision", "DECISION", str(record["decision_id"]), 0),
-                  occurred_at_ms=int(record.get("observed_ms") or at_ms))             # the OBSERVATION time, so the same decision stored twice is byte-identical (a duplicate, never a conflict)
+                  occurred_at_ms=int(record.get("observed_ms") or record.get("evaluated_ms") or at_ms))             # the OBSERVATION time, so the same decision stored twice is byte-identical (a duplicate, never a conflict)
         return "STORED" if ob.pending > before else "DUPLICATE"
     except Exception as exc:                                                    # noqa: BLE001
         return f"REFUSED:{type(exc).__name__}"
@@ -470,6 +490,7 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         book.ensure_baseline(usdt_now)
         settled = book.settle(usdt_now)
     except CC.BookUnreadable as exc:
+        _alert_book_unreadable(engine_root, clock, d, exc)
         return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])      # (settle = what the venue's cash REALLY did since the last verified-flat session: losses in full, gains only as far as explained)
     if settled["status"] == "UNEXPLAINED_CASH":                       # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
         emit(EL.capital_settled(settled))
@@ -484,6 +505,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if settled.get("status") not in ("NO_PENDING", "CASH_UNKNOWN"):
         emit(EL.capital_book(book.report()))
     emit(EL.capital_allocated(alloc.as_dict(), settled))
+    _annotate_decision(d, {"allocator_notional_usd": str(alloc.notional), "binding_limit": str(alloc.binding), "portfolio_after_settle": _decision_context(engine_root, None)["portfolio"],
+                           "note": "the decision was evaluated at the grant's maximum size and the book as it stood; this is what the allocator then sized from the settled book"})
     if alloc.notional <= 0:                                           # the allocator can only say LESS than the owner's limits; zero is a decision to stay idle
         return _res("SKIPPED", ["ALLOCATION_ZERO:" + alloc.binding], state_dir=d, allocation=alloc.as_dict())
     if step("plan", "--symbol", sym, "--notional-usd", str(alloc.notional), "--hold-seconds", str(hold_s)) != 0:
@@ -518,7 +541,12 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
-    if not book.park(os.path.basename(d), usdt_now, None, False, False, cash_read_ms=cash_read_ms):          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
+    try:
+        parked = book.park(os.path.basename(d), usdt_now, None, False, False, cash_read_ms=cash_read_ms)
+    except CC.BookUnreadable as exc:                                  # the book went bad between the check and the park: still BEFORE any order
+        _alert_book_unreadable(engine_root, clock, d, exc)
+        return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])
+    if not parked:          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
         return _res("SKIPPED", ["CAPITAL_PENDING_UNSETTLED_OR_CASH_UNKNOWN"], state_dir=d)
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
@@ -539,7 +567,10 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     net = rec.get("net") or {}
     fees, price, fund = (CC._d(net.get(k)) for k in ("fees_usd", "price_pnl_usd", "funding_usd"))
     known = None if (fees is None or price is None) else price - fees + (fund or D(0))
-    book.update_pending(os.path.basename(d), known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT cash read, never from fill arithmetic alone
+    try:
+        book.update_pending(os.path.basename(d), known, fund is not None, rec.get("flat_verified") is True)   # settled at the NEXT cash read, never from fill arithmetic alone
+    except CC.BookUnreadable as exc:                                  # a venue session ALREADY ran: keep going so every lifecycle event is still emitted, and stop all future entries
+        _alert_book_unreadable(engine_root, clock, d, exc)
     summary["allocation"] = alloc.as_dict()
     funding = ES.read_json(os.path.join(d, "funding_settlement.json"))
     quality = ES.read_json(os.path.join(d, "execution_quality.json"))               # measured per-leg execution quality (observation only; None when it was not written)
@@ -1208,6 +1239,11 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         return 0
     if a.cmd == "capital":
         cbk = CC.CapitalBook(a.root)
+        try:
+            cbk.load()
+        except CC.BookUnreadable as exc:
+            print(f"capital book unreadable: {exc}\nInspect the file; if it is genuinely lost or damaged, move it aside DELIBERATELY (it is the record of your halts and losses; nothing here overwrites it).", file=sys.stderr)
+            return 2
         if a.ack_halt:
             print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
         if a.ack_drawdown:

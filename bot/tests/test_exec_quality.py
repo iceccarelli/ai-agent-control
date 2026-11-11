@@ -18,6 +18,7 @@ import exec_lifecycle as EL  # noqa: E402
 import exec_quality as EQ  # noqa: E402
 from ms_testnet_world import World, begin, resting_plan, restart  # noqa: E402
 
+CREATE_PATH = "/v5/order/create"
 REF = {"bid": "100.00", "ask": "100.20", "ts_ms": 1_000, "source": "TICKER_TOUCH", "age_ms_at_send": 0}
 
 
@@ -324,9 +325,32 @@ def test_the_feedback_report_says_how_far_the_model_is_from_measurement_and_neve
 def test_an_unknown_model_cost_or_unresolved_funding_is_unknown_in_the_row_never_zero():
     q = {"group": {"style": "TAKER", "attempt_completed": True, "cost_complete": True, "position_notional_usd": "100", "total_execution_cost_usd": "0.2",
                    "total_execution_cost_bps_of_position_notional": "20.0"}}
-    r = EQ.feedback_row(session="s", at_ms=1, decision_id="dec_1", quality=q, funding=None, edge={"costs_bps": {"a": "5", "b": None}, "expected_funding_bps": "9"}, flat_verified=True)
+    r = EQ.feedback_row(session="s", at_ms=1, decision_id="dec_1", quality=q, funding=None, edge={"costs_bps": {"fees": "5", "spread": None, "impact": "1"}, "expected_funding_bps": "9"}, flat_verified=True)
     assert r["modelled_cost_bps"] is None and r["realised_funding_bps"] is None and r["funding_booked_usd"] is None and r["expected_funding_bps"] == "9.0000"
     unresolved = {"recognitions": [{"all_prints_resolved": False, "booked_usd": None}]}
     assert EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=unresolved, edge=None, flat_verified=True)["realised_funding_bps"] is None
     booked = {"recognitions": [{"all_prints_resolved": True, "booked_usd": "0.9"}]}
     assert EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=booked, edge=None, flat_verified=True)["realised_funding_bps"] == "90.0000"
+
+
+def test_the_modelled_cost_is_like_for_like_only_fees_spread_and_slippage_lines_count():
+    """Review finding: impact, basis stress, hedge error, adverse selection and borrow are not what a leg's measured fee + spread + walk cover; summing them in biased the 'surprise' negative."""
+    q = {"group": {"style": "TAKER", "attempt_completed": True, "cost_complete": True, "position_notional_usd": "100", "total_execution_cost_usd": "0.3",
+                   "total_execution_cost_bps_of_position_notional": "30.0"}}
+    edge = {"costs_bps": {"fees": "31", "spread": "0.3", "slippage": "0", "impact": "1", "basis": "3", "hedge_error": "0.05", "adverse_selection": "0", "borrow": "0", "maker_fill": "0"},
+            "expected_funding_bps": "80"}
+    r = EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=None, edge=edge, flat_verified=True)
+    assert r["modelled_cost_bps"] == "31.3000"                                        # 31 + 0.3 + 0, NOT 35.35
+    assert EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=None, edge={"costs_bps": {"impact": "1"}}, flat_verified=True)["modelled_cost_bps"] is None
+
+
+def test_a_planned_entry_leg_the_engine_never_sent_is_in_the_record_and_the_group_is_not_hedged(w):
+    from ms_fake_bybit_testnet import SimulatedCrash
+    _ready(w)
+    d = w.plan_doc()["plan_digest"]
+    w.fake.inject(CREATE_PATH, "crash_after", match=lambda b: b["orderLinkId"].endswith("-p"))       # the process dies right after the perp leg: the spot leg was never sent
+    with pytest.raises(SimulatedCrash):
+        w.run("execute", "--confirm-plan-digest", d, typed=d)
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    g = _quality(w)["group"]
+    assert g["entry_legs_planned"] == 2 and g["entry_legs_filled"] == 1 and g["all_entry_legs_filled"] is False and g["attempt_completed"] is True

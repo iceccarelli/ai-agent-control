@@ -111,8 +111,57 @@ def test_funding_is_declared_zero_only_when_a_complete_history_shows_no_held_set
 
 def test_a_print_while_flat_is_not_held():
     fl = fills(exit_=PRINT - 10_000)                                # flat before the print
-    r = rec([row("-3.0")], fl=fl)
+    r = rec([], fl=fl)
     assert r["prints"] == [] and r["actions"][0]["action"] == "declare_none"
+
+
+def test_a_venue_row_for_a_settlement_we_believe_we_were_flat_for_is_unknown_not_zero():
+    fl = fills(exit_=PRINT - 10_000)                                # we exited 10 s before the print ... and the venue nevertheless paid a Funding row
+    r = rec([row("-3.0")], fl=fl)
+    assert not any(a["action"] == "declare_none" for a in r["actions"]) and any(f.startswith("UNLISTED_FUNDING_ROW") for f in r["flags"]) and r["booked_usd"] is None
+
+
+def test_an_empty_history_with_a_venue_row_in_the_window_is_never_declared_zero():
+    """Review finding: the history can lag (or be cut off by clock skew); a real Funding row in the held window means a settlement HAPPENED."""
+    r = rec([row("-3.0")], pr=[])
+    assert not any(a["action"] == "declare_none" for a in r["actions"]) and r["booked_usd"] is None and r["all_prints_resolved"] is False
+    assert any(f.startswith("UNLISTED_FUNDING_ROW") for f in r["flags"]) and [u["exec_id"] for u in r["unmatched_rows"]] == ["F1"]
+    assert not any(a["action"] == "declare_none" for a in rec([row(None)], pr=[])["actions"])           # an unparseable Funding row blocks a zero too
+
+
+def test_a_settlement_the_schedule_says_fell_in_the_window_but_the_history_does_not_list_is_unknown():
+    step = 8 * 3_600_000
+    fl = [{"ts_ms": step - 600_000, "side": "Sell", "qty": "0.5", "price": "60000"}, {"ts_ms": step + 900_000, "side": "Buy", "qty": "0.5", "price": "60000"}]       # held across 08:00 UTC
+    r = FS.recognise(symbol=SYM, perp_fills=fl, prints=[], rows=[], now_ms=step + 2_000_000, interval_min=480)
+    assert any(f.startswith("PRINT_EXPECTED_NOT_LISTED") for f in r["flags"]) and not any(a["action"] == "declare_none" for a in r["actions"])
+    assert {"action": "record", "ts_ms": step, "amount_usd": None, "prov": "UNKNOWN"} in r["actions"] and r["booked_usd"] is None
+    quiet = [{"ts_ms": step + 1_000_000, "side": "Sell", "qty": "0.5", "price": "60000"}, {"ts_ms": step + 1_900_000, "side": "Buy", "qty": "0.5", "price": "60000"}]     # not across any grid point
+    assert FS.recognise(symbol=SYM, perp_fills=quiet, prints=[], rows=[], now_ms=step + 5_000_000, interval_min=480)["actions"][0]["action"] == "declare_none"
+    assert FS.recognise(symbol=SYM, perp_fills=fl, prints=[], rows=[], now_ms=step + 2_000_000, interval_min=None)["actions"][0]["action"] == "declare_none"   # an unknown interval claims nothing either way
+    assert FS.expected_grid(480, 0, 3 * step) == [step, 2 * step, 3 * step] and FS.expected_grid(7, 0, 10 ** 9) == [] and FS.expected_grid(None, 0, 10) == [] and FS.expected_grid(True, 0, 10) == []
+
+
+def test_a_tiny_expectation_never_books_a_payment_as_income():
+    """Review finding: below $0.005 expected cash the old branch accepted a cash of the OPPOSITE sign within 0.005."""
+    # expected +0.0049 (short, positive rate): a row whose H1 cash is -0.0049 (fee +0.0049) is a PAYMENT: quarantined
+    pr = prints((PRINT, "0.00000163"))                              # 0.5 x 60000 x 1.63e-6 = 0.0489 ... scale the position down instead for a clean tiny figure
+    fl = [{"ts_ms": T_IN, "side": "Sell", "qty": "0.0005", "price": "60000"}, {"ts_ms": T_OUT, "side": "Buy", "qty": "0.0005", "price": "60000"}]
+    r = FS.recognise(symbol=SYM, perp_fills=fl, prints=prints((PRINT, "0.0016")), rows=[row("0.0480")], now_ms=NOW)              # expected +0.0480?  (0.0005 x 60000 x 0.0016)
+    assert D(only(r)["expected_usd"]) == D("0.048")
+    tiny = FS.recognise(symbol=SYM, perp_fills=fl, prints=prints((PRINT, "0.00016")), rows=[row("0.0048")], now_ms=NOW)           # expected +0.0048 (< 0.005), row cash -0.0048
+    assert only(tiny)["status"] == "QUARANTINED_SIGN" and tiny["booked_usd"] is None
+    ok = FS.recognise(symbol=SYM, perp_fills=fl, prints=prints((PRINT, "0.00016")), rows=[row("-0.0048")], now_ms=NOW)
+    assert only(ok)["status"] == "BOOKED" and D(only(ok)["amount_usd"]) == D("0.0048")
+    nothing = FS.recognise(symbol=SYM, perp_fills=fl, prints=prints((PRINT, "0.00000001")), rows=[row("0.0003")], now_ms=NOW)       # both negligible: agree, whatever the sign
+    assert only(nothing)["status"] == "BOOKED"
+
+
+def test_a_wallet_that_cannot_discriminate_is_not_called_a_confirmation():
+    r = rec([row("-0.0201")], pr=prints((PRINT, "0.00000067")), wallet=[(PRINT - 10_000, "1000.00"), (PRINT + 10_000, "1000.00")])        # cash +0.0201: a flat wallet is within its own tolerance
+    e = only(r)
+    assert e["wallet"]["status"] == "NOT_DISCRIMINATING" and e["status"] == "BOOKED" and any(f.startswith("WALLET_UNCONFIRMED") for f in r["flags"])
+    big = rec([row("-3.0")], wallet=[(PRINT - 10_000, "1000.00"), (PRINT + 10_000, "1003.00")])
+    assert only(big)["wallet"]["status"] == "CONFIRMED" and only(big)["status"] == "BOOKED_WALLET_CONFIRMED"
 
 
 def test_an_open_position_books_prints_up_to_now():
@@ -180,7 +229,7 @@ def w(tmp_path, monkeypatch):
     return World(tmp_path, monkeypatch)
 
 
-def _held_session(w, *, rate="0.0001", convention="H1", publish_print=True, settle=True, sample_wallet=True, credit_wallet=True):
+def _held_session(w, *, rate="0.002", convention="H1", publish_print=True, settle=True, sample_wallet=True, credit_wallet=True):
     """Hedge, hold, let the venue settle funding mid-hold, exit, verify flat. Returns (run, rec)."""
     assert w.run("preflight") == 0 and w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "90") == 0
     run, ctx, rec = begin(w)
@@ -210,7 +259,7 @@ def test_a_held_settlement_is_booked_into_the_session_net_and_confirmed_by_the_w
     f = json.load(open(os.path.join(w.state_dir, "funding_settlement.json")))["recognitions"][0]
     assert [p["status"] for p in f["prints"]] == ["BOOKED_WALLET_CONFIRMED"] and f["booked_usd"] is not None
     qty = D(str(w.fake.execs[0]["execQty"]))                                           # the perp quantity the venue held
-    expected = -(-qty) * D("60000.5") * D("0.0001")                                    # short: + qty * mark * rate received
+    expected = -(-qty) * D("60000.5") * D("0.002")                                     # short: + qty * mark * rate received
     assert rec["net"]["funding_usd"] == pytest.approx(float(expected), abs=1e-6) and rec["net"]["funding_usd"] > 0
     assert rec["net"]["price_pnl_usd"] is not None
 

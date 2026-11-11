@@ -257,13 +257,24 @@ def policy_summary(groups: Sequence[Mapping[str, Any]], *, min_orders: int = MIN
 
 
 # ---------------------------------------------------------------------------------------------------- research feedback: measured vs modelled, session by session
+#: the model's cost lines that EXECUTION measurement covers (fees, spread, taker walk / slippage). Impact, basis stress, hedge error, adverse selection and borrow are other things: they are not
+#: comparable with fees + spread + walk and would bias the "surprise" if summed in.
+_EXEC_COST_WORDS = ("fee", "spread", "slip")
+
+
+def _is_execution_cost_line(name: Any) -> bool:
+    low = str(name).lower()
+    return any(w in low for w in _EXEC_COST_WORDS)
+
+
 def feedback_row(*, session: str, at_ms: int, decision_id: Optional[str], quality: Optional[Mapping[str, Any]], funding: Optional[Mapping[str, Any]], edge: Optional[Mapping[str, Any]],
                  flat_verified: Optional[bool]) -> Dict[str, Any]:
     """One chained row per finished session: the MEASURED execution cost of the whole attempt beside the cost the economic model charged for it, and the funding the venue paid beside the funding
-    the model expected. Everything is a string / number / None (None = UNKNOWN); nothing is estimated here. ``modelled_cost_bps`` is the sum of the verdict's own cost lines (None when any is unknown);
+    the model expected. Everything is a string / number / None (None = UNKNOWN); nothing is estimated here. ``modelled_cost_bps`` is the sum of the verdict's cost lines that execution measurement covers (fee / spread / slippage lines; None when none exists or any is unknown);
     ``expected_funding_bps`` is the verdict's post-haircut expectation over the hold; ``realised_funding_bps`` exists only when the settlement recognition booked every held settlement."""
     g = dict((quality or {}).get("group") or {})
-    costs = dict((edge or {}).get("costs_bps") or {})
+    allc = dict((edge or {}).get("costs_bps") or {})
+    costs = {k: v for k, v in allc.items() if _is_execution_cost_line(k)}        # like for like: the model's lines that a leg's measured fee / spread / walk actually cover
     cv = [_d(v) for v in costs.values()]
     modelled = None if (not costs or any(c is None for c in cv)) else sum(cv, D(0))
     booked, notional = None, _d(g.get("position_notional_usd"))
@@ -291,7 +302,7 @@ def feedback_report(rows: Sequence[Mapping[str, Any]], *, min_orders: int = MIN_
             "model_vs_measured": {"sessions": len(done), "mean_measured_cost_bps": mean([_d(r["total_execution_cost_bps_of_position_notional"]) for r in done]),
                                   "mean_modelled_cost_bps": mean([_d(r["modelled_cost_bps"]) for r in done]), "mean_cost_surprise_bps": mean(sur),
                                   "sessions_costlier_than_modelled": sum(1 for x in sur if x > 0), "status": "ENOUGH" if len(done) >= min_orders else "INSUFFICIENT_SAMPLE",
-                                  "reading": "positive surprise = the model under-charged execution cost; the first measurement of the assumed 0.4 bps spread / slippage term"},
+                                  "reading": "like for like: measured fees + spread + walk against the model's fee / spread / slippage lines (impact, basis, hedge error, adverse selection and borrow are excluded); positive = the model under-charged execution cost"},
             "funding_vs_expected": {"sessions": len(fund), "mean_realised_bps": mean([_d(r["realised_funding_bps"]) for r in fund]), "mean_expected_bps": mean([_d(r["expected_funding_bps"]) for r in fund]),
                                     "mean_shortfall_bps": mean(fs), "status": "ENOUGH" if len(fund) >= min_orders else "INSUFFICIENT_SAMPLE"},
             "claim": "Testnet measurements describe this execution path, not Mainnet expectancy"}

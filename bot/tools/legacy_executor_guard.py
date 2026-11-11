@@ -72,12 +72,17 @@ def acquire(env: Mapping[str, str], *, lease_factory: Optional[Callable[[str, st
     return Handle(lease), ""
 
 
-def single_writer(env: Mapping[str, str], *, state_dir: Optional[str] = None) -> Tuple[Optional[Callable[[], None]], str]:
+def single_writer(env: Mapping[str, str], *, state_dir: Optional[str] = None, max_runtime_s: Optional[float] = None) -> Tuple[Optional[Callable[[], None]], str]:
     """The authority any ARMED legacy entry tool needs before it may send an order: the local account lock (``ms_executor_lock``: one writer per account on this host) AND the shared Supabase lease (one
     executor per account everywhere). Started BY the guarded unattended drill (which already holds both) a child recognises its parent (the lock's note names the parent's pid and role) and proceeds.
     Returns (release, "") or (None, reason); no lease configuration, a lease held elsewhere or an unreadable lock all REFUSE, and anything taken is given back on a refusal."""
     import ms_executor_lock as XL
     path = XL.resolve_path(env)
+    if max_runtime_s is not None and max_runtime_s > TTL_SECONDS - 300:        # the lease is NOT renewed by the legacy tools: a run that may outlive it would let another host open a second hedge
+        holder0 = XL.read_holder(path)
+        if not (holder0 is not None and holder0["role"] == "legacy-drill" and holder0["pid"] == os.getppid()):
+            return None, (f"this run may last {int(max_runtime_s)} s but the shared lease is {TTL_SECONDS} s and the legacy tools do not renew it; shorten the run (e.g. --max-hold-hours) "
+                          f"to under {TTL_SECONDS - 300} s, or use the autopilot")
     lock = XL.ExecutorLock(path, role="legacy-armed", state_dir=state_dir or os.getcwd(), now_ms=int(time.time() * 1000))
     if lock.try_acquire():
         handle, why = acquire(env)
@@ -97,12 +102,15 @@ def single_writer(env: Mapping[str, str], *, state_dir: Optional[str] = None) ->
 
 
 def run_guarded_cli(main_fn: Callable[[Optional[list]], int], argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str],
-                    safe_flags: Sequence[str] = ("-h", "--help", "--dry-run", "--self-check-offline")) -> int:
+                    safe_flags: Sequence[str] = ("-h", "--help", "--dry-run", "--self-check-offline"), safe_pairs: Sequence[Tuple[str, str]] = ()) -> int:
     """The ``__main__`` wrapper of a legacy tool that can send orders: unless the command line asks only for help / a dry run / an offline self-check (no network, no order), it first takes
     ``single_writer``. ``main_fn`` itself is unchanged (its own tests and gates still apply); only the command-line entry is guarded."""
     args = list(sys.argv[1:] if argv is None else argv)
     if any(a in safe_flags or a.split("=", 1)[0] in safe_flags for a in args):
         return main_fn(args)
+    for flag, value in safe_pairs:                                      # a PROTECTIVE mode (e.g. `--phase recover`: cancel and flatten what the tool placed) is never held behind the lease
+        if f"{flag}={value}" in args or any(args[i] == flag and args[i + 1] == value for i in range(len(args) - 1)):
+            return main_fn(args)
     release, why = single_writer(env)                                   # the caller passes its own variables in: this module reads none by itself
     if release is None:
         print(f"REFUSED: {why}", file=sys.stderr)

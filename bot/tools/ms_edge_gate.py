@@ -74,7 +74,7 @@ class EdgeInputs:
 
 def _touch_summary(prefix: str, b: Any, now_ms: int) -> Dict[str, Any]:
     """Top of book, spread and the dollar depth within 10 bps of the mid, as decimal strings (None for anything the book cannot give). Pure arithmetic on the book the verdict used."""
-    out: Dict[str, Any] = {f"{prefix}_bid": None, f"{prefix}_ask": None, f"{prefix}_spread_bps": None, f"{prefix}_depth_usd_within_10bps": None, f"{prefix}_book_age_ms": int(max(0, now_ms - int(b.ts_ms)))}
+    out: Dict[str, Any] = {f"{prefix}_bid": None, f"{prefix}_ask": None, f"{prefix}_spread_bps": None, f"{prefix}_depth_usd_within_10bps": None, f"{prefix}_book_age_ms": int(now_ms - int(b.ts_ms))}   # SIGNED: negative = the book is stamped AFTER our clock reading (venue clock ahead / a reading taken before the reads); never clamped to look fresh
     try:
         bid, ask = D(str(b.bids[0][0])), D(str(b.asks[0][0]))
         mid = (bid + ask) / 2

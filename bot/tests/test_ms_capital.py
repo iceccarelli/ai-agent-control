@@ -365,3 +365,12 @@ def test_a_present_but_unreadable_book_is_not_a_fresh_book_and_is_left_untouched
         assert open(b.path, encoding="utf-8").read() == junk                  # never overwritten
     os.unlink(b.path)
     assert book(tmp_path).load()["loss_streak"] == 0                           # only a MISSING file is a fresh book
+
+
+def test_a_schema_valid_book_stripped_of_its_stop_state_is_not_a_fresh_book(tmp_path):
+    b = book(tmp_path)
+    for doc in ({"schema": C.BOOK_SCHEMA}, {"schema": C.BOOK_SCHEMA, "start_cash_usd": "10000", "realised_usd": "0"}):          # no loss_streak / halted / history: a halt could be silently dropped
+        with open(b.path, "w", encoding="utf-8") as fh:
+            fh.write(_json.dumps(doc))
+        with pytest.raises(C.BookUnreadable):
+            b.load()

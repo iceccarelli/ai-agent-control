@@ -144,23 +144,30 @@ def test_a_missing_funding_record_is_unknown_never_zero_and_a_declared_none_is_z
     assert led2.canonical_net()["net"] is None
 
 
-def test_mutations_a_wrong_sign_a_double_count_or_a_lost_fee_all_change_the_answer():
+def test_mutations_a_wrong_sign_an_omitted_fee_and_an_extra_fee_each_change_the_answer_by_exactly_the_amount():
     price, fees, funding, net = known_net()
     base = ACC.Ledger()
     feed(base)
     assert base.canonical_net()["net"] == pytest.approx(float(net), abs=EPS)
-    # sign of funding
+    # sign of funding: flipping it moves the net by exactly twice the funding
     neg = ACC.Ledger()
     feed(neg, funding=False)
     neg.record_funding("BTCUSDT", T0 + 4_000, -float(FUNDING), "MEASURED")
     assert neg.canonical_net()["net"] == pytest.approx(float(net - 2 * funding), abs=EPS)
-    # a fee that is NOT deducted (the classic omission) would read higher by exactly the fees
-    assert float(net + fees) != pytest.approx(base.canonical_net()["net"], abs=1e-6)
-    # a fee that is deducted twice
-    dbl = ACC.Ledger()
-    feed(dbl)
-    dbl.record_fill(F("f5", "BTCUSDT", "Buy", D("0.0000001"), PERP_OUT, FEE["p_in"], "P", T0 + 9_500), category="linear")
-    assert dbl.canonical_net()["net"] != pytest.approx(base.canonical_net()["net"], abs=1e-3)
+    # an omitted fee: the SAME fills with every fee zeroed read higher by exactly the fees (what a writer that forgot fees would report)
+    nofee = ACC.Ledger()
+    for fid, side, px, fee, leg, cat, ts in (("f1", "Sell", PERP_IN, FEE["p_in"], "P", "linear", T0), ("f2", "Buy", SPOT_IN, FEE["s_in"], "S", "spot", T0 + 1),
+                                             ("f3", "Buy", PERP_OUT, FEE["p_out"], "P", "linear", T0 + 9_000), ("f4", "Sell", SPOT_OUT, FEE["s_out"], "S", "spot", T0 + 9_001)):
+        nofee.record_fill(F(fid, "BTCUSDT", side, QTY, px, 0, leg, ts), category=cat)
+    nofee.record_funding("BTCUSDT", T0 + 4_000, float(FUNDING), "MEASURED")
+    assert nofee.canonical_net()["net"] - base.canonical_net()["net"] == pytest.approx(float(fees), abs=EPS)
+    # an extra, separately identified round trip at the same price costs exactly its fee (price leg 0): the net drops by that fee and by nothing else
+    extra = D("0.25")
+    more = ACC.Ledger()
+    feed(more)
+    more.record_fill(F("f5", "BTCUSDT", "Buy", D("0.001"), PERP_OUT, extra, "P", T0 + 9_500), category="linear")
+    more.record_fill(F("f6", "BTCUSDT", "Sell", D("0.001"), PERP_OUT, 0, "P", T0 + 9_501), category="linear")
+    assert base.canonical_net()["net"] - more.canonical_net()["net"] == pytest.approx(float(extra), abs=EPS)
 
 
 # ------------------------------------------------------------------ the session, measured execution, wallet cash and the capital book

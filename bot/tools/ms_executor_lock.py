@@ -46,6 +46,8 @@ class ExecutorLock:
     def __init__(self, path: str, *, role: str, state_dir: str, now_ms: int) -> None:
         self.path, self.role, self.state_dir, self.now_ms = path, role, state_dir, int(now_ms)
         self._fd: Optional[int] = None
+        #: None after a refusal that was CONTENTION (someone holds the lock); otherwise a short description of the infrastructure fault (a directory at the path, EACCES, no flock...)
+        self.error: Optional[str] = None
 
     @property
     def held(self) -> bool:
@@ -53,17 +55,26 @@ class ExecutorLock:
 
     def try_acquire(self) -> bool:
         """Non-blocking. True = this process now holds the lock (and has written who it is). False = another process holds it, or no lock could be taken at all (fail closed)."""
-        if _fcntl is None or self._fd is not None:
-            return self._fd is not None
+        self.error = None
+        if _fcntl is None:
+            self.error = "NO_FLOCK_ON_THIS_PLATFORM"
+            return False
+        if self._fd is not None:
+            return True
         try:
             os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
             fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        except OSError:
+        except OSError as exc:
+            self.error = f"LOCK_FILE_UNUSABLE:{type(exc).__name__}"
             return False
         try:
             _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        except OSError:                                              # BlockingIOError: held by someone else; anything else: not held by us either
+        except BlockingIOError:                                      # contention: someone else really holds it
             os.close(fd)
+            return False
+        except OSError as exc:                                       # anything else is a FAULT of the lock, not a holder
+            os.close(fd)
+            self.error = f"FLOCK_FAILED:{type(exc).__name__}"
             return False
         try:
             os.ftruncate(fd, 0)

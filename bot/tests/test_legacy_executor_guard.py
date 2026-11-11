@@ -187,7 +187,7 @@ def test_manual_execute_is_refused_while_the_autopilot_holds_the_lease_and_runs_
     autopilot.release()
     seen = []
 
-    def run(argv, env, sleep=None):
+    def run(argv, env, sleep=None, pre_order_check=None):
         seen.append(server.holder)                                  # the lease is HELD while the order-capable run executes
         return 0
     assert MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=run) == 0
@@ -197,7 +197,7 @@ def test_manual_execute_is_refused_while_the_autopilot_holds_the_lease_and_runs_
 def test_manual_execute_releases_the_lease_even_when_the_run_raises():
     server = FakeServer()
 
-    def boom(argv, env, sleep=None):
+    def boom(argv, env, sleep=None, pre_order_check=None):
         raise RuntimeError("venue exploded")
     with pytest.raises(RuntimeError):
         MTS.guarded_main(["execute"], env=ENV, acquire=_acquirer(server), run=boom)

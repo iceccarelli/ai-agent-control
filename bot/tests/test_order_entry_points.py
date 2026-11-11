@@ -35,7 +35,7 @@ ENTRY_POINTS: Dict[str, str] = {
     "tools/testnet_session.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check)",
     "tools/testnet_conformance_run.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check)",
     "tools/linear_stop_venue_drill.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check)",
-    "tools/close_testnet_experiment.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check)",
+    "tools/close_testnet_experiment.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check; `--phase recover`, a protective flatten, is exempt)",
 }
 LEGACY_ARMED_TOOLS = [f for f, d in ENTRY_POINTS.items() if "run_guarded_cli" in d]
 
@@ -167,3 +167,28 @@ def test_the_shared_helper_refuses_without_authority_and_lets_a_dry_run_through(
     assert LG.run_guarded_cli(lambda a: called.append(a) or 0, ["--arm"], env={}) == 2 and len(called) == 1                          # armed, no lease configuration: refused, main never ran
     assert "NO_GLOBAL_LEASE_CONFIGURED" in capsys.readouterr().err
     assert LG.run_guarded_cli(lambda a: called.append(a) or 0, ["--symbol", "BTCUSDT"], env={}) == 2                                   # a bare invocation is armed by default: guarded too
+
+
+def test_the_protective_recover_phase_is_never_behind_the_lease_but_every_other_mode_is(monkeypatch, tmp_path):
+    import legacy_executor_guard as LG
+    monkeypatch.setenv("MS_EXECUTOR_LOCK_PATH", str(tmp_path / "l" / "ms_executor.lock"))
+    ran = []
+    pairs = (("--phase", "recover"),)
+    assert LG.run_guarded_cli(lambda a: ran.append(a) or 0, ["--phase", "recover", "--symbol", "BTCUSDT"], env={}, safe_pairs=pairs) == 0
+    assert LG.run_guarded_cli(lambda a: ran.append(a) or 0, ["--phase=recover"], env={}, safe_pairs=pairs) == 0
+    assert len(ran) == 2
+    for argv in (["--phase", "submit"], ["--phase", "full"], ["--phase"], ["recover"]):                 # not the exempt spelling: guarded (and refused here: no lease configuration)
+        assert LG.run_guarded_cli(lambda a: ran.append(a) or 0, argv, env={}, safe_pairs=pairs) == 2
+    assert len(ran) == 2
+    src = open(os.path.join(BOT, "tools", "close_testnet_experiment.py"), encoding="utf-8").read()
+    assert 'safe_pairs=(("--phase", "recover"),)' in src
+
+
+def test_an_armed_drill_whose_hold_could_outlive_the_unrenewed_lease_is_refused_up_front(monkeypatch, tmp_path):
+    import legacy_executor_guard as LG
+    import drill as DRL
+    monkeypatch.setenv("MS_EXECUTOR_LOCK_PATH", str(tmp_path / "l" / "ms_executor.lock"))
+    release, why = DRL.single_writer_guard({}, max_runtime_s=(9 + 6.25) * 3600)                        # the drill's own defaults: 9 h hold + settle wait
+    assert release is None and "do not renew" in why
+    r2, why2 = DRL.single_writer_guard({}, max_runtime_s=900.0)                                        # a short run proceeds to the lease check (refused here only for lack of lease configuration)
+    assert r2 is None and "NO_GLOBAL_LEASE_CONFIGURED" in why2

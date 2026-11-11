@@ -191,6 +191,7 @@ class GroupRuntime:
     legs: Dict[str, LegRuntime] = field(default_factory=dict)
     exit_mode: Optional[str] = None
     halted_reason: Optional[str] = None
+    exit_attempt_floor: int = 0          # rejected exit legs at the moment the owner's confirmed unwind lifted an exit halt: only rejections AFTER it count towards the next halt
     flat_verified: bool = False
     first_intent_ms: Optional[int] = None
     approved: bool = False
@@ -388,6 +389,8 @@ class ExecutionEngine:
             g.flat_verified = False
         elif typ == "HALT_GROUP":
             g.halted_reason = b["reason"] or None
+            if "exit_floor" in b:
+                g.exit_attempt_floor = int(b["exit_floor"])
         elif typ == "FLAT_VERIFIED":
             g.flat_verified = True
         elif typ == "INTERVAL_FLAG":
@@ -513,17 +516,17 @@ class ExecutionEngine:
         return g.state
 
     def clear_exit_halt(self, group_id: str, now_ms: int) -> Optional[str]:
-        """The owner's CONFIRMED emergency unwind lifts a halt that would otherwise stop every exit order (repeated exit rejections, a position the venue still shows). Journalled as a HALT_GROUP with an
-        empty reason, so the chain shows who lifted what and when. Halts that are not exit halts (a conflicting order id, an instrument halt) are NOT lifted: returns the reason lifted, or None."""
+        """The owner's CONFIRMED emergency unwind lifts the halt that repeated exit rejections raised (``EXIT_ORDERS_REJECTED``), which would otherwise stop every further exit order. The lift is
+        journalled as a HALT_GROUP with an empty reason AND the number of rejected exit legs so far (``exit_floor``): only rejections after this point count towards a new halt, so the next
+        step really sends exits instead of re-halting on the old count. No other halt is lifted (a conflicting order id, an instrument halt, ``NOT_FLAT_ON_VENUE`` where the engine believes
+        flat while the venue is not: nothing the engine could send would be an exit, so lifting it would only look like progress). Returns the reason lifted, or None."""
         g = self.groups.get(group_id)
-        if g is None or not g.halted_reason:
+        if g is None or g.halted_reason != "EXIT_ORDERS_REJECTED":
             return None
-        why = g.halted_reason
-        if why == "EXIT_ORDERS_REJECTED" or why.startswith("NOT_FLAT_ON_VENUE"):
-            self._emit("HALT_GROUP", group_id, now_ms, {"reason": ""})
-            self._settle(g, now_ms)
-            return why
-        return None
+        rejected = sum(1 for l in g.exit_legs() if l.status == REJECTED)
+        self._emit("HALT_GROUP", group_id, now_ms, {"reason": "", "exit_floor": rejected})
+        self._settle(g, now_ms)
+        return "EXIT_ORDERS_REJECTED"
 
     # ---------------------------------------------------------------- public: external events
     def halt_new_exposure(self, reason: str, now_ms: int) -> None:
@@ -830,7 +833,7 @@ class ExecutionEngine:
     def _drive_exit(self, g: GroupRuntime, ts: int) -> bool:
         if any(l.status in (SENT, UNKNOWN) for l in g.legs.values()) or g.halted_reason:
             return False
-        if sum(1 for l in g.exit_legs() if l.status == REJECTED) >= self.policy.max_exit_attempts:
+        if sum(1 for l in g.exit_legs() if l.status == REJECTED) - g.exit_attempt_floor >= self.policy.max_exit_attempts:
             self._emit("HALT_GROUP", g.plan.group_id, ts, {"reason": "EXIT_ORDERS_REJECTED"})
             return True
         sent = False

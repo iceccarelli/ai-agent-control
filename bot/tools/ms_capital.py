@@ -145,6 +145,9 @@ class CapitalBook:
             raise BookUnreadable(f"capital book {self.path!r} exists but cannot be read ({type(exc).__name__}); it is NOT treated as a fresh book") from None
         if not (isinstance(d, dict) and d.get("schema") == BOOK_SCHEMA):
             raise BookUnreadable(f"capital book {self.path!r} has an unknown schema; it is NOT treated as a fresh book")
+        missing = [k for k in ("start_cash_usd", "realised_usd", "loss_streak", "halted", "history", "pending") if k not in d]
+        if missing:                                                    # schema-valid but stripped of the state that stops entries: also NOT a fresh book
+            raise BookUnreadable(f"capital book {self.path!r} lacks {missing}; it is NOT treated as a fresh book")
         return {**self._fresh(), **d}
 
     def _save(self, b: Mapping[str, Any]) -> None:

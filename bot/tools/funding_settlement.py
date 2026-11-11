@@ -25,7 +25,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 ATTRIBUTION_SLACK_MS = 60_000          # a perp fill this close to a print makes the held quantity at the print ambiguous
 MATCH_TOLERANCE_MS = 300_000           # a row belongs to the print it is closest to within 5 minutes
 GRACE_MS = 1_800_000                   # a missing row is PENDING for 30 minutes after the print, MISSING afterwards (UNKNOWN either way)
-SIGN_MIN_EXPECTED_USD = D("0.005")     # below this the expected cash is too small for a sign check: the amount itself must be ~ the expectation
+SIGN_MIN_EXPECTED_USD = D("0.005")     # below this the expected cash is too small for a clean sign check
+TINY_USD = D("0.0005")                 # ... where both the expectation and the row are at most this, they are both "nothing" and agree
 MAG_TOL_MARK = D("0.05")               # relative magnitude tolerance when the row states the settlement mark
 MAG_TOL_PROXY = D("0.10")              # ... when only a nearby fill price is available as the mark
 WALLET_TOL_ABS = D("0.02")
@@ -116,8 +117,18 @@ def _wallet_delta(samples: Sequence[Tuple[int, Any]], print_ts: int, fill_ts: Se
     return a[1] - b[1], b[0], a[0]
 
 
+def expected_grid(interval_min: Optional[int], lo_ms: int, hi_ms: int) -> List[int]:
+    """The settlement instants the venue's schedule says fall in (lo, hi]: multiples of the funding interval counted from 00:00 UTC (valid for the 60/120/240/480-minute intervals, which divide a
+    day). An unknown or odd interval gives [] (nothing is claimed). Used ONLY to refuse a false zero: an expected settlement the public history does not list is UNKNOWN, never 'none'."""
+    if not isinstance(interval_min, int) or isinstance(interval_min, bool) or interval_min <= 0 or 1440 % interval_min != 0:
+        return []
+    step = interval_min * 60_000
+    first = (lo_ms // step + 1) * step
+    return list(range(first, hi_ms + 1, step))[:64]
+
+
 def recognise(*, symbol: str, perp_fills: Sequence[Mapping[str, Any]], other_fill_ts: Sequence[int] = (), prints: Optional[Sequence[Mapping[str, Any]]], rows: Sequence[Mapping[str, Any]],
-              wallet_samples: Sequence[Tuple[int, Any]] = (), now_ms: int) -> Dict[str, Any]:
+              wallet_samples: Sequence[Tuple[int, Any]] = (), now_ms: int, interval_min: Optional[int] = None) -> Dict[str, Any]:
     """The funding story of ONE perp symbol in ONE session. ``perp_fills``: {ts_ms, side, qty, price} of the session's perp executions; ``other_fill_ts``: every other leg's fill times (a wallet delta
     across a fill is not funding); ``prints``: the public history {ts_ms, rate} (None = unavailable); ``rows``: the venue's non-Trade execution rows as the executor keeps them."""
     tl, t_in, flat_ts, any_fill = _position_timeline(perp_fills)
@@ -194,8 +205,9 @@ def recognise(*, symbol: str, perp_fills: Sequence[Mapping[str, Any]], other_fil
             res["actions"].append({"action": "record", "ts_ms": pts, "amount_usd": None, "prov": "UNKNOWN"})
             resolved = False
             continue
-        if abs(expected) < SIGN_MIN_EXPECTED_USD:
-            ok_sign = abs(cash - expected) <= D("0.01")
+        if abs(expected) < SIGN_MIN_EXPECTED_USD:                      # too small for a clean sign check: the sign must STILL agree unless both are negligible (never book a payment as income)
+            both_negligible = abs(cash) <= TINY_USD and abs(expected) <= TINY_USD
+            ok_sign = both_negligible or (cash != 0 and (cash > 0) == (expected > 0) and abs(cash - expected) <= D("0.01"))
             ok_mag = ok_sign
         else:
             ok_sign = (cash > 0) == (expected > 0) and cash != 0
@@ -218,13 +230,18 @@ def recognise(*, symbol: str, perp_fills: Sequence[Mapping[str, Any]], other_fil
         else:
             delta, b_ts, a_ts = w
             ok_w = abs(delta - cash) <= WALLET_TOL_ABS + WALLET_TOL_REL * abs(cash)
-            entry["wallet"] = {"status": "CONFIRMED" if ok_w else "MISMATCH", "delta_usd": _s(delta), "before_ms": b_ts, "after_ms": a_ts}
+            discriminating = abs(cash) >= 2 * WALLET_TOL_ABS            # a cash amount inside the wallet tolerance cannot be told from "nothing happened": agreement proves nothing
+            entry["wallet"] = {"status": ("CONFIRMED" if discriminating else "NOT_DISCRIMINATING") if ok_w else "MISMATCH", "delta_usd": _s(delta), "before_ms": b_ts, "after_ms": a_ts}
             if not ok_w:
                 entry["status"], entry["reason"] = "WALLET_MISMATCH", "the wallet's USDT change across the settlement does not equal the row: the cash record cannot explain it"
                 res["actions"].append({"action": "record", "ts_ms": pts, "amount_usd": None, "prov": "UNKNOWN"})
                 resolved = False
                 continue
-            entry["status"] = "BOOKED_WALLET_CONFIRMED"
+            if discriminating:
+                entry["status"] = "BOOKED_WALLET_CONFIRMED"
+            else:
+                entry["status"] = "BOOKED"
+                res["flags"].append(f"WALLET_UNCONFIRMED:{symbol}:{pts}")
         res["actions"].append({"action": "record", "ts_ms": pts, "amount_usd": _s(cash), "prov": "MEASURED"})
         booked += cash
         any_booked = True
@@ -234,11 +251,24 @@ def recognise(*, symbol: str, perp_fills: Sequence[Mapping[str, Any]], other_fil
             why = "BEFORE_FIRST_FILL" if r["ts_ms"] <= t_in else "AFTER_WINDOW" if r["ts_ms"] > t_out + MATCH_TOLERANCE_MS else "NO_HELD_PRINT_NEARBY"
             res["unmatched_rows"].append({"exec_id": r["exec_id"], "ts_ms": r["ts_ms"], "reason": why})
     res["unmatched_rows"] += bad_rows
-    if not held_positions:
+    # evidence that a settlement DID happen inside the window although the public history shows none held: a venue row in the window (or one we could not even parse), or a settlement the
+    # schedule says fell inside it that the history does not list. Any of these makes "no funding" unprovable: UNKNOWN, not zero.
+    in_window_rows = [r for r in parsed.values() if t_in - ATTRIBUTION_SLACK_MS <= r["ts_ms"] <= t_out + MATCH_TOLERANCE_MS and r["exec_id"] not in used]
+    unusable_funding = [b for b in bad_rows if str(b.get("reason", "")).startswith("UNUSABLE")]
+    listed = [int(p["ts_ms"]) for p in prints]
+    unlisted_expected = [g for g in expected_grid(interval_min, t_in, t_out) if not any(abs(g - t) <= MATCH_TOLERANCE_MS for t in listed)]
+    if in_window_rows:
+        res["flags"].append(f"UNLISTED_FUNDING_ROW:{symbol}:{len(in_window_rows)}")
+    if unusable_funding:
+        res["flags"].append(f"UNUSABLE_FUNDING_ROW:{symbol}:{len(unusable_funding)}")
+    for g in unlisted_expected:
+        res["flags"].append(f"PRINT_EXPECTED_NOT_LISTED:{symbol}:{g}")
+        res["actions"].append({"action": "record", "ts_ms": int(g), "amount_usd": None, "prov": "UNKNOWN"})            # the print happened, its amount is unknown
+    if not held_positions and not (in_window_rows or unusable_funding or unlisted_expected):
         res["actions"].append({"action": "declare_none", "reason": "the complete public funding history shows no settlement while the perp position was held", "prov": "DERIVED"})
         res["all_prints_resolved"] = True
         res["booked_usd"] = "0"
     else:
-        res["all_prints_resolved"] = resolved
-        res["booked_usd"] = _s(booked) if (resolved and any_booked) else None
+        res["all_prints_resolved"] = bool(resolved and held_positions and not (in_window_rows or unlisted_expected))          # a malformed row blocks a ZERO, not a print that has its own good row
+        res["booked_usd"] = _s(booked) if (res["all_prints_resolved"] and any_booked) else None
     return res

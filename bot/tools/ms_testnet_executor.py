@@ -342,7 +342,7 @@ class TestnetExecutor:
             row = r["list"][0]
             self._quotes[(category, symbol)] = {"bid": row.get("bid1Price"), "ask": row.get("ask1Price"), "ts_ms": int(self.clock()), "source": "TICKER_TOUCH"}
             return row
-        except (ExecutorError, KeyError, IndexError, TypeError, ValueError, ArithmeticError):
+        except (ExecutorError, KeyError, IndexError, TypeError, ValueError, ArithmeticError, AttributeError):          # a malformed ticker row must never escape into an order send (nor slow an exit)
             return None
 
     def _reference_for(self, leg: T.LegPlan, now_ms: int, fresh: bool) -> Optional[Dict[str, Any]]:
@@ -554,8 +554,13 @@ class TestnetExecutor:
             view_pos[sym] = {"category": "linear", "notional_usd": float(size * m * (1 if side == "Buy" else -1)), "qty": float(size)}
         w = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, signed=True)
         eq, coins = parse_wallet(w)
-        if QUOTE in coins and len(self.wallet_samples) < 50_000:
-            self.wallet_samples.append((int(self.clock()), str(coins[QUOTE])))
+        if QUOTE in coins:
+            ts, val = int(self.clock()), str(coins[QUOTE])
+            last = self.wallet_samples[-1] if self.wallet_samples else None
+            if last is None or last[1] != val or ts - last[0] >= 15_000:   # a sample when the value changes or every 15 s: an UNCHANGED wallet after a settlement is itself the evidence, and a long hold keeps the samples around EVERY settlement
+                self.wallet_samples.append((ts, val))
+                if len(self.wallet_samples) > 20_000:
+                    del self.wallet_samples[: len(self.wallet_samples) - 20_000]
         equity = float(eq)
         # THE LOSS MEASURE IS THE SESSION'S, NOT THE OWNER'S WHOLE ACCOUNT: spot the client held BEFORE the session (``baseline``) is valued at the wallet read's own implied price
         # (coin usdValue / walletBalance, the same basis as totalEquity) and taken out, so its price swings cancel exactly. Without this a $10 move in BTC on a 0.1 BTC holding
