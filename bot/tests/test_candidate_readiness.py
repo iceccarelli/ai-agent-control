@@ -1345,7 +1345,7 @@ def test_mutation_without_the_modelled_exclusion_the_maker_variant_is_selected(t
     RH._PATH_HIGH_WATER.clear()
     path = os.path.join(BOT, "tools", "candidate_readiness.py")
     src = open(path, encoding="utf-8").read()
-    old = 'selectable = {k: v for k, v in series_by.items() if k not in modelled}'
+    old = 'selectable = {k: v for k, v in series_by.items() if k not in unselectable}'
     assert src.count(old) == 1
     mod = types.ModuleType("cr_mut_" + uuid.uuid4().hex)
     mod.__file__ = path
@@ -1354,3 +1354,32 @@ def test_mutation_without_the_modelled_exclusion_the_maker_variant_is_selected(t
     out = mod.evaluate_family(_world(520, seed=3, edge=0.6), mod.FAMILY_SPREAD, ledger_path=str(tmp_path / "m.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60,
                              allow_unverified_key_basis_for_tests=True)                                   # the copy has its own key-basis sentinel; selection is what is under test
     assert out["selected_per_fold"] and all(n.endswith("Cmaker_modelled") for n in out["selected_per_fold"])
+
+
+def test_a_family_with_only_modelled_or_unclassified_costs_has_no_selectable_variant_and_does_not_crash(tmp_path, monkeypatch):
+    """Fail closed: a variant is selectable only when its cost provenance is KNOWN and not MODELLED. With nothing selectable the family says so instead of raising from an empty selector."""
+    for costs in ({"maker_modelled": {"bps": 4.0, "fee_bps": 4.0, "spread_bps": 0.0, "prov": "MODELLED", "fee_prov": "MODELLED", "spread_prov": "MODELLED"}},
+                  {"taker": {"bps": 11.4, "fee_bps": 11.0, "spread_bps": 0.4, "prov": None, "fee_prov": "VENUE_STATED", "spread_prov": "ASSUMED"}}):       # an unclassified provenance is not "not modelled"
+        RH._FAMILY_HIGH_WATER.clear()
+        RH._PATH_HIGH_WATER.clear()
+        monkeypatch.setattr(CR, "family_costs", lambda kind, c=costs: c)
+        out = CR.evaluate_family(_world(520, seed=3, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / f"n{len(costs)}{next(iter(costs))}.jsonl"), formation_days_grid=(7,), top_k_grid=(1,),
+                                 hold_days=7, min_rows=60)
+        assert out["status"] == "NO_SELECTABLE_VARIANT" and out["verdict"] == "INSUFFICIENT_DATA" and out["n_variants_counted"] >= 1, out.get("status")
+
+
+def test_a_short_capture_shows_the_modelled_scenario_apart_and_the_competition_headline_is_not_the_modelled_one(tmp_path):
+    """TOO_FEW_HOLDING_ROWS is what the owner's short captures produce, so its descriptive figure is the only one shown: it must be the taker one."""
+    import candidate_competition as CCmp
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    f = CR.evaluate_family(_world(120, seed=2, edge=0.6), CR.FAMILY_SPREAD, ledger_path=str(tmp_path / "s.jsonl"), formation_days_grid=(7,), top_k_grid=(1,), hold_days=7, min_rows=60)
+    assert f["status"] == "TOO_FEW_HOLDING_ROWS" and f["selection_excludes_modelled_cost_variants"]
+    d = f["descriptive_only"]
+    assert d["book_analytics"] and all(n.endswith("Ctaker") for n in d["book_analytics"])
+    assert d["book_analytics_modelled_scenarios"] and all(n.endswith("Cmaker_modelled") for n in d["book_analytics_modelled_scenarios"])
+    taker_mean = max(v["mean_net_bps"] for v in d["book_analytics"].values())
+    maker_mean = max(v["mean_net_bps"] for v in d["book_analytics_modelled_scenarios"].values())
+    assert maker_mean > taker_mean                                                                 # the modelled scenario is the cheaper one: it must not become the headline
+    summary = CCmp._xs_summary({"status": "EVALUATED", "evaluation": {"families": {CR.FAMILY_SPREAD: f}}})
+    assert summary["families"][CR.FAMILY_SPREAD]["descriptive_best_in_sample_net_bps"] == pytest.approx(taker_mean)

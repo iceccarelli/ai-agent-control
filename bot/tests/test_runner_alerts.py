@@ -488,15 +488,16 @@ def test_a_history_with_no_recorder_field_never_raises_recorder_down():
 # -- the recorder's volume: early warning before the write reserve --------------------------------------------
 
 def _free_rows(*mbs):
+    """History lines as the monitor WRITES them: every recorder field is prefixed, so the free space is ``recorder_free_mb`` (an end-to-end test through the real writer is in test_recorder_liveness)."""
     n = len(mbs)
-    return [row((n - i) * 60, recorder_state="RECORDING", free_mb=mb) for i, mb in enumerate(mbs)]
+    return [row((n - i) * 60, recorder_state="RECORDING", recorder_free_mb=mb) for i, mb in enumerate(mbs)]
 
 
 def test_a_volume_that_stays_within_one_day_of_the_write_reserve_warns_before_the_recorder_stops():
     alerts = RA.evaluate(text(*_free_rows(5000, 1400, 1300, 1200)), NOW)
     assert "recorder_disk_low" in _keys(alerts) and "recorder_down" not in _keys(alerts)          # still RECORDING: this is the notice, not the failure
     msg = next(a for a in alerts if a.key == "recorder_disk_low")
-    assert msg.severity == RA.WARNING and "1200 MB" in msg.text and "does NOT recover by itself" in msg.text and "fly volumes list" in msg.text
+    assert msg.severity == RA.WARNING and "1200 MiB" in msg.text and "does NOT recover by itself" in msg.text and "fly volumes list" in msg.text
 
 
 def test_a_briefly_low_or_comfortable_volume_does_not_warn():
@@ -506,12 +507,22 @@ def test_a_briefly_low_or_comfortable_volume_does_not_warn():
 
 def test_below_the_reserve_the_warning_says_below():
     msg = next(a for a in RA.evaluate(text(*_free_rows(400, 300, 200)), NOW) if a.key == "recorder_disk_low")
-    assert "BELOW the 512 MB write reserve" in msg.text
+    assert "BELOW the 512 MiB write reserve" in msg.text
 
 
 def test_rows_without_a_numeric_free_space_never_raise_the_disk_warning():
-    rows = [row(180, recorder_state="RECORDING", free_mb=None), row(120, recorder_state="RECORDING", free_mb="low"), row(60, recorder_state="RECORDING", free_mb=True)]
+    rows = [row(180, recorder_state="RECORDING", recorder_free_mb=None), row(120, recorder_state="RECORDING", recorder_free_mb="low"), row(60, recorder_state="RECORDING", recorder_free_mb=True)]
     assert "recorder_disk_low" not in _keys(RA.evaluate(text(*rows), NOW))
+    # the UNPREFIXED key is not what the monitor writes: a row carrying it is not a reading (it was the key the first version of this alert wrongly read, so it was inert in production)
+    assert "recorder_disk_low" not in _keys(RA.evaluate(text(*[row((3 - i) * 60, recorder_state="RECORDING", free_mb=100) for i in range(3)]), NOW))
+
+
+def test_an_absurd_or_non_finite_free_space_is_not_a_reading_and_never_crashes_the_evaluation():
+    rows = [row(180, recorder_state="RECORDING"), row(120, recorder_state="RECORDING"), row(60, recorder_state="RECORDING")]
+    for bad in ("1" + "0" * 400, "-Infinity", "NaN"):
+        lines = [json.dumps({**r, "recorder_free_mb": 0}).replace('"recorder_free_mb": 0', '"recorder_free_mb": ' + bad) if i == 2 else json.dumps({**r, "recorder_free_mb": 100})
+                 for i, r in enumerate(rows)]
+        RA.evaluate("\n".join(lines) + "\n", NOW)                                                  # must not raise (OverflowError used to escape and kill a CRITICAL order_sent alert with it)
 
 
 def test_the_alert_reserve_is_the_recorders_own_default_reserve():
