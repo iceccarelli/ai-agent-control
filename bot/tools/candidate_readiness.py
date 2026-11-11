@@ -554,9 +554,15 @@ def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_co
         for h in HOLDS_PRINTS:
             ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - cost, "cost_bps": cost} for e in base_entries[h]], curve)
             holds[str(h)] = OM.excess_summary(ent, unk, hold=h)
+            if cls == CAP_OVERLAY and ent and holds[str(h)].get("cash_coverage_ok"):          # how strong is the loss, by the repo's own rejection standard (the policies the competition ranks)
+                holds[str(h)]["rejection_bars"] = {"nominal": rejection_bar([e["net_bps"] for e in ent], basis="mean_net_bps_of_notional_zero_capital_cost"),
+                                                   "excess": rejection_bar([e["excess_over_cash_bps_of_capital"] for e in ent], basis="mean_excess_over_cash_bps_of_capital")}
         out[cls] = {"round_trip_bps": cost, "holds": holds}
     gt, gunk = OM.on_capital(list(gated["trades"]), curve)
     gs = OM.excess_summary(gt, gunk, hold=OM.HOLD_PRINTS)
+    if gt and gs.get("cash_coverage_ok"):
+        gs["rejection_bars"] = {"nominal": rejection_bar([e["net_bps"] for e in gt], basis="mean_net_bps_of_notional_zero_capital_cost"),
+                                "excess": rejection_bar([e["excess_over_cash_bps_of_capital"] for e in gt], basis="mean_excess_over_cash_bps_of_capital")}
     return {**base, "status": "COMPUTED", "classes": out, "gated_sequential_overlay": gs,
             "reading": "mean_excess_over_cash_bps_of_capital below zero = the position earns LESS than the cash alternative on the capital it ties up, after every modelled cost; "
                        "the nominal bps-of-notional figures elsewhere in this report do not charge that capital"}
@@ -611,6 +617,18 @@ def _carry_verdict(econ: Mapping[str, Any]) -> Tuple[str, List[str], Dict[str, A
     policies = {"single_print_harvest": "REJECTED" if neg_single else UNKNOWN, "gated_policy": "REJECTED" if gated_lost else "INSUFFICIENT_DATA",
                 "long_hold_vs_cash": ("REJECTED" if (o.get("mean_excess_over_cash_bps_of_capital") is not None and o["mean_excess_over_cash_bps_of_capital"] < 0) else
                                       (UNKNOWN if o.get("mean_excess_over_cash_bps_of_capital") is None else "INSUFFICIENT_DATA"))}
+    meeting, not_meeting = [], []
+    for m in mat:
+        if m["scenario"] != taker:
+            continue
+        h = m["hold_prints"]
+        hold = ov.get(str(h)) or {}
+        bars = hold.get("rejection_bars") or {}
+        bar = bars.get("excess") or bars.get("nominal") or {}                                  # the like-for-like test is against CASH; the nominal test only when no cash series covers it
+        (meeting if bar.get("meets_early_rejection_standard") else not_meeting).append(f"{h}_prints")
+    reasons.append("STATISTICAL STRENGTH of the loss, by the repo's own early-rejection standard (>= 12 independent observations, lower-tail p <= 0.01, widest 90% interval wholly below zero; applied IN-SAMPLE to "
+                   f"overlapping entries): meeting it: {meeting or 'none'}; not meeting it: {not_meeting or 'none'}. A point-estimate loss that does not meet it is a loss BY POINT ESTIMATE only; the "
+                   "verdict below is the competition's documented in-sample one, not a statistical or out-of-sample rejection. Registered holds are at most 17 days; longer holds were never registered")
     reasons.append("no out-of-sample settlement exists in the repo; no price-leg/basis residual beyond the 4h-bar basis shed; no L2 depth: INSUFFICIENT_DATA is the ceiling"
                    + (" (every policy loses after costs or to cash: REJECTED)" if all_rejected else ""))
     return ("REJECTED" if all_rejected else "INSUFFICIENT_DATA"), reasons, policies
@@ -1432,6 +1450,25 @@ def early_rejection(st: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     return {"rule": (f">= {REJECT_EARLY_MIN_INDEPENDENT} independent OOS observations, negative mean, lower-tail p <= {REJECT_EARLY_ALPHA} (ESS-adjusted) AND the widest 90% interval wholly below zero; "
                      "per look, taker cost scenario only (the modelled maker scenario is never selected), reject-only: never promotes"),
             "independent_observations": ind, "mean_bps": mean, "t": t, "p_lower": p_lower, "alpha": REJECT_EARLY_ALPHA, "ci_hi_bps": float(hi)}
+
+
+def rejection_bar(xs: Sequence[float], *, basis: str) -> Dict[str, Any]:
+    """Would this series meet the repo's early-rejection standard (``early_rejection``)? Reported WITH the numbers so a point-estimate loss is never read as a statistical rejection. Applied here to
+    IN-SAMPLE overlapping entries (the standard is defined for out-of-sample rows; the ESS adjustment handles the serial dependence, the in-sample caveat remains), so it describes how strong the
+    evidence of a loss is, it does not turn the in-sample verdict into an out-of-sample one. Fails closed: too few points or an unusable interval is 'does not meet'."""
+    vals = [float(x) for x in xs]
+    out: Dict[str, Any] = {"basis": basis, "scope": "IN_SAMPLE_OVERLAPPING_ENTRIES", "n": len(vals), "meets_early_rejection_standard": False, "mean": None, "p_lower": None,
+                           "independent_observations": 0, "widest_ci90": None,
+                           "rule": (f">= {REJECT_EARLY_MIN_INDEPENDENT} independent observations (ESS floor), negative mean, lower-tail p <= {REJECT_EARLY_ALPHA} (ESS-adjusted) AND the widest 90% interval "
+                                    "wholly below zero")}
+    if len(vals) < 8:
+        return out
+    st = RH.significance(vals, ci=True)
+    ci = st.get("ci") if isinstance(st.get("ci"), Mapping) and st["ci"].get("status") == "OK" else None
+    p1 = st.get("p_one_sided")
+    out.update({"mean": st.get("mean"), "independent_observations": int(st.get("independent_observations") or 0), "p_lower": (None if p1 is None else 1.0 - float(p1)),
+                "widest_ci90": None if ci is None else [ci.get("lo"), ci.get("hi")], "meets_early_rejection_standard": early_rejection(st) is not None})
+    return out
 
 
 def family_costs(kind: str) -> Dict[str, Dict[str, Any]]:

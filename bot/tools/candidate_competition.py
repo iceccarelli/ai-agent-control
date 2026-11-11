@@ -97,27 +97,46 @@ def btc_policies(econ: Mapping[str, Any]) -> List[Dict[str, Any]]:
         lost_nominal = mean is not None and mean < 0
         lost_to_cash = (not lost_nominal) and excess is not None and excess < 0
         rejected = lost_nominal or lost_to_cash
+        rb = ch.get("rejection_bars") or {}
+        bar = (rb.get("excess") or rb.get("nominal")) if rejected else None            # the like-for-like test is against CASH (the alternative); the nominal (zero capital cost) test only when no cash series covers it
         out.append({"policy": f"unconditional_{h}_print_hold", "hold_prints": h, "mean_net_bps": mean, "n_overlapping_entries": s.get("n"), "mean_block_ci90": ci,
                     "mean_excess_over_cash_bps_of_capital": excess, "excess_block_ci90": ch.get("excess_block_ci90"), "mean_net_bps_on_capital": ch.get("mean_net_bps_on_capital"),
                     "n_cash_unknown": ch.get("n_cash_unknown"), "annualised_excess_pct_of_capital": ch.get("annualised_excess_pct_of_capital"),
                     "latest_year": ly, "latest_year_mean_net_bps": lv, "label": CORPUS_LABEL,
-                    "verdict": "REJECTED" if rejected else "INSUFFICIENT_DATA",
-                    "note": ("loses after costs over the whole corpus" if lost_nominal else
-                             (f"positive on notional ({mean:.1f} bps, ZERO capital cost) but {excess:.1f} bps EXCESS over cash on the capital it ties up: it does not beat the cash alternative" if lost_to_cash else
-                              ("in-sample positive, regime dependent" + (f"; latest year {ly}: {lv:.1f} bps" if lv is not None and lv <= 0 else "")
-                               + ("" if (cap_ok and excess is not None) else "; CASH_UNKNOWN: no cost of capital applied"))))})
+                    "verdict": "REJECTED" if rejected else "INSUFFICIENT_DATA", "statistical_rejection": bar,
+                    "note": (("loses after costs over the whole corpus" if lost_nominal else
+                              (f"positive on notional ({mean:.1f} bps, ZERO capital cost) but {excess:.1f} bps EXCESS over cash on the capital it ties up: it does not beat the cash alternative" if lost_to_cash else
+                               ("in-sample positive, regime dependent" + (f"; latest year {ly}: {lv:.1f} bps" if lv is not None and lv <= 0 else "")
+                                + ("" if (cap_ok and excess is not None) else "; CASH_UNKNOWN: no cost of capital applied")))) + _strength_note(rejected, bar))})
     g = econ["gated_sequential_taker"]
     gc = cap.get("gated_sequential_overlay") if cap_ok else None
     g_excess = (gc or {}).get("mean_excess_over_cash_bps_of_capital")
     g_nominal_lost = g["mean_net_bps"] is not None and g["mean_net_bps"] < 0
     g_cash_lost = (not g_nominal_lost) and g_excess is not None and g_excess < 0
+    g_rejected = g_nominal_lost or g_cash_lost
+    g_rb = (gc or {}).get("rejection_bars") or {}
+    g_bar = (g_rb.get("excess") or g_rb.get("nominal")) if g_rejected else None
     out.append({"policy": "production_gated_sequence", "hold_prints": g["hold_prints"], "mean_net_bps": g["mean_net_bps"], "n_overlapping_entries": g["n"], "trailing_365d_mean_net_bps": g["trailing_365d_mean_net_bps"],
                 "trailing_365d_n": g["trailing_365d_n"], "mean_excess_over_cash_bps_of_capital": g_excess, "excess_block_ci90": (gc or {}).get("excess_block_ci90"),
                 "label": CORPUS_LABEL + " (gate constants tuned on this corpus)",
-                "verdict": "REJECTED" if (g_nominal_lost or g_cash_lost) else "INSUFFICIENT_DATA",
+                "verdict": "REJECTED" if g_rejected else "INSUFFICIENT_DATA", "statistical_rejection": g_bar,
                 "note": ((f"positive on notional ({g['mean_net_bps']:.1f} bps, ZERO capital cost) but {g_excess:.1f} bps EXCESS over cash on the capital it ties up; " if g_cash_lost else "")
-                         + (f"trailing 365d mean {g['trailing_365d_mean_net_bps']:.1f} bps over n={g['trailing_365d_n']}" if g["trailing_365d_mean_net_bps"] is not None else "no trailing trades"))})
+                         + (f"trailing 365d mean {g['trailing_365d_mean_net_bps']:.1f} bps over n={g['trailing_365d_n']}" if g["trailing_365d_mean_net_bps"] is not None else "no trailing trades")
+                         + _strength_note(g_rejected, g_bar))})
     return out
+
+
+def _strength_note(rejected: bool, bar: Optional[Mapping[str, Any]]) -> str:
+    """Say, in the note, whether a REJECTED policy meets the repo's early-rejection standard: a point-estimate loss that does not is not a statistical rejection."""
+    if not rejected or not bar:
+        return ""
+    if bar.get("meets_early_rejection_standard"):
+        return f"; meets the repo's early-rejection standard in-sample (ESS-adjusted lower-tail p={bar['p_lower']:.4f}, widest 90% interval {[round(x, 1) for x in bar['widest_ci90']]} wholly below zero)"
+    ci, p = bar.get("widest_ci90"), bar.get("p_lower")
+    return ("; NOT statistically rejected at the repo's early-rejection standard"
+            + (f" (ESS-adjusted lower-tail p={p:.3f} > {CR.REJECT_EARLY_ALPHA}" if p is not None else " (no usable p")
+            + (f"; widest 90% interval {[round(x, 1) for x in ci]} " + ("includes zero" if ci[0] < 0 < ci[1] else "does not clear the standard") if ci else "; no usable interval") + ")"
+            + ": the point estimate loses, the evidence does not exclude break-even")
 
 
 def btc_multiple_testing(econ: Optional[Mapping[str, Any]], ldir: str) -> Dict[str, Any]:
@@ -248,6 +267,13 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                       ["no out-of-sample settlement exists in the repo; the gate constants were tuned on this corpus"]
             mt = btc_multiple_testing(econ, ldir)
             extra["policies"] = pols
+            meeting = [p["policy"] for p in pols if p["verdict"] == "REJECTED" and (p.get("statistical_rejection") or {}).get("meets_early_rejection_standard")]
+            not_meeting = [p["policy"] for p in pols if p["verdict"] == "REJECTED" and not (p.get("statistical_rejection") or {}).get("meets_early_rejection_standard")]
+            extra["statistical_rejection_summary"] = {"meeting_the_standard": meeting, "not_meeting_the_standard": not_meeting, "scope": "IN_SAMPLE_OVERLAPPING_ENTRIES",
+                                                      "reading": "REJECTED is the documented in-sample verdict (a loss after costs or to cash by point estimate); the repo's stronger early-rejection standard is met only by the policies "
+                                                                 "listed; registered holds are at most 17 days, longer holds (90/365 days) were never registered and this verdict does not cover them"}
+            reasons.append(f"REJECTED is an IN-SAMPLE point-estimate verdict on registered holds of at most 17 days; policies meeting the repo's statistical rejection standard: {len(meeting)} of {len(meeting) + len(not_meeting)}"
+                           + (f"; NOT statistically rejected: {', '.join(not_meeting)}" if not_meeting else "") + "; longer holds were never registered")
         elif name == "cross_sectional_funding":
             verdict, reasons = xs["verdict"], xs["reasons"] + [x for x in reasons if "UNIVERSE_DIR_REQUIRED" in x]
             net = xs["net_edge"]
