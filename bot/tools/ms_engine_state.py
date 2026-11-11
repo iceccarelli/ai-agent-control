@@ -119,6 +119,11 @@ class EngineState:
     def read(self, name: str) -> Optional[Any]:
         return read_json(self.marker_path(name))
 
+    def audit(self, name: str, action: str, payload: Dict[str, Any]) -> None:
+        """An OWNER action that is not itself a marker (a capital acknowledgement, a declared transfer, a refused attempt) gets the same append-only, fsynced row. Raises ``OSError`` when the row cannot
+        be written: a caller that must not change anything unaudited lets that stop it."""
+        self._log(name, action, payload)
+
     def _log(self, name: str, action: str, payload: Dict[str, Any]) -> None:
         """Append-only marker log: a cleared ALERT is still on record (who/why/when)."""
         fd = os.open(os.path.join(self.root, "marker_log.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)

@@ -22,7 +22,7 @@ import ms_testnet_executor as TE  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
 import ms_types as T  # noqa: E402
-from ms_execution import OrderRequest  # noqa: E402
+from ms_execution import HELD_REASON as EX_HELD_REASON, OrderRequest  # noqa: E402
 from ms_fake_bybit_testnet import FakeBybitTestnet, SimulatedCrash  # noqa: E402
 from ms_testnet_world import World, begin, restart, resting_plan  # noqa: E402
 
@@ -235,6 +235,71 @@ def test_spot_fee_charged_in_the_received_coin_is_reported_net_so_the_engine_equ
     consistent(w, run)
     x = [e for e in run.ex.venue_state()["executions"] if e["category"] == "spot" and e["side"] == "Buy"][0]
     assert x["qty"] == pytest.approx(0.001 * 0.999) and x["fee_usd"] == pytest.approx(0.001 * 0.001 * 60001.01)
+
+
+def _fee_charged_in(w, ccy, fee, *, category, side):
+    """The venue charges the fee of every matching fill in ``ccy`` (an amount in THAT currency): the row says so, the wallet effects are left alone."""
+    orig = w.fake._fill
+
+    def fill(o, qty, px, *, taker, dup=False):
+        orig(o, qty, px, taker=taker, dup=dup)
+        if o["category"] == category and o["side"] == side:
+            w.fake.execs[-1]["feeCurrency"], w.fake.execs[-1]["execFee"] = ccy, fee
+    w.fake._fill = fill
+
+
+@pytest.mark.parametrize("ccy", ["MNT", "USDC", "ETH"])
+def test_a_spot_fee_in_a_currency_that_is_neither_the_quote_nor_the_base_coin_is_unknown_never_a_quantity_never_dollars(w, ccy):
+    """REPRODUCED (red-team F, 'third-currency fee abandons hedge'): the executor took ANY non-USDT spot fee for the received coin. A BUY fee of 0.18 MNT was subtracted from the 0.001 BTC bought (the engine's
+    spot leg went to -0.179, the group FAILED with the perp short and the spot long still on the venue) and valued at the BTC price (10,800 USD of fee, MEASURED). Only a fee in the base coin reduces the
+    received quantity; a fee in any other currency is an UNKNOWN fee: the quantity is what the venue filled, the dollars are not invented."""
+    _fee_charged_in(w, ccy, "0.18", category="spot", side="Buy")
+    run, ctx, rec = begin(w)
+    assert drive(w, run, 2) == "HEDGED", "the hedge must not be abandoned over a fee the engine cannot value"
+    consistent(w, run)
+    assert D(str(run.engine.positions()["spot:BTCUSDT"])) == D("0.001")
+    x = [e for e in run.ex.venue_state()["executions"] if e["category"] == "spot" and e["side"] == "Buy"][0]
+    assert x["qty"] == pytest.approx(0.001) and x["fee_known"] is False and x["prov"] == "UNKNOWN" and x["fee_usd"] == 0.0 and x["fee_signed_usd"] is None, x
+    assert x["fee_ccy_venue"] == ccy and x["fee_ccy_unsupported"] is True
+
+
+def test_a_session_whose_entry_fee_is_in_a_third_currency_ends_flat_and_publishes_no_fee_total(w):
+    _fee_charged_in(w, "MNT", "0.18", category="spot", side="Buy")
+    d = w.plan_doc()["plan_digest"]
+    assert w.execute(d) == 0, w.text()
+    rec = w.record()
+    assert rec["flat_verified"] is True and all(p["size"] == 0 for p in w.fake.positions.values())
+    assert rec["net"]["fees_usd"] is None, f"a fee nobody could value was published as {rec['net']['fees_usd']}"
+
+
+def test_a_perp_fee_in_a_currency_other_than_the_quote_is_unknown_too_and_never_relabelled_usdt(w):
+    _fee_charged_in(w, "MNT", "0.18", category="linear", side="Sell")
+    run, ctx, rec = begin(w)
+    assert drive(w, run, 2) == "HEDGED"
+    x = [e for e in run.ex.venue_state()["executions"] if e["category"] == "linear"][0]
+    assert x["fee_known"] is False and x["fee_usd"] == 0.0 and x["fee_ccy_venue"] == "MNT" and x["fee_ccy_unsupported"] is True and x["qty"] == pytest.approx(0.001)
+
+
+def test_when_the_base_coin_cannot_be_read_no_fee_currency_but_the_quote_is_trusted(w):
+    """Fail closed: with the instrument filters gone from the cache and unreadable, the executor cannot tell the base coin from a third currency, so a fee in the (really) base coin is UNKNOWN too, and
+    the quantity is left as the venue filled it."""
+    w.fake.spot_fee_in_base = True
+    run, ctx, rec = begin(w)
+    drive(w, run, 2)
+    run.ex._filters.pop(("spot", "BTCUSDT"), None)
+    w.fake.inject("/v5/market/instruments-info", "http500", times=50, match=lambda d: d.get("category") == "spot")
+    row = {"execId": "E999999", "orderLinkId": f"{run.gid}-s", "orderId": "O1", "symbol": "BTCUSDT", "side": "Buy", "execQty": "0.001", "execPrice": "60000", "execFee": "0.000001",
+           "feeCurrency": "BTC", "isMaker": False, "execTime": str(w.clock.now()), "execType": "Trade"}
+    out = []
+    run.ex._take_exec(row, "spot", out)
+    assert out[0]["fee_known"] is False and out[0]["fee_ccy_unsupported"] is True and out[0]["qty"] == pytest.approx(0.001) and out[0]["fee_usd"] == 0.0
+
+
+def test_the_base_coin_and_the_quote_fees_are_still_valued_exactly_as_before(w):
+    run, ctx, rec = begin(w)
+    drive(w, run, 2)
+    xs = run.ex.venue_state()["executions"]
+    assert all(e["fee_known"] is True and e["prov"] == "MEASURED" and not e.get("fee_ccy_unsupported") for e in xs) and all(e["fee_ccy_venue"] == "USDT" for e in xs)
 
 
 def test_executions_outside_our_links_are_unattributed_not_fills(w):
@@ -574,6 +639,82 @@ def test_a_spot_exit_whose_perp_never_closes_gives_up_after_the_hold_with_one_re
     ack = run._await_perp_closed(OrderRequest(run.gid, "c", "d", leg, f"{run.gid}-xspot"))
     assert ack.status == "REJECTED" and ack.reason == "SPOT_EXIT_HELD_PERP_NOT_CLOSED" and w.clock.now() - t0 >= 20_000
     assert [b for b in (json.loads(r[3]) for r in creates(w)) if b["category"] == "spot" and b["side"] == "Sell"] == []
+
+
+@pytest.mark.parametrize("perp,group_spot,baseline,sale,goes", [
+    ("-0.001", "0.004", "0",   "0.003", True),                  # the excess of a partial hedge: the spot still covers the perp short afterwards
+    ("-0.001", "0.004", "0.5", "0.003", True),                  # the same with a pre-session spot holding the group never bought
+    ("-0.001", "0.001", "0.5", "0.001", False),                 # the owner's OWN coin must not make the group's spot look like it covers the short
+    ("-0.001", "0.004", "0",   "0.004", False),                 # selling it all leaves the perp naked
+    ("-0.001", "0.004", "0",   "0.0031", False),                # one step too much
+    ("-0.001", "0.003", "0",   "0.002", True),                  # exactly covered afterwards (within the 1e-9 tolerance)
+    ("0",      "0.004", "0",   "0.004", True),                  # no perp left: nothing to keep hedged
+    ("0.001",  "0.004", "0",   "0.003", False),                 # a perp LONG nobody planned is not a hedge: the sale still waits for a flat perp, as before
+])
+def test_the_spot_exit_hold_lets_a_sale_through_only_while_the_group_spot_still_covers_the_perp_short(w, perp, group_spot, baseline, sale, goes):
+    run, ctx, rec = begin(w, submit=False)
+    w.fake.inject_position("BTCUSDT", perp)
+    w.fake.wallet["BTC"] = D(group_spot) + D(baseline)
+    run.baseline = {"spot:BTCUSDT": float(baseline)}
+    leg = T.LegPlan("xspot", "BTCUSDT", "spot", "Sell", sale, "Market", None, False, False, "IOC")
+    t0 = w.clock.now()
+    ack = run._await_perp_closed(OrderRequest(run.gid, "c", "d", leg, f"{run.gid}-xspot"))
+    if goes:
+        assert ack is None and w.clock.now() - t0 < 5_000, f"the sale of {sale} was held although the spot still covers the short: {ack}"
+    else:
+        assert ack is not None and ack.status == "REJECTED" and ack.reason == EX_HELD_REASON and w.clock.now() - t0 >= 20_000, (ack, "the sale would have left the perp short uncovered")
+
+
+# ---- the unattended close-out of an ENTRY leg that never got an answer (the owner's unwind does the same by hand)
+def _a_run_whose_spot_entry_got_no_answer(w, fault="rate_limit"):
+    w.fake.inject(CREATE, fault, times=2, match=lambda d: d.get("category") == "spot" and d.get("side") == "Buy")       # the create of the second leg fails twice (the send and its one idempotent resend)
+    run, ctx, rec = begin(w)
+    drive(w, run, 1)                                                                         # one engine step: the perp fill is read, the second leg's idempotent resend fails too
+    leg = run.engine.groups[run.gid].legs["s"]
+    assert run.unresolved_entries() == [f"{run.gid}-s"] and leg.status == "UNKNOWN" and run.engine.groups[run.gid].legs["p"].status == "FILLED"
+    return run, ctx, leg.sent_ms
+
+
+def test_an_unanswered_entry_leg_is_closed_out_only_after_the_age_bound_and_the_filled_leg_then_unwinds(w):
+    run, ctx, sent = _a_run_whose_spot_entry_got_no_answer(w)
+    link = f"{run.gid}-s"
+    for age in (0, 1, S.CLOSE_OUT_MIN_AGE_MS - 1):                                           # a create that left a moment ago may still reach the venue: closing it out could double the order
+        w.clock.t = sent + age
+        S.close_out_unanswered_entries(ctx, run)
+        assert run.unresolved_entries() == [link] and "closed out" not in w.text(), f"closed out after only {age} ms"
+    w.clock.t = sent + S.CLOSE_OUT_MIN_AGE_MS
+    S.close_out_unanswered_entries(ctx, run)
+    assert run.engine.groups[run.gid].legs["s"].status == "CANCELLED" and f"ENTRY LEG {link}" in w.text() and "closed out" in w.text()
+    assert drive(w, run, 6) == "CLOSED", w.text()                                            # the perp that DID fill is unwound reduce-only instead of waiting for a human
+    assert all(p["size"] == 0 for p in w.fake.positions.values()) and not w.fake.wallet.get("BTC"), "the venue is flat"
+    assert link not in executed(w), "the closed-out leg never executed at the venue and is never re-sent"
+
+
+def test_an_entry_leg_the_venue_has_an_order_for_is_never_closed_out_however_old(w):
+    run, ctx, sent = _a_run_whose_spot_entry_got_no_answer(w)
+    link = f"{run.gid}-s"
+    leg = next(l for l in run.group_plan.legs if l.leg_id == "s")
+    w.fake._create({"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit", "qty": leg.qty, "price": leg.price, "timeInForce": "IOC", "orderLinkId": link})      # the request the engine gave up on LANDS late
+    assert link in run.ex.venue_state()["orders"], "the fixture must leave an order at the venue under the leg's link"
+    w.clock.t = sent + 10 * S.CLOSE_OUT_MIN_AGE_MS
+    S.close_out_unanswered_entries(ctx, run)
+    assert run.engine.groups[run.gid].legs["s"].status == "UNKNOWN" and "closed out" not in w.text(), "closing it out and unwinding would trade against an order that did execute"
+
+
+@pytest.mark.parametrize("read", ["incomplete", "no_positions", "raises"])
+def test_an_entry_leg_is_never_closed_out_on_a_venue_read_that_is_not_complete(w, read):
+    run, ctx, sent = _a_run_whose_spot_entry_got_no_answer(w)
+    real = run.ex.venue_state
+
+    def venue_state(*a, **k):
+        if read == "raises":
+            raise TE.ExecutorError("the read failed")
+        v = dict(real(*a, **k))
+        return {**v, "complete": False} if read == "incomplete" else {**v, "positions": None}
+    run.ex.venue_state = venue_state
+    w.clock.t = sent + 10 * S.CLOSE_OUT_MIN_AGE_MS
+    S.close_out_unanswered_entries(ctx, run)
+    assert run.engine.groups[run.gid].legs["s"].status == "UNKNOWN" and "closed out" not in w.text(), "absence from an INCOMPLETE read proves nothing"
 
 
 def test_the_delayed_exit_sequence_end_to_end_through_the_session_tool(w):

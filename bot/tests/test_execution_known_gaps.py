@@ -1,13 +1,21 @@
-"""Known gaps in the Testnet execution lifecycle, from an independent adversarial integration review, reproduced on the fake venue with the repo's own World harness.
+"""Gaps in the Testnet execution lifecycle that an independent adversarial integration review reproduced on the fake venue (the repo's own World harness), and that are now CLOSED.
 
-Each test states the DESIRED behaviour. The ones that still FAIL are strict xfails: they document the open defect precisely, and the moment a fix lands the xfail goes red (XPASS strict) and
-the mark must be deleted, so this table can only get shorter. They are low-probability on BTC at the sizes the autopilot uses (an IOC market order partially filling; two creates of one leg failing
-in a row) but they decide whether an UNATTENDED session or the owner's `reconcile --unwind` ends flat, so they are stated, not forgotten:
+They were strict xfails (each test states the DESIRED behaviour; the moment a fix landed the xfail went red and had to be deleted, so the table could only get shorter). They are low-probability on
+BTC at the sizes the autopilot uses (an IOC market order partially filling; two creates of one leg failing in a row) but they decide whether an UNATTENDED session or the owner's
+`reconcile --unwind` ends flat:
 
-  R2 / R2b  a partial perp ENTRY fill leaves a naked spot long that neither the session nor the owner's unwind closes
-  R3        a partial perp EXIT fill halts the group with the hedge still open (the owner's unwind does succeed)
-  R6        two failed creates of the second (spot) leg leave a naked perp short that only the owner's unwind closes
-  R5, R1    (fixed here: a lost first ack, and an order the venue says filled with no execution rows)
+  R2 / R2b  a partial perp ENTRY fill left a naked spot long that neither the session nor the owner's unwind closed
+            -> the session's spot-exit hold now lets a sale through when the spot still covers the perp short afterwards (the excess of a partial hedge), and the owner's unwind re-requests the exit
+               when the first pass leaves a balanced remainder (the engine's UNWIND mode ends there)
+  R3        a partial perp EXIT fill halted the group with the hedge still open
+            -> a spot exit HELD behind its perp exit (reason ``ms_execution.HELD_REASON``) is not a venue rejection: it never counts toward ``max_exit_attempts`` and is not re-sent in the same step
+  R6        two failed creates of the second (spot) leg left a naked perp short that only the owner's unwind closed
+            -> the engine classifies a group with a planned-but-never-sent entry leg as UNHEDGED (``ENTRY_LEG_NEVER_SENT``), and the session closes out an entry leg that never got an answer
+               and that the venue's COMPLETE read has no order for, so the filled leg is unwound
+  R5, R1    (fixed earlier: a lost first ack, and an order the venue says filled with no execution rows)
+
+The red team's fourth report, a fee charged in a third currency, was REPRODUCED and fixed too (the executor took any non-USDT spot fee for the received coin): its tests are in
+tests/test_ms_testnet_executor.py (`..._neither_the_quote_nor_the_base_coin...`). A session crash between the imbalance exit's intent and its send, then the owner's one confirmed unwind: below.
 """
 from __future__ import annotations
 
@@ -103,7 +111,6 @@ def test_R1_a_filled_order_whose_executions_the_venue_list_omits_must_not_publis
 
 
 # R2 / R3 ------------------------------------------------------------------------------------------------------------------------------------------
-@pytest.mark.xfail(strict=True, reason="known gap (see the module docstring)")
 def test_R2_a_partial_perp_entry_fill_must_unwind_to_flat_in_the_session_and_in_ONE_owner_unwind(w):
     _profit_world(w)
     limit_first(w, "linear", "Sell", False, "0.0015")                   # the perp short fills 0.001 of 0.003 (IOC), the spot buy fills in full
@@ -112,7 +119,6 @@ def test_R2_a_partial_perp_entry_fill_must_unwind_to_flat_in_the_session_and_in_
     assert res["result"] == "DONE", f"session ended {res['result']}: the venue holds perp {perp} spot {spot} (naked spot long); journal: 5 spot exits REJECTED SPOT_EXIT_HELD_PERP_NOT_CLOSED then HALT EXIT_ORDERS_REJECTED"
 
 
-@pytest.mark.xfail(strict=True, reason="known gap (see the module docstring)")
 def test_R2b_the_owner_unwind_after_a_partial_perp_entry_sends_an_exit(w):
     _profit_world(w)
     limit_first(w, "linear", "Sell", False, "0.0015")
@@ -127,13 +133,47 @@ def test_R2b_the_owner_unwind_after_a_partial_perp_entry_sends_an_exit(w):
     assert rc == 0, f"owner `reconcile --unwind` rc={rc}, {len([r for r in w.fake.requests if r[0] == 'POST']) - posts0} orders sent, venue still holds perp {perp} spot {spot}: {out[-1][:160]}"
 
 
-@pytest.mark.xfail(strict=True, reason="known gap (see the module docstring)")
 def test_R3_a_partial_perp_exit_fill_must_not_halt_the_group_with_an_open_hedge(w):
     _profit_world(w)
     limit_first(w, "linear", "Buy", True, "0.001")                      # the first reduce-only perp exit fills 0.001 of 0.003
     res, _ = cycle(w, sleep=held_funding(w))
     perp, spot = venue_truth(w)
     assert res["result"] == "DONE", f"session ended {res['result']}: perp {perp} spot {spot} remain (spot exit held 5x20 s, counted as 5 rejections -> HALT EXIT_ORDERS_REJECTED)"
+
+
+def _crash_before_the_first(w, category, side):
+    """The process dies BEFORE the first matching create reaches the venue (nothing executes): the engine journalled the intent and never saw an answer."""
+    from ms_fake_bybit_testnet import SimulatedCrash
+    real, armed = w.fake.request, {"on": True}
+
+    def request(method, url, **kw):
+        if armed["on"] and url.endswith("/v5/order/create"):
+            b = json.loads(kw.get("body") or "{}")
+            if b.get("category") == category and b.get("side") == side:
+                armed["on"] = False
+                raise SimulatedCrash(f"before the {category} {side} reached the venue")
+        return real(method, url, **kw)
+    w.fake.request = request
+    return real
+
+
+def test_the_owner_unwind_of_a_group_still_in_unwind_mode_exits_the_balanced_remainder_too_in_ONE_run(w):
+    """The session died after it had journalled the imbalance exit (the spot sale of the excess of a partial hedge) and before it reached the venue: perp short 0.001, spot long 0.004, the group in
+    UNWIND mode. The engine's UNWIND mode ends at the balanced remainder (HEDGED, perp 0.001 / spot 0.001) by design; the owner asked for FLAT, so the confirmed unwind must exit that too."""
+    from ms_fake_bybit_testnet import SimulatedCrash
+    d = w.ready("BTCUSDT", 270.0)                                       # 0.004 of each leg
+    limit_first(w, "linear", "Sell", False, "0.001")                    # the perp short fills 0.001 of 0.004 (IOC); the spot buy fills in full
+    real = _crash_before_the_first(w, "spot", "Sell")
+    with pytest.raises(SimulatedCrash):
+        w.run("execute", "--confirm-plan-digest", d, typed=d)
+    w.fake.request = real
+    perp, spot = venue_truth(w)
+    assert perp == {"BTCUSDT": "-0.001"} and spot == {"BTC": "0.004000"}, (perp, spot)         # unbalanced and not flat: a naked 0.003 spot long
+    w.clock.t += 60_000                                                 # the unanswered exit is old enough to be closed out (it never existed at the venue)
+    assert w.run("reconcile", "--unwind", "--confirm-plan-digest", d) == 0, w.text()
+    perp, spot = venue_truth(w)
+    assert perp == {} and spot == {}, f"the venue still holds perp {perp} spot {spot} after ONE confirmed unwind: {w.text()[-300:]}"
+    assert w.record()["flat_verified"] is True
 
 
 # R4 ------------------------------------------------------------------------------------------------------------------------------------------------
@@ -150,7 +190,6 @@ def test_R5_a_timed_out_first_leg_must_not_leave_a_one_legged_group_HEDGED_and_h
                                                                        f"{rec['net']['funding_usd']} as the carry's result")
 
 
-@pytest.mark.xfail(strict=True, reason="known gap (see the module docstring)")
 def test_R6_two_failed_creates_of_the_second_leg_must_not_leave_a_naked_perp_short(w):
     _profit_world(w)
     w.fake.inject("/v5/order/create", "rate_limit", times=2, match=lambda d: d.get("category") == "spot" and d.get("side") == "Buy")

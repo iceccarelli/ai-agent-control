@@ -167,7 +167,10 @@ def test_a_declared_deposit_or_withdrawal_is_never_a_trading_result(tmp_path):
     assert not b.declare_transfer("dep-1", "500")                            # applied ids stay known: a retry cannot re-subtract it
     b.park("s2", "10499", "0.50", True, True)
     assert b.declare_transfer("wd-1", "-200")
-    assert D(b.settle("10299.50")["credited_usd"]) == D("0.50")              # withdrawal removed too
+    r = b.settle("10299.50")
+    # the withdrawal is removed from the delta too, but a DECLARED withdrawal (the owner's unverified claim) can never lift a credit above the cash that actually rose (red-team F3): the cash FELL by
+    # 199.50, so the +0.50 the ledger explains is recorded as excess and sizes nothing. This used to credit +0.50; the change only ever makes the book more conservative.
+    assert r["transfers_removed_usd"] == "-200" and D(r["credited_usd"]) == 0 and D(r["unverified_excess_usd"]) == D("0.50"), r
 
 
 def test_concurrent_settlement_credits_exactly_once(tmp_path):
@@ -348,6 +351,8 @@ def test_a_transfer_declared_between_the_cash_read_and_the_park_is_in_the_delta_
 def test_halt_and_drawdown_acknowledgements_are_reachable_only_from_the_owner_cli():
     """Red-team MED: the autopilot must never clear its own capital stop. Only the `capital --ack-*` CLI branch may call the acknowledgements; no other function in the tools tree does."""
     import ast
+    # every method that clears a stop, re-bases the drawdown or changes what the book counts as cash/sizing: the autopilot's loop, run_once and the session tool never call them (red-team F2)
+    OWNER_ONLY = ("acknowledge_halt", "acknowledge_drawdown", "acknowledge_review", "declare_transfer", "set_reserve_fraction")
     tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
     offenders = []
     for fn in sorted(os.listdir(tools)):
@@ -357,7 +362,7 @@ def test_halt_and_drawdown_acknowledgements_are_reachable_only_from_the_owner_cl
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for sub in ast.walk(node):
-                    if isinstance(sub, ast.Attribute) and sub.attr in ("acknowledge_halt", "acknowledge_drawdown") and not (fn == "ms_testnet_autopilot.py" and node.name == "main"):
+                    if isinstance(sub, ast.Attribute) and sub.attr in OWNER_ONLY and not (fn == "ms_testnet_autopilot.py" and node.name == "main"):
                         offenders.append((fn, node.name, sub.attr))
     offenders = [o for o in offenders if o[0] != "ms_capital.py"]
     assert offenders == [], offenders
@@ -480,3 +485,145 @@ def test_a_dust_sized_booked_loss_still_counts_toward_the_loss_streak_a_conserva
         assert r["status"] == "SETTLED" and D(r["credited_usd"]) == D("-0.02"), r
     rep = book.report()
     assert rep["loss_streak"] == C.LOSS_STREAK_STOP and rep["halted"] is True and D(rep["verified_losses_usd"]) == D("-0.08")
+
+
+# ---- a DECLARED transfer is the owner's unverified claim (red-team F3): it may explain cash that moved, never hide a loss the ledger measured and never raise a credit above the cash that rose
+@pytest.mark.parametrize("funding_read", [False, True])
+def test_a_declared_withdrawal_cannot_hide_a_loss_the_ledger_measured(tmp_path, funding_read):
+    """The session lost 1.0017 (the ledger's price result minus fees); nobody withdrew anything. A declared 'withdrawal' of exactly that amount made the settled delta 0: status SETTLED, credited 0, streak 0,
+    NO alert, with funding unread, and (funding read) an alert but still no debit. The measured loss is booked whatever was declared, and the book asks for a review."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-1.0017", funding_read, True)
+    assert b.declare_transfer("fake-wd", "-1.0017")
+    r = b.settle("9998.9983")
+    assert D(r["credited_usd"]) == D("-1.0017"), r
+    assert r["status"] == "UNEXPLAINED_CASH" and (b.load()["review_required"] or {}).get("code") == "ACCOUNT_CASH_UNEXPLAINED", r
+    assert b.load()["loss_streak"] == 1 and D(b.load()["realised_usd"]) == D("-1.0017")
+    assert D(r["unverified_excess_usd"]) == D("1.0017"), "the part of the cash change the book cannot place stays visible as excess and sizes nothing"
+
+
+def test_a_declared_withdrawal_cannot_raise_a_credit_above_the_cash_that_actually_rose(tmp_path):
+    """Funding read, known +2.00, the wallet rose by 1.00; a declared 'withdrawal' of 1.00 turned that into a settled delta of +2.00 and the whole +2.00 was credited against a true +1.00."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "2.00", True, True)
+    assert b.declare_transfer("fake-wd", "-1.00")
+    r = b.settle("10001")
+    assert D(r["credited_usd"]) == D("1.00") and b.basis() == D("10001.00"), r
+    assert D(r["unverified_excess_usd"]) == D("1.00")
+
+
+def test_a_withdrawal_the_owner_really_made_during_a_session_never_costs_more_than_the_known_loss_nor_credits_a_gain(tmp_path):
+    """The same cap and floor are conservative for a REAL withdrawal made in the window (rare: the runbook declares transfers before the next session starts, where they are not counted at all)."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-1.00", True, True)
+    assert b.declare_transfer("wd", "-500")
+    r = b.settle("9499")                                                          # -1.00 trading + the real -500 withdrawal: exactly what the ledger measured
+    assert D(r["credited_usd"]) == D("-1.00") and r["status"] == "SETTLED", r
+    assert b.park("s2", "9499", "0.50", True, True)
+    assert b.declare_transfer("wd2", "-300")
+    r = b.settle("9199.50")                                                       # +0.50 trading and a real -300 withdrawal: the cash fell, so the gain is not credited (visible as excess)
+    assert D(r["credited_usd"]) == 0 and D(r["unverified_excess_usd"]) == D("0.50"), r
+
+
+def test_a_deposit_declared_in_the_window_still_removes_exactly_the_deposit(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "1.00", True, True)
+    assert b.declare_transfer("dep", "500")
+    r = b.settle("10501")
+    assert D(r["credited_usd"]) == D("1.00") and r["status"] == "SETTLED" and r["transfers_removed_usd"] == "500", r
+
+
+@pytest.mark.parametrize("amount", ["1e9", "-1e9", "1000001", "-1000001", "1e999999", "-1e999999", "NaN", "Infinity", "0", "", "abc"])
+def test_an_absurd_or_unreadable_transfer_is_refused_and_leaves_the_book_untouched(tmp_path, amount):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    before = b.load()
+    assert b.declare_transfer("x", amount) is False
+    assert b.load() == before
+
+
+def test_a_withdrawal_larger_than_the_cash_the_book_knows_of_is_refused_but_a_deposit_is_not(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.declare_transfer("wd-too-big", "-10000.01") is False and b.declare_transfer("wd", "-10000") is True
+    assert b.declare_transfer("dep", "250000") is True                                    # a deposit has no cash to be larger than; only the absolute sanity bound applies
+    assert b.declare_transfer("wd2", "-60000") is True, "the declared deposit is available to withdraw"
+    assert b.declare_transfer("wd3", "-200000") is False
+
+
+def test_the_declaration_bound_is_inclusive_at_the_limit(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.declare_transfer("max-dep", str(C.MAX_DECLARED_TRANSFER_USD)) is True
+    assert b.declare_transfer("over", str(C.MAX_DECLARED_TRANSFER_USD + D("0.01"))) is False
+
+
+def test_a_declared_deposit_never_changes_how_a_loss_is_booked_with_funding_unread(tmp_path):
+    """The masked-loss floor binds only a declared WITHDRAWAL (the claim that moves the delta up). A deposit leaves the existing rule alone: funding unread, the cash delta alone decides a loss."""
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-1.00", False, True)                          # known -1.00 is partial (funding unread); the cash says the session lost only 0.50
+    assert b.declare_transfer("dep", "100")
+    r = b.settle("10099.50")
+    assert D(r["credited_usd"]) == D("-0.50") and r["status"] == "SETTLED", r
+
+
+# ---- a LIFETIME loss stop that no acknowledgement can lift (red-team F2: five rounds of "four losses, ack-halt, ack-drawdown" reached -60 realised and the next size was still 198.80)
+def test_the_lifetime_loss_stop_is_twice_the_drawdown_stop_and_four_session_ceilings():
+    import ms_testnet_adapter as AD
+    assert C.LIFETIME_LOSS_STOP_USD == C.DRAWDOWN_STOP_USD * 2 == D(str(AD.MAX_LOSS_CEILING_USD)) * 4, "one definition: it cannot drift from the manifest's per-session ceiling"
+
+
+@pytest.mark.parametrize("realised,stops", [("5", False), ("0", False), ("-11.10", False), ("-22.19", False), ("-22.20", True), ("-22.21", True), ("-60", True)])
+def test_allocation_stops_at_the_lifetime_realised_loss(realised, stops):
+    a = alloc(realised_usd=D(realised))
+    assert (a.notional == 0 and a.binding == "LIFETIME_LOSS_STOP" and a.reasons[0] == "LIFETIME_LOSS_STOP") == stops, (a.binding, a.reasons)
+    if not stops:
+        assert a.notional > 0
+
+
+def test_the_lifetime_stop_is_named_first_even_when_other_stops_are_also_open():
+    a = alloc(realised_usd=D("-30"), halted=True, loss_streak=4, drawdown_usd=D("30"))
+    assert a.binding == "LIFETIME_LOSS_STOP" and {"LIFETIME_LOSS_STOP", "LOSS_STREAK_STOP_NOT_ACKNOWLEDGED", "DRAWDOWN_LIMIT", "LOSS_STREAK_STOP"} <= set(a.reasons)
+
+
+def test_repeated_acknowledgements_cannot_walk_past_the_lifetime_stop(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    cash, n, rounds = D(10000), 0, 0
+    while True:
+        rounds += 1
+        for _ in range(4):
+            n += 1
+            before, cash = cash, cash - D("1.50")
+            assert b.park(f"s{n}", str(before), "-1.50", True, True)
+            assert b.settle(str(cash))["status"] == "SETTLED"
+        assert b.load()["halted"] is True
+        cb = b.load()
+        stopped = C.allocate(grant_max_usd=375, ceiling_usd=CEIL, open_gross_usd=0, available_usdt=cash, basis=b.sizing_basis(cb), start_cash=D(cb["start_cash_usd"]), loss_streak=cb["loss_streak"],
+                             drawdown_usd=b.drawdown(cb), profit_seeking=True, halted=cb["halted"], realised_usd=D(cb["realised_usd"]))
+        assert stopped.notional == 0, "four losses halt entries until acknowledged"
+        assert b.acknowledge_halt() is True
+        b.acknowledge_drawdown()
+        cb = b.load()
+        a = C.allocate(grant_max_usd=375, ceiling_usd=CEIL, open_gross_usd=0, available_usdt=cash, basis=b.sizing_basis(cb), start_cash=D(cb["start_cash_usd"]), loss_streak=cb["loss_streak"],
+                       drawdown_usd=b.drawdown(cb), profit_seeking=True, halted=cb["halted"], realised_usd=D(cb["realised_usd"]))
+        if a.notional == 0:
+            break
+        assert rounds < 10
+    assert a.binding == "LIFETIME_LOSS_STOP" and rounds == 4 and D(b.load()["realised_usd"]) == D("-24.00")        # 4 rounds of -6.00: acknowledged three times, stopped on the fourth
+    assert b.report()["lifetime_loss_stop_active"] is True and b.report()["lifetime_loss_stop_usd"] == str(C.LIFETIME_LOSS_STOP_USD)
+    assert b.acknowledge_halt() is False and b.acknowledge_drawdown() is False and b.acknowledge_review() is False, "nothing left for an acknowledgement to clear: the stop is not one it can lift"
+
+
+def test_a_gain_after_losses_lifts_the_lifetime_figure_it_is_a_net_realised_bound(tmp_path):
+    b = book(tmp_path)
+    b.ensure_baseline("10000")
+    assert b.park("l1", "10000", "-20.00", True, True) and b.settle("9980")
+    assert b.report()["lifetime_loss_stop_active"] is False
+    assert b.park("l2", "9980", "-3.00", True, True) and b.settle("9977")
+    assert b.report()["lifetime_loss_stop_active"] is True and D(b.load()["realised_usd"]) == D("-23.00")

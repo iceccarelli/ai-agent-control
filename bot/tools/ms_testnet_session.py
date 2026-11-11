@@ -673,10 +673,16 @@ class Run:
         while True:
             v = self.ex.venue_state()
             pos = v["positions"]
-            if v["complete"] and pos is not None and abs(pos.get(f"linear:{sym}", 0.0)) < 1e-12:
-                return None
+            if v["complete"] and pos is not None:
+                perp = pos.get(f"linear:{sym}", 0.0)
+                if abs(perp) < 1e-12:
+                    return None                                             # the perp is closed
+                if perp < 0:                                                # a SHORT perp: a sale that leaves the group's spot (the account's balance MINUS the owner's own pre-session coin)
+                    spot_held = max(0.0, _minus(pos.get(f"spot:{sym}", 0.0), self.baseline.get(f"spot:{sym}", 0.0)))   # still covering that short is the excess of a partial hedge, not its exit
+                    if spot_held - float(req.leg.qty) >= -perp - 1e-9:
+                        return None                                         # (a perp LONG nobody planned is not a hedge: it still holds the sale until the perp is flat, as before)
             if int(self.ctx.clock()) >= deadline:
-                return EX.Ack(req.link_id, "REJECTED", None, "SPOT_EXIT_HELD_PERP_NOT_CLOSED")
+                return EX.Ack(req.link_id, "REJECTED", None, EX.HELD_REASON)                 # the engine's own constant: a HELD exit is not a venue rejection and never counts toward the halt
             self.ctx.sleep(0.5)
 
     # ---- canonical ledger + reconciliation, fed from the venue read the engine acted on
@@ -1106,6 +1112,27 @@ def _account_lock(ctx: Ctx, role: str) -> "XL.ExecutorLock":
     return XL.ExecutorLock(XL.lock_path(AD.DEFAULT_CAPABILITY_PATH), role=role, state_dir=ctx.dir, now_ms=int(ctx.clock()))
 
 
+def close_out_unanswered_entries(ctx: Ctx, run: "Run") -> None:
+    """The unattended twin of the owner's ``reconcile --unwind`` close-out, for ENTRY legs only: a leg whose create got no answer twice, that the venue's COMPLETE read has no order for and that was sent at
+    least ``CLOSE_OUT_MIN_AGE_MS`` ago never existed there; marking it done lets the engine unwind the leg that did fill (reduce-only) instead of waiting for a human with a naked perp short."""
+    try:
+        view = run.ex.venue_state()
+        g = run.engine.groups.get(run.gid) if run.engine else None
+        if g is None or not (view.get("complete") and view.get("positions") is not None):
+            return
+        now_ms = int(ctx.clock())
+        for link in run.unresolved_entries():
+            leg_id = link[len(run.gid) + 1:]
+            leg = g.legs.get(leg_id)
+            sent = getattr(leg, "sent_ms", None)
+            if link in view["orders"] or (sent is not None and now_ms - int(sent) < CLOSE_OUT_MIN_AGE_MS):
+                continue
+            ctx.out(f"ENTRY LEG {link}: no answer to its create and no order at the venue (complete read): closed out so the filled leg can unwind")
+            run.engine.on_order_done(run.gid, leg_id, now_ms)
+    except (TE.ExecutorError, bc.BybitAPIError):
+        return
+
+
 def _execute_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any]) -> int:
     rec = load_record(ctx)
     rec["confirmation"] = {"state": "CONFIRMED", "plan_digest_confirmed": plan["plan_digest"]}
@@ -1161,6 +1188,7 @@ def _execute_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any]) ->
                 break
             ctx.sleep(float(tm["poll_s"]))
     if run.state() not in ("CLOSED", "FAILED"):
+        close_out_unanswered_entries(ctx, run)                          # an entry leg whose create never got an answer (and the venue's COMPLETE read has no order under it) must not wedge the unwind of the leg that DID fill
         run.engine.request_exit(run.gid, int(ctx.clock()), "SESSION_EXIT")
         _drive(ctx, run, rec, ("CLOSED", "FAILED"), tm["exit_wait_s"])
     # 4. the final word: a COMPLETE venue read, never local arithmetic
@@ -1322,7 +1350,10 @@ def _reconcile_locked(ctx: Ctx, plan: Dict[str, Any], manifest: Dict[str, Any], 
         if cleared:
             ctx.out(f"group halt '{cleared}' lifted by the confirmed unwind (journalled); exits are reduce-only")
         eng.request_exit(run.gid, int(ctx.clock()), "RECONCILE_UNWIND")
-        _drive(ctx, run, rec, ("CLOSED", "FAILED"), plan["timing"]["exit_wait_s"])
+        st = _drive(ctx, run, rec, ("CLOSED", "FAILED", "HEDGED"), plan["timing"]["exit_wait_s"])
+        if st == "HEDGED":                                              # the imbalance exit left a BALANCED remainder (the engine's UNWIND mode ends there): the owner asked for flat, so exit all of it
+            eng.request_exit(run.gid, int(ctx.clock()), "RECONCILE_UNWIND")
+            _drive(ctx, run, rec, ("CLOSED", "FAILED"), plan["timing"]["exit_wait_s"])
     run.snapshot_record(rec, final=True)
     save_record(ctx, rec)
     ctx.out(f"group state {run.state()}; engine halts={sorted(eng.halts)}; flat_verified={rec['flat_verified']}")

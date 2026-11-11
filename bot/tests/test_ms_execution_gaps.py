@@ -353,3 +353,71 @@ def test_the_fee_in_base_remainder_rule_belongs_to_a_spot_buy_alone():
     assert h.e.positions_exp["linear:XUSDT"] == D("-10"), "a perp keeps the venue's quantity: the missing 0.02 is a lagging execution, not a fee"
     assert h.e.positions_exp["spot:XUSDT"] == D("9.98"), "a spot BUY's fee is taken from the coin received: the 0.02 was never held"
     assert EX.FEE_IN_BASE_MAX_FRACTION * 10 == D("0.020")
+
+
+# ---------------------------------------------------------------- a spot exit HELD behind its perp exit is not a venue rejection (R3)
+def _engine_with_a_spot_exit_that_answers(reason):
+    """A HEDGED group whose perp exit stays live and whose spot exit is answered REJECTED with ``reason`` (``mode['reason']`` can be switched while the test runs)."""
+    import ms_execution as X
+    from test_ms_execution import H, hedged
+    h = hedged(H())
+    real = h.v.send_order
+    mode = {"reason": reason}
+
+    def send(req):
+        if req.leg.category == "spot" and "-x" in req.link_id:
+            return X.Ack(req.link_id, "REJECTED", None, mode["reason"])
+        return real(req)
+    h.e._send = send
+    return X, h, mode
+
+
+def test_a_held_spot_exit_never_counts_toward_the_exit_halt_but_a_venue_rejection_does():
+    """Review R3: the session holds a spot sale while the perp is still short (selling the spot first would leave a naked short), answering the engine REJECTED. The engine counted every such answer
+    as a venue rejection, so a perp exit that needed several steps (a partial fill) halted the group (EXIT_ORDERS_REJECTED) with the hedge still open. A HELD answer is not a rejection."""
+    from test_ms_execution import GID
+    X, h, mode = _engine_with_a_spot_exit_that_answers(None)
+    mode["reason"] = X.HELD_REASON
+    h.e.request_exit(GID, 5_000)
+    for i in range(1, 16):
+        h.e.step(5_000 + i * 1_000)
+    g = h.e.groups[GID]
+    held = [l for l in g.exit_legs() if l.status == X.REJECTED and l.reject_reason == X.HELD_REASON]
+    assert len(held) > h.policy.max_exit_attempts, f"the scenario must hold MORE answers than the halt allows, got {len(held)}"
+    assert not g.halted_reason, f"held answers halted the group: {g.halted_reason}"
+    # control: the SAME number of answers that are real venue rejections DO halt it
+    X2, h2, mode2 = _engine_with_a_spot_exit_that_answers("REDUCE_ONLY_NO_POSITION_TO_REDUCE")
+    h2.e.request_exit(GID, 5_000)
+    for i in range(1, 16):
+        h2.e.step(5_000 + i * 1_000)
+    assert h2.e.groups[GID].halted_reason == "EXIT_ORDERS_REJECTED"
+
+
+def test_the_exit_halt_floor_the_owner_lifts_to_counts_only_real_rejections_and_a_held_answer_is_not_resent_in_its_own_step():
+    from test_ms_execution import GID
+    X, h, mode = _engine_with_a_spot_exit_that_answers(None)
+    mode["reason"] = X.HELD_REASON
+    h.e.request_exit(GID, 5_000)
+    spot_exits = lambda: [l for l in h.e.groups[GID].exit_legs() if l.plan.category == "spot"]   # noqa: E731
+    assert len(spot_exits()) == 1 and spot_exits()[0].reject_reason == X.HELD_REASON, "the exit request sends the spot exit ONCE: a held answer is not re-sent inside the step that was held"
+    for i in range(1, 5):
+        h.e.step(5_000 + i * 1_000)                                                   # four more steps: one held answer per step
+    assert len(spot_exits()) == 5 and all(l.reject_reason == X.HELD_REASON for l in spot_exits())
+    assert len({l.sent_ms for l in spot_exits()}) == 5, "two held exits were sent in the same step"
+    mode["reason"] = "REDUCE_ONLY_NO_POSITION_TO_REDUCE"
+    for i in range(5, 14):
+        h.e.step(5_000 + i * 1_000)
+    g = h.e.groups[GID]
+    real = [l for l in g.exit_legs() if l.status == X.REJECTED and l.reject_reason != X.HELD_REASON]
+    assert g.halted_reason == "EXIT_ORDERS_REJECTED" and len(real) == h.policy.max_exit_attempts, (g.halted_reason, len(real))
+    every_rejected_exit = sum(1 for l in g.exit_legs() if l.status == X.REJECTED)
+    assert every_rejected_exit == len(real) + 5, "five held answers and the real rejections are the only rejected exit legs"
+    assert h.e.clear_exit_halt(GID, 30_000) == "EXIT_ORDERS_REJECTED"
+    lifts = [r["body"] for r in h.types("HALT_GROUP") if r["body"].get("reason") == ""]
+    assert len(lifts) == 1, "the lift is one journalled HALT_GROUP with an empty reason (the engine may re-halt after it; that is a later, separate record)"
+    floor = lifts[0]["exit_floor"]
+    assert floor == len(real) < every_rejected_exit, f"the floor must exclude the held answers: floor={floor}, rejected exit legs={every_rejected_exit}"
+    # the reason is a pure fold of the journal: a restart rebuilds it
+    again = h.make()
+    assert [l.reject_reason for l in again.groups[GID].exit_legs()] == [l.reject_reason for l in g.exit_legs()]
+

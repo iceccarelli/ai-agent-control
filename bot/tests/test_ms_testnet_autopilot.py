@@ -1046,6 +1046,23 @@ def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
     assert res["result"] in ("DONE", "SKIPPED") and "ALLOCATION_ZERO" not in "".join(res["why"])
 
 
+def test_the_lifetime_loss_stop_idles_the_engine_and_no_acknowledgement_resumes_it(w):
+    """Red-team F2: the owner's acknowledgements resume the loss-streak halt and the drawdown stop; the LIFETIME stop (verified net realised <= -2 x the drawdown stop) is not theirs to lift."""
+    _profit_world(w)
+    eng = str(w.tmp / "eng")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("10000")
+    bk = b.load()
+    bk["realised_usd"], bk["losses_usd"], bk["halted"], bk["loss_streak"] = "-23.00", "-23.00", True, 4
+    b._save(bk)
+    w.fake.requests.clear()
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "SKIPPED" and "LIFETIME_LOSS_STOP" in "".join(res["why"]) and not [r for r in w.fake.requests if r[0] == "POST"], res["why"]
+    assert b.acknowledge_halt() is True and b.acknowledge_drawdown() in (True, False)
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "SKIPPED" and "LIFETIME_LOSS_STOP" in "".join(res["why"]) and not [r for r in w.fake.requests if r[0] == "POST"], "acknowledged, and still stopped"
+
+
 # ---------------------------------------------------------------- the STALE EXECUTOR: a frozen process must be refused by the server before any entry order
 class SimServer:
     """The server's lease record: one holder at a time, a fencing token that only grows, expiry on the SERVER clock."""
@@ -1621,6 +1638,15 @@ def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_a
         _json.dump(doc, fh)
     halted = _evaluate(w, notional_usd="200", engine_root=str(root))
     assert "CAPITAL_BOOK_HALTED" in halted["authority_gaps"] and "CAPITAL_REVIEW_OPEN" not in halted["authority_gaps"]
+
+    doc["halted"] = False
+    doc["realised_usd"] = "-22.20"
+    with open(book.path, "w") as fh:
+        _json.dump(doc, fh)
+    stopped = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert "CAPITAL_LIFETIME_LOSS_STOP" in stopped["authority_gaps"] and stopped["decision_record"]["portfolio_context"]["lifetime_loss_stop_active"] is True, "the stop no acknowledgement lifts is named"
+    from decimal import Decimal as D
+    assert D(stopped["decision_record"]["risk_limits"]["lifetime_loss_stop_usd"]) == D("22.20") == 2 * D(stopped["decision_record"]["risk_limits"]["drawdown_stop_usd"])
 
     with open(book.path, "w") as fh:
         fh.write("{broken")

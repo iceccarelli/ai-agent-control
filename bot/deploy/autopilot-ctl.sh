@@ -1,5 +1,7 @@
 #!/bin/sh
-# The owner's control wrapper, run INSIDE the machine:  fly ssh console -a carry-autopilot -C "autopilot-ctl <command>"   (commands: status, drain, deploy-check, resume, clear-alert, grant)
+# The owner's control wrapper, run INSIDE the machine:  fly ssh console -a carry-autopilot -C "autopilot-ctl <command>"   (commands: status, drain, deploy-check, resume, clear-alert, grant, capital)
+# OWNER-ONLY commands (grant, capital --ack-*/--declare-transfer/--reserve-fraction, clear-alert, resume of a STOP/PAUSED marker) need an INTERACTIVE terminal: open `fly ssh console -a carry-autopilot`
+# WITHOUT -C and run them there; with -C (no terminal) they refuse and change nothing. status, drain, deploy-check and a deploy's own resume stay scriptable.
 # Why it exists: a root ssh session would create marker/log files owned by root that the unprivileged worker could not append to, and it may not see the machine's secrets. This wrapper
 # (1) copies the few variables the autopilot needs from PID 1's environment (where Fly puts the secrets), (2) drops to the `bot` user, (3) runs the autopilot CLI with HOME=/data.
 set -eu

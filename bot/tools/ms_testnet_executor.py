@@ -472,6 +472,13 @@ class TestnetExecutor:
         return {"orders": orders, "executions": execs, "positions": positions, "complete": complete, "read_ms": int(self.clock()),
                 "foreign_open_orders": list(self.foreign_open_orders), "unattributed": list(self._read_unattributed)}
 
+    def _spot_base_coin(self, symbol: str) -> Optional[str]:
+        """The symbol's base coin from the instrument filters this executor already holds (None when they cannot be read: then no fee currency but the quote is trusted)."""
+        try:
+            return self.filters("spot", symbol).base_coin.upper()
+        except (ExecutorError, AttributeError):
+            return None
+
     def _take_order(self, r: Mapping[str, Any], cat: str, out: Dict[str, Dict[str, Any]]) -> None:
         link, st = r.get("orderLinkId"), r.get("orderStatus")
         if not isinstance(link, str) or not link:
@@ -509,7 +516,15 @@ class TestnetExecutor:
             return
         fee_ccy = r.get("feeCurrency") or QUOTE
         fee_signed = fee
-        if cat == "spot" and fee_ccy != QUOTE:                           # fee taken from the received base coin: net quantity, fee in USD at the fill price
+        # Only two currencies can be applied: the quote (dollars as stated) and, on a SPOT fill, the symbol's own base coin (the received quantity is net of it; dollars at the fill price). A fee in ANYTHING
+        # else (MNT, a third coin, USDC on a USDT contract) can be neither subtracted from this coin's quantity nor valued at this coin's price: it used to be treated as the base coin (a 0.18 MNT fee
+        # took 0.18 BTC off a 0.001 BTC fill, the group FAILED with both legs still open, and 10,800 USD of fee was booked MEASURED). It is an UNKNOWN fee now: the quantity is what the venue filled, the
+        # dollars are not invented, and the ledger and the quality record see it as unknown like a blank fee.
+        base = self._spot_base_coin(sym) if cat == "spot" else None
+        unsupported = fee_ccy != QUOTE and not (base is not None and fee_ccy == base)
+        if unsupported:
+            fee_blank, fee, fee_signed = True, D(0), D(0)
+        elif cat == "spot" and fee_ccy != QUOTE:                         # fee taken from the received base coin: net quantity, fee in USD at the fill price
             if side == "Buy":
                 qty = qty - fee
                 self._fee_in_qty[link] = self._fee_in_qty.get(link, D(0)) + fee
@@ -518,7 +533,7 @@ class TestnetExecutor:
         out.append({"fill_id": eid, "link_id": link, "qty": float(qty), "price": float(px), "fee_usd": float(max(fee, D(0))), "fee_ccy": QUOTE,
                     "liquidity": "MAKER" if r.get("isMaker") in (True, "true") else "TAKER", "ts_ms": int(r["execTime"]), "symbol": sym, "category": cat, "side": side,
                     "prov": "UNKNOWN" if fee_blank else "MEASURED", "fee_signed_usd": None if fee_blank else float(fee_signed), "fee_known": not fee_blank, "fee_rate": r.get("feeRate") if r.get("feeRate") not in (None, "") else None,
-                    "fee_ccy_venue": fee_ccy, "is_maker_reported": r.get("isMaker") is not None})
+                    "fee_ccy_venue": fee_ccy, "fee_ccy_unsupported": unsupported, "is_maker_reported": r.get("isMaker") is not None})
 
     def funding_history(self, symbol: str, start_ms: int, end_ms: int) -> Optional[List[Dict[str, Any]]]:
         """The public settlement history for ``symbol`` between two times: [{ts_ms, rate}] oldest first, or None when it cannot be read COMPLETELY (a read error, a malformed row, or a page that
