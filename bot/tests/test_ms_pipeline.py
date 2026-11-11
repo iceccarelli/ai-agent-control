@@ -1029,8 +1029,12 @@ def test_a_verified_history_root_goes_through_the_loader_and_is_labelled_not_inj
     root, uni, spot = TCR._hist(tmp_path)
     c = RP.ReplayConfig(start_ms=TMH.FIRST + 20 * TMH.H8, end_ms=TMH.FIRST + 40 * TMH.H8, fill=FILL, hold_ms=2 * D, decision_every_ms=8 * H, spec_digest=DIGEST,
                         portfolio=PF.PortfolioPolicy(max_wait_ms=3 * H, style="MAKER_FIRST"))
-    pr = MP.run(root, universe_dir=uni, spot_dir=spot, mark_interval=TCR.MARK_IV, spec=SPEC, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c, artifacts_dir=str(tmp_path / "hist_art"), competition_row=PROMOTED_ROW)
+    import history_holdout as HH
+    # This proof is about the LOADER's labelling, not the holdout (test_history_holdout.py / test_ms_pipeline_cli.py prove the guarded path): the explicit, stamped sentinel reads the whole window.
+    loaded = MP.verify_inputs(root, universe_dir=uni, spot_dir=spot, mark_interval=TCR.MARK_IV, holdout_ledger=HH.UNGUARDED)       # the ONLY way a history root enters the pipeline (the CLI does the same with the registry)
+    pr = MP.run(loaded, spec=SPEC, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c, artifacts_dir=str(tmp_path / "hist_art"), competition_row=PROMOTED_ROW)
     assert pr.data_label == "VERIFIED_HISTORY_ROOT" and art(pr, "replay_report.json")["data_label"] == "VERIFIED_HISTORY_ROOT"
+    assert "NOT_GUARDED" in json.dumps(pr.summary["data_parts"]), f"the whole-window read must say so in the run's own identity: {pr.summary['data_parts']}"
     assert art(pr, "replay_report.json")["universe_scope"] == "DELISTINGS_OBSERVED"          # what the loader reported (its Closed partition served rows) ...
     assert cc_state(pr)["execution"]["survivorship"]["survivorship_free"] is False           # ... is still not believed without a verified universe capture beside it in the control centre
     items = {tuple(i["symbols"]): i for i in art(pr, "opportunities.json")["items"]}
@@ -1040,7 +1044,11 @@ def test_a_verified_history_root_goes_through_the_loader_and_is_labelled_not_inj
     assert pr.policy["allowed_symbols"] == sorted(pr.policy["allowed_symbols"]) and "*" not in pr.policy["allowed_symbols"]
     check_consistent(pr)
     with pytest.raises(MP.PipelineRefused, match="HISTORY_REFUSED"):
-        MP.run(root, universe_dir=str(tmp_path / "nowhere"), mark_interval=TCR.MARK_IV, spec=SPEC, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c, artifacts_dir=str(tmp_path / "h2"))
+        MP.verify_inputs(root, universe_dir=str(tmp_path / "nowhere"), spot_dir=None, mark_interval=TCR.MARK_IV, holdout_ledger=HH.UNGUARDED)
+    with pytest.raises(MP.PipelineRefused, match="HOLDOUT_LEDGER_REQUIRED"):                    # a history root handed straight to run() has no registry argument: refused outright, a missing argument is never an opt-out
+        MP.run(root, universe_dir=uni, spot_dir=spot, mark_interval=TCR.MARK_IV, spec=SPEC, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c, artifacts_dir=str(tmp_path / "h3"))
+    with pytest.raises(MP.PipelineRefused, match="HOLDOUT_LEDGER_REQUIRED"):
+        MP.verify_inputs(root, universe_dir=uni, spot_dir=spot, mark_interval=TCR.MARK_IV)
 
 
 # ================================================================================================ MUTATIONS: each break must make the matching proof fail
