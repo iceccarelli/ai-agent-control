@@ -1,0 +1,105 @@
+{
+  "schema": "proxy_study_protocol/v1",
+  "id": "binance_archive_carry_v1",
+  "label": "PROXY_RESEARCH_ONLY",
+  "registered": {
+    "date_utc": "2026-11-12",
+    "state": "BEFORE_ANY_STRATEGY_RETURN_WAS_COMPUTED",
+    "inspected_before_registration": "file formats only (one BTCUSDT month of each dataset) and the list of symbol directories in the public archive; no funding, price or volume figure of any other symbol or month was read",
+    "reviewers": "two independent read-only reviews preceded this registration (the data contract and guards of the existing evaluators; a quantitative critique of the design). Their findings are built in: carry is the only family that can be decided; both a favourable and an adverse bound; delisting, jitter, duplicate-exposure and funding-interval guards; the reserved months are not downloaded until the one final read."
+  },
+  "question": "Does a spot-hedged funding-carry book, selected by trailing funding among LIQUID Binance USD-M USDT perpetuals that have a Binance spot pair, earn a positive excess over cash on the capital it commits, after Bybit-style taker costs, in the explore window of the public archive? The answer is evidence about the MECHANISM on the deepest venue. It is not evidence about Bybit alts, about owner dollars or about capacity.",
+  "data": {
+    "source": "https://data.binance.vision (public static archive, read-only GET; no credential, no account, no order path)",
+    "datasets": {
+      "fundingRate": "data/futures/um/monthly/fundingRate/<SYMBOL>/<SYMBOL>-fundingRate-<YYYY>-<MM>.zip (calc_time, funding_interval_hours, last_funding_rate)",
+      "klines_1d": "data/futures/um/monthly/klines/<SYMBOL>/1d/ (volume and quote_volume: the point-in-time liquidity rank and the listing day)",
+      "markPriceKlines_1d": "data/futures/um/monthly/markPriceKlines/<SYMBOL>/1d/ (aliveness and the perp leg of the basis)",
+      "indexPriceKlines_1d": "data/futures/um/monthly/indexPriceKlines/<SYMBOL>/1d/ (the spot proxy of the basis)",
+      "spot_klines_1d": "data/spot/monthly/klines/<SPOT SYMBOL>/1d/ (only the first month that exists: the hedge's listing month)"
+    },
+    "verification": "every downloaded zip must equal the sha256 in its own .CHECKSUM file; the extracted CSV must have the documented columns, strictly increasing times, finite positive prices and no duplicate rows; anything else is a counted reject, never repaired",
+    "integrity_limit": "the .CHECKSUM is served from the same origin: it proves the download is intact, not that the publisher is right"
+  },
+  "window": {
+    "start_utc": "2020-01-01",
+    "cut_utc": "2024-10-01",
+    "end_utc": "2026-11-01",
+    "explore_months": "2020-01 to 2024-09",
+    "reserved_months": "2024-10 to 2026-10",
+    "reserved_rule": "the reserved months are NOT downloaded and NOT read until the one final read of a frozen pick; an explore row's holding window must end at or before the cut",
+    "arithmetic": "explore 1,735 days (69.5% of the 2,496-day window), about 242 weekly rows after the 37-day warm-up; reserved 761 days, 108 weekly rows"
+  },
+  "universe": {
+    "perp": "USD-M perpetual quoted in USDT with monthly funding files; the stablecoin bases USDC, BUSD, TUSD, FDUSD, USDP, DAI and USDE are excluded",
+    "hedge": "a Binance spot <BASE>USDT pair whose first monthly file is strictly before the month of the decision; a 1000x or 1M perp base is matched to its spot base by stripping the multiplier prefix (the exact symbol is tried first); no spot pair means not hedgeable, which also excludes index, equity, commodity and pre-listing perpetuals",
+    "listing_age": "launch = the later of the perp's first kline day and the spot pair's first month; at least 30 days before the decision",
+    "liquidity": "at decision time t: median daily quote volume of the perp over the 30 complete days before t is at least 20,000,000 USDT, and the symbol ranks in the top 60 by that median among the symbols that pass every other rule",
+    "one_symbol_per_base": "if several symbols map to one base the one with the higher trailing median volume is kept",
+    "alive": "the three complete days before t have positive volume; a contract is DELIVERED at its last funding print (not at its last kline: a halted contract's marks can stay frozen for a year)",
+    "point_in_time": "every rule uses data from complete days before t only; a month file is never used for a day it does not yet contain"
+  },
+  "data_quality_rules": {
+    "funding_time_grid": "calc_time is snapped to the nearest multiple of the print's stated interval when it is within 1 s of it; a print farther off is dropped and counted",
+    "funding_interval": "taken from the per-print column and checked against the spacing of consecutive snapped prints; a stretch where they disagree is a counted reject for that symbol-month; segments of equal interval build the per-print normalisation",
+    "marks": "daily mark and index closes, observed at the close of their day; an aliveness test uses volume from klines, not the mark",
+    "base_map": "stripping a leading 1000000, 1000 or 1M multiplier; ambiguous maps are rejected, not guessed"
+  },
+  "families": {
+    "confirmatory": [
+      "SPOT_PERP_CARRY"
+    ],
+    "not_run": {
+      "PERP_FUNDING_SPREAD": "its price leg (weekly sd of the order of hundreds of bps) swamps tens of bps of funding: at about 100 independent rows the detectable effect is above any plausible hurdle, so a result could not be decided; it stays untested and is reported as such",
+      "PERP_DIRECTIONAL_FUNDING": "the same reason, and an unhedged short perp is not carry"
+    }
+  },
+  "grid": {
+    "formation_days": [
+      7,
+      14,
+      30
+    ],
+    "top_k": [
+      1,
+      3
+    ],
+    "hold_days": 7,
+    "min_listing_age_days": 30,
+    "rows": "the repository's own row builder (candidate_readiness.run_family_variant) on the fixed non-overlapping weekly grid, one row per week, per-slot universe as above",
+    "selection": "walk-forward: research_harness.walk_forward_folds(train_min=max(20, n//2), test_len=max(5, n//10), label_horizon=1, embargo=1); each fold picks the variant with the best TRAIN mean of the bound's own excess series (research_harness.train_only_best); the pooled out-of-sample series is the statistic"
+  },
+  "bounds": {
+    "why": "the repository charges every weekly row a full round trip although the same names are often held on, and its cash series starts late: a verdict on one set of assumptions would be fragile in either direction. Two bounds are fixed in advance and neither is tuned.",
+    "ADVERSE": {
+      "cost": "the repository's carry taker round trip (carry_costs authoritative figure, fee VENUE_STATED plus spread ASSUMED) charged in full every week, plus a slippage add-on per leg by trailing median volume: +2 bps at >= 200M USDT, +6 bps at 50M to 200M, +15 bps at 20M to 50M",
+      "capital": "per unit of gross notional: the live plan's own definition at leverage 1 (economic_model.hedged_pair_capital_usd): 2.04",
+      "cash": "the repository's hourly OKX USDT lending series; before the series begins its mean over its first 90 days, flat; the exact rate and window are reported"
+    },
+    "FAVOURABLE": {
+      "cost": "the carry taker FEE only (no spread, no slippage), charged only on turnover: half a round trip for every leg that enters the book and half for every leg that leaves it (a name held in consecutive weeks is not re-traded; the last week exits everything)",
+      "capital": "leverage 5 on the perp margin: 1.224 per unit of gross notional (economic_model.hedged_pair_capital_usd at leverage 5)",
+      "cash": "the same series; zero before it begins"
+    },
+    "common": "both bounds use the same funding prints, the same universe, the same rows and the same MEASURED basis P&L per week (short perp, long spot: minus the change of (mark - index) / index between entry and exit, from the daily closes; zero and flagged when a leg is delivered inside the hold); the Binance basis understates Bybit's by about 17 to 24% (BTC, measured by the reviewer), which is stated as a limit and not corrected"
+  },
+  "statistic": "excess_bps_of_capital per weekly row = (funding - cost + basis P&L, in bps of gross notional) / capital - cash over the hold, in bps of CAPITAL. Every row has a cash figure by construction (each bound states how the series is extended before its start); rows that lie before the series begins are counted and flagged 'cash extended', and the survivor test (a) uses only rows the series itself covers",
+  "multiple_testing": {
+    "family": "proxy.binance_archive_carry_v1",
+    "counted": "6 variants (3 formation x 2 top_k) x 2 bounds = 12 series, each recorded once in a persistent ledger kept in a throwaway directory (never under the owner's home); Holm over the ledger's total at the time of the run; a re-run of the same series is the same trial"
+  },
+  "decision_rules": {
+    "NO_WINNER": "the FAVOURABLE bound's pooled out-of-sample mean excess has its widest 90% interval (research_harness.significance ci) with an upper end at or below zero. The direction is closed for this venue's liquid names and no Bybit data capture is justified for carry on this ground.",
+    "SURVIVOR_AS_HYPOTHESIS_ONLY": "ALL of: (a) ADVERSE bound, cash-covered rows only: pooled out-of-sample mean excess > 0, Holm-adjusted one-sided p <= 0.05 and the widest 90% interval's lower end > 0; (b) the mean excess is positive in at least 2 of the 3 calendar years 2022, 2023 and 2024 (to September); (c) dropping the 3 best weeks leaves the mean > 0; (d) no single symbol contributes more than 25% of the summed out-of-sample P&L; (e) the one final read of the reserved months with the frozen last-fold pick under the ADVERSE bound has a mean excess > 0. A survivor is a hypothesis to be re-tested on Bybit's own data under Bybit's own holdout; it is not a winner and not an owner-dollar figure.",
+    "INCONCLUSIVE": "everything else: the edge is neither excluded under the most favourable assumptions nor demonstrated under the adverse ones; what decides it is the realised turnover and execution cost, which this data cannot measure",
+    "power_statement": "the out-of-sample series is serially dependent (BTC weekly funding has an effective sample size of roughly one in nine of its rows); the report states the effective number of independent observations and never calls a short series decisive"
+  },
+  "descriptives_not_decisions": "per year: the mean forward weekly funding of the selected names against the break-even funding of each bound; the persistence of trailing-top-k funding; turnover; the share of weeks whose selection clears each bound's hurdle; the symbols and their share of P&L; median daily quote volume of the legs. Descriptive tables carry no verdict.",
+  "forbidden_claims": [
+    "any Bybit funding, price, fee tier or capacity figure derived from this data",
+    "any owner-dollar or annualised-return figure presented as achievable",
+    "'winner', 'edge', 'profitable' or 'survivorship-free'",
+    "using a result of this study to select, rank or tune anything on the owner's holdout registry or on Bybit data"
+  ],
+  "changes": "this file is frozen when the first strategy return is computed from it. Any change afterwards is a new protocol id, a new count of trials and a new report; the digest of this file (sha256 of its canonical JSON) is printed in every result."
+}
