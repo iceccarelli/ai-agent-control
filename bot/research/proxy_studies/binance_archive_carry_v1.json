@@ -43,7 +43,9 @@
     "funding_time_grid": "calc_time is snapped to the nearest multiple of the print's stated interval when it is within 1 s of it; a print farther off is dropped and counted",
     "funding_interval": "taken from the per-print column and checked against the spacing of consecutive snapped prints; a stretch where they disagree is a counted reject for that symbol-month; segments of equal interval build the per-print normalisation",
     "marks": "daily mark and index closes, observed at the close of their day; an aliveness test uses volume from klines, not the mark",
-    "base_map": "stripping a leading 1000000, 1000 or 1M multiplier; ambiguous maps are rejected, not guessed"
+    "base_map": "stripping a leading 1000000, 1000 or 1M multiplier; ambiguous maps are rejected, not guessed",
+    "funding_holes": "a symbol is not eligible for a week when its snapped funding prints have a hole (a gap longer than 1.5 intervals) anywhere in the 30 days before the decision or inside the hold (a hold cut short by delivery is not a hole); the same universe applies to every formation window, so the variants of a week are comparable",
+    "stale_basis": "a leg whose mark or index close is older than two days at entry or exit, or that is delivered inside the hold, has an UNMEASURED basis: its basis P&L is zero and the leg is counted and reported"
   },
   "families": {
     "confirmatory": [
@@ -101,5 +103,81 @@
     "'winner', 'edge', 'profitable' or 'survivorship-free'",
     "using a result of this study to select, rank or tune anything on the owner's holdout registry or on Bybit data"
   ],
-  "changes": "this file is frozen when the first strategy return is computed from it. Any change afterwards is a new protocol id, a new count of trials and a new report; the digest of this file (sha256 of its canonical JSON) is printed in every result."
+  "changes": "this file is frozen when the first strategy return is computed from it. Any change afterwards is a new protocol id, a new count of trials and a new report; the digest of this file (sha256 of its canonical JSON) is printed in every result.",
+  "parameters": {
+    "note": "machine-readable copy of the numbers in the prose above (the runner reads these and nothing else); added before any strategy return was computed; no number differs from the prose",
+    "window_start_utc": "2020-01-01",
+    "cut_utc": "2024-10-01",
+    "last_explore_month": "2024-09",
+    "hold_days": 7,
+    "formation_days": [
+      7,
+      14,
+      30
+    ],
+    "top_k": [
+      1,
+      3
+    ],
+    "min_listing_age_days": 30,
+    "median_volume_days": 30,
+    "min_median_days_present": 28,
+    "min_median_quote_volume_usdt": 20000000,
+    "top_n_by_median_volume": 60,
+    "alive_days": 3,
+    "delivered_if_funding_ends_more_than_days_before_cut": 3,
+    "funding_snap_tolerance_ms": 1000,
+    "hole_intervals": 1.5,
+    "stale_mark_days": 2,
+    "stable_bases": [
+      "USDC",
+      "BUSD",
+      "TUSD",
+      "FDUSD",
+      "USDP",
+      "DAI",
+      "USDE"
+    ],
+    "multiplier_prefixes": [
+      "1000000",
+      "1000",
+      "1M"
+    ],
+    "adverse": {
+      "leverage": 1,
+      "cost": "FULL_TAKER_ROUND_TRIP_EVERY_WEEK_PLUS_SLIPPAGE",
+      "extra_slippage_bps_by_median_volume": [
+        [
+          200000000,
+          2
+        ],
+        [
+          50000000,
+          6
+        ],
+        [
+          20000000,
+          15
+        ]
+      ],
+      "cash_before_series": "MEAN_OF_FIRST_90_DAYS"
+    },
+    "favourable": {
+      "leverage": 5,
+      "cost": "TAKER_FEE_ONLY_ON_TURNOVER",
+      "cash_before_series": "ZERO"
+    },
+    "decision": {
+      "alpha": 0.05,
+      "ci_alpha_two_sided": 0.1,
+      "survivor_years": [
+        2022,
+        2023,
+        2024
+      ],
+      "survivor_min_positive_years": 2,
+      "drop_best_weeks": 3,
+      "max_symbol_share": 0.25
+    }
+  }
 }
