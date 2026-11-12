@@ -25,11 +25,27 @@ T0 = 1_700_000_000_000
 
 
 def cyc(j, d0, d1, *, funding, close=100_000.0, tag, fee_status="confirmed",
-        basis="venue", mark=None):
+        basis="venue", mark=None, inventory_mark=True):
+    """A perp-only (overlay) cycle. By default the client's BTC is booked and
+    marked FLAT (a verified, zero-move revaluation), so the perp's move
+    `close - 100_000` is a real BASIS loss/gain of the measured hedged pair and
+    the pair net equals the booked net. That is what lets these fixtures keep
+    exercising the verdict thresholds: an overlay with NO inventory leg booked
+    is the net of an unhedged short, whose verdict is not a profit or loss
+    claim (tests/test_net_economics_pair.py)."""
     L.perp_open(j, ms=T0 + d0 * DAY, ref=f"{tag}-o", qty=1.0, price=100_000.0,
                 fee_usd=55.0, fee_status=fee_status, decision_mark=mark)
     L.funding(j, ms=T0 + ((d0 + d1) // 2) * DAY, ref=f"{tag}-f", usd=funding,
               basis=basis, raw=(_vraw(f"{tag}-f", T0 + ((d0 + d1) // 2) * DAY, funding) if basis == "venue" else None))
+    if inventory_mark:
+        L.revalue_inventory(
+            j, ms=T0 + d1 * DAY - 1, ref=f"{tag}-rv", qty=1.0,
+            from_price=100_000.0, to_price=100_000.0,
+            raw={"valuation": L.MARK_VALUATION, "qty": 1.0,
+                 "entry_spot": 100_000.0, "exit_spot": 100_000.0,
+                 "exit_mark_source": "tick_spot_mark",
+                 "exit_mark_observed_ms": T0 + d1 * DAY - 1,
+                 "fill_ms": T0 + d1 * DAY})
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=1.0, price=close,
                  entry_price=100_000.0, fee_usd=55.0, fee_status=fee_status,
                  decision_mark=mark)

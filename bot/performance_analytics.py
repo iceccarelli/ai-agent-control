@@ -433,13 +433,19 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
                        "cycle")
         return out
     # The overlay's increment: what the hedge (short perp, its funding and its
-    # costs) added, with any inventory revaluation taken back out so the BTC
-    # leg is not counted twice.
-    increment = net - reval
+    # costs) added. The cycle's booked `net_usd` is CASH and ALREADY EXCLUDES
+    # every inventory revaluation entry (carry_performance.cycles_from_journal
+    # accumulates a revaluation apart, as `revalue_usd`, never into the
+    # realised figure), so the increment is `net` itself. Subtracting `reval`
+    # here took the BTC mark out of a figure that never held it: the hedged
+    # pair read `reval` too low and the unhedged comparison `reval` too far
+    # below, by exactly the inventory move.
+    increment = net
     out["overlay_increment_usd"] = increment
+    out["inventory_revaluation_usd"] = reval
     out["overlay_increment_basis"] = (
-        "booked cycle net (funding - fees - financing + realised price legs) "
-        "minus any inventory revaluation entries")
+        "booked cycle net (funding - fees - financing + realised price legs); "
+        "CASH, it holds no inventory revaluation entry")
     if incomplete:
         out["overlay_increment_incomplete"] = incomplete
         out["overlay_increment_note"] = (
