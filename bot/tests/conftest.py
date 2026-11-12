@@ -110,6 +110,9 @@ def _isolated_capital_anchor(tmp_path_factory, monkeypatch):
     """The capital lineage lives OUTSIDE --root (ms_capital_anchor), at $CAPITAL_ANCHOR_DIR or ~/.ai-agent-control/capital_anchor. A test must never read or write the developer's real one, and two tests must
     never share an account's lineage: every test gets its own directory."""
     monkeypatch.setenv("CAPITAL_ANCHOR_DIR", str(tmp_path_factory.mktemp("capital_anchor")))
+    # the SESSION-wide directories set at import are the safety net for module-scoped fixtures and subprocesses; a TEST gets its own candidate-ledger directory so that one test's research ledgers can never make
+    # another test's reservation look like it follows an earlier evaluation (PRIOR_EVALUATION_DETECTED)
+    monkeypatch.setenv("CANDIDATE_LEDGER_DIR", str(tmp_path_factory.mktemp("candidate_ledgers")))
     monkeypatch.delenv("CAPITAL_WITNESS", raising=False)
     monkeypatch.delenv("CAPITAL_WITNESS_REQUIRED", raising=False)
     yield

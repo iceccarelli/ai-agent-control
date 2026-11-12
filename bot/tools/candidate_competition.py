@@ -30,6 +30,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import candidate_readiness as CR  # noqa: E402
+import cash_basis as CB  # noqa: E402
 import opportunity_map as OM  # noqa: E402
 import research_harness as RH  # noqa: E402
 
@@ -176,7 +177,7 @@ def btc_multiple_testing(econ: Optional[Mapping[str, Any]], ldir: str) -> Dict[s
 
 # ---------------------------------------------------------------- cross-sectional
 def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], ldir: str, *, spot_dir: Optional[str], mark_interval: Optional[str], history_root: Optional[str],
-                        unreserved_exploratory: bool = False, holdout_registry: Any = None) -> Dict[str, Any]:
+                        unreserved_exploratory: bool = False, holdout_registry: Any = None, cash_bases: Sequence[Any] = ()) -> Dict[str, Any]:
     """The cross-sectional evaluation or the loud reason it did not run. Never raises on missing/failed data. The load is CUT at the reserved-holdout boundary and refused (HOLDOUT_NOT_RESERVED,
     with the exact command) when nothing is reserved in the per-user registry (``holdout_registry``, default ``history_holdout.default_registry_path()``; ``ldir`` only holds the
     multiple-testing ledgers), unless ``unreserved_exploratory`` (stamped NOT_A_HOLDOUT_STUDY, recorded, and the time it read is burned)."""
@@ -189,7 +190,7 @@ def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], l
     try:
         out = CR.evaluate_cross_sectional(root, universe_dir=universe_dir, ledger_path=_path("cross_sectional_funding", ldir), spot_dir=spot_dir, mark_interval=mark_interval,
                                           holdout_ledger=HH.default_registry_path() if holdout_registry is None else holdout_registry, unreserved_exploratory=unreserved_exploratory,
-                                          reader="candidate_competition")
+                                          reader="candidate_competition", cash_bases=cash_bases)
     except RH.HarnessError as exc:
         return {"status": "REFUSED", "reason": str(exc)[:600]}
     return {"status": "EVALUATED", "evaluation": out}
@@ -204,6 +205,7 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     verdicts = []
     best = None
     fam_out: Dict[str, Any] = {}
+    excess_by_basis: Dict[str, List[float]] = {}
     for k, f in fams.items():
         verdicts.append(f["verdict"])
         oos = f.get("oos_mean_total_bps_per_row") if f.get("status") == "WALK_FORWARD_DONE" else None
@@ -217,7 +219,13 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
                       "p_adjusted": f.get("p_adjusted"), "n_variants_counted": f.get("n_variants_counted"), "survivorship": f.get("survivorship"), "reason": f.get("reason"),
                       "rejected_early": f.get("reject_early") is not None, "oos_independent_observations": f.get("oos_independent_observations"),
                       "oos_beta_to_market": (f.get("oos_book_analytics") or {}).get("beta_to_market"),
-                      "oos_max_drawdown_bps": (f.get("oos_book_analytics") or {}).get("max_drawdown_bps")}
+                      "oos_max_drawdown_bps": (f.get("oos_book_analytics") or {}).get("max_drawdown_bps"),
+                      "vs_cash": {lbl: {k2: b.get(k2) for k2 in ("verdict", "status", "rows", "rows_without_cash", "capital_per_gross_notional", "oos_mean_excess_bps_of_capital_per_row", "p_adjusted",
+                                                                 "oos_mean_cash_hurdle_bps_of_gross_per_row", "oos_independent_observations", "reason")} for lbl, b in (f.get("vs_cash") or {}).items()}}
+        for lbl, b in (f.get("vs_cash") or {}).items():
+            x = b.get("oos_mean_excess_bps_of_capital_per_row")
+            if x is not None:
+                excess_by_basis.setdefault(lbl, []).append(x)
         if oos is not None and (best is None or oos > best):
             best = oos
         if f.get("reason"):
@@ -231,7 +239,16 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     if isinstance(ho, Mapping) and ho.get("status") != "RESERVED":
         reasons.insert(0, f"HOLDOUT {ho.get('status')}: {ho.get('label')}")           # an exploratory read must be the first thing a reader of this row sees
     verdict = "REJECTED" if verdicts and all(v == "REJECTED" for v in verdicts) else "INSUFFICIENT_DATA"
-    return {"verdict": verdict, "net_edge": best, "reasons": reasons, "families": fam_out, "evaluation": ev, "survivorship": ev.get("survivorship"), "holdout": dict(ho) if isinstance(ho, Mapping) else None}
+    net_edge, basis = best, "NOMINAL_BPS_OF_GROSS_NOTIONAL (no cash alternative was applied: this is NOT a comparison with cash)"
+    if excess_by_basis:
+        # With a cash source applied the headline is the EXCESS over cash on the capital committed, and it is the CONSERVATIVE one: the lowest, over the sources applied, of each source's best family. A figure that
+        # ignores the cash the book displaces is never the headline when the cash is known (the nominal figure stays in every family row).
+        net_edge = min(max(v) for v in excess_by_basis.values())
+        basis = "EXCESS_OVER_CASH_BPS_OF_CAPITAL_PER_ROW (lowest over the cash sources applied: " + ", ".join(sorted(excess_by_basis)) + ")"
+        if best is not None and best > 0 and net_edge <= 0:
+            reasons.append(f"VS_CASH: the nominal out-of-sample mean is +{best:.1f} bps of gross notional per row but the excess over cash on the capital committed is {net_edge:+.1f} bps of capital per row")
+    return {"verdict": verdict, "net_edge": net_edge, "net_edge_basis": basis, "reasons": reasons, "families": fam_out, "evaluation": ev, "survivorship": ev.get("survivorship"),
+            "holdout": dict(ho) if isinstance(ho, Mapping) else None}
 
 
 # ---------------------------------------------------------------- the competition
@@ -247,12 +264,12 @@ def _tier(row: Mapping[str, Any]) -> int:
 
 def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[str] = None, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None,
                     ledger_dir: Optional[str] = None, history_root: Optional[str] = None, with_economics: bool = True, unreserved_exploratory: bool = False,
-                    holdout_registry: Any = None) -> Dict[str, Any]:
+                    holdout_registry: Any = None, cash_bases: Sequence[Any] = ()) -> Dict[str, Any]:
     """Run the competition. Deterministic for fixed inputs (no clock). The ledger is persistent by default (``default_ledger_dir``)."""
     ldir = default_ledger_dir(data_root or history_root, ledger_dir)
     base = CR.build_report(data_root=data_root or history_root, universe_dir=universe_dir, with_economics=with_economics)
     xs = _xs_summary(run_cross_sectional(data_root, universe_dir, ldir, spot_dir=spot_dir, mark_interval=mark_interval, history_root=history_root, unreserved_exploratory=unreserved_exploratory,
-                                           holdout_registry=holdout_registry))
+                                           holdout_registry=holdout_registry, cash_bases=cash_bases))
     evals = {"cross_sectional_funding": xs["evaluation"]["families"].get("PERP_FUNDING_SPREAD")} if xs["evaluation"] else None
     if evals and evals["cross_sectional_funding"] is not None:
         base = CR.build_report(data_root=data_root or history_root, universe_dir=universe_dir, with_economics=with_economics, evaluations=evals)
@@ -387,9 +404,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--unreserved-exploratory", action="store_true",
                     help="evaluate the cross-sectional rows WITHOUT a reserved holdout: the whole window is read, the result is stamped NOT_A_HOLDOUT_STUDY and the dataset can never be reserved "
                          "afterwards (default: refuse until `tools/history_holdout.py --reserve` has been run)")
+    ap.add_argument("--no-historical-cash", action="store_true", help="do NOT compare the cross-sectional rows with the repository's historical cash series (OKX USDT lending): the result is then bps of gross notional "
+                    "with no cash alternative applied, and says so")
+    ap.add_argument("--owner-cash-apr", default=None, help="YOUR stated cost of capital as a plain decimal fraction per year (0.04 = 4%%): a separate cash source, never substituted for the historical series")
+    ap.add_argument("--owner-cash-source", default=None, help="where that figure comes from (free text)")
+    ap.add_argument("--owner-cash-stated-utc", default=None, help="the UTC date you stated it (YYYY-MM-DD); a statement older than the gate's freshness limit is refused")
     a = ap.parse_args(argv)
+    import time as _t
+    import ms_edge_gate as EG
+    bases: List[Any] = []
+    if not a.no_historical_cash:
+        hb = CB.historical_basis(BOT)
+        if hb is not None:
+            bases.append(hb)
+        else:
+            print("NOTE: the repository's cash series is unreadable: no cash alternative is applied (UNKNOWN, never zero)")
+    if any(x is not None for x in (a.owner_cash_apr, a.owner_cash_source, a.owner_cash_stated_utc)):
+        stmt = {k: v for k, v in ((EG.ENV_CASH_APR, a.owner_cash_apr), (EG.ENV_CASH_SOURCE, a.owner_cash_source), (EG.ENV_CASH_STATED_UTC, a.owner_cash_stated_utc)) if v is not None}
+        ob, info = CB.owner_basis(stmt, int(_t.time() * 1000))
+        if ob is None:
+            print(f"NOTE: your cost-of-capital statement is not usable ({info.get('state')}: {'; '.join(info.get('problems') or [])}): no OWNER_STATED comparison was made, and the historical series was NOT substituted for it")
+        else:
+            bases.append(ob)
     rep = run_competition(data_root=a.data_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval, ledger_dir=a.ledger_dir, history_root=a.history_root,
-                          unreserved_exploratory=a.unreserved_exploratory)
+                          unreserved_exploratory=a.unreserved_exploratory, cash_bases=bases)
     print(render_table(rep))
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:

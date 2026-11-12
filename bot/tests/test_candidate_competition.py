@@ -191,7 +191,8 @@ def test_with_verified_data_and_a_universe_the_three_families_are_evaluated_and_
     assert rep["winner"] is None
 
 
-def test_the_ledger_is_persistent_by_default_a_fresh_process_keeps_the_count_and_an_identical_rerun_does_not_inflate_it(tmp_path):
+def test_the_ledger_is_persistent_by_default_a_fresh_process_keeps_the_count_and_an_identical_rerun_does_not_inflate_it(tmp_path, monkeypatch):
+    monkeypatch.delenv("CANDIDATE_LEDGER_DIR", raising=False)         # the suite isolates the variable for the whole session; this test is about the DEFAULT resolution without it
     _reset()
     a = CC_.run_competition(ledger_dir=str(tmp_path))
     n1 = row(a, "cash_and_carry")["multiple_testing"]["n_variants_counted"]

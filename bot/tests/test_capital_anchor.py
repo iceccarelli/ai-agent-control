@@ -1001,3 +1001,40 @@ def test_the_capital_command_prints_the_anchor_and_the_cumulative_result(world, 
     rep = json.loads(capsys.readouterr().out)
     assert rc == 0 and rep["anchor"]["anchored"] is True and rep["anchor"]["account"] == ACCT and rep["anchor"]["witness"] == "NOT_CONFIGURED"
     assert D(rep["lifetime_cumulative_realised_usd"]) == D(rep["verified_realised_usd"]) and rep["lifetime_loss_stop_active"] is True and rep["epoch"] == 0
+
+
+# --------------------------------------------------------------------------------- the first-ever genesis is a race the lock must decide
+def test_two_owners_racing_the_first_genesis_produce_exactly_one_lineage(world):
+    results: list = []
+    start = threading.Barrier(2)
+
+    def go(root):
+        an = AN.Anchor(root, ACCT, "testnet", world.anchor)
+        book = CC.CapitalBook(root, an)
+        start.wait()
+        try:
+            book.initialise({"racer": root})
+            results.append("OK")
+        except CC.BookRefused as exc:
+            results.append(exc.code)
+
+    ts = [threading.Thread(target=go, args=(world.root,)), threading.Thread(target=go, args=(world.root2,))]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert sorted(results) == ["GENESIS_REFUSED_LINEAGE_EXISTS", "OK"], results
+    entries = AN.Lineage(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"), ACCT, "testnet").read()
+    assert [e["kind"] for e in entries] == ["GENESIS"], "one GENESIS, whoever won"
+
+
+def test_the_loops_classification_of_anchor_refusals_incident_versus_owner_action_versus_transient():
+    """OWNER_AUTHORITY_REFUSALS is matched with startswith: an incident code must never be classified as 'wait for the owner' (it would be retried quietly instead of alerting), and the three owner-action codes and two
+    transient ones must be."""
+    codes_owner = ("ACCOUNT_NOT_INITIALISED", "BOOK_UNANCHORED", "ACCOUNT_IDENTITY_UNAVAILABLE", "WITNESS_UNAVAILABLE", "LOCK_TIMEOUT")
+    incidents = ("ACCOUNT_MISMATCH", "VIEW_TAMPERED", "VIEW_UNBOUND", "ANCHOR_BEHIND_BOOK", "ANCHOR_CORRUPT", "ANCHOR_MISSING_BOOK_BOUND", "LOCAL_BEHIND_WITNESS", "LINEAGE_FORKED", "WITNESS_MISCONFIGURED",
+                 "BARE_WRITE_TO_BOUND_BOOK", "GENESIS_REFUSED_LINEAGE_EXISTS")
+    owner_side = lambda why: any(why.startswith(p) for p in AP.OWNER_AUTHORITY_REFUSALS)          # noqa: E731
+    for c in codes_owner:
+        assert owner_side("CAPITAL_ANCHOR_REFUSED:" + c), c
+    for c in incidents:
+        assert not owner_side("CAPITAL_ANCHOR_REFUSED:" + c), c
+    assert set(AP.NO_ALERT_ANCHOR_CODES) == set(codes_owner)
