@@ -142,6 +142,11 @@ def test_the_listing_url_is_the_s3_endpoint_with_a_prefix_inside_the_archive():
     "https://evil.example/data/x.zip",
     "https://data.binance.vision.evil.example/data/x.zip",
     "https://data.binance.vision@evil.example/data/x.zip",
+    "https://evil.data.binance.vision/data/x.zip",                # a host that merely ends with an allowed one
+    "https://xdata.binance.vision/data/x.zip",
+    "https://evil.s3-ap-northeast-1.amazonaws.com/data.binance.vision?prefix=data%2Ffutures%2Fum%2Fmonthly%2FfundingRate%2F",     # a suffix host that also copies the listing path
+    "https://xs3-ap-northeast-1.amazonaws.com/data.binance.vision?prefix=data%2Ffutures%2Fum%2Fmonthly%2FfundingRate%2F",
+    "https://data.binance.vision.",
     "https://api.bybit.com/v5/market/time",                       # never a venue API
     "https://fapi.binance.com/fapi/v1/time",
     "https://data.binance.vision/etc/passwd",                     # a path outside data/
@@ -641,3 +646,70 @@ def test_a_blocked_host_is_never_retried_as_if_it_were_a_network_blip(tmp_path):
     with pytest.raises(BA.ArchiveError) as e:
         archive(tmp_path, blocked).download_month("klines", "BTCUSDT", "1d", "2024-01")
     assert e.value.code == "HOST_NOT_ALLOWED" and len(calls) == 1
+
+
+def test_a_trailing_newline_never_passes_a_validator():
+    for args in (("fundingRate", "BTCUSDT\n", None, "2024-01"), ("fundingRate", "BTCUSDT", None, "2024-01\n")):
+        with pytest.raises(BA.ArchiveError) as e:
+            BA.data_path(*args)
+        assert e.value.code == "BAD_ARGUMENT"
+    with pytest.raises(BA.ArchiveError):
+        BA.listing_url("data/futures/um/monthly/fundingRate/\n")
+    with pytest.raises(BA.ArchiveError) as e:
+        BA.parse_checksum(("a" * 64 + "\n  x.zip\n").encode())                          # the hash and the name on different lines
+    assert e.value.code == "CHECKSUM_MALFORMED"
+
+
+def test_the_user_agent_is_generic_and_is_what_a_request_actually_sends(monkeypatch):
+    assert "ai-agent" not in BA.USER_AGENT.lower() and "control" not in BA.USER_AGENT.lower() and "@" not in BA.USER_AGENT
+    sent = {}
+
+    class Resp:
+        status = 200
+
+        def read(self, n):
+            return b"x"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class Opener:
+        def open(self, req, timeout):
+            sent.update({k.lower(): v for k, v in req.header_items()})
+            sent["method"] = req.get_method()
+            return Resp()
+    monkeypatch.setattr(BA.urllib.request, "build_opener", lambda *a, **k: Opener())
+    assert BA.http_fetch("https://data.binance.vision/data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip") == (200, b"x")
+    assert sent["user-agent"] == BA.USER_AGENT and sent["method"] == "GET" and set(sent) <= {"user-agent", "accept", "method"}
+
+
+def test_one_refusal_stops_every_later_request_of_the_run_but_not_what_is_already_on_disk(tmp_path):
+    net = FakeNet()
+    net.add_month("klines", "BTCUSDT", "1d", "2024-01", GOOD_KLINES)
+    net.add(BA.data_url("klines", "ETHUSDT", "1d", "2024-01"), b"", status=451)
+    a = archive(tmp_path, net)
+    assert a.download_month("klines", "BTCUSDT", "1d", "2024-01")["status"] == "OK"
+    with pytest.raises(BA.ArchiveError) as e:
+        a.download_month("klines", "ETHUSDT", "1d", "2024-01")
+    assert e.value.code == "REFUSED_BY_ARCHIVE"
+    n = len(net.calls)
+    with pytest.raises(BA.ArchiveError) as e2:
+        a.download_month("klines", "SOLUSDT", "1d", "2024-01")                            # a queued symbol: no request is sent
+    assert e2.value.code == "REFUSED_BY_ARCHIVE" and len(net.calls) == n
+    assert a.download_month("klines", "BTCUSDT", "1d", "2024-01")["status"] == "EXISTS"       # what is on disk is still served
+
+
+def test_a_symlink_planted_at_the_destination_is_replaced_and_never_followed(tmp_path):
+    net = FakeNet()
+    net.add_month("klines", "BTCUSDT", "1d", "2024-01", GOOD_KLINES)
+    a = archive(tmp_path, net)
+    target = a.file_path("klines", "BTCUSDT", "1d", "2024-01")
+    os.makedirs(os.path.dirname(target))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("precious")
+    os.symlink(str(outside), target)
+    assert a.download_month("klines", "BTCUSDT", "1d", "2024-01")["status"] == "OK"
+    assert outside.read_text() == "precious" and not os.path.islink(target) and os.path.isfile(target)

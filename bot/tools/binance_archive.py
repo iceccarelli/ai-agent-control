@@ -40,7 +40,7 @@ SCHEMA = "binance_archive_store/v1"
 HOST_FILES = "data.binance.vision"
 HOST_LISTING = "s3-ap-northeast-1.amazonaws.com"
 LISTING_PATH = "/" + HOST_FILES
-USER_AGENT = "ai-agent-control-research/1 (public data archive reader)"
+USER_AGENT = "research-archive-reader/1"           # generic on purpose: a request to an outside service carries no project or owner name
 MAX_ZIP_BYTES = 64 * 1024 * 1024               # a monthly file is a few MB at most
 MAX_CSV_BYTES = 32 * 1024 * 1024
 MAX_LISTING_BYTES = 8 * 1024 * 1024
@@ -85,14 +85,14 @@ def _dataset(dataset: Any) -> Tuple[str, bool, str]:
 
 def _check_parts(dataset: Any, symbol: Any, interval: Any, month: Any) -> Tuple[str, str, str, str]:
     market, needs_interval, dirname = _dataset(dataset)
-    if not isinstance(symbol, str) or not _SYMBOL.match(symbol):
+    if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
         raise ArchiveError("BAD_ARGUMENT", f"symbol {symbol!r} is not [A-Z0-9]{{2,24}}")
     if needs_interval:
         if interval not in INTERVALS:
             raise ArchiveError("BAD_ARGUMENT", f"interval {interval!r} is not one of {INTERVALS}")
     elif interval is not None:
         raise ArchiveError("BAD_ARGUMENT", f"{dataset} has no interval, got {interval!r}")
-    if not isinstance(month, str) or not _MONTH.match(month):
+    if not isinstance(month, str) or not _MONTH.fullmatch(month):
         raise ArchiveError("BAD_ARGUMENT", f"month {month!r} is not YYYY-MM")
     return market, dirname, symbol, month
 
@@ -111,7 +111,7 @@ def data_url(dataset: str, symbol: str, interval: Optional[str], month: str, ext
 
 
 def listing_url(prefix: str, marker: str = "", delimiter: bool = True) -> str:
-    if not isinstance(prefix, str) or not _PREFIX.match(prefix):
+    if not isinstance(prefix, str) or not _PREFIX.fullmatch(prefix):
         raise ArchiveError("BAD_ARGUMENT", f"listing prefix {prefix!r} is not a dataset, symbol or symbol/interval directory of the archive")
     if marker and (not isinstance(marker, str) or not marker.startswith(prefix) or ".." in marker or len(marker) > 400):
         raise ArchiveError("BAD_ARGUMENT", "listing marker is not inside the prefix")
@@ -214,7 +214,7 @@ def _int(x: str, what: str, line: int) -> int:
 
 def month_bounds_ms(month: str) -> Tuple[int, int]:
     """[start, end) of a UTC calendar month in ms."""
-    if not _MONTH.match(month):
+    if not _MONTH.fullmatch(month):
         raise ArchiveError("BAD_ARGUMENT", f"month {month!r} is not YYYY-MM")
     y, m = int(month[:4]), int(month[5:])
     ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
@@ -286,7 +286,7 @@ def parse_checksum(body: bytes) -> Tuple[str, str]:
     if len(rows) != 1:
         raise ArchiveError("CHECKSUM_MALFORMED", f"{len(rows)} lines, expected one")
     parts = rows[0].split()
-    if len(parts) != 2 or not _HEX64.match(parts[0]):
+    if len(parts) != 2 or not _HEX64.fullmatch(parts[0]):
         raise ArchiveError("CHECKSUM_MALFORMED", "expected '<64 hex>  <file name>'")
     return parts[0], parts[1].lstrip("*")
 
@@ -423,6 +423,7 @@ class Archive:
         self._throttle = Throttle(rps, max(1, int(rps)), monotonic, sleep)
         self._lock = threading.Lock()
         self._absent = self._load_absent() if root is not None else {}
+        self._refused: Optional[ArchiveError] = None                    # set by a 403/451: every later request of this object fails at once, so queued workers do not each knock again
 
     # ---- bookkeeping
     def _need_store(self) -> None:
@@ -461,6 +462,8 @@ class Archive:
 
     # ---- network with bounded retries
     def _get(self, url: str) -> Optional[bytes]:
+        if self._refused is not None:
+            raise self._refused
         attempt = 0
         while True:
             self._throttle.acquire()
@@ -477,7 +480,8 @@ class Archive:
             if status == 404:
                 return None
             if status in (403, 451):
-                raise ArchiveError("REFUSED_BY_ARCHIVE", f"HTTP {status} for {url.split('?')[0].rsplit('/', 1)[-1]}: a network or policy refusal; the run stops and does not retry, change host or change path")
+                self._refused = ArchiveError("REFUSED_BY_ARCHIVE", f"HTTP {status} for {url.split('?')[0].rsplit('/', 1)[-1]}: a network or policy refusal; the run stops and does not retry, change host or change path")
+                raise self._refused
             if (status == 429 or 500 <= status <= 599) and attempt < self._retries:
                 self._sleep(self._backoff * (2 ** attempt))
                 attempt += 1
@@ -510,7 +514,7 @@ class Archive:
         prefix = f"data/{market}/monthly/{dirname}/"
         prefixes, _ = self._list(prefix, True)
         out = {p[len(prefix):].rstrip("/") for p in prefixes if p.startswith(prefix)}
-        return sorted(s for s in out if _SYMBOL.match(s))
+        return sorted(s for s in out if _SYMBOL.fullmatch(s))
 
     def list_months(self, dataset: str, symbol: str, interval: Optional[str]) -> List[str]:
         market, dirname, _sym, _month = _check_parts(dataset, symbol, interval, "2020-01")
@@ -518,7 +522,7 @@ class Archive:
         _, keys = self._list(prefix, False)
         stem = f"{symbol}-{interval}-" if interval else f"{symbol}-{dirname}-"
         pat = re.compile("^" + re.escape(prefix + stem) + r"(\d{4}-(?:0[1-9]|1[0-2]))\.zip$")
-        return sorted({m.group(1) for k in keys for m in [pat.match(k)] if m})
+        return sorted({m.group(1) for k in keys for m in [pat.fullmatch(k)] if m})
 
     # ---- one month
     def _reject(self, code: str, message: str, dataset: str, symbol: str, interval: Optional[str], month: str, url: str) -> Dict[str, Any]:
@@ -568,14 +572,14 @@ class Archive:
 
     def download_range(self, dataset: str, symbol: str, interval: Optional[str], months: Sequence[str], *, until_month: Optional[str]) -> List[Dict[str, Any]]:
         """Download ``months`` up to and INCLUDING ``until_month``; later months are never requested. ``until_month`` is required."""
-        if not isinstance(until_month, str) or not _MONTH.match(until_month):
+        if not isinstance(until_month, str) or not _MONTH.fullmatch(until_month):
             raise ArchiveError("BAD_ARGUMENT", "until_month (YYYY-MM) is required: a download states where it stops")
         return [self.download_month(dataset, symbol, interval, m) for m in sorted(set(months)) if m <= until_month]
 
 
 # ---------------------------------------------------------------- command line
 def _months_between(first: str, last: str) -> List[str]:
-    if not (_MONTH.match(first) and _MONTH.match(last)):
+    if not (_MONTH.fullmatch(first) and _MONTH.fullmatch(last)):
         raise ArchiveError("BAD_ARGUMENT", "months are YYYY-MM")
     y, m = int(first[:4]), int(first[5:])
     out: List[str] = []

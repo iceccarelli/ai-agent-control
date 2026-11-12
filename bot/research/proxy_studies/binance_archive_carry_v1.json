@@ -6,7 +6,8 @@
     "date_utc": "2026-11-12",
     "state": "BEFORE_ANY_STRATEGY_RETURN_WAS_COMPUTED",
     "inspected_before_registration": "file formats only (one BTCUSDT month of each dataset) and the list of symbol directories in the public archive; no funding, price or volume figure of any other symbol or month was read",
-    "reviewers": "two independent read-only reviews preceded this registration (the data contract and guards of the existing evaluators; a quantitative critique of the design). Their findings are built in: carry is the only family that can be decided; both a favourable and an adverse bound; delisting, jitter, duplicate-exposure and funding-interval guards; the reserved months are not downloaded until the one final read."
+    "reviewers": "two independent read-only reviews preceded this registration (the data contract and guards of the existing evaluators; a quantitative critique of the design). Their findings are built in: carry is the only family that can be decided; both a favourable and an adverse bound; delisting, jitter, duplicate-exposure and funding-interval guards; the reserved months are not downloaded until the one final read.",
+    "note_on_amendments": "this file was amended once after its first registration commit, before any strategy return was computed; see 'amendments'. The runner pins the digest of the amended file."
   },
   "question": "Does a spot-hedged funding-carry book, selected by trailing funding among LIQUID Binance USD-M USDT perpetuals that have a Binance spot pair, earn a positive excess over cash on the capital it commits, after Bybit-style taker costs, in the explore window of the public archive? The answer is evidence about the MECHANISM on the deepest venue. It is not evidence about Bybit alts, about owner dollars or about capacity.",
   "data": {
@@ -32,20 +33,22 @@
   },
   "universe": {
     "perp": "USD-M perpetual quoted in USDT with monthly funding files; the stablecoin bases USDC, BUSD, TUSD, FDUSD, USDP, DAI and USDE are excluded",
-    "hedge": "a Binance spot <BASE>USDT pair whose first monthly file is strictly before the month of the decision; a 1000x or 1M perp base is matched to its spot base by stripping the multiplier prefix (1000000, 10000, 1000 or 1M) (the exact symbol is tried first); no spot pair means not hedgeable, which also excludes index, equity, commodity and pre-listing perpetuals",
+    "hedge": "a Binance spot <BASE>USDT pair whose first monthly file is strictly before the month of the decision and whose last listed month has not ended; a 1000x, 10000x or 1M perp base is matched to its spot base by stripping the multiplier prefix (the exact symbol is tried first); no spot pair means not hedgeable, which also excludes index, equity, commodity and pre-listing perpetuals",
     "listing_age": "launch = the later of the perp's first kline day and the spot pair's first month; at least 30 days before the decision",
-    "liquidity": "at decision time t: median daily quote volume of the perp over the 30 complete days before t is at least 20,000,000 USDT, and the symbol ranks in the top 60 by that median among the symbols that pass every other rule",
+    "liquidity": "at decision time t: median daily quote volume of the perp over the 30 complete days before t is at least 20,000,000 USDT, and the symbol ranks in the top 60 by that median among the symbols that pass every other rule; at least min_median_days_present (28) of those 30 days must exist",
     "one_symbol_per_base": "if several symbols map to one base the one with the higher trailing median volume is kept",
-    "alive": "the three complete days before t have positive volume; a contract is DELIVERED at its last funding print (not at its last kline: a halted contract's marks can stay frozen for a year)",
+    "alive": "each of the three complete days right before t exists in the volume klines and has positive volume (a file that stops earlier is not a live market); a contract is DELIVERED at its last funding print (not at its last kline: a halted contract's marks can stay frozen for a year)",
     "point_in_time": "every rule uses data from complete days before t only; a month file is never used for a day it does not yet contain"
   },
   "data_quality_rules": {
     "funding_time_grid": "calc_time is snapped to the nearest multiple of the print's stated interval when it is within 1 s of it; a print farther off is dropped and counted",
-    "funding_interval": "taken from the per-print column and checked against the spacing of consecutive snapped prints; a stretch where they disagree is a counted reject for that symbol-month; segments of equal interval build the per-print normalisation",
+    "funding_interval": "taken from the per-print column; a print more than 1 s off the grid of its own stated interval means the stated interval and the real spacing disagree: the print is dropped and counted, and the whole calendar month of it is treated as a hole for that symbol (so it is not eligible for any week whose 30-day window or decision touches that month); segments of equal interval build the per-print normalisation",
     "marks": "daily mark and index closes, observed at the close of their day; an aliveness test uses volume from klines, not the mark",
-    "base_map": "stripping a leading 1000000, 10000, 1000 or 1M multiplier; ambiguous maps are rejected, not guessed",
-    "funding_holes": "a symbol is not eligible for a week when its snapped funding prints have a hole (a gap longer than 1.5 intervals) anywhere in the 30 days before the decision or inside the hold (a hold cut short by delivery is not a hole); the same universe applies to every formation window, so the variants of a week are comparable",
-    "stale_basis": "a leg whose mark or index close is older than two days at entry or exit, or that is delivered inside the hold, has an UNMEASURED basis: its basis P&L is zero and the leg is counted and reported"
+    "funding_holes": "a symbol is not eligible for a week when its snapped funding prints have a hole (a gap longer than 1.5 intervals) anywhere in the 30 days up to and including the decision. Holes INSIDE the hold are not used to choose the universe (that would condition on the future): a hold with a hole simply earns the prints that exist (the missing ones count as zero, which is conservative for a positive-funding short) and the legs concerned are counted and reported",
+    "stale_basis": "a leg whose mark or index close is older than two days at entry or exit, or that is delivered inside the hold, has an UNMEASURED basis. Under the ADVERSE bound it is charged the WORST measured weekly basis P&L of any selected leg in the window (a stress, reported with its value and the count of legs); under the FAVOURABLE bound it is charged zero",
+    "base_map": "stripping a leading 1000000, 10000, 1000 or 1M multiplier, and only when the rest is at least two characters and starts with a letter; if several symbols map to one base the higher-volume one is kept",
+    "unpriced_terminal_exit": "a leg delivered inside its hold whose terminal exit the repository's builder cannot price (no mark within one day of delivery) is an unknown loss: it is counted and listed, and if any exists in any variant or week the verdict is INSUFFICIENT_DATA (the repository's own rule: neither a pass nor a rejection can be claimed)",
+    "completeness": "the aligned weekly rows must number at least 95% of the grid the window implies and the last row must lie within one hold of the grid's last slot, else the run reports INSUFFICIENT_DATA; a stored month that fails its checksum stops the run (a symbol is never silently dropped); the downloader's counted rejects are printed"
   },
   "families": {
     "confirmatory": [
@@ -69,10 +72,10 @@
     "hold_days": 7,
     "min_listing_age_days": 30,
     "rows": "the repository's own row builder (candidate_readiness.run_family_variant) on the fixed non-overlapping weekly grid, one row per week, per-slot universe as above",
-    "selection": "walk-forward: research_harness.walk_forward_folds(train_min=max(20, n//2), test_len=max(5, n//10), label_horizon=1, embargo=1); each fold picks the variant with the best TRAIN mean of the bound's own excess series (research_harness.train_only_best); the pooled out-of-sample series is the statistic"
+    "selection": "calendar-fixed expanding walk-forward: the out-of-sample blocks are the calendar quarters from parameters.walk_forward.oos_start_utc up to the cut; each block is tested with a variant picked on the TRAIN rows only (research_harness.train_only_best on the bound's own excess series), training on every row at least label_horizon + embargo (2) rows before the block, audited for leakage with statistical_power.audit_split. A missing slot changes one block by one row; it can no longer move the out-of-sample window by months. The pooled out-of-sample series is the statistic"
   },
   "bounds": {
-    "why": "the repository charges every weekly row a full round trip although the same names are often held on, and its cash series starts late: a verdict on one set of assumptions would be fragile in either direction. Two bounds are fixed in advance and neither is tuned.",
+    "why": "the repository charges every weekly row a full round trip although the same names are often held on, and its cash series starts late: a verdict on one set of assumptions would be fragile in either direction. Two bounds are fixed in advance and neither is tuned. They differ in cost and in capital; BOTH charge the cash series on every out-of-sample row (the out-of-sample window lies wholly inside it), so the favourable bound is favourable in cost and capital only",
     "ADVERSE": {
       "cost": "the repository's carry taker round trip (carry_costs authoritative figure, fee VENUE_STATED plus spread ASSUMED) charged in full every week, plus a slippage add-on per leg by trailing median volume: +2 bps at >= 200M USDT, +6 bps at 50M to 200M, +15 bps at 20M to 50M",
       "capital": "per unit of gross notional: the live plan's own definition at leverage 1 (economic_model.hedged_pair_capital_usd): 2.04",
@@ -81,9 +84,9 @@
     "FAVOURABLE": {
       "cost": "the carry taker FEE only (no spread, no slippage), charged only on turnover: half a round trip for every leg that enters the book and half for every leg that leaves it (a name held in consecutive weeks is not re-traded; the last week exits everything)",
       "capital": "leverage 5 on the perp margin: 1.224 per unit of gross notional (economic_model.hedged_pair_capital_usd at leverage 5)",
-      "cash": "the same series; zero before it begins"
+      "cash": "the same series; zero before it begins, which can affect only the TRAIN rows that choose a variant: every out-of-sample row lies inside the series. A zero-cash sensitivity (the raw net return on capital) is reported as a descriptive line and decides nothing"
     },
-    "common": "both bounds use the same funding prints, the same universe, the same rows and the same MEASURED basis P&L per week (short perp, long spot: minus the change of (mark - index) / index between entry and exit, from the daily closes; zero and flagged when a leg is delivered inside the hold); the Binance basis understates Bybit's by about 17 to 24% (BTC, measured by the reviewer), which is stated as a limit and not corrected"
+    "common": "both bounds use the same funding prints, the same universe, the same rows and the same MEASURED basis P&L per week (short perp, long spot: minus the change of (mark - index) / index between entry and exit, from the daily closes); the Binance basis may understate Bybit's (one reviewer measured 17 to 24% for BTC in one month; that figure was not reproduced here), which is stated as a limit and not corrected"
   },
   "statistic": "excess_bps_of_capital per weekly row = (funding - cost + basis P&L, in bps of gross notional) / capital - cash over the hold, in bps of CAPITAL. Every row has a cash figure by construction (each bound states how the series is extended before its start); rows that lie before the series begins are counted and flagged 'cash extended', and the survivor test (a) uses only rows the series itself covers",
   "multiple_testing": {
@@ -91,17 +94,19 @@
     "counted": "6 variants (3 formation x 2 top_k) x 2 bounds = 12 series, each recorded once in a persistent ledger kept in a throwaway directory (never under the owner's home); Holm over the ledger's total at the time of the run; a re-run of the same series is the same trial"
   },
   "decision_rules": {
-    "NO_WINNER": "the FAVOURABLE bound's pooled out-of-sample mean excess has its widest 90% interval (research_harness.significance ci) with an upper end at or below zero. The direction is closed for this venue's liquid names and no Bybit data capture is justified for carry on this ground.",
-    "SURVIVOR_AS_HYPOTHESIS_ONLY": "ALL of: (a) ADVERSE bound, cash-covered rows only: pooled out-of-sample mean excess > 0, Holm-adjusted one-sided p <= 0.05 and the widest 90% interval's lower end > 0; (b) the mean excess is positive in at least 2 of the 3 calendar years 2022, 2023 and 2024 (to September); (c) dropping the 3 best weeks leaves the mean > 0; (d) no single symbol contributes more than 25% of the summed out-of-sample P&L; (e) the one final read of the reserved months with the frozen last-fold pick under the ADVERSE bound has a mean excess > 0. A survivor is a hypothesis to be re-tested on Bybit's own data under Bybit's own holdout; it is not a winner and not an owner-dollar figure.",
-    "INCONCLUSIVE": "everything else: the edge is neither excluded under the most favourable assumptions nor demonstrated under the adverse ones; what decides it is the realised turnover and execution cost, which this data cannot measure",
-    "power_statement": "the out-of-sample series is serially dependent (BTC weekly funding has an effective sample size of roughly one in nine of its rows); the report states the effective number of independent observations and never calls a short series decisive"
+    "NO_WINNER": "the FAVOURABLE bound's pooled out-of-sample mean excess has its widest 90% interval (research_harness.significance ci) with an upper end at or below zero. It means: for an always-invested top-k carry in these liquid names over the out-of-sample window, even with turnover-aware fee-only costs and leverage 5, the excess over cash is not positive. It does NOT close the mechanism: it says nothing about an entry-threshold design, about 2020-21, about illiquid names or about Bybit",
+    "INCONCLUSIVE": "everything else: the design is neither excluded under the favourable assumptions nor demonstrated under the adverse ones; what decides it is the realised turnover and execution cost, which this data cannot measure",
+    "power_statement": "the out-of-sample series is serially dependent (BTC weekly funding has an effective sample size of roughly one in nine of its rows); every bound's report states the effective number of independent observations and the minimum detectable mean excess at 80% power under the Holm threshold of the twelve counted series; a mean inside that margin is not evidence of absence",
+    "SURVIVOR_PENDING_FINAL_READ": "ALL of: (a) ADVERSE bound, cash-covered rows only: pooled out-of-sample mean excess > 0, Holm-adjusted one-sided p <= 0.05 and the widest 90% interval's lower end > 0; (b) the mean excess is positive in at least 2 of the 3 calendar years 2022, 2023 and 2024 (to September); (c) dropping the 3 best weeks leaves the mean > 0; (d) no single symbol contributes more than 25% of the summed out-of-sample P&L; (e) the one final read of the reserved months with the frozen last-fold pick under the ADVERSE bound has a mean excess > 0. Until (e) is done the verdict is SURVIVOR_PENDING_FINAL_READ. A survivor is a hypothesis to be re-tested on Bybit's own data under Bybit's own holdout; it is not a winner and not an owner-dollar figure.",
+    "INSUFFICIENT_DATA": "an unpriced terminal exit exists, or the completeness gate fails: no verdict of either sign is claimed"
   },
-  "descriptives_not_decisions": "per year: the mean forward weekly funding of the selected names against the break-even funding of each bound; the persistence of trailing-top-k funding; turnover; the share of weeks whose selection clears each bound's hurdle; the symbols and their share of P&L; median daily quote volume of the legs. Descriptive tables carry no verdict.",
+  "descriptives_not_decisions": "per bound and per calendar year over the out-of-sample rows: weeks, mean gross funding, mean cost, mean basis, mean cash and capital, mean net and mean excess, the share of weeks with a positive excess, turnover, the break-even gross funding the bound needs, the persistence of trailing against forward funding, the raw net return on capital with free capital, and the symbols that carry the P&L. Descriptive tables carry no verdict",
   "forbidden_claims": [
     "any Bybit funding, price, fee tier or capacity figure derived from this data",
     "any owner-dollar or annualised-return figure presented as achievable",
     "'winner', 'edge', 'profitable' or 'survivorship-free'",
-    "using a result of this study to select, rank or tune anything on the owner's holdout registry or on Bybit data"
+    "using a result of this study to select, rank or tune anything on the owner's holdout registry or on Bybit data",
+    "'the direction is closed', 'carry cannot work' or any statement about a design, a period or a venue this study did not test"
   ],
   "changes": "this file is frozen when the first strategy return is computed from it. Any change afterwards is a new protocol id, a new count of trials and a new report; the digest of this file (sha256 of its canonical JSON) is printed in every result.",
   "parameters": {
@@ -178,8 +183,38 @@
       ],
       "survivor_min_positive_years": 2,
       "drop_best_weeks": 3,
-      "max_symbol_share": 0.25
+      "max_symbol_share": 0.25,
+      "mde_power": 0.8
     },
-    "min_aligned_rows": 60
-  }
+    "min_aligned_rows": 60,
+    "walk_forward": {
+      "scheme": "CALENDAR_QUARTERS",
+      "oos_start_utc": "2022-01-01",
+      "label_horizon_rows": 1,
+      "embargo_rows": 1,
+      "train_min_rows": 20
+    },
+    "completeness": {
+      "min_fraction_of_grid": 0.95
+    }
+  },
+  "amendments": [
+    {
+      "date_utc": "2026-11-12",
+      "state": "BEFORE_ANY_STRATEGY_RETURN_WAS_COMPUTED",
+      "why": "findings of an independent adversarial review of the code (read-only): hole rule conditioned the universe on the hold; a delisted spot pair stayed hedgeable; the favourable bound's cash wording could not reach the statistic; the walk-forward window moved by months with one slot; unmeasured basis was charged zero under the adverse bound; unpriced terminal exits were dropped silently; promised descriptive tables, the interval rule and the verdict names were not implemented. Also: a symbol map for 10000x contracts and for two-character tickers.",
+      "what": [
+        "trailing-window holes only; hold holes counted",
+        "spot last month ends eligibility",
+        "calendar-quarter folds from 2022-01-01",
+        "adverse unmeasured basis = worst measured leg-week",
+        "unpriced terminal exit -> INSUFFICIENT_DATA",
+        "completeness gate and a pinned protocol digest",
+        "favourable cash wording and NO_WINNER wording, MDE reported",
+        "descriptive tables",
+        "month-level hole for an interval disagreement",
+        "verdict name SURVIVOR_PENDING_FINAL_READ"
+      ]
+    }
+  ]
 }

@@ -161,7 +161,9 @@ def protocol():
     proto, digest = P.load_protocol()
     proto = copy.deepcopy(proto)
     proto["parameters"].update({"window_start_utc": WINDOW_START, "cut_utc": CUT, "last_explore_month": LAST_MONTH, "top_n_by_median_volume": 5})
-    return proto, digest
+    proto["parameters"]["walk_forward"] = {**proto["parameters"]["walk_forward"], "oos_start_utc": "2020-07-01"}
+    proto["parameters"]["decision"] = {**proto["parameters"]["decision"], "survivor_years": [2020, 2021], "survivor_min_positive_years": 1}
+    return proto, P.protocol_digest(proto)                                       # the edited protocol is a different file: its digest is not the pinned one
 
 
 class FakeCurve:
@@ -266,7 +268,7 @@ def oracle_rows(mkt, params, F, K):
                 continue
             end = t + hold if delivery is None else min(t + hold, delivery)
             prints = [p[0] for p in s.funding]
-            holed = any(b - a > 1.5 * 8 * H and a < end and b > t - 30 * DAY for a, b in zip(prints, prints[1:]))
+            holed = any(b - a > 1.5 * 8 * H and a < t and b > t - 30 * DAY for a, b in zip(prints, prints[1:]))               # the trailing window only
             if holed:
                 continue
             days = {o: d for o, d in s.kl}
@@ -358,7 +360,24 @@ def cash_apr(a, b, before):
     return total / (b - a)
 
 
-def oracle_bound(mkt, rows, medv, bound, params):
+def oracle_basis_floor(mkt, all_rows, ts):
+    """The worst measured weekly basis P&L of any selected leg of any variant over the aligned weeks (plain loops)."""
+    by = {s.perp: s for s in mkt}
+    worst = None
+    for rr in all_rows.values():
+        for t in ts:
+            for l in rr[t]["legs"]:
+                if l["delivery"] is not None and l["delivery"] <= t + 7 * DAY:
+                    continue
+                s = by[l["symbol"]]
+                b0, b1 = basis_at(s, t, 2 * DAY), basis_at(s, t + 7 * DAY, 2 * DAY)
+                if b0 is not None and b1 is not None:
+                    v = -(b1 - b0) * 1e4
+                    worst = v if worst is None or v < worst else worst
+    return worst
+
+
+def oracle_bound(mkt, rows, medv, bound, params, stress=0.0):
     by = {s.perp: s for s in mkt}
     ts = sorted(rows)
     tset = set(ts)
@@ -373,10 +392,11 @@ def oracle_bound(mkt, rows, medv, bound, params):
         nets = []
         for l in legs:
             s = by[l["symbol"]]
-            b = 0.0
+            b = stress                                                  # an unmeasured basis (stale marks, or delivered inside the hold) is charged the stress
             if not (l["delivery"] is not None and l["delivery"] <= t + hold):
                 b0, b1 = basis_at(s, t, 2 * DAY), basis_at(s, t + hold, 2 * DAY)
-                b = 0.0 if b0 is None or b1 is None else -(b1 - b0) * 1e4
+                if b0 is not None and b1 is not None:
+                    b = -(b1 - b0) * 1e4
             if bound == "ADVERSE":
                 mv = medv[t][l["symbol"]]
                 slip = 2.0 if mv >= 200e6 else (6.0 if mv >= 50e6 else 15.0)
@@ -396,18 +416,22 @@ def production_series(store_root, proto):
     cut = P.day_ms(params["cut_utc"])
     first = max(P.day_ms(params["window_start_utc"]), min(i.series.funding[0][0] for i in insts))
     slots = P.slot_grid(first, cut, params)
-    rows, medvol, _why = P.build_variant_rows(insts, slots, params)
+    rows, medvol, _why, stats = P.build_variant_rows(insts, slots, params)
     common = set(slots)
     for v in rows.values():
         common &= set(v)
     ts = sorted(common)
     by = {i.symbol: i for i in insts}
     costs = P.CR.family_costs(P.FAMILY)["taker"]
+    floor = P.measured_basis_floor(rows, ts, by, params)
+    stress = {"ADVERSE": min(0.0, floor) if floor is not None else 0.0, "FAVOURABLE": 0.0}
     out = {}
     for bound in ("ADVERSE", "FAVOURABLE"):
         cash = P.BoundedCash(cash_basis(), params[bound.lower()]["cash_before_series"])
         for (f, k) in rows:
-            out[(bound, f, k)] = P.bound_series(rows[(f, k)], ts, bound, by, medvol, params, cash, costs)
+            out[(bound, f, k)] = P.bound_series(rows[(f, k)], ts, bound, by, medvol, params, cash, costs, stress[bound])
+    production_series.last_stats = stats
+    production_series.last_floor = floor
     return ts, rows, medvol, out
 
 
@@ -433,9 +457,12 @@ def test_the_production_series_equal_an_independent_oracle_for_every_variant_and
             prod_legs = [l["symbol"] for l in rows[(f, k)][t]["legs"]]
             assert prod_legs == [l["symbol"] for l in rr[t]["legs"]], (f, k, t)
             assert rows[(f, k)][t]["funding_bps"] == pytest.approx(rr[t]["funding"], abs=1e-9)
+    o_floor = oracle_basis_floor(mkt, o_rows, ts)
+    assert o_floor == pytest.approx(production_series.last_floor, abs=1e-9)
     for bound in ("ADVERSE", "FAVOURABLE"):
+        stress = min(0.0, o_floor) if bound == "ADVERSE" and o_floor is not None else 0.0
         for (f, k), rr in o_rows.items():
-            ob = oracle_bound(mkt, {t: rr[t] for t in ts}, o_medv, bound, params)
+            ob = oracle_bound(mkt, {t: rr[t] for t in ts}, o_medv, bound, params, stress)
             got = series[(bound, f, k)]
             assert [g["t"] for g in got] == ts
             for g in got:
@@ -502,7 +529,7 @@ def test_the_explore_run_refuses_a_store_opened_with_another_ceiling(store):
     proto, digest = protocol()
     st = P.Store(store, "2021-07")
     with pytest.raises(P.StudyError) as e:
-        P.run_explore(st, [], proto, digest, os.path.join(store, "x.jsonl"), cash_basis())
+        P.run_explore(st, [], proto, digest, os.path.join(store, "x.jsonl"), cash_basis(), {}, allow_unpinned=True)
     assert e.value.code == "STORE_CEILING"
 
 
@@ -531,13 +558,13 @@ def test_a_symbol_with_a_hole_is_excluded_for_the_weeks_around_it_and_only_those
     st, pairs, insts = instruments(store, proto)
     g = next(i for i in insts if i.symbol == "GGGUSDT")
     assert len(g.holes) == 1
-    # the prints stop at day 149 16:00 and resume at day 153: a decision t is affected when t + 7 d > 149.67 d and t - 30 d < 153 d, that is for t in (142.67, 183)
-    for d in (145, 160, 182):
+    # the prints stop at day 149 16:00 and resume at day 153: only the TRAILING window chooses the universe, so a decision t is affected when t > 149.67 d and t - 30 d < 153 d, that is for t in (149.67, 183)
+    for d in (150, 160, 182):
         uni, _mv, why = P.universe_at(insts, START + d * DAY, params)
         assert "GGGUSDT" not in [i.symbol for i in uni] and why["funding_hole"] >= 1, d
-    for d in (140, 190, 200):
+    for d in (140, 145, 149, 190, 200):                                                  # up to the hole (the hold may contain it: that is not used) and more than 30 days after it
         uni, _mv, why = P.universe_at(insts, START + d * DAY, params)
-        assert "GGGUSDT" in [i.symbol for i in uni], d                                # before the hole's reach and more than 30 days after it
+        assert "GGGUSDT" in [i.symbol for i in uni], d
 
 
 def test_one_base_under_two_symbols_keeps_the_higher_volume_one_and_a_stablecoin_never_enters(store):
@@ -719,6 +746,7 @@ def test_one_week_by_hand_adverse_and_favourable():
         i = I()
         i.symbol = sym
         i.series = type("S", (), {"delivery_ms": delivery})()
+        i.holes = []
         i.mark_ts, i.mark_px = [0, 7 * DAY, 14 * DAY], [100.2, 100.1, 100.05]     # the mark at the three times
         i.index_ts, i.index_px = [0, 7 * DAY, 14 * DAY], [100.0, 100.0, 100.0]     # the index is flat
         return i
@@ -766,12 +794,16 @@ def test_bounded_cash_extends_the_series_backwards_as_the_bound_says_and_weights
 
 
 # ------------------------------------------------------------------------------------------------ the decision
+def real_params():
+    return P.load_protocol()[0]["parameters"]
+
+
 def _bound(mean, lo, hi, adj=0.01, years=None, drop=1.0, share=0.2):
     return {"stats": {"mean": mean, "ci": {"status": "OK", "lo": lo, "hi": hi}}, "p_adjusted": adj, "by_year": years or {"2022": 1.0, "2023": 1.0, "2024": -1.0}, "mean_without_best_weeks": drop, "max_symbol_share": share}
 
 
 def test_the_decision_rules_are_the_registered_ones():
-    params = protocol()[0]["parameters"]
+    params = real_params()
     good, bad_fav = _bound(5.0, 1.0, 9.0), _bound(-2.0, -4.0, -0.5)
     assert P.decide(good, bad_fav, params)["verdict"] == "INCONCLUSIVE"                       # contradiction: nothing is claimed
     assert P.decide(good, _bound(8.0, 2.0, 12.0), params)["verdict"] == "SURVIVOR_PENDING_FINAL_READ"
@@ -789,13 +821,13 @@ def test_the_decision_rules_are_the_registered_ones():
     {"stats": {"mean": None, "ci": None}},
 ])
 def test_each_survivor_criterion_blocks_a_survivor_on_its_own(change):
-    params = protocol()[0]["parameters"]
+    params = real_params()
     adv = {**_bound(5.0, 1.0, 9.0), **change}
     assert P.decide(adv, _bound(8.0, 2.0, 12.0), params)["verdict"] == "INCONCLUSIVE"
 
 
 def test_the_favourable_bound_must_have_a_usable_interval_to_close_the_direction():
-    params = protocol()[0]["parameters"]
+    params = real_params()
     weak = {"stats": {"mean": -5.0, "ci": None}, "p_adjusted": 1.0, "by_year": {}, "mean_without_best_weeks": None, "max_symbol_share": None}
     assert P.decide(_bound(-1.0, -3.0, 1.0), weak, params)["verdict"] == "INCONCLUSIVE"
     assert P.decide(_bound(-1.0, -3.0, 1.0), _bound(-1.0, -3.0, 0.0), params)["verdict"] == "NO_WINNER"       # at zero counts: not above it
@@ -902,19 +934,25 @@ def test_the_explore_run_end_to_end_counts_twelve_series_writes_only_its_ledger_
     ledger = str(tmp_path / "ledger" / "proxy.jsonl")
     os.makedirs(os.path.dirname(ledger))
     before = sorted(os.listdir(store))
-    rep = P.run_explore(st, pairs, proto, digest, ledger, cash_basis())
-    assert rep["label"] == "PROXY_RESEARCH_ONLY" and rep["protocol_digest"] == digest and rep["data_digest"] == st.digest()
+    rep = P.run_explore(st, pairs, proto, digest, ledger, cash_basis(), {}, allow_unpinned=True)
+    assert rep["label"] == "PROXY_RESEARCH_ONLY" and rep["protocol_digest"] == digest and rep["data_digest"] == st.digest() and rep["pre_registered"] is False
     assert rep["bounds"]["ADVERSE"]["n_variants_counted"] == 12 and rep["bounds"]["FAVOURABLE"]["n_variants_counted"] == 12
     assert rep["decision"]["verdict"] in ("NO_WINNER", "SURVIVOR_PENDING_FINAL_READ", "INCONCLUSIVE")
     adv, fav = rep["bounds"]["ADVERSE"], rep["bounds"]["FAVOURABLE"]
     assert adv["cash_covered_only"] is True and adv["oos_rows"] < adv["oos_rows_all"]                  # the survivor statistic uses only rows the cash series itself covers
     assert fav["cash_covered_only"] is False and fav["oos_rows"] == fav["oos_rows_all"]
     assert adv["cash"]["before_series"] == "MEAN_OF_FIRST_90_DAYS" and fav["cash"]["before_series"] == "ZERO"
+    assert adv["quarters"][0] == "2020Q3" and adv["quarters"] == fav["quarters"] and adv["folds"] == len(adv["picks"]) == len(adv["quarters"])
+    assert adv["ledger_anchor"]["n"] == 12 and len(adv["ledger_anchor"]["head"]) == 64
+    assert adv["minimum_detectable_mean_excess_bps_80pct_power"] > 0 and adv["descriptives"]["overall"]["weeks"] == adv["oos_rows"]
+    assert adv["unmeasured_basis_charge_bps"] <= 0.0 and fav["unmeasured_basis_charge_bps"] == 0.0
+    sf = rep["selection_facts"]
+    assert sf["terminal_exit_unpriced_count"] == 0 and sf["slots_with_a_universe"] > 0 and rep["rejects_recorded_by_the_downloader"] == {}
     assert "not Bybit" in rep["claim_limits"] and rep["forbidden"]
     assert set(rep["code_sha256"]) == {"proxy_carry_study.py", "binance_archive.py"} and all(len(v) == 64 for v in rep["code_sha256"].values())
     assert sorted(os.listdir(store)) == before                                      # the store is only read
     assert os.path.exists(ledger)
-    rep2 = P.run_explore(P.Store(store, LAST_MONTH), pairs, proto, digest, ledger, cash_basis())
+    rep2 = P.run_explore(P.Store(store, LAST_MONTH), pairs, proto, digest, ledger, cash_basis(), {}, allow_unpinned=True)
     assert rep2["bounds"]["ADVERSE"]["n_variants_counted"] == 12                  # the same series are the same trials
     assert rep2["bounds"]["ADVERSE"]["stats"]["mean"] == rep["bounds"]["ADVERSE"]["stats"]["mean"]
     json.dumps(P._clean(rep), allow_nan=False)                                       # a report is JSON with no NaN
@@ -925,13 +963,13 @@ def test_too_few_aligned_rows_is_insufficient_data_not_a_verdict(store, tmp_path
     proto["parameters"]["min_aligned_rows"] = 10 ** 6
     st = P.Store(store, LAST_MONTH)
     pairs = P.plan_pairs(st.symbols("klines", "1d"), st.symbols("spot_klines", "1d"), proto["parameters"])
-    rep = P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis())
-    assert rep["verdict"] == "INSUFFICIENT_DATA" and "bounds" not in rep
+    rep = P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    assert rep["verdict"] == "INSUFFICIENT_DATA" and "bounds" not in rep and rep["reason"].startswith("COMPLETENESS")
 
 
 def test_the_protocol_digest_moves_with_any_change_and_the_file_is_the_registered_one():
     proto, digest = P.load_protocol()
-    assert proto["id"] == "binance_archive_carry_v1" and proto["label"] == "PROXY_RESEARCH_ONLY" and proto["registered"]["state"] == "BEFORE_ANY_STRATEGY_RETURN_WAS_COMPUTED"
+    assert digest == P.protocol_digest(proto) and proto["id"] == "binance_archive_carry_v1" and proto["label"] == "PROXY_RESEARCH_ONLY" and proto["registered"]["state"] == "BEFORE_ANY_STRATEGY_RETURN_WAS_COMPUTED"
     assert len(digest) == 64
     import tempfile
     with tempfile.TemporaryDirectory() as d:
@@ -973,3 +1011,349 @@ def test_the_runner_reads_no_environment_touches_no_real_registry_and_has_no_ord
     for forbidden in ("os.environ", "getenv", "subprocess", ".ai-agent-control", "HISTORY_HOLDOUT_LEDGER", "CANDIDATE_LEDGER_DIR", "unreserved", "prior_reads", "_KEY_BASIS_OBSERVED", "LIVE_TRADING_ACK", "api.bybit.com"):
         assert forbidden not in src, forbidden
     assert "RESEARCH ONLY" in src and "HYPOTHESIS" in src
+
+# ------------------------------------------------------------------------------------------------ the verdict layer on hand-built rows (the oracle covers rows and series, not this)
+def weekly(start="2021-05-03", n=87):
+    t0 = P.day_ms(start)
+    return [t0 + k * 7 * DAY for k in range(n)]
+
+
+WF = {"scheme": "CALENDAR_QUARTERS", "oos_start_utc": "2022-01-01", "label_horizon_rows": 1, "embargo_rows": 1, "train_min_rows": 20}
+
+
+def test_calendar_folds_are_the_quarters_from_the_start_and_one_missing_slot_moves_one_block_by_one_row():
+    ts = weekly()                                                                # 2021-05-03 ... 2022-12-26
+    folds = P.calendar_folds(ts, WF)
+    assert [f"{k[0]}Q{k[1] + 1}" for _a, _b, k in folds] == ["2022Q1", "2022Q2", "2022Q3", "2022Q4"]
+    for train, test, key in folds:
+        assert all(P.quarter_key(ts[i]) == key for i in test) and test == list(range(test[0], test[0] + len(test)))
+        assert train == list(range(0, test[0] - 2)) and len(train) >= 20             # every row at least label_horizon + embargo before the block
+    assert sum(len(f[1]) for f in folds) == len([t for t in ts if t >= P.day_ms("2022-01-01")])
+    dropped = ts[:60] + ts[61:]                                                  # one slot of 2022Q2 is missing
+    f2 = P.calendar_folds(dropped, WF)
+    members = lambda ff, tt: [[tt[i] for i in b] for _a, b, _k in ff]
+    for a, b in zip(members(folds, ts), members(f2, dropped)):
+        assert set(b) <= set(a) and len(a) - len(b) in (0, 1)                    # the blocks keep their calendar membership
+    assert sum(len(f[1]) for f in f2) == sum(len(f[1]) for f in folds) - 1
+    early = P.calendar_folds(ts, {**WF, "oos_start_utc": "2021-05-03"})          # an out-of-sample start so early that the first quarters have too little training data
+    assert all(len(tr) >= 20 for tr, _te, _k in early) and early[0][2] > (2021, 1)
+    for _tr, te, key in early:                                                   # a block with too little training data is skipped, never shortened or merged
+        assert len(te) == len([t for t in ts if P.quarter_key(t) == key])
+
+
+def test_a_calendar_fold_that_leaked_would_be_refused(monkeypatch):
+    monkeypatch.setattr(P.SP, "audit_split", lambda *a, **k: {"clean": False, "reading": "leaks"})
+    with pytest.raises(P.StudyError) as e:
+        P.calendar_folds(weekly(), WF)
+    assert e.value.code == "FOLD_LEAKS"
+
+
+def test_the_walk_forward_picks_on_train_rows_only_and_pools_the_blocks_it_applied_the_pick_to():
+    ts = weekly()
+    n = len(ts)
+    folds = P.calendar_folds(ts, WF)
+    a = [2.0] * n
+    b = [0.0] * n
+    c = [0.5] * n
+    for i in range(folds[1][1][0], folds[2][1][0] - 2):                          # B is very good on rows that only the third and fourth blocks train on
+        b[i] = 30.0
+    series = {"A": a, "B": b, "C": c}
+    wf = P.walk_forward(series, ts, WF)
+    expected = [max(series, key=lambda k, tr=tr: (sum(series[k][i] for i in tr) / len(tr), k)) for tr, _te, _k in folds]       # the best TRAIN mean, plain arithmetic
+    assert wf["picks"] == expected == ["A", "A", "B", "B"]
+    assert wf["oos"] == [(p, i) for p, (_tr, te, _k) in zip(expected, folds) for i in te]
+    assert wf["quarters"] == ["2022Q1", "2022Q2", "2022Q3", "2022Q4"] and wf["folds"] == 4
+    for k, (_tr, te, _key) in enumerate(folds):                                  # a variant that is enormous ONLY in a block's own test rows cannot be picked for that block: only train rows choose
+        p2 = {name: list(v) for name, v in series.items()}
+        for i in te:
+            p2["C"][i] = 1e9
+        assert P.walk_forward(p2, ts, WF)["picks"][k] == wf["picks"][k]
+    late = {name: list(v) for name, v in series.items()}                         # ... while the same values, once they are in the past of a later block, do count: the window expands
+    for i in folds[0][1]:
+        late["C"][i] = 1e9
+    assert P.walk_forward(late, ts, WF)["picks"][1] == "C"
+
+
+class StubLedger:
+    def __init__(self, n):
+        self.n_variants = n
+
+    def anchor(self):
+        return P.SP.LedgerAnchor(self.n_variants, "ab" * 32)
+
+
+def hand_rows(ts, values, legs=("XXXUSDT", "YYYUSDT"), leg_nets=None, capital=2.04, cash=7.0):
+    out = []
+    for t, v in zip(ts, values):
+        ln = leg_nets(t, v) if leg_nets else [v * 2.04 + 7.0, v * 2.04 + 7.0]
+        net = sum(ln) / len(ln)
+        out.append({"t": t, "net_bps_of_gross": net, "capital": capital, "cash_bps_of_capital": cash, "excess_bps_of_capital": v, "legs": list(legs), "leg_net_bps": ln, "unmeasured_basis_legs": 0, "hold_hole_legs": 0,
+                    "gross_funding_bps": net + 31.4, "cost_bps_mean": 31.4, "basis_bps_mean": 0.0, "entered_legs": 2, "exited_legs": 2, "leg_funding_bps": [30.0, 20.0], "leg_formation_bps_per_day": [4.0, 3.0]})
+    return out
+
+
+def test_bound_report_pools_the_picked_blocks_and_derives_every_figure_by_hand():
+    params = copy.deepcopy(real_params())
+    params["walk_forward"] = WF
+    ts = weekly()
+    n = len(ts)
+    vals = [3.0 + (i % 5) - 2.0 for i in range(n)]
+    vals[70], vals[74], vals[78], vals[82] = 40.0, 35.0, 30.0, 25.0              # four big weeks inside the out-of-sample blocks: the three LARGEST are dropped
+    better = hand_rows(ts, vals)
+    worse = hand_rows(ts, [-5.0] * n)
+    rep = P.bound_report("ADVERSE", {"A": better, "B": worse}, ts, StubLedger(12), params, cash_first_ms=P.day_ms("2022-03-01"), covered_only=False)
+    folds = P.calendar_folds(ts, WF)
+    oos_idx = [i for _tr, te, _k in folds for i in te]
+    oos = [vals[i] for i in oos_idx]
+    assert rep["picks"] == ["A"] * 4 and rep["oos_rows"] == rep["oos_rows_all"] == len(oos) and rep["quarters"] == ["2022Q1", "2022Q2", "2022Q3", "2022Q4"]
+    st = P.RH.significance(oos, ci=True)
+    assert rep["stats"]["mean"] == pytest.approx(statistics.fmean(oos)) and rep["stats"]["p_one_sided"] == st["p_one_sided"]
+    assert rep["n_variants_counted"] == 12 and rep["p_adjusted"] == pytest.approx(min(1.0, 12 * st["p_one_sided"]))                 # Holm over the whole family of 12
+    assert rep["mean_without_best_weeks"] == pytest.approx(statistics.fmean(sorted(oos)[:-3])) and rep["dropped_best_weeks"] == 3    # the three LARGEST are dropped, not the smallest
+    assert rep["mean_without_best_weeks"] < statistics.fmean(oos) < statistics.fmean(sorted(oos)[3:])
+    by_year = {}
+    for i in oos_idx:
+        by_year.setdefault(str(P.year_of(ts[i])), []).append(vals[i])
+    assert rep["by_year"] == {y: pytest.approx(statistics.fmean(v)) for y, v in by_year.items()} and set(rep["by_year"]) == {"2022"}
+    assert rep["ledger_anchor"] == {"n": 12, "head": "ab" * 32}
+    assert rep["minimum_detectable_mean_excess_bps_80pct_power"] == pytest.approx(P.mde_bps(st["sd"], st["ess"], 12, 0.05, 0.8))
+    cov = P.bound_report("ADVERSE", {"A": better, "B": worse}, ts, StubLedger(12), params, cash_first_ms=P.day_ms("2022-07-01"), covered_only=True)       # only rows the cash series covers
+    assert cov["oos_rows"] < cov["oos_rows_all"] and cov["oos_rows"] == len([i for i in oos_idx if ts[i] >= P.day_ms("2022-07-01")])
+
+
+def test_the_symbol_share_is_the_largest_symbols_part_of_the_summed_net_and_is_none_without_a_gain():
+    params = copy.deepcopy(real_params())
+    params["walk_forward"] = WF
+    ts = weekly()
+    rows = hand_rows(ts, [2.0] * len(ts), leg_nets=lambda t, v: [30.0, 10.0])      # X earns 30, Y earns 10 per leg-week: per row the book nets 20, X is 15 of it
+    rep = P.bound_report("ADVERSE", {"A": rows}, ts, StubLedger(12), params, cash_first_ms=0, covered_only=False)
+    assert rep["max_symbol_share"] == pytest.approx(15.0 / 20.0) and rep["symbol_share_top"][0][0] == "XXXUSDT"
+    loss = hand_rows(ts, [2.0] * len(ts), leg_nets=lambda t, v: [-30.0, -10.0])
+    assert P.bound_report("ADVERSE", {"A": loss}, ts, StubLedger(12), params, cash_first_ms=0, covered_only=False)["max_symbol_share"] is None
+
+
+def test_the_detectable_effect_is_the_holm_scaled_normal_margin_and_grows_with_the_family():
+    assert P.mde_bps(60.0, 40.0, 12, 0.05, 0.8) == pytest.approx(33.013, abs=1e-3)
+    assert P.mde_bps(60.0, 40.0, 1, 0.05, 0.8) == pytest.approx(23.589, abs=1e-3)
+    assert P.mde_bps(60.0, 40.0, 12, 0.05, 0.8) > P.mde_bps(60.0, 40.0, 6, 0.05, 0.8) > P.mde_bps(60.0, 40.0, 1, 0.05, 0.8)
+    assert P.mde_bps(60.0, 160.0, 12, 0.05, 0.8) == pytest.approx(P.mde_bps(60.0, 40.0, 12, 0.05, 0.8) / 2)
+    assert P.mde_bps(None, 40.0, 12, 0.05, 0.8) is None and P.mde_bps(60.0, 0.0, 12, 0.05, 0.8) is None
+
+
+def test_the_descriptive_block_and_persistence_by_hand():
+    ts = weekly(n=4)
+    rows = hand_rows(ts, [10.0, -4.0, 6.0, 0.0])
+    rows[1]["entered_legs"], rows[1]["exited_legs"] = 0, 2
+    rows[2]["hold_hole_legs"], rows[3]["unmeasured_basis_legs"] = 1, 2
+    d = P.descriptive_block(rows)
+    assert d["weeks"] == 4 and d["mean_excess_bps_of_capital"] == pytest.approx(3.0) and d["share_of_weeks_with_positive_excess"] == 0.5
+    assert d["turnover_share_of_legs_traded_per_week"] == pytest.approx((4 + 2 + 4 + 4) / (2.0 * 8))                       # (entries + exits) over twice the legs
+    assert d["break_even_gross_funding_bps_per_week"] == pytest.approx(31.4 - 0.0 + 7.0 * 2.04)
+    assert d["legs_with_a_funding_hole_in_the_hold"] == 1 and d["legs_with_unmeasured_basis"] == 2 and P.descriptive_block([]) is None
+    pr = P.persistence(rows)
+    assert pr["pairs"] == 8 and pr["mean_forward_over_mean_trailing"] == pytest.approx(25.0 / (3.5 * 7)) and pr["correlation"] is not None
+
+
+# ------------------------------------------------------------------------------------------------ what the build and the run now do with data they cannot trust or price
+def test_a_hole_inside_the_hold_does_not_choose_the_universe_but_the_leg_is_counted(store):
+    proto, _ = protocol()
+    ts, rows, medvol, series = production_series(store, proto)
+    assert START + 145 * DAY in ts                                              # a grid slot whose hold (day 145 to 152) contains the prints that are missing from day 149 16:00 to day 153
+    held = [r for key, rr in series.items() for r in rr if r["t"] == START + 145 * DAY and "GGGUSDT" in r["legs"]]
+    assert held and all(r["hold_hole_legs"] >= 1 for r in held)
+    assert all(r["hold_hole_legs"] == 0 for key, rr in series.items() for r in rr if r["t"] < START + 138 * DAY)
+
+
+def test_an_unpriced_terminal_exit_is_listed_and_caps_the_verdict(tmp_path):
+    root = str(tmp_path / "s")
+    mk = [s for s in market() if s.perp not in ("NOSPOTUSDT", "AAAUSDT")]
+    mk.append(Sym("HHHUSDT", "HHHUSDT", 0.0030, 5.0e8, 0, 0, end_day=400, mark_gap=(395, 400), seed=12))      # the highest funding, delivered on day 400, no mark in its last five days
+    write_store(root, [s for s in mk])
+    proto, digest = protocol()
+    st = P.Store(root, LAST_MONTH)
+    pairs = P.plan_pairs(st.symbols("klines", "1d"), st.symbols("spot_klines", "1d"), proto["parameters"])
+    rep = P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    sf = rep["selection_facts"]
+    assert sf["terminal_exit_unpriced_count"] > 0 and {u["symbol"] for u in sf["terminal_exit_unpriced_first_20"]} == {"HHHUSDT"}
+    assert rep["decision"]["verdict"] == "INSUFFICIENT_DATA" and rep["decision"]["note"].startswith("TERMINAL_EXIT_UNPRICED") and "verdict_before_the_cap" in rep["decision"]
+    assert "bounds" in rep                                                      # everything is still computed and shown; only the claim is withheld
+
+
+def test_an_incomplete_store_is_insufficient_data_and_a_stricter_gate_is_honoured(store, tmp_path):
+    import shutil
+    proto, digest = protocol()
+    short = str(tmp_path / "short")
+    shutil.copytree(store, short)
+    for root, _d, files in os.walk(short):
+        for f in files:
+            if "2021-05" in f:
+                os.remove(os.path.join(root, f))                                # the store ends with April while the protocol's last explore month is May
+    pairs = P.plan_pairs(P.Store(short, LAST_MONTH).symbols("klines", "1d"), P.Store(short, LAST_MONTH).symbols("spot_klines", "1d"), proto["parameters"])
+    rep = P.run_explore(P.Store(short, LAST_MONTH), pairs, proto, digest, str(tmp_path / "a.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    assert rep["verdict"] == "INSUFFICIENT_DATA" and rep["reason"].startswith("COMPLETENESS") and rep["last_row_ms"] < rep["last_slot_expected_ms"]
+    strict = copy.deepcopy(proto)
+    strict["parameters"]["completeness"] = {"min_fraction_of_grid": 1.01}
+    full_pairs = P.plan_pairs(P.Store(store, LAST_MONTH).symbols("klines", "1d"), P.Store(store, LAST_MONTH).symbols("spot_klines", "1d"), strict["parameters"])
+    rep2 = P.run_explore(P.Store(store, LAST_MONTH), full_pairs, strict, digest, str(tmp_path / "b.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    assert rep2["verdict"] == "INSUFFICIENT_DATA" and rep2["aligned_rows"] < rep2["grid_slots_required"]
+
+
+def test_only_the_pinned_protocol_is_pre_registered_and_any_other_file_is_refused_or_marked(store, tmp_path):
+    proto, digest = P.load_protocol()
+    assert P.EXPECTED_PROTOCOL_DIGEST == digest and len(digest) == 64            # the registered file, and the digest the runner pins
+    st = P.Store(store, "2021-07")                                              # a wrong ceiling: whatever is judged first decides the error
+    with pytest.raises(P.StudyError) as e:
+        P.run_explore(st, [], proto, "0" * 64, str(tmp_path / "x.jsonl"), cash_basis(), {})
+    assert e.value.code == "PROTOCOL_NOT_PINNED"                                 # not the pinned digest: refused before anything is read
+    with pytest.raises(P.StudyError) as e2:
+        P.run_explore(st, [], proto, digest, str(tmp_path / "x.jsonl"), cash_basis(), {})
+    assert e2.value.code == "STORE_CEILING"                                      # the pinned digest passes the pin and meets the next check
+
+
+def test_a_stored_month_that_fails_its_checksum_stops_the_run_and_no_symbol_is_dropped_silently(store, tmp_path):
+    import shutil
+    proto, digest = protocol()
+    root = str(tmp_path / "t")
+    shutil.copytree(store, root)
+    victim = os.path.join(root, *BA.data_path("fundingRate", "BBBUSDT", None, "2020-05").split("/"))
+    with open(victim, "r+b") as fh:
+        fh.seek(30)
+        fh.write(b"\x00")
+    st = P.Store(root, LAST_MONTH)
+    pairs = P.plan_pairs(st.symbols("klines", "1d"), st.symbols("spot_klines", "1d"), proto["parameters"])
+    with pytest.raises(P.StudyError) as e:
+        P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    assert e.value.code == "STORE_ERROR" and "BBBUSDT" in str(e.value)
+
+
+def test_a_symbol_that_cannot_be_built_is_counted_with_its_reason(store, tmp_path):
+    proto, digest = protocol()
+    st = P.Store(store, LAST_MONTH)
+    pairs = P.plan_pairs(st.symbols("klines", "1d"), st.symbols("spot_klines", "1d"), proto["parameters"]) + [("ZZZUSDT", "ZZZUSDT")]
+    rep = P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    assert rep["quality"]["instrument_not_buildable:no_funding_months"] == 1
+    assert P.not_buildable_reason(st, "AAAUSDT", "ZZZUSDT") == "no_spot_month"
+
+
+def test_a_delisted_spot_pair_ends_the_hedge_after_its_last_listed_month(store, tmp_path):
+    proto, digest = protocol()
+    params = proto["parameters"]
+    st = P.Store(store, LAST_MONTH)
+    pairs = P.plan_pairs(st.symbols("klines", "1d"), st.symbols("spot_klines", "1d"), params)
+    ctr = {"CCCUSDT": {"first": "2019-12", "last": "2020-08"}, "BBBUSDT": {"first": "2019-12", "last": "2030-01"}}
+    insts = {p: P.build_instrument(st, p, s, params, P.day_ms(CUT), P.BA.month_bounds_ms(ctr[s]["last"])[1] if s in ctr and ctr[s]["last"] <= LAST_MONTH else None) for p, s in pairs if p in ("CCCUSDT", "BBBUSDT")}
+    assert insts["CCCUSDT"].spot_last_ms == P.BA.month_bounds_ms("2020-08")[1] and insts["BBBUSDT"].spot_last_ms is None
+    before, _mv, w1 = P.universe_at([insts["CCCUSDT"]], P.day_ms("2020-08-31"), params)
+    after, _mv, w2 = P.universe_at([insts["CCCUSDT"]], P.day_ms("2020-09-01"), params)
+    assert w1["spot_delisted"] == 0 and w2["spot_delisted"] == 1 and after == []
+    rep = P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis(), ctr, allow_unpinned=True)
+    assert rep["exclusions"]["spot_delisted"] > 0 and rep["quality"]["pairs_with_a_spot_listing"] == 2
+
+
+def test_a_print_off_the_grid_of_its_stated_interval_makes_that_calendar_month_a_hole():
+    params = protocol()[0]["parameters"]
+    cut = P.day_ms(CUT)
+    fs = FakeStore(cut - 8 * H)
+    fs.funding = [(t + (7_000 if (cut - 40 * DAY) <= t < (cut - 39 * DAY) else 0), iv, r) for t, iv, r in fs.funding]          # one print 7 s off its grid
+    inst = P.build_instrument(fs, "ZZZUSDT", "ZZZUSDT", params, cut)
+    assert inst.quality["funding_off_grid_dropped"] >= 1 and inst.quality["interval_disagreement_months"] == 1
+    month = P.ym_of(cut - 40 * DAY)
+    lo, hi = P.BA.month_bounds_ms(month)
+    assert P.has_hole(inst, lo + DAY, lo + 2 * DAY) and not P.has_hole(inst, hi + DAY, hi + 2 * DAY) and not P.has_hole(inst, lo - 5 * DAY, lo - 3 * DAY)
+
+
+def test_the_downloaders_counted_rejects_are_read_and_a_garbage_line_is_skipped(tmp_path):
+    root = tmp_path / "r"
+    root.mkdir()
+    (root / "REJECTS.jsonl").write_text('{"code": "CHECKSUM_MISMATCH"}\n{"code": "ROWS_INVALID"}\nnot json\n{"code": "CHECKSUM_MISMATCH"}\n')
+    assert P.Store(str(root), LAST_MONTH).rejects() == {"CHECKSUM_MISMATCH": 2, "ROWS_INVALID": 1}
+    assert P.Store(str(tmp_path / "none"), LAST_MONTH).rejects() == {}
+
+
+def test_the_spot_listing_file_round_trips_merges_and_refuses_garbage(tmp_path):
+    root = str(tmp_path)
+    assert P.load_spot_listing(root) == {}
+    P.write_spot_listing(root, {"AAAUSDT": {"first": "2019-12", "last": "2026-10"}})
+    P.write_spot_listing(root, {"BBBUSDT": {"first": "2020-02", "last": "2022-11"}})
+    got = P.load_spot_listing(root)
+    assert got == {"AAAUSDT": {"first": "2019-12", "last": "2026-10"}, "BBBUSDT": {"first": "2020-02", "last": "2022-11"}}
+    open(os.path.join(root, P.SPOT_LISTING_NAME), "w").write('{"spots": {"bad/symbol": {"first": "x"}, "CCCUSDT": 5, "DDDUSDT": {"first": "2020-01", "last": "2020-02"}}}')
+    assert P.load_spot_listing(root) == {"DDDUSDT": {"first": "2020-01", "last": "2020-02"}}
+    open(os.path.join(root, P.SPOT_LISTING_NAME), "w").write("not json")
+    assert P.load_spot_listing(root) == {}
+
+
+def test_an_unmeasured_basis_is_charged_the_stress_under_the_adverse_bound_and_zero_under_the_favourable_one():
+    class I:
+        pass
+    i = I()
+    i.symbol = "AAAUSDT"
+    i.holes = []
+    i.series = type("S", (), {"delivery_ms": None})()
+    i.mark_ts, i.mark_px, i.index_ts, i.index_px = [0], [100.0], [0], [100.0]               # no exit marks: the basis cannot be measured
+    rows = {0: {"legs": [{"symbol": "AAAUSDT", "funding_bps": 40.0}], "funding_bps": 40.0}}
+    params = copy.deepcopy(real_params())
+    cash = type("C", (), {"apr_over": lambda self, s, e: 0.0, "label": "X"})()
+    costs = {"bps": 31.4, "fee_bps": 31.0}
+    medvol = {0: {"AAAUSDT": 300e6}}
+    adv = P.bound_series(rows, [0], "ADVERSE", {"AAAUSDT": i}, medvol, params, cash, costs, -25.0)
+    fav = P.bound_series(rows, [0], "FAVOURABLE", {"AAAUSDT": i}, medvol, params, cash, costs, 0.0)
+    assert adv[0]["net_bps_of_gross"] == pytest.approx(40.0 - 33.4 - 25.0) and adv[0]["unmeasured_basis_legs"] == 1
+    assert fav[0]["net_bps_of_gross"] == pytest.approx(40.0 - 31.0) and fav[0]["unmeasured_basis_legs"] == 1
+
+
+def test_the_basis_floor_is_the_worst_measured_leg_week_and_none_without_a_measurement():
+    class I:
+        pass
+
+    def inst(entry_mark, exit_mark):
+        i = I()
+        i.series = type("S", (), {"delivery_ms": None})()
+        i.mark_ts, i.mark_px, i.index_ts, i.index_px = [0, 7 * DAY], [entry_mark, exit_mark], [0, 7 * DAY], [100.0, 100.0]
+        return i
+    insts = {"A": inst(100.5, 100.2), "B": inst(100.0, 101.0), "C": I()}
+    insts["C"].series = type("S", (), {"delivery_ms": 3 * DAY})()
+    insts["C"].mark_ts, insts["C"].mark_px, insts["C"].index_ts, insts["C"].index_px = [0], [100.0], [0], [100.0]
+    rows = {(7, 1): {0: {"legs": [{"symbol": "A"}, {"symbol": "B"}, {"symbol": "C"}]}}, (7, 3): {0: {"legs": [{"symbol": "A"}]}}}
+    params = real_params()
+    assert P.measured_basis_floor(rows, [0], insts, params) == pytest.approx(-100.0)       # B: the premium goes from 0 to +1.00%: -100 bps to a short perp / long spot pair; A gains 30 bps; C is unmeasured
+    assert P.measured_basis_floor(rows, [], insts, params) is None
+    assert P.measured_basis_floor({(7, 1): {0: {"legs": [{"symbol": "C"}]}}}, [0], insts, params) is None
+
+
+def test_a_lower_confidence_bound_of_exactly_zero_is_not_a_survivor():
+    params = real_params()
+    zero = {**_bound(5.0, 0.0, 9.0)}
+    assert P.decide(zero, _bound(8.0, 2.0, 12.0), params)["survivor_checks"]["a_adverse_mean_positive_holm_and_ci_lo_positive"] is False
+    assert P.decide(_bound(5.0, 0.01, 9.0), _bound(8.0, 2.0, 12.0), params)["survivor_checks"]["a_adverse_mean_positive_holm_and_ci_lo_positive"] is True
+
+
+def test_the_run_charges_the_adverse_bound_the_worst_measured_basis_for_a_leg_it_could_not_measure(store, tmp_path):
+    proto, digest = protocol()
+    st = P.Store(store, LAST_MONTH)
+    pairs = P.plan_pairs(st.symbols("klines", "1d"), st.symbols("spot_klines", "1d"), proto["parameters"])
+    rep = P.run_explore(st, pairs, proto, digest, str(tmp_path / "l.jsonl"), cash_basis(), {}, allow_unpinned=True)
+    _ts, _rows, _mv, _series = production_series(store, proto)
+    floor = production_series.last_floor
+    assert floor is not None and floor < 0
+    assert rep["bounds"]["ADVERSE"]["unmeasured_basis_charge_bps"] == pytest.approx(min(0.0, floor)) and rep["bounds"]["FAVOURABLE"]["unmeasured_basis_charge_bps"] == 0.0
+    assert rep["quality"]["aligned_rows_before_the_cash_series_(cash_extended)"] > 0                  # the synthetic cash series starts late: those rows used the extension
+
+
+def test_the_builder_s_dropped_legs_and_missing_rows_are_counted_not_lost(store):
+    proto, _ = protocol()
+    production_series(store, proto)
+    stats = production_series.last_stats
+    assert stats["slots_with_universe"] > 0
+    # AAA has no mark or index file for days 330-336: a top-3 week that would hold it cannot price it, so the builder drops the leg: a count, not silence
+    assert sum(stats["legs_dropped"].values()) > 0
+    k1_rows_missing = stats["slots_without_row"]
+    assert all(isinstance(v, int) and v >= 0 for v in k1_rows_missing.values())
+    st, pairs, insts = instruments(store, proto)
+    params = proto["parameters"]
+    cut = P.day_ms(CUT)
+    first = max(P.day_ms(params["window_start_utc"]), min(i.series.funding[0][0] for i in insts))
+    slots = P.slot_grid(first, cut, params)
+    only = [i for i in insts if i.symbol in ("AAAUSDT",)]
+    rows, medvol, why, st2 = P.build_variant_rows(only, slots, params)                      # a one-symbol universe: top-3 weeks cannot even form, top-1 weeks lose the leg when its marks are stale
+    assert st2["slots_with_universe"] > 0 and sum(st2["slots_without_row"].values()) > 0
