@@ -489,7 +489,10 @@ def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_
         hv = "UNTESTED"
     return {"levels": L, "highest": reached[-1] if reached else "NONE", "highest_supportable_verdict": hv,
             "survivorship_free_claim": bool(pit_ok and survivorship == DELISTINGS_OBSERVED),
-            "notes": ["levels are cumulative; DATA_READY is a property of datasets, the rest are properties of a strategy", "no level here promotes a candidate: the verdict ceiling is INSUFFICIENT_DATA"]}
+            "notes": ["levels are cumulative; DATA_READY is a property of datasets, the rest are properties of a strategy", "no level here promotes a candidate: the verdict ceiling is INSUFFICIENT_DATA",
+                      "PROMISING stands on an ESTIMATED count of independent observations and a Holm-adjusted p computed from it. The estimate assumes AR-type dependence and cannot see a slow hidden "
+                      "regime: an independent audit measured false-pass rates 5 to 28 times the stated level on regime-driven nulls at n 100 to 250 (docs/MONEY_MISSION.md, Round 14). PROMISING is a "
+                      "reason to look, not evidence: declare the regime dwell of the mechanism before any holdout is read."]}
 
 
 # ---------------------------------------------------------------- the BTC funding carry on the committed corpus
@@ -1469,7 +1472,9 @@ FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
 #: hold: (1) at least 12 independent observations by the ESS floor, (2) a lower-tail p <= 0.01 from the ESS-adjusted t, and (3) the WIDEST of the bootstrap / ESS-t / batch-means 90% intervals
 #: (RH.significance ``ci``) lies wholly below zero. The ESS is estimated from the same short series, so (2) alone is anti-conservative at n of 24-40 under serial dependence (the independent review measured
 #: 3-6% false rejection at alpha 0.025 and ESS >= 8); with (1)-(3) the simulated false-rejection rate under a ZERO true edge is about 0.2-2.5% for n 24-60 and rho 0-0.6 (500 trials per cell, so +-0.7 pp),
-#: per look: repeated re-runs on a growing capture accumulate. Power is deliberately modest: about 70% at a mean of -1 sd at n=24 (90% at n=40) and 27% at -0.5 sd; a borderline loser stays INSUFFICIENT_DATA.
+#: per look: repeated re-runs on a growing capture accumulate. THAT FIGURE IS FOR AUTOREGRESSIVE-TYPE DEPENDENCE ONLY: the Round 14 audit measured 5.6% to 18% for a two-state regime (+-1 sd, n 24-100), 11.9% for a
+#: slow regime hidden under noise (+-0.3 sd, mean dwell 100, n = 100) and 14% for a seasonal-masked level, because the ESS estimate cannot see persistence longer than the sample. The rule can only REJECT, so it never
+#: authorises anything, but REJECTED is terminal: read it with the size of the loss, not the p alone. Power is deliberately modest: about 70% at a mean of -1 sd at n=24 (90% at n=40) and 27% at -0.5 sd; a borderline loser stays INSUFFICIENT_DATA.
 REJECT_EARLY_MIN_INDEPENDENT = 12
 REJECT_EARLY_ALPHA = 0.01
 

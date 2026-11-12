@@ -39,7 +39,11 @@ KNOWN LIMITS (also stated in the results that depend on them)
     selectively dropping observations inside it is not refused (supply and check a declared cadence or count yourself, and
     treat the evidence chain as the guard on what rows exist); (b) the p-value uses an ESS-adjusted t with se = sd / sqrt(ESS), which
     over-rejects on short persistent series at the adjusted level (measured: 0.76 % against 0.31 % nominal at AR(0.8), n = 200,
-    16 hypotheses, Holm), so require a larger ESS than ``MIN_ESS_FOR_SUPPORT`` before relying on it.
+    16 hypotheses, Holm), so require a larger ESS than ``MIN_ESS_FOR_SUPPORT`` before relying on it. The Round 14 audit measured it on REGIME-driven nulls, where it is far worse: under a zero edge
+    P(p <= 0.05/12) is 11.8% at n = 100 and 11.6% at 250 for a slow regime hidden under noise (+-0.3 sd, mean dwell 100: 28 times the stated level), 5.1% / 2.3% / 0.7% for AR(0.95) at
+    n = 100 / 250 / 1000 and 11.0% for a seasonal-masked level at n = 100 (iid, heavy-tailed and volatility-clustered series are conservative). No estimator can see a regime longer than
+    the sample, and a widest-of p-value that restores the size cuts power at the Holm level for an edge of 0.2 sd at n = 250 from 58% to 6%: the protection is a DECLARED dwell
+    (independent observations <= span / dwell), not a different p-value.
   * Sample sizes are conditional on the supplied sd and dependence. Understate either and the study is
     underpowered; the framework cannot know.
   * The AR(1) design effect (1+rho)/(1-rho) is the large-n value (slightly conservative at finite n); a
@@ -341,7 +345,7 @@ def noncentral_t_sf(tcrit: float, df: float, delta: float) -> float:
 
     T' = (Z + delta) / S with S = sqrt(chi2_df / df). So P(T' > t) = E_S[ P(Z > t*S - delta) ], integrated
     over the chi density of S by composite Simpson on a range that holds all but ~1e-20 of its mass and
-    renormalised. Exact to about 1e-9 for df >= 2; no table or approximation formula."""
+    renormalised. Accurate to about 1e-5 (a fixed-step quadrature: the worst absolute error an audit measured was 8e-6); no table or approximation formula."""
     tcrit, delta, df = float(tcrit), float(delta), _pos(df, "df")
     if df >= _T_AS_NORMAL_DF:
         return _N.cdf(delta - tcrit)

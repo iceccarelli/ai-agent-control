@@ -210,8 +210,14 @@ def block_bootstrap_ci(xs: Sequence[float], stat: Optional[Callable[[Sequence[fl
     (``2 * n / ESS``, never shorter than n^(1/3)), and for the mean the result is the WIDER of
     that and an effective-sample-size t interval. Even so, a short, persistent series stays
     under-covered: the ESS is reported with every interval so the caller can see how many
-    independent draws it really rests on, and ``funding_eval`` / ``opportunity_engine`` refuse
-    to use an interval whose ESS is below their floor. A constant series has no variance to
+    independent draws it really rests on. ``funding_eval`` (and so ``opportunity_engine``'s carry
+    evaluator) refuses an interval whose ESS is below its floor; the other ``opportunity_engine``
+    evaluators floor sample COUNTS only. COVERAGE IS NOMINAL, not delivered, under strong
+    persistence: the Round 14 audit measured the two-sided miscoverage of the nominal 90% interval
+    at 40% / 28% / 17% / 8.9% / 5.2% for AR(0.95) at n = 24 / 48 / 100 / 250 / 1000 (a two-state
+    regime and a seasonal-masked level are similar), and about five times the stated one-sided rate
+    at the family-wise alpha for a regime at n of 12 to 48; iid, heavy-tailed and volatility-clustered
+    series are conservative. A constant series has no variance to
     resample: it gets NO interval (a zero-width interval is not a bound)."""
     n = len(xs)
     if n < MIN_FOR_CI:
