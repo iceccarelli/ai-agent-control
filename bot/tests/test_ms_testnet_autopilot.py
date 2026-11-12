@@ -15,6 +15,7 @@ for _p in (HERE, os.path.dirname(HERE), os.path.join(os.path.dirname(HERE), "too
 import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
+import capital_testkit as CT  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
@@ -1013,27 +1014,27 @@ def test_the_session_is_sized_by_the_allocator_not_the_grants_full_maximum_and_i
     assert res["allocation"]["binding_limit"] == "COMPOUNDED_SIZE"
     ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
     assert ev["allocation"]["notional_usd"] == "200.00" and ev["capital_settlement"]["status"] == "NO_PENDING"
-    book = CC.CapitalBook(eng).load()
+    book = CT.anchored(eng).load()
     assert book["start_cash_usd"] is not None and book["pending"]["session_id"] == os.path.basename(res["state_dir"]) and book["realised_usd"] == "0"   # parked, NOT credited yet
 
 
 def test_cash_the_ledger_cannot_explain_raises_an_alert_and_places_nothing(w):
     _profit_world(w)
     eng = str(w.tmp / "eng")
-    b = CC.CapitalBook(eng)
+    b = CT.anchored(eng)
     b.ensure_baseline("1")
     b.park("prev_session", "1", "0.50", True, True)                                                   # the venue's cash is thousands of dollars away from this
     w.fake.requests.clear()
     res, _ = _cycle_eng(w)
     assert res["result"] == "REFUSED" and res["why"] == ["ACCOUNT_CASH_UNEXPLAINED"] and not [r for r in w.fake.requests if r[0] == "POST"]
     assert AP.ES.EngineState(eng, w.clock.now).has("ALERT")
-    assert CC.CapitalBook(eng).load()["realised_usd"] == "0"                                          # and nothing unexplained was credited
+    assert CT.anchored(eng).load()["realised_usd"] == "0"                                          # and nothing unexplained was credited
 
 
 def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
     _profit_world(w)
     eng = str(w.tmp / "eng")
-    b = CC.CapitalBook(eng)
+    b = CT.anchored(eng)
     b.ensure_baseline("10000")
     bk = b.load()
     bk["halted"], bk["loss_streak"] = True, 4
@@ -1050,7 +1051,7 @@ def test_the_lifetime_loss_stop_idles_the_engine_and_no_acknowledgement_resumes_
     """Red-team F2: the owner's acknowledgements resume the loss-streak halt and the drawdown stop; the LIFETIME stop (verified net realised <= -2 x the drawdown stop) is not theirs to lift."""
     _profit_world(w)
     eng = str(w.tmp / "eng")
-    b = CC.CapitalBook(eng)
+    b = CT.anchored(eng)
     b.ensure_baseline("10000")
     bk = b.load()
     bk["realised_usd"], bk["losses_usd"], bk["halted"], bk["loss_streak"] = "-23.00", "-23.00", True, 4
@@ -1239,7 +1240,7 @@ def test_the_next_session_settles_the_previous_one_and_emits_the_settlement_and_
 def test_an_unexplained_cash_refusal_still_leaves_evidence(w):
     _profit_world(w)
     eng = str(w.tmp / "eng_ev2")
-    b = CC.CapitalBook(eng)
+    b = CT.anchored(eng)
     b.ensure_baseline("1")
     b.park("prev_session", "1", "0.50", True, True)
     res, got = _collect(w, "eng_ev2")
@@ -1367,10 +1368,10 @@ def test_a_crash_between_execute_and_the_end_of_the_session_leaves_the_cash_pend
     eng = str(w.tmp / "eng_crash")
     with pytest.raises(RuntimeError):
         AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=[].append, state_root=str(w.tmp / "auto"), engine_root=eng)
-    p = CC.CapitalBook(eng).load()["pending"]
+    p = CT.anchored(eng).load()["pending"]
     assert p is not None and p["flat_verified"] is False and p["ledger_net_known_usd"] is None, "no conservative placeholder was parked before execution"
-    r = CC.CapitalBook(eng).settle("1")                                        # the venue's cash is thousands lower than this: a LOSS, booked in full
-    assert r["status"] == "SETTLED" and CC.CapitalBook(eng).load()["loss_streak"] == 1
+    r = CT.anchored(eng).settle("1")                                        # the venue's cash is thousands lower than this: a LOSS, booked in full
+    assert r["status"] == "SETTLED" and CT.anchored(eng).load()["loss_streak"] == 1
 
 
 # ---------------------------------------------------------------- the durable, reproducible decision record
@@ -1598,15 +1599,22 @@ def test_a_different_capital_state_is_a_different_decision_and_an_unreadable_boo
     ctx = AP._decision_context(str(tmp_path / "none"), 1.0)
     assert ctx["portfolio"] == {"status": "NO_CAPITAL_BOOK"} and ctx["venue"]["scope"] == "TESTNET_FAKE_MONEY"
     root = tmp_path / "book"
-    b = CC.CapitalBook(str(root))
+    b = CT.anchored(str(root))
     b.ensure_baseline("10000")
     ctx2 = AP._decision_context(str(root), 1.0)
     assert ctx2["portfolio"]["status"] == "BOOK" and ctx2["portfolio"]["halted"] in (False, None)
     base = {"decision": "REJECT_UNECONOMIC", "symbol": "BTCUSDT", "notional_usd": "200", "inputs_digest": "d" * 64, "observed_ms": 1_794_312_000_000, "edge": None}
     a = EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"]
     assert a == EL.decision_record(base, code_sha="c" * 40, **ctx)["decision_id"] and a != EL.decision_record(base, code_sha="c" * 40, **ctx2)["decision_id"]
-    (root / "capital.json").write_text("{broken")
-    assert AP._decision_context(str(root), 1.0)["portfolio"]["status"] == "BOOK_UNREADABLE"
+    (root / "capital.json").write_text("{broken")                                        # the view is damaged but the lineage is intact: the book is the lineage's, and the record says it had to be rebuilt
+    rebuilt = AP._decision_context(str(root), 1.0)["portfolio"]
+    assert rebuilt["status"] == "BOOK" and rebuilt["anchor"]["view_rebuilt"] == "VIEW_UNREADABLE", rebuilt
+    assert (root / "capital.json").read_text() == "{broken", "a read-only decision never rewrites the book"
+    lone = tmp_path / "lone"
+    os.makedirs(lone)
+    (lone / "capital.json").write_text("{broken")
+    monkeypatch.setenv("CAPITAL_ANCHOR_DIR", str(tmp_path / "an_empty_anchor_dir"))       # no lineage at all: the loop refuses this book, so the record names the refusal
+    assert AP._decision_context(str(lone), 1.0)["portfolio"] == {"status": "BOOK_REFUSED", "refusal": "ACCOUNT_NOT_RESOLVED"}
 
 
 def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_and_that_cash_was_not_checked(tmp_path, monkeypatch):
@@ -1622,7 +1630,7 @@ def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_a
     assert not any(g.startswith("CAPITAL_") for g in clean["authority_gaps"]), "no book, no stop"
 
     root = tmp_path / "book_review"
-    book = CC.CapitalBook(str(root))
+    book = CT.anchored(str(root))
     book.ensure_baseline("1")
     assert book.park("prev_session", "1", "0.50", True, True)
     assert book.settle("10000")["status"] == "UNEXPLAINED_CASH"                    # the review is persisted IN the book
@@ -1632,27 +1640,29 @@ def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_a
     assert res["decision_record"]["portfolio_context"]["review_required"] == "ACCOUNT_CASH_UNEXPLAINED"
     assert res["decision_record"]["decision_id"] != clean["decision_record"]["decision_id"]            # a different capital state is a different decision
 
-    doc = _json.load(open(book.path))
+    doc = book.load()                                                                  # (test-only state injection, THROUGH the lineage: an edit of the view file would be VIEW_TAMPERED)
     doc["review_required"], doc["halted"] = None, True
-    with open(book.path, "w") as fh:
-        _json.dump(doc, fh)
+    book._save(doc, "BASELINE")
     halted = _evaluate(w, notional_usd="200", engine_root=str(root))
     assert "CAPITAL_BOOK_HALTED" in halted["authority_gaps"] and "CAPITAL_REVIEW_OPEN" not in halted["authority_gaps"]
 
+    doc = book.load()
     doc["halted"] = False
     doc["realised_usd"] = "-22.20"
-    with open(book.path, "w") as fh:
-        _json.dump(doc, fh)
+    book._save(doc, "BASELINE")
     stopped = _evaluate(w, notional_usd="200", engine_root=str(root))
     assert "CAPITAL_LIFETIME_LOSS_STOP" in stopped["authority_gaps"] and stopped["decision_record"]["portfolio_context"]["lifetime_loss_stop_active"] is True, "the stop no acknowledgement lifts is named"
     from decimal import Decimal as D
     assert D(stopped["decision_record"]["risk_limits"]["lifetime_loss_stop_usd"]) == D("22.20") == 2 * D(stopped["decision_record"]["risk_limits"]["drawdown_stop_usd"])
 
+    tampered = _json.load(open(book.path))
+    tampered["realised_usd"] = "0"                                                     # someone edits the view to lift the lifetime stop
     with open(book.path, "w") as fh:
-        fh.write("{broken")
+        _json.dump(tampered, fh)
+    before = open(book.path).read()
     broken = _evaluate(w, notional_usd="200", engine_root=str(root))
-    assert "CAPITAL_BOOK_UNREADABLE" in broken["authority_gaps"]
-    assert open(book.path).read() == "{broken", "a read-only evaluation never rewrites the book"
+    assert "CAPITAL_ANCHOR_REFUSED:VIEW_TAMPERED" in broken["authority_gaps"], broken["authority_gaps"]
+    assert open(book.path).read() == before, "a read-only evaluation never rewrites the book"
 
 
 def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w):
@@ -1661,7 +1671,7 @@ def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_re
     os.makedirs(root)
     (root / "capital.json").write_text("{corrupt")
     res, _got = _collect(w, eng_name="eng_corrupt")
-    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:BOOK_UNREADABLE"], res      # no lineage to rebuild it from and nothing the owner could adopt: not reset, not guessed
     assert (root / "capital.json").read_text() == "{corrupt" and not w.requests_to("/v5/order/create")
 
 
@@ -1749,7 +1759,7 @@ def test_two_no_data_decisions_at_different_moments_are_different_decisions_and_
 def test_long_digit_runs_in_the_book_or_the_limits_never_make_a_record_unstorable(tmp_path):
     import ms_capital as CC
     root = tmp_path / "book"
-    b = CC.CapitalBook(str(root))
+    b = CT.anchored(str(root))
     b.ensure_baseline("10000.12345678")
     b.park("s1", "10000.12345678", "0.30000000000000004", True, True)
     b.settle("10000.43")
@@ -1806,8 +1816,8 @@ def test_a_book_that_goes_bad_at_the_park_refuses_before_any_order_and_alerts(w,
 def test_the_capital_command_on_a_corrupt_book_explains_instead_of_a_traceback(tmp_path, capsys):
     (tmp_path / "capital.json").write_text("{corrupt")
     assert AP.main(["capital", "--root", str(tmp_path)], env={}) == 2
-    err = capsys.readouterr().err
-    assert "unreadable" in err and "move it aside DELIBERATELY" in err and (tmp_path / "capital.json").read_text() == "{corrupt"
+    out = capsys.readouterr().out
+    assert "NO_ACCOUNT_RESOLVED" in out and "--anchor-init" in out and (tmp_path / "capital.json").read_text() == "{corrupt", "it explains what to do and rewrites nothing"
 
 
 # ---------------------------------------------------------------- the owner's emergency unwind must STOP the loop, not just the session
@@ -1921,7 +1931,7 @@ def test_a_capital_book_with_a_nonsense_figure_stops_the_session_before_any_orde
     """REPRODUCED (specialist E N1): a parsable book with realised_usd='abc' made the allocator size 200.00 where the honest book said LIFETIME_LOSS_STOP."""
     _profit_world(w)
     root = w.tmp / "eng_semantic"
-    b = CC.CapitalBook(str(root))
+    b = CT.anchored(str(root))
     b.ensure_baseline("10000")
     assert b.park("s1", "10000", "-30", True, True)
     b.settle("9970")
@@ -1930,5 +1940,6 @@ def test_a_capital_book_with_a_nonsense_figure_stops_the_session_before_any_orde
     text = json.dumps(doc)
     (root / "capital.json").write_text(text)
     res, _got = _collect(w, eng_name="eng_semantic")
-    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
+    # the view no longer matches what the lineage attested: refused before any order (a figure edited in place can never size anything), and the file is left exactly as it is
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:VIEW_TAMPERED"], res
     assert (root / "capital.json").read_text() == text and not w.requests_to("/v5/order/create")

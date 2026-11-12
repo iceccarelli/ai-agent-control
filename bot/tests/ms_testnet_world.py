@@ -15,8 +15,11 @@ for _p in (BOT, os.path.join(BOT, "tools"), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import ms_capital as CC  # noqa: E402
+import ms_capital_anchor as AN  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
+import ms_testnet_autopilot as AP  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 import ms_testnet_transport as TT  # noqa: E402
 from ms_fake_bybit_testnet import FAKE_KEY, FAKE_SECRET, FakeBybitTestnet  # noqa: E402
@@ -34,8 +37,27 @@ class SimClock:
 
 
 class World:
-    def __init__(self, tmp_path: Any, monkeypatch: Any, symbols: Tuple[str, ...] = ("BTCUSDT", "ETHUSDT"), lower: Optional[Dict[str, float]] = None, grant: bool = True) -> None:
+    def __init__(self, tmp_path: Any, monkeypatch: Any, symbols: Tuple[str, ...] = ("BTCUSDT", "ETHUSDT"), lower: Optional[Dict[str, float]] = None, grant: bool = True,
+                 owner_initialised_account: bool = True) -> None:
         self.tmp = tmp_path
+        # the autopilot's default engine root is ~/.ai-agent-control/ms_autopilot, computed at import from the REAL home: a test that did not pass --root / engine_root used to read and write the developer's (or the
+        # CI job's) real capital book, and one test's book leaked into the next. Every world gets its own default root.
+        monkeypatch.setattr(AP, "DEFAULT_ROOT", str(tmp_path / "default_engine_root"))
+        if owner_initialised_account:
+            # THE OWNER HAS RUN `capital --anchor-init` for this account (production refuses a session on an account with no capital lineage: ms_capital_anchor). The world models that one-time owner act by creating
+            # the lineage the first time a session asks for the book (adopting a book a test seeded in the root); a test about the refusal builds the world with owner_initialised_account=False.
+            real_open = AP._open_book
+
+            def _open_book_after_the_owner_initialised_it(root: str, account_ref: Any, env: Any, **kw: Any) -> Any:
+                try:
+                    return real_open(root, account_ref, env, **kw)
+                except CC.BookRefused as exc:
+                    if exc.code in ("ACCOUNT_NOT_INITIALISED", "BOOK_UNANCHORED") and account_ref is not None and not kw.get("read_only"):
+                        CC.CapitalBook(root, AN.Anchor(root, account_ref, "testnet", AP._anchor_dir(env))).initialise({"test": "the owner ran capital --anchor-init"})
+                        return real_open(root, account_ref, env, **kw)
+                    raise
+
+            monkeypatch.setattr(AP, "_open_book", _open_book_after_the_owner_initialised_it)
         self.clock = SimClock()
         monkeypatch.setattr(time, "sleep", lambda s: None)               # the client's retry backoff must not wait
         self.fake = FakeBybitTestnet(now_ms=self.clock.now)

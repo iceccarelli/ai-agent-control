@@ -591,11 +591,37 @@ class RestClient:
         assert last is not None
         raise last
 
-    def _once(self, url: str, body: bytes) -> Any:
+    def select(self, table: str, query: Mapping[str, str], *, retries: Optional[int] = None) -> Any:
+        """GET /rest/v1/<table>?<query> (READ ONLY): the parsed JSON (a list of rows). The same origin pinning, no-redirect opener, secret scrubbing and response bound as ``rpc``; ``Accept-Profile`` selects the
+        schema. An empty list is what a key that cannot SEE the rows also gets: a caller that treats [] as 'nothing exists' must first prove it can see something (ms_capital_witness does)."""
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,60}", table):
+            raise ClientRefused("bad table name")
+        if not isinstance(query, Mapping) or len(query) > 16:
+            raise ClientRefused("bad query")
+        qs = urllib.parse.urlencode([(str(k), str(v)) for k, v in query.items()], safe=",.:()*")
+        if len(qs) > 2000:
+            raise ClientRefused("query too long")
+        url = f"{self._origin}/rest/v1/{table}?{qs}"
+        tries = (self._retries if retries is None else max(0, retries)) + 1
+        last: Optional[RestError] = None
+        for i in range(tries):
+            if i:
+                self._sleep(min(self._backoff * (2 ** (i - 1)), 30.0))
+            try:
+                return self._once(url, None, method="GET")
+            except RestError as exc:
+                last = exc
+                if not exc.retryable:
+                    raise
+        assert last is not None
+        raise last
+
+    def _once(self, url: str, body: Optional[bytes], method: str = "POST") -> Any:
         key = self._key.reveal()
-        req = urllib.request.Request(url, data=body, method="POST", headers={
-            "apikey": key, "Authorization": "Bearer " + key, "Content-Type": "application/json",
-            "Accept": "application/json", "Content-Profile": self._schema, "Accept-Profile": self._schema})
+        headers = {"apikey": key, "Authorization": "Bearer " + key, "Accept": "application/json", "Accept-Profile": self._schema}
+        if method == "POST":
+            headers.update({"Content-Type": "application/json", "Content-Profile": self._schema})
+        req = urllib.request.Request(url, data=body, method=method, headers=headers)
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:
                 raw = resp.read(self._max + 1)

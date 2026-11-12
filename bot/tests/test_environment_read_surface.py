@@ -29,6 +29,7 @@ ALLOWED = {
     "tools/strategy_verdict.py": 1,      # default key provider: reads ONE named variable (the owner's attestation key) at verification time; never logged, stored or serialised
     "tools/candidate_competition.py": 1,   # reads ONE named directory variable (CANDIDATE_LEDGER_DIR) to place the persistent multiple-testing ledger outside the data root; no credential, no secret
     "tools/candidate_readiness.py": 1,     # reads the same single non-secret ledger-directory variable; see candidate_competition
+    "tools/ms_capital_anchor.py": 2,       # reads ONE named, non-secret DIRECTORY variable (CAPITAL_ANCHOR_DIR: an owner may mount a second volume for the capital lineage) in anchor_dir_for, once from the mapping it is handed and once as the process's own setting; no credential, no secret, nothing on the order path
     "tools/history_holdout.py": 1,         # reads ONE named, non-secret PATH variable (HISTORY_HOLDOUT_LEDGER) to place the per-user holdout registry; no credential, no secret, off the order path (research only)
     "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
     "tools/control_centre.py": 1,        # read-only localhost UI: hands os.environ to owner_console.build (config.is_live_authorized); secrets reported as set/unset only, no value logged or served

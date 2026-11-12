@@ -45,6 +45,7 @@ import bybit_connection as bc  # noqa: E402
 import exec_lifecycle as EL  # noqa: E402
 import exec_quality as EQ  # noqa: E402
 import ms_capital as CC  # noqa: E402
+import ms_capital_anchor as AN  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
@@ -335,11 +336,16 @@ def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) ->
               "entries_stop_at_consecutive_losses": CC.LOSS_STREAK_STOP, "size_halved_at_consecutive_losses": CC.LOSS_STREAK_HALF}
     portfolio: Dict[str, Any] = {"status": "NO_CAPITAL_BOOK"}
     try:
-        if root and os.path.exists(os.path.join(root, "capital.json")):
-            r = CC.CapitalBook(root).report()
+        if root and (os.path.exists(os.path.join(root, "capital.json")) or AN.lineage_accounts(_anchor_dir())):
+            acct = AN.resolve_account(root, _anchor_dir())
+            if acct is None:                                       # a book exists and the account it belongs to cannot be told: say so, never guess
+                raise CC.BookRefused("ACCOUNT_NOT_RESOLVED", "no single capital lineage can be matched to this root offline (the venue states the account at the next session)")
+            r = CC.CapitalBook.anchored(root, account_ref=acct, venue="testnet", anchor_dir=_anchor_dir(), read_only=True, check_witness=False).report()
             portfolio = {"status": "BOOK", "sizing_basis_usd": r.get("sizing_basis_usd"), "verified_result_usd": r.get("verified_realised_usd"), "lifecycles_settled": r.get("lifecycles_settled"),
                          "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "lifetime_loss_stop_active": r.get("lifetime_loss_stop_active"), "pending_session": bool(r.get("pending")),
-                         "review_required": (r.get("review_required") or {}).get("code") if isinstance(r.get("review_required"), dict) else None}
+                         "review_required": (r.get("review_required") or {}).get("code") if isinstance(r.get("review_required"), dict) else None, "anchor": r.get("anchor")}
+    except CC.BookRefused as exc:                                  # the anchor refuses this book: the loop would refuse on it too, so the read-only record says so
+        portfolio = {"status": "BOOK_REFUSED", "refusal": exc.code}
     except Exception:                                              # noqa: BLE001 - an unreadable book is stated, never guessed
         portfolio = {"status": "BOOK_UNREADABLE"}
     return {"risk_limits": limits, "portfolio": portfolio, "venue": {"id": "testnet", "host": S._venues.get("testnet").host, "scope": "TESTNET_FAKE_MONEY"}}
@@ -357,13 +363,53 @@ def _book_stops(portfolio: Mapping[str, Any]) -> List[str]:
         out.append("CAPITAL_LIFETIME_LOSS_STOP")                          # no acknowledgement lifts this one
     if portfolio.get("status") == "BOOK_UNREADABLE":
         out.append("CAPITAL_BOOK_UNREADABLE")
+    if portfolio.get("status") == "BOOK_REFUSED":
+        out.append("CAPITAL_ANCHOR_REFUSED:" + str(portfolio.get("refusal")))     # the loop refuses on it (a restore, another account, a tampered view, no lineage)
     return out
 
 
-def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir: str, exc: Exception) -> None:
-    """A present-but-invalid capital book stops ALL entries until the owner has looked (a persistent ALERT marker, like unexplained cash): the file is never reset or overwritten."""
+def _anchor_dir(env: Optional[Mapping[str, str]] = None) -> str:
+    """Where the capital lineage lives: ``$CAPITAL_ANCHOR_DIR``, else ``capital_anchor`` next to the owner's capability file. ONE place whatever ``--root`` says."""
+    return AN.anchor_dir_for(env, default_home_file=AD.DEFAULT_CAPABILITY_PATH)
+
+
+def _anchor_status(env: Mapping[str, str]) -> Dict[str, Any]:
+    """What the owner reads before trusting the capital record: where the lineage lives, which accounts have one, which are waiting for ``capital --anchor-init``, and whether the remote witness is configured (it is
+    NOT_CONFIGURED until the owner sets it: a whole-volume rollback is then visible only through the venue's cash, see ms_capital_anchor). Read-only; no network."""
+    adir = _anchor_dir(env)
+    mode = (env.get(AN.WITNESS_ENV) or "").strip().lower() or "off"
+    return {"dir": adir, "lineages": AN.lineage_accounts(adir), "proposals_waiting_for_the_owner": [p["account"] for p in AN.proposals(adir) if p["account"] not in AN.lineage_accounts(adir)],
+            "witness": "NOT_CONFIGURED" if mode in ("off", "none") else f"CONFIGURED:{mode}", "witness_required": (env.get(AN.WITNESS_REQUIRED_ENV) or "").strip().lower() in ("1", "true", "yes")}
+
+
+def _open_book(root: str, account_ref: Optional[str], env: Optional[Mapping[str, str]], *, read_only: bool = False, check_witness: bool = True) -> "CC.CapitalBook":
+    """THE way production opens the capital book (a structural test forbids any other): bound to the account the VENUE stated, to a lineage outside ``--root``, optionally to the remote witness.
+    Raises ``CC.BookRefused`` (a ``BookUnreadable``) with a stable code; nothing is rewritten on a refusal."""
     try:
-        ES.EngineState(engine_root, clock).set("ALERT", {"code": "CAPITAL_BOOK_UNREADABLE", "state_dir": state_dir, "detail": str(exc)[:160]})
+        witness = AN.witness_from_env(env or {}) if check_witness else None
+    except AN.AnchorRefused as exc:
+        raise CC.BookRefused(exc.code, exc.detail) from None
+    return CC.CapitalBook.anchored(root, account_ref=account_ref, venue="testnet", anchor_dir=_anchor_dir(env), env=env, witness=witness, read_only=read_only, check_witness=check_witness)
+
+
+#: Refusals that say "try again", not "look at your book": an unreachable required witness and a lock that did not free up. They end the session as REFUSED without an ALERT marker (an ALERT needs a venue-flat proof and
+#: the owner's typed line to clear: a network blip must not cost the owner that) and they are not counted towards REPEATED_UNEXPECTED_REFUSAL.
+TRANSIENT_ANCHOR_CODES = ("WITNESS_UNAVAILABLE", "LOCK_TIMEOUT")
+#: Refusals that ask for the OWNER's one-time act, not for an investigation: the account has no lineage yet (``capital --anchor-init``), a pre-anchor book waits to be adopted, or the venue did not state which account
+#: this is (an owner decision, see RUNBOOKS). Nothing was lost and nothing is wrong with the book, so no ALERT (which would then need a venue-flat proof and a typed line to clear): the loop PAUSES with the reason and
+#: resumes by itself the moment the owner has done it. Every OTHER refusal (a tampered view, an older anchor, another account, a fork, a rollback) is an incident and keeps its ALERT.
+OWNER_ACTION_ANCHOR_CODES = ("ACCOUNT_NOT_INITIALISED", "BOOK_UNANCHORED", "ACCOUNT_IDENTITY_UNAVAILABLE")
+NO_ALERT_ANCHOR_CODES = TRANSIENT_ANCHOR_CODES + OWNER_ACTION_ANCHOR_CODES
+
+
+def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir: str, exc: Exception) -> None:
+    """A present-but-invalid capital book stops ALL entries until the owner has looked (a persistent ALERT marker, like unexplained cash): the file is never reset or overwritten. A book the anchor refuses
+    (no lineage, a restore, another account, a tampered view) carries its stable code."""
+    code = getattr(exc, "code", None)
+    if code in NO_ALERT_ANCHOR_CODES:
+        return
+    try:
+        ES.EngineState(engine_root, clock).set("ALERT", {"code": "CAPITAL_ANCHOR_REFUSED" if code else "CAPITAL_BOOK_UNREADABLE", **({"reason": code} if code else {}), "state_dir": state_dir, "detail": str(exc)[:160]})
     except Exception:                                                  # noqa: BLE001 - the refusal itself is already fail-closed
         pass
 
@@ -506,15 +552,17 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if step("preflight") != 0:
         return _res("ERROR", ["PREFLIGHT_FAILED"], state_dir=d, detail=lines[-6:])
     pf = ES.read_json(os.path.join(d, "preflight.json")) or {}
-    book = CC.CapitalBook(engine_root)
     usdt_now = pf.get("usdt")
     try:
+        # the book is bound to the ACCOUNT THE VENUE STATED in this very preflight and to a lineage outside --root: a deleted, restored or relocated book cannot start clean (ms_capital_anchor)
+        book = _open_book(engine_root, pf.get("account_ref"), env)
         book.load()                                                   # a book that exists but cannot be read is NOT a fresh book: refuse before any order (the file stays as evidence)
         book.ensure_baseline(usdt_now)
         settled = book.settle(usdt_now)
     except CC.BookUnreadable as exc:
         _alert_book_unreadable(engine_root, clock, d, exc)
-        return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])      # (settle = what the venue's cash REALLY did since the last verified-flat session: losses in full, gains only as far as explained)
+        code = getattr(exc, "code", None)
+        return _res("REFUSED", ["CAPITAL_ANCHOR_REFUSED:" + code if code else "CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])      # (settle = what the venue's cash REALLY did since the last verified-flat session: losses in full, gains only as far as explained)
     cb = book.load()
     review = cb.get("review_required")
     if settled["status"] == "UNEXPLAINED_CASH" or review:             # cash the ledger cannot explain: no new entries until a human has looked (the evidence stays in capital.json)
@@ -578,6 +626,11 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("REFUSED", ["CAPITAL_BOOK_UNREADABLE"], state_dir=d, detail=[str(exc)[:200]])
     if not parked:          # a conservative placeholder BEFORE any order: a crash from here on still gets its cash settled (loss debited, gain never credited)
         return _res("SKIPPED", ["CAPITAL_PENDING_UNSETTLED_OR_CASH_UNKNOWN"], state_dir=d)
+    try:
+        book.barrier()      # the remote witness (when configured) must hold the head INCLUDING this placeholder before an order leaves; a required witness that cannot say so refuses (settled later with delta ~0)
+    except CC.BookUnreadable as exc:
+        _alert_book_unreadable(engine_root, clock, d, exc)
+        return _res("REFUSED", ["CAPITAL_ANCHOR_REFUSED:" + str(getattr(exc, "code", "UNREADABLE"))], state_dir=d, detail=[str(exc)[:200]])
     on_state("EXECUTING", "execute_started")
     watch_sleep, watch = _watching_sleep(sleep, d, clock, manifest, engine_root, lease)
 
@@ -953,7 +1006,7 @@ def evidence_net(net: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
 IDLE_POLL_S = 30
 IN_SESSION_HEARTBEAT_S = 30
 DRAINED_FRESH_MS = 300_000
-OWNER_AUTHORITY_REFUSALS = ("GRANT_", "OWNER_CAPABILITY_FILE", "DEDICATED_TESTNET_CREDENTIALS_MISSING")
+OWNER_AUTHORITY_REFUSALS = ("GRANT_", "OWNER_CAPABILITY_FILE", "DEDICATED_TESTNET_CREDENTIALS_MISSING", *("CAPITAL_ANCHOR_REFUSED:" + c for c in NO_ALERT_ANCHOR_CODES))
 
 
 def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[..., Dict[str, Any]] = run_once, clock: Optional[Callable[[], int]] = None,
@@ -1302,6 +1355,7 @@ def _book_state(cbk: "CC.CapitalBook") -> Dict[str, Any]:
     hist = b.get("history") or []
     dd = cbk.drawdown(b)
     return {"halted": bool(b.get("halted")), "loss_streak": int(b.get("loss_streak", 0)), "realised_usd": b.get("realised_usd"), "drawdown_usd": None if dd is None else str(dd),
+            "epoch": int(b.get("epoch") or 0), "cumulative_usd": str(cbk.lifetime_cumulative_usd(b)), "head": (b.get("ledger_ref") or {}).get("head", "")[:12] or None, "pending": bool(b.get("pending")),
             "basis_usd": None if cbk.basis(b) is None else str(cbk.basis(b)), "review_code": (b.get("review_required") or {}).get("code"), "reserve_fraction": b.get("reserve_fraction"),
             "transfers_pending": len(b.get("transfers_pending") or []), "last_session": (hist[-1].get("session_id") if hist else None)}
 
@@ -1373,6 +1427,12 @@ def _parser() -> argparse.ArgumentParser:
     cp.add_argument("--ack-drawdown", action="store_true", help="after YOU reviewed the losses that hit the drawdown stop: resume from the current verified basis (a new drawdown peak)")
     cp.add_argument("--reserve-fraction", help="share (0..0.9) of every verified realised gain that is withheld from reinvestment")
     cp.add_argument("--declare-transfer", nargs=2, metavar=("EVENT_ID", "USD"), help="a deposit (+) or withdrawal (-) YOU made: it is removed from the next settlement so it is never read as a trading result")
+    cp.add_argument("--check-witness", action="store_true", help="read-only: compare the local lineage head with the remote witness (OK / LOCAL_BEHIND_WITNESS / LINEAGE_FORKED / WITNESS_UNAVAILABLE / NOT_CONFIGURED); publishes nothing (the first read of a project writes one small canary row)")
+    cp.add_argument("--account", help="the acct_ reference of the account (default: the one this root's book is bound to, else the only lineage); the autopilot prints it when it refuses a new account")
+    cp.add_argument("--anchor-init", action="store_true", help="OWNER ONLY: create this account's capital lineage (a new account, or adopt a pre-anchor capital.json). The only way a lineage begins; refused when one exists or a witness knows the account")
+    cp.add_argument("--rebaseline", action="store_true", help="OWNER ONLY: close the current EPOCH of this account (its closing figures become a permanent, witnessed lineage row with your --reason) and start a new one: streak, halt, review, drawdown, realised result and baseline begin again from the next flat cash read. The one supported way to lift the lifetime stop on the same account; the cumulative result stays in every report")
+    cp.add_argument("--reason", help="with --rebaseline: 8-200 characters of your own on what happened and why")
+    cp.add_argument("--rebuild-view", action="store_true", help="OWNER ONLY: replace a capital.json that does not match its lineage (VIEW_TAMPERED / VIEW_UNBOUND) with the lineage head; the rejected file is kept. Never for ANCHOR_BEHIND_BOOK")
     qp = sub.add_parser("quality", help="READ-ONLY: measured execution cost vs the model's, realised funding vs expected, and the policy comparison, from the chained session log (no venue access, nothing written)")
     qp.add_argument("--root", default=DEFAULT_ROOT)
     ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
@@ -1412,18 +1472,81 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
         eng = ES.EngineState(a.root, clock)
         print(json.dumps({"grant": None if g is None else {k: v for k, v in g.items() if k != "grant_sha256"}, "grant_problems": why, "engine": {k: v for k, v in eng.load().items() if k != "history"},
                           "markers": {m: eng.has(m) for m in ES.MARKERS}, "credentials": TT.TestnetCredentials.presence(e), "last_result": ES.read_json(os.path.join(a.root, "last_result.json")),
-                          "cost_of_capital": EG.describe_cash_alternative(e, clock())},
+                          "cost_of_capital": EG.describe_cash_alternative(e, clock()),
+                          "capital_anchor": _anchor_status(e)},
                          indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "capital":
-        cbk = CC.CapitalBook(a.root)
+        adir = _anchor_dir(e)
+        acct = a.account or AN.resolve_account(a.root, adir)
+        if acct is None and a.anchor_init:
+            props = AN.proposals(adir)
+            acct = props[0]["account"] if len(props) == 1 else None
+        if acct is not None and not AN.is_account_ref(acct):
+            print("refused: --account must be an acct_ reference as the autopilot's refusal printed it", file=sys.stderr)
+            return 2
+        if acct is None:
+            print(json.dumps({"capital_book": "NO_ACCOUNT_RESOLVED", "anchor_dir": adir, "lineages": AN.lineage_accounts(adir), "proposals": [p["account"] for p in AN.proposals(adir)],
+                              "next": "the autopilot writes a proposal the first time it sees an account that has no lineage (ACCOUNT_NOT_INITIALISED); then, in an interactive session, `capital --anchor-init` (or --account ACCT_REF)"}, indent=2, sort_keys=True))
+            return 2
         try:
-            cbk.load()
+            witness = AN.witness_from_env(e)
+        except AN.AnchorRefused as exc:
+            print(f"capital: {exc.code}: {exc.detail}", file=sys.stderr)
+            return 2
+        owner_act = bool(a.anchor_init or a.rebuild_view or a.rebaseline)
+        gated = owner_act or a.ack_halt or a.ack_review or a.ack_drawdown or a.reserve_fraction is not None or bool(a.declare_transfer)
+        try:
+            if owner_act:
+                cbk = CC.CapitalBook(a.root, AN.Anchor(a.root, acct, "testnet", adir, witness=witness, clock=clock))
+            else:
+                # offline: the witness is consulted by the session that holds the venue's answer; here the book is opened against its lineage (read-only unless an owner action is asked for)
+                cbk = CC.CapitalBook.anchored(a.root, account_ref=acct, venue="testnet", anchor_dir=adir, env=e, witness=witness, check_witness=False, read_only=not gated)
+        except CC.BookRefused as exc:
+            print(f"capital book refused: {exc.code}: {exc.detail}\nNothing was changed and nothing was repaired. The autopilot refuses on this too. See bot/RUNBOOKS.md (capital anchor).", file=sys.stderr)
+            return 2
         except CC.BookUnreadable as exc:
             print(f"capital book unreadable: {exc}\nInspect the file; if it is genuinely lost or damaged, move it aside DELIBERATELY (it is the record of your halts and losses; nothing here overwrites it).", file=sys.stderr)
             return 2
+
+        def lineage_state() -> Dict[str, Any]:
+            """what an owner act on the lineage itself reads BEFORE it acts (the book may be refused, which is often why the owner is here)"""
+            raw = ES.read_json(os.path.join(a.root, "capital.json"))
+            bound = isinstance(raw, dict) and isinstance(raw.get("ledger_ref"), dict)
+            try:
+                cbk.load()
+                refusal = None
+            except CC.BookUnreadable as exc:
+                refusal = getattr(exc, "code", "UNREADABLE")
+            try:
+                n = len(cbk.anchor.entries())                                 # type: ignore[union-attr]
+            except AN.AnchorRefused:
+                n = None
+            return {"account": acct, "venue": "testnet", "book_file": "BOUND" if bound else ("LEGACY" if isinstance(raw, dict) else "ABSENT"), "refusal": refusal, "lineage_entries": n,
+                    "legacy_realised_usd": raw.get("realised_usd") if isinstance(raw, dict) else None, "legacy_history_rows": len(raw.get("history") or []) if isinstance(raw, dict) and isinstance(raw.get("history"), list) else None,
+                    "witness": "NOT_CONFIGURED" if not getattr(witness, "configured", False) else "CONFIGURED"}
+
+        def init_account() -> bool:
+            cbk.initialise({"gate": "TTY_TYPED_LINE", "tty": True, "uid": os.getuid() if uid is None else uid})
+            return True
+
+        def rebuild() -> bool:
+            return cbk.rebuild_view() == "REBUILT"
+
+        def rebaseline() -> bool:
+            cbk.rebaseline(a.reason or "", {"gate": "TTY_TYPED_LINE", "tty": True, "uid": os.getuid() if uid is None else uid})
+            cbk.barrier()                                                     # a configured REQUIRED witness must hold the new epoch before the owner is told it happened
+            return True
+
         # (flag given, action, the facts the typed line must embed [read from the book AS IT IS when this step runs], the change, the words for done / nothing to do)
         steps = [
+            (a.anchor_init, "ANCHOR-INIT", lambda st: {k: st[k] for k in ("account", "venue", "book_file", "legacy_realised_usd", "legacy_history_rows", "witness")}, init_account,
+             "capital lineage created (the account's history now lives outside --root and cannot be reset by deleting or restoring files)", "nothing created"),
+            (a.rebaseline, "REBASELINE", lambda st: {"account": acct, "epoch": st["epoch"], "realised_usd": st["realised_usd"], "cumulative_usd": st["cumulative_usd"], "head": st["head"], "pending": st["pending"],
+                                                              "reason_sha": hashlib.sha256((a.reason or "").encode("utf-8")).hexdigest()[:10]}, rebaseline,
+             "new epoch started: the closing figures of the previous one are a permanent lineage row; the next flat cash read sets the new baseline", "nothing changed"),
+            (a.rebuild_view, "REBUILD-VIEW", lambda st: {"account": st["account"], "refusal": st["refusal"], "lineage_entries": st["lineage_entries"]}, rebuild,
+             "capital.json replaced with the lineage head (the rejected file was kept)", "nothing to rebuild (or refused: ANCHOR_BEHIND_BOOK is never rebuilt)"),
             (a.ack_halt, "ACK-HALT", lambda st: {"loss_streak": st["loss_streak"], "realised_usd": st["realised_usd"], "last_session": st["last_session"]}, cbk.acknowledge_halt,
              "halt acknowledged", "no halt to acknowledge"),
             (a.ack_review, "ACK-REVIEW", lambda st: {"review_code": st["review_code"], "last_session": st["last_session"], "realised_usd": st["realised_usd"]}, cbk.acknowledge_review,
@@ -1435,6 +1558,24 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
             (bool(a.declare_transfer), "DECLARE-TRANSFER", lambda st: {"event": a.declare_transfer[0], "usd": a.declare_transfer[1], "pending": st["transfers_pending"]},
              lambda: cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]), "transfer declared", "refused or already declared"),
         ]
+        if a.check_witness:
+            if not getattr(witness, "configured", False):
+                print(json.dumps({"witness": "NOT_CONFIGURED", "next": "set CAPITAL_WITNESS=supabase (and CAPITAL_WITNESS_REQUIRED=1) on the machine; see RUNBOOKS, capital lineage"}, sort_keys=True))
+                return 0
+            try:
+                with cbk._locked():
+                    cbk.anchor.open_view()                                               # type: ignore[union-attr]
+                    verdict = cbk.anchor.check_witness(publish=False)                    # type: ignore[union-attr]
+                    local = len(cbk.anchor.entries()) - 1                                # type: ignore[union-attr]
+                    try:
+                        remote = witness.head(acct)
+                    except AN.WitnessError:
+                        remote = "UNREADABLE"
+                print(json.dumps({"witness": verdict, "local_head_seq": local, "remote_head_seq": remote[0] if isinstance(remote, tuple) else remote, "account": acct}, sort_keys=True))
+                return 0
+            except (CC.BookUnreadable, AN.AnchorRefused) as exc:
+                print(json.dumps({"witness": getattr(exc, "code", "UNREADABLE"), "detail": getattr(exc, "detail", str(exc))[:200]}, sort_keys=True))
+                return 2
         owner: Optional[OwnerGate] = None                                  # built only when an owner action is asked for: printing the book touches nothing
         asked = [action for given, action, *_rest in steps if given]
         if len(asked) > 1:
@@ -1443,16 +1584,25 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
             if not given:
                 continue
             owner = owner or OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, env=e)
-            before = _book_state(cbk)
+            before = lineage_state() if action in ("ANCHOR-INIT", "REBUILD-VIEW") else _book_state(cbk)
             code = owner.confirm(action, facts_of(before), before)
             if code is not None:
                 return code
-            applied = apply()
-            closed = owner.done("APPLIED" if applied else "NOOP", _book_state(cbk))
+            try:
+                applied = apply()
+            except CC.BookUnreadable as exc:                                # the act itself was refused (a lineage exists, the witness knows the account, ...): nothing changed
+                owner.done("REFUSED:" + str(getattr(exc, "code", "UNREADABLE")), lineage_state() if action in ("ANCHOR-INIT", "REBUILD-VIEW") else {})
+                print(f"refused: {getattr(exc, 'code', 'UNREADABLE')}: {getattr(exc, 'detail', str(exc))}; nothing was changed", file=sys.stderr)
+                return 2
+            closed = owner.done("APPLIED" if applied else "NOOP", lineage_state() if action in ("ANCHOR-INIT", "REBUILD-VIEW") else _book_state(cbk))
             print(did if applied else did_not)
             if not closed:
                 return 1
-        print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
+        try:
+            print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
+        except CC.BookUnreadable as exc:
+            print(f"capital book refused: {getattr(exc, 'code', 'UNREADABLE')}: {getattr(exc, 'detail', str(exc))}", file=sys.stderr)
+            return 2
         return 0
     if a.cmd == "quality":
         import evidence_chain as _EC

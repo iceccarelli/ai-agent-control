@@ -48,6 +48,44 @@ _SAVED_ENV = {} if _ALLOW_NETWORK else {
     k: os.environ.pop(k) for k in _SCRUBBED if k in os.environ}
 
 
+# ---------------------------------------------------------------------------
+# OWNER STATE IS NEVER A TEST'S TO TOUCH: the holdout registry, the candidate ledgers and the capital lineage.
+#
+# These live in the owner's home (``~/.ai-agent-control``). The function-scoped fixtures below give every TEST its own copies, but a MODULE-scoped fixture (and any subprocess it starts) is set up BEFORE
+# them, so it saw the real files: ``test_ms_pipeline_cli.py::ran`` runs ``ms_pipeline.py run --unreserved-exploratory`` as a subprocess, which RECORDED A READ of the fixture window (to 2027-01-03) in the real
+# per-user registry. The owner is told to run ``make test-quick`` (RUNBOOKS); doing so burned ``mainnet|linear`` through 2027-01-03 and every later ``--reserve`` was refused ALREADY_READ. The variables are
+# therefore set for the WHOLE SESSION here, at import (before any module is collected and before any subprocess is started), and a session-end check fails the run if the real files changed anyway.
+# ---------------------------------------------------------------------------
+_REAL_OWNER_HOME = os.path.join(os.path.expanduser("~"), ".ai-agent-control")
+_OWNER_STATE_VARS = ("HISTORY_HOLDOUT_LEDGER", "CANDIDATE_LEDGER_DIR", "CAPITAL_ANCHOR_DIR")
+_OWNER_STATE_ORIG = {k: os.environ.get(k) for k in _OWNER_STATE_VARS}
+_SESSION_OWNER_STATE = tempfile.mkdtemp(prefix="bot_tests_owner_state_")
+os.environ["HISTORY_HOLDOUT_LEDGER"] = os.path.join(_SESSION_OWNER_STATE, "history_holdout.jsonl")
+os.environ["CANDIDATE_LEDGER_DIR"] = os.path.join(_SESSION_OWNER_STATE, "candidate_ledgers")
+os.environ["CAPITAL_ANCHOR_DIR"] = os.path.join(_SESSION_OWNER_STATE, "capital_anchor")
+
+
+def _real_owner_state_fingerprint():
+    """(name, size, mtime_ns) of what a test run must never change under the real ``~/.ai-agent-control``: the holdout registry and its sidecars, the capital anchor directory, the autopilot's engine root book."""
+    out = []
+    for rel in ("history_holdout.jsonl", "history_holdout.jsonl.chain", "history_holdout.jsonl.head", "ms_autopilot/capital.json", "ms_testnet_capability.json", "ms_autopilot_grant.json"):
+        p = os.path.join(_REAL_OWNER_HOME, rel)
+        try:
+            st = os.stat(p)
+            out.append((rel, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append((rel, None, None))
+    anchor = os.path.join(_REAL_OWNER_HOME, "capital_anchor")
+    try:
+        out.append(("capital_anchor/", tuple(sorted((n, os.stat(os.path.join(anchor, n)).st_size) for n in os.listdir(anchor)))))
+    except OSError:
+        out.append(("capital_anchor/", None))
+    return tuple(out)
+
+
+_OWNER_STATE_BEFORE = _real_owner_state_fingerprint()
+
+
 class NetworkBlocked(RuntimeError):
     """A test tried to make a real HTTP request."""
 
@@ -67,10 +105,30 @@ if not _ALLOW_NETWORK:
         pass
 
 
+@pytest.fixture(autouse=True)
+def _isolated_capital_anchor(tmp_path_factory, monkeypatch):
+    """The capital lineage lives OUTSIDE --root (ms_capital_anchor), at $CAPITAL_ANCHOR_DIR or ~/.ai-agent-control/capital_anchor. A test must never read or write the developer's real one, and two tests must
+    never share an account's lineage: every test gets its own directory."""
+    monkeypatch.setenv("CAPITAL_ANCHOR_DIR", str(tmp_path_factory.mktemp("capital_anchor")))
+    monkeypatch.delenv("CAPITAL_WITNESS", raising=False)
+    monkeypatch.delenv("CAPITAL_WITNESS_REQUIRED", raising=False)
+    yield
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _restore_caller_environment():
     yield
     os.environ.update(_SAVED_ENV)
+    for k, v in _OWNER_STATE_ORIG.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    after = _real_owner_state_fingerprint()
+    if after != _OWNER_STATE_BEFORE:                                                    # a test (or a subprocess it started) wrote the owner's REAL state: fail the run loudly, never quietly
+        changed = [a for a, b in zip(after, _OWNER_STATE_BEFORE) if a != b]
+        pytest.fail("this test run changed the owner's REAL state under ~/.ai-agent-control (a test must use the session-isolated $HISTORY_HOLDOUT_LEDGER / $CANDIDATE_LEDGER_DIR / "
+                    f"$CAPITAL_ANCHOR_DIR and an engine root under tmp_path): {changed}", pytrace=False)
 
 
 @pytest.fixture(autouse=True, scope="session")
