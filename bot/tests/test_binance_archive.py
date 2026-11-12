@@ -604,3 +604,40 @@ def test_a_symlink_where_a_directory_belongs_is_refused(tmp_path):
     with pytest.raises(BA.ArchiveError) as e:
         a.download_month("klines", "BTCUSDT", "1d", "2024-01")
     assert e.value.code == "ROOT_NOT_ALLOWED"
+
+
+def test_a_transient_network_error_is_retried_with_growing_pauses_and_a_lasting_one_is_reported(tmp_path):
+    good = FakeNet()
+    good.add_month("klines", "BTCUSDT", "1d", "2024-01", GOOD_KLINES)
+    state = {"n": 0}
+    slept = []
+
+    def flaky(url):
+        if state["n"] < 2:
+            state["n"] += 1
+            raise BA.ArchiveError("NETWORK_ERROR", "request failed (URLError: timeout)")
+        return good(url)
+    a = archive(tmp_path, flaky, sleep=slept.append)
+    assert a.download_month("klines", "BTCUSDT", "1d", "2024-01")["status"] == "OK"
+    assert state["n"] == 2 and slept[1] > slept[0] > 0
+
+    calls = []
+
+    def dead(url):
+        calls.append(url)
+        raise BA.ArchiveError("NETWORK_ERROR", "request failed (URLError: refused)")
+    b = archive(tmp_path / "b", dead, retries=2)
+    with pytest.raises(BA.ArchiveError) as e:
+        b.download_month("klines", "BTCUSDT", "1d", "2024-01")
+    assert e.value.code == "NETWORK_ERROR" and len(calls) == 3                            # one try and two retries
+
+
+def test_a_blocked_host_is_never_retried_as_if_it_were_a_network_blip(tmp_path):
+    calls = []
+
+    def blocked(url):
+        calls.append(url)
+        raise BA.ArchiveError("HOST_NOT_ALLOWED", "no")
+    with pytest.raises(BA.ArchiveError) as e:
+        archive(tmp_path, blocked).download_month("klines", "BTCUSDT", "1d", "2024-01")
+    assert e.value.code == "HOST_NOT_ALLOWED" and len(calls) == 1

@@ -166,7 +166,8 @@ def http_fetch(url: str, timeout: float = 30.0, max_bytes: int = MAX_ZIP_BYTES) 
     except urllib.error.HTTPError as exc:
         return int(exc.code), b""
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-        raise ArchiveError("NETWORK_ERROR", f"request failed ({type(exc).__name__})") from exc
+        why = getattr(exc, "reason", None)
+        raise ArchiveError("NETWORK_ERROR", f"request failed ({type(exc).__name__}: {type(why).__name__ if why is not None else str(exc)[:60]})") from exc
 
 
 class Throttle:
@@ -463,7 +464,14 @@ class Archive:
         attempt = 0
         while True:
             self._throttle.acquire()
-            status, body = self._fetch(url)
+            try:
+                status, body = self._fetch(url)
+            except ArchiveError as exc:
+                if exc.code == "NETWORK_ERROR" and attempt < self._retries:        # a reset or a timeout through a proxy is transient: bounded retries, growing pauses
+                    self._sleep(self._backoff * (2 ** attempt))
+                    attempt += 1
+                    continue
+                raise
             if status == 200:
                 return body
             if status == 404:
