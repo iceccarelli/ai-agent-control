@@ -223,6 +223,43 @@ def test_a_stalled_store_with_a_clock_stepped_far_ahead_loses_at_most_one_extra_
     assert healthy.apply_retention(BASE + 400 * DAY, 2) == ["md-20261104.db"]         # the same clock on a healthy volume removes only what the policy always did
 
 
+def test_a_stall_that_lasts_drops_one_more_expired_day_for_every_day_it_lasts(tmp_path, monkeypatch):
+    """REPRODUCED (Round 16): two retained days that ONE dropped day cannot free never recovered, whatever the
+    wall clock did (every later call removed nothing). The allowance now grows by one day per day of MONOTONIC
+    stall, so a stalled recorder can recover by itself; a stepped wall clock alone still cannot grow it."""
+    store = _four_days(str(tmp_path / "md"))                                          # 4, 5, 6, 7 Nov
+    clock = {"t": 5_000.0}
+    monkeypatch.setattr(ST.time, "monotonic", lambda: clock["t"])
+    _stall(store)
+    day8 = BASE + 4 * DAY + 5_000
+    assert store.apply_retention(day8, 2) == ["md-20261104.db", "md-20261105.db"]     # the one-day allowance, as before
+    assert store.segments() == ["md-20261106.db", "md-20261107.db"]
+    # the wall clock steps a day ahead but the stall has NOT lasted a day
+    day9 = day8 + DAY
+    assert store.apply_retention(day9, 2) == []                                       # a stepped clock cannot grow the allowance
+    clock["t"] += 86_400.0 + 1.0                                                       # a full day of real stall
+    assert store.apply_retention(day9, 2) == ["md-20261106.db"]                       # now 6 Nov is past retention (9 Nov - 2 = 7 Nov) and goes
+    assert store.segments() == ["md-20261107.db"] and store.verify() == []
+    clock["t"] += 30 * 86_400.0                                                        # however long it lasts, the newest segment is never touched
+    assert store.apply_retention(day9 + 30 * DAY, 2) == []
+    assert store.segments() == ["md-20261107.db"]
+
+
+def test_the_stall_clock_resets_when_the_volume_recovers(tmp_path, monkeypatch):
+    store = _four_days(str(tmp_path / "md"))
+    clock = {"t": 5_000.0}
+    monkeypatch.setattr(ST.time, "monotonic", lambda: clock["t"])
+    _stall(store)
+    store.apply_retention(BASE + 4 * DAY + 5_000, 2)
+    clock["t"] += 3 * 86_400.0
+    store.min_free_bytes, store.free_bytes = 1000, lambda: 10_000                      # the volume has room again
+    assert store.apply_retention(BASE + 7 * DAY, 2) == []
+    assert store._stalled_since is None
+    _stall(store)                                                                      # a NEW stall starts from one day of allowance, not three
+    store.apply_retention(BASE + 7 * DAY, 2)
+    assert store._stalled_since == clock["t"]
+
+
 def test_a_failed_free_space_look_never_enables_a_deletion(tmp_path):
     """The WRITER treats a failed look as 'low' (never assume room); the RETENTION must treat it as 'not stalled' (an error must never enable a deletion)."""
     store = _three_days(str(tmp_path / "md"))

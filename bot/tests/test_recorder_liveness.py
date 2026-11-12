@@ -190,6 +190,52 @@ def test_the_history_line_carries_the_age_and_the_detail_for_every_non_recording
     assert line["recorder_state"] == "NOT_PERSISTING" and line["recorder_growth_age_s"] == pytest.approx(900.0) and "has not grown" in line["recorder_detail"]
 
 
+def test_a_stale_recorder_keeps_its_own_explanation_when_an_old_store_fault_is_in_the_file(tmp_path):
+    """REPRODUCED (Round 16): a status file that stopped updating still holds the store's last fault.
+    The history line wrote `fault or detail`, so the old 'free space below the reserve' fault REPLACED the
+    reason the recorder was not reporting (the file's age and the supervisor's restarts), and the alert said
+    'full disk' for a recorder whose process or heartbeat was dead. The state's explanation comes first."""
+    p, now = status_file(tmp_path, age_s=3 * 86_400,
+                         fault="StoreError: free space below the 536870912-byte reserve; not writing")
+    (tmp_path / "supervisor_status.json").write_text(json.dumps(
+        {"recorder_pid": None, "recorder_restarts": 7, "recorder_consecutive_failures": 5, "recorder_last_exit": 1}))
+    rec = {"at": "2026-11-12T18:24:00Z", "outcome": "OK", "reasons": [],
+           "recorder": RM.recorder_observation(p, now=now), "decision": {}}
+    assert RM._history_line(str(tmp_path), rec) is True
+    line = json.loads((tmp_path / "monitor.jsonl").read_text().splitlines()[-1])
+    assert line["recorder_state"] == "STALE"
+    detail = line["recorder_detail"]
+    assert "s old" in detail and "supervisor" in detail, detail        # why it is not reporting
+    assert "last fault:" in detail and "free space below" in detail, detail
+    assert detail.index("s old") < detail.index("last fault:")
+
+
+def test_the_history_line_says_where_the_free_space_figure_came_from(tmp_path):
+    """A STALE recorder stopped updating its own free-space figure, so the monitor reads the volume itself
+    (statvfs): the history must say so, or 510 MiB cannot be told from a dead recorder's last value."""
+    p, now = status_file(tmp_path, age_s=1830)
+    obs = RM.recorder_observation(p, now=now)
+    assert obs["free_mb_source"] == "statvfs"
+    rec = {"at": "2026-11-12T18:24:00Z", "outcome": "OK", "reasons": [], "recorder": obs, "decision": {}}
+    assert RM._history_line(str(tmp_path), rec) is True
+    line = json.loads((tmp_path / "monitor.jsonl").read_text().splitlines()[-1])
+    assert line["recorder_free_mb_source"] == "statvfs"
+    p2, now = status_file(tmp_path, age_s=10)
+    rec["recorder"] = RM.recorder_observation(p2, now=now)
+    assert RM._history_line(str(tmp_path), rec) is True
+    line = json.loads((tmp_path / "monitor.jsonl").read_text().splitlines()[-1])
+    assert line["recorder_free_mb_source"] == "recorder_status"
+
+
+def test_a_fault_with_no_state_detail_is_still_reported_alone(tmp_path):
+    p, now = status_file(tmp_path, age_s=10, fault="OSError: disk is full")
+    rec = {"at": "2026-11-12T18:24:00Z", "outcome": "OK", "reasons": [],
+           "recorder": RM.recorder_observation(p, now=now), "decision": {}}
+    assert RM._history_line(str(tmp_path), rec) is True
+    line = json.loads((tmp_path / "monitor.jsonl").read_text().splitlines()[-1])
+    assert line["recorder_state"] == "FAULT" and line["recorder_detail"] == "OSError: disk is full"
+
+
 def test_the_alert_names_the_age_and_the_supervisor_instead_of_no_detail_recorded(tmp_path):
     """End to end through the REAL history writer and the REAL alert rules: the alert semantics are unchanged (3 cycles not RECORDING = recorder_down), the text is now diagnostic."""
     import runner_alerts as RA
