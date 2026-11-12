@@ -1623,6 +1623,31 @@ def pair_economics(closed: Sequence[Mapping[str, Any]], cls_closed: str,
         notional_usd=N, fees_usd=fees,
         not_scaled="slippage already inside the price leg; spread (not "
                    "journalled); financing")
+    if derived:
+        # A pair whose inventory leg is only DERIVED from perp prices is funding
+        # minus fees by construction: its basis (perp vs spot) is NOT measured
+        # and counts as zero. An EDGE, a CUSHION or a RETURN on it would claim
+        # money the basis may have taken back (the reviewer's repro: +1.77% on
+        # posted margin and +2.95 bps per notional-day while the unmeasured
+        # basis was worth about -$300 per cycle). The cost-recovery LEVELS above
+        # (break-even funding, minimum hold, required edge) stay, with their
+        # existing "basis not measurable" label: they say what must be earned,
+        # not that it was.
+        why_d = (
+            f"OVERLAY_PAIR_DERIVED_NOT_BOOKED: {len(derived)} overlay cycle(s) "
+            "have no booked inventory leg, so their pair is funding minus fees "
+            "by construction and its basis (perp vs spot) is NOT measured; an "
+            "edge, cushion or return on it would count the basis as zero")
+        for key, unit in (("funding_margin_over_break_even_bps",
+                           "bps_per_settlement"),
+                          ("net_bps_per_notional_day", "bps_per_notional_day"),
+                          ("pair_return_on_posted_margin_pct", "pct")):
+            out[key] = unavailable(why_d, key, unit=unit)
+        out["execution_cost_sensitivity"] = dict(
+            out["execution_cost_sensitivity"],
+            extra_round_trip_bps_to_zero_net=None,
+            fee_multiple_to_zero_net=None, basis_pnl_included=False,
+            cushion_withheld=why_d)
     return out
 
 

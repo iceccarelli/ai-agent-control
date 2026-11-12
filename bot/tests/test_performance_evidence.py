@@ -32,13 +32,23 @@ NOW = T0 + 60 * DAY
 
 def overlay_cycle(j, d0, d1, *, tag, funding=300.0, close_price=98_000.0,
                   fee_status="confirmed", close_fee_status=None,
-                  basis="venue", reconcile=True, qty=1.0):
+                  basis="venue", reconcile=True, qty=1.0, mark=None):
     """A hedged overlay cycle: short at 100k, venue funding, cover. Net with
     the defaults: 300 - 110 + 2000 = 2190."""
     L.perp_open(j, ms=T0 + d0 * DAY, ref=f"{tag}-o", qty=qty, price=100_000.0,
                 fee_usd=55.0, fee_status=fee_status)
     L.funding(j, ms=T0 + (d0 + 1) * DAY, ref=f"{tag}-f", usd=funding,
               basis=basis, raw=(_vraw(f"{tag}-f", T0 + (d0 + 1) * DAY, funding) if basis == "venue" else None))
+    if mark is not None:
+        # the client's BTC booked and VERIFIED-marked to `mark` (a measured pair)
+        L.revalue_inventory(
+            j, ms=T0 + d1 * DAY - 1, ref=f"{tag}-rv", qty=qty,
+            from_price=100_000.0, to_price=mark,
+            raw={"valuation": L.MARK_VALUATION, "qty": qty,
+                 "entry_spot": 100_000.0, "exit_spot": mark,
+                 "exit_mark_source": "tick_spot_mark",
+                 "exit_mark_observed_ms": T0 + d1 * DAY - 1,
+                 "fill_ms": T0 + d1 * DAY})
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=qty,
                  price=close_price, entry_price=100_000.0, fee_usd=55.0,
                  fee_status=close_fee_status or fee_status)
@@ -405,8 +415,23 @@ def test_no_benchmark_rate_is_ever_invented(tmp_path, clean):
     assert c["vs_benchmark_rate"]["evidence_class"] == "UNAVAILABLE"
 
 
-def test_overlay_against_unhedged_btc_and_an_operator_rate(tmp_path, clean):
+def test_a_derived_overlay_cycle_is_not_compared_with_a_benchmark_rate(tmp_path, clean):
+    """Round 16 (second review pass): the pair of an unmarked overlay is derived
+    from perp prices (basis unmeasured); comparing it with a benchmark would
+    count the basis as zero."""
     r = report(write_db(tmp_path, clean), environment="mainnet",
+               cash_apr_pct=5.0, cash_apr_source="operator: T-bill 2023-11")
+    c = r["sections"]["opportunity_cost"]["cycles"][0]
+    assert c["vs_benchmark_rate"]["available"] is False
+    assert "OVERLAY_PAIR_DERIVED_NOT_BOOKED" in c["vs_benchmark_rate"]["why"]
+    assert c["vs_unhedged_btc"]["pair_basis"] == "DERIVED_BASIS_UNMEASURED"
+
+
+def test_overlay_against_unhedged_btc_and_an_operator_rate(tmp_path):
+    # a MEASURED pair: the client's BTC booked and verified-marked 100k -> 98k
+    marked = L.Journal()
+    overlay_cycle(marked, 0, 10, tag="a", mark=98_000.0)
+    r = report(write_db(tmp_path, marked), environment="mainnet",
                cash_apr_pct=5.0, cash_apr_source="operator: T-bill 2023-11")
     opp = r["sections"]["opportunity_cost"]
     assert opp["evidence_class"] == "HISTORICAL_SIMULATION"

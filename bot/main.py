@@ -2461,6 +2461,16 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
     for any of them.
     """
     cfg = overrides.pop("config", None) or _config.get_config_object()
+    # The continuation exit prices holding against the owner's cost of capital:
+    # `config.load` refuses it unless one was STATED, and a Config object built
+    # by any other route (a caller passing `config=`) must meet the same rule
+    # here, before anything is constructed. An unstated cost is not zero.
+    if (str(getattr(cfg, "CARRY_EXIT_POLICY", "funding_streak")) == "continuation"
+            and not getattr(cfg, "CARRY_OPPORTUNITY_COST_APR_SUPPLIED", False)):
+        raise _config.ConfigError(
+            "CARRY_EXIT_POLICY=continuation needs CARRY_OPPORTUNITY_COST_APR "
+            "stated by the owner (an explicit 0 is a statement; an absent "
+            "value is not)")
     _config.setup_logging(cfg)
     if attach_strategy is None:
         attach_strategy = bool(getattr(cfg, "ENTRIES_ENABLED", True))

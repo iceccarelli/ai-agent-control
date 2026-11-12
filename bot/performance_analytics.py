@@ -458,6 +458,7 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
     prices_ok = qty is not None and qty > 0 and p0 and p1 and p0 > 0 and p1 > 0
 
     # (a) the same BTC, unhedged
+    pair_measured = True        # an acquire cycle books both legs; overlay below
     if not cycle.get("overlay"):
         out["vs_unhedged_btc"] = {
             "available": False, "evidence_class": "UNAVAILABLE",
@@ -471,6 +472,7 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
             "why": "the hedged quantity or a perp fill price is not in the "
                    "journal for this cycle"}
         pair = None
+        pair_measured = False
     else:
         unhedged = qty * (p1 - p0)
         # The pair. With VERIFIED inventory marks it is MEASURED: the cash net
@@ -479,7 +481,13 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
         # perp fill prices, which cancels the price legs by construction and
         # leaves the basis out (a -$265 per-cycle error at a +35 bps basis).
         # Without verified marks it stays the derived figure it always was.
-        if reval and cycle.get("mark_status") == "VERIFIED":
+        # `revalue_entries`, not the truthiness of `reval`: a VERIFIED mark of
+        # exactly 0.0 (spot flat while the perp moved) is a measured pair whose
+        # whole basis is the perp move; `if reval` read it as "no mark" and hid
+        # a $300 per-cycle basis loss in the reviewer's repro.
+        pair_measured = bool(cycle.get("revalue_entries")) \
+            and cycle.get("mark_status") == "VERIFIED"
+        if pair_measured:
             pair = net + reval
         else:
             pair = unhedged + increment
@@ -489,6 +497,8 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
             "hedged_qty_btc": qty, "price_basis": UNHEDGED_PRICE_BASIS,
             "unhedged_btc_pnl_usd": unhedged,
             "hedged_pair_pnl_usd": pair,
+            "pair_basis": ("MEASURED_MARK" if pair_measured
+                           else "DERIVED_BASIS_UNMEASURED"),
             "incremental_vs_unhedged_usd": increment,
             "denominator": "hedged notional at entry = hedged_qty_btc x perp "
                            "entry price",
@@ -522,6 +532,16 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
         out["vs_benchmark_rate"] = {
             "available": False, "evidence_class": "UNAVAILABLE",
             "why": "the hedged pair's result is not computable for this cycle"}
+    elif not pair_measured:
+        # The pair is only DERIVED from perp prices (funding minus fees by
+        # construction, basis unmeasured): a comparison with the benchmark would
+        # count the basis as zero and could read "beats 5%" (+$21 per cycle in
+        # the reviewer's repro) for a pair the basis may have taken back.
+        out["vs_benchmark_rate"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": "OVERLAY_PAIR_DERIVED_NOT_BOOKED: the hedged pair is only "
+                   "derived from perp fill prices (basis not measured), so it "
+                   "is not compared with a benchmark rate"}
     else:
         bench = capital * apr / 100.0 * days / 365.0
         out["vs_benchmark_rate"] = {
