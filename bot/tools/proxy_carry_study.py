@@ -89,13 +89,14 @@ def year_of(ms: int) -> int:
 # ---------------------------------------------------------------- names: base, multiplier, spot pair
 def strip_multiplier(base: str, prefixes: Sequence[str]) -> str:
     for p in sorted(prefixes, key=len, reverse=True):
-        if base.startswith(p) and len(base) - len(p) >= 2:
-            return base[len(p):]
+        rest = base[len(p):]
+        if base.startswith(p) and len(rest) >= 2 and rest[0].isalpha():          # a multiplier is followed by a ticker, which starts with a letter (a rest like "0X" is not a ticker)
+            return rest
     return base
 
 
 def perp_base(symbol: str) -> Optional[str]:
-    return symbol[:-4] if symbol.endswith("USDT") and len(symbol) > 6 else None
+    return symbol[:-4] if symbol.endswith("USDT") and len(symbol) >= 6 else None                 # a base has at least two characters (OP, AR, ID ...)
 
 
 def spot_candidates(symbol: str, prefixes: Sequence[str]) -> List[str]:

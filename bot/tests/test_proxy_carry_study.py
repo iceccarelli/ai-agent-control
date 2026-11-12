@@ -239,7 +239,6 @@ def oracle_rows(mkt, params, F, K):
         base = s.perp[:-4]
         if base in params["stable_bases"]:
             continue
-        cands = [s.perp] + ([base[len(p):] + "USDT" for p in sorted(prefixes, key=len, reverse=True) if base.startswith(p) and len(base) - len(p) >= 2][:1])
         if s.perp == "NOSPOTUSDT":
             continue
         pairs[s.perp] = s
@@ -282,7 +281,7 @@ def oracle_rows(mkt, params, F, K):
                 continue
             key = s.perp[:-4]
             for p in sorted(prefixes, key=len, reverse=True):
-                if key.startswith(p) and len(key) - len(p) >= 2:
+                if key.startswith(p) and len(key) - len(p) >= 2 and key[len(p)].isalpha():
                     key = key[len(p):]
                     break
             cand.append((mv, s, key, delivery))
@@ -646,9 +645,16 @@ def test_holes_are_gaps_longer_than_one_and_a_half_intervals_and_an_interval_cha
     assert P.funding_holes([(0, 8, 1.0), (8 * h, 4, 1.0)], 1.5) == []
 
 
+def test_two_character_bases_are_perps_too_and_one_character_is_not():
+    assert P.perp_base("OPUSDT") == "OP" and P.perp_base("ARUSDT") == "AR" and P.perp_base("BTCUSDT") == "BTC" and P.perp_base("AUSDT") is None and P.perp_base("USDT") is None
+    assert P.perp_base("BTCUSDC") is None and P.perp_base("BTCBUSD") is None
+    assert P.plan_pairs(["OPUSDT", "AUSDT"], ["OPUSDT", "AUSDT"], protocol()[0]["parameters"]) == [("OPUSDT", "OPUSDT")]
+
+
 def test_multipliers_and_pairs_follow_the_protocol_rules():
-    pre = ["1000000", "1000", "1M"]
+    pre = ["1000000", "10000", "1000", "1M"]
     assert P.strip_multiplier("1000PEPE", pre) == "PEPE" and P.strip_multiplier("1000000MOG", pre) == "MOG" and P.strip_multiplier("1MBABYDOGE", pre) == "BABYDOGE"
+    assert P.strip_multiplier("10000LADYS", pre) == "LADYS" and P.strip_multiplier("100000X", pre) == "100000X"                      # the longest matching prefix wins; nothing is stripped to a stub
     assert P.strip_multiplier("1INCH", pre) == "1INCH" and P.strip_multiplier("1000", pre) == "1000" and P.strip_multiplier("1000A", pre) == "1000A"
     assert P.spot_candidates("1000PEPEUSDT", pre) == ["1000PEPEUSDT", "PEPEUSDT"] and P.spot_candidates("BTCUSDC", pre) == []
     params = protocol()[0]["parameters"]

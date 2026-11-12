@@ -32,7 +32,7 @@
   },
   "universe": {
     "perp": "USD-M perpetual quoted in USDT with monthly funding files; the stablecoin bases USDC, BUSD, TUSD, FDUSD, USDP, DAI and USDE are excluded",
-    "hedge": "a Binance spot <BASE>USDT pair whose first monthly file is strictly before the month of the decision; a 1000x or 1M perp base is matched to its spot base by stripping the multiplier prefix (the exact symbol is tried first); no spot pair means not hedgeable, which also excludes index, equity, commodity and pre-listing perpetuals",
+    "hedge": "a Binance spot <BASE>USDT pair whose first monthly file is strictly before the month of the decision; a 1000x or 1M perp base is matched to its spot base by stripping the multiplier prefix (1000000, 10000, 1000 or 1M) (the exact symbol is tried first); no spot pair means not hedgeable, which also excludes index, equity, commodity and pre-listing perpetuals",
     "listing_age": "launch = the later of the perp's first kline day and the spot pair's first month; at least 30 days before the decision",
     "liquidity": "at decision time t: median daily quote volume of the perp over the 30 complete days before t is at least 20,000,000 USDT, and the symbol ranks in the top 60 by that median among the symbols that pass every other rule",
     "one_symbol_per_base": "if several symbols map to one base the one with the higher trailing median volume is kept",
@@ -43,7 +43,7 @@
     "funding_time_grid": "calc_time is snapped to the nearest multiple of the print's stated interval when it is within 1 s of it; a print farther off is dropped and counted",
     "funding_interval": "taken from the per-print column and checked against the spacing of consecutive snapped prints; a stretch where they disagree is a counted reject for that symbol-month; segments of equal interval build the per-print normalisation",
     "marks": "daily mark and index closes, observed at the close of their day; an aliveness test uses volume from klines, not the mark",
-    "base_map": "stripping a leading 1000000, 1000 or 1M multiplier; ambiguous maps are rejected, not guessed",
+    "base_map": "stripping a leading 1000000, 10000, 1000 or 1M multiplier; ambiguous maps are rejected, not guessed",
     "funding_holes": "a symbol is not eligible for a week when its snapped funding prints have a hole (a gap longer than 1.5 intervals) anywhere in the 30 days before the decision or inside the hold (a hold cut short by delivery is not a hole); the same universe applies to every formation window, so the variants of a week are comparable",
     "stale_basis": "a leg whose mark or index close is older than two days at entry or exit, or that is delivered inside the hold, has an UNMEASURED basis: its basis P&L is zero and the leg is counted and reported"
   },
@@ -140,6 +140,7 @@
     ],
     "multiplier_prefixes": [
       "1000000",
+      "10000",
       "1000",
       "1M"
     ],
