@@ -158,3 +158,10 @@ class SupabaseWitness:
             raise AN.WitnessError(f"the head was refused by the evidence guard ({type(exc).__name__})") from None
         if self._put(ev) == XE.CONFLICT:
             raise AN.WitnessConflict(f"the witness holds a different head at seq {entry['seq']}")
+        # READ-BACK. A write that the server accepted proves nothing about what a READ will say: if the head query's filter (a PostgREST JSON-path filter, never run against the real service here) answers [] for
+        # rows that do exist, every later "witness: OK" would be a publish nobody reads, and a rolled-back volume would open as if the witness agreed (reproduced against a loopback server whose head query
+        # answers []: a REQUIRED witness let the rolled-back book open). A head is acknowledged only when it can be read back.
+        got = self.head(account)
+        want_seq, want_ref = int(entry["seq"]), ref(entry["h"])
+        if got is None or got[0] < want_seq or (got[0] == want_seq and got[1] != want_ref):
+            raise AN.WitnessError("READBACK_FAILED: the witness accepted the head but a read does not return it (is the head query working on this project?)")

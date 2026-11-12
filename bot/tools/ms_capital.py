@@ -54,7 +54,7 @@ DRAWDOWN_STOP_USD = D("11.10")         # twice the Testnet loss ceiling: peak ba
 #: The VERIFIED realised result (gains net of losses, since the book began) at or beyond which entries stop for good: twice the drawdown stop, four per-session loss ceilings. The loss-streak halt and
 #: the drawdown stop are the owner's to acknowledge after a review; this one is not, so an owner (or a script, or a habit) that acknowledges every stop cannot walk the account down without limit
 #: (red-team F2: five rounds of "four losses, ack-halt, ack-drawdown" reached -60 and the next size was still 198.80). It derives from the realised figure alone, which no acknowledgement edits; lifting
-#: it means starting a NEW book on purpose (move capital.json aside; RUNBOOKS), never a command.
+#: it means a NEW EPOCH on purpose (the owner's interactive, typed, audited ``capital --rebaseline``, which the lineage and the witness keep for good; RUNBOOKS), never an acknowledgement.
 LIFETIME_LOSS_STOP_USD = DRAWDOWN_STOP_USD * 2
 TOLERANCE_USD = D("0.05")
 TOLERANCE_FRAC = D("0.05")
@@ -342,18 +342,27 @@ class CapitalBook:
         with self._locked():
             b = self.load()
             v = _d(usdt_now)
-            if v is not None and v > 0:
-                now_ms = int(time.time() * 1000)
-                gap = self._book_gap(b, v, now_ms) if b["pending"] is None and b["start_cash_usd"] is not None else None
-                first = b["start_cash_usd"] is None
-                if not first and gap is None and _d(b.get("last_cash_usdt")) == v:
-                    return b                                            # the same cash read again with nothing to book: not a durable event (an idle loop re-reads every cycle; the lineage must not grow with it)
+            if v is None or v <= 0:
+                return b
+            now_ms = int(time.time() * 1000)
+            if b["start_cash_usd"] is None:
+                # The FIRST flat cash read of an epoch. Normally nothing is parked yet and the read is the baseline. After an owner REBASELINE that fell between a cycle's settle and its park, a session IS parked and
+                # its starting cash is the epoch's true start: the post-session cash would put the session's own result into the baseline and book it a second time (reproduced: 202 instead of 207).
+                p = b.get("pending")
+                pre = _d(p.get("usdt_before")) if isinstance(p, dict) else None
+                base = pre if pre is not None and pre > 0 else v
                 b["last_cash_usdt"], b["last_cash_ms"] = str(v), now_ms
-                if first:
-                    b["start_cash_usd"], b["peak_basis_usd"] = str(v), str(v)
-                rows = [gap["entry"]] if gap and gap["entry"] is not None else []
-                self._save(b, "GAP" if rows else "BASELINE", {"usdt": str(v), "first": first, **({"gap": gap["entry"]["status"] if gap["entry"] is not None else "TRANSFERS_CONSUMED"} if gap else {})},
-                           rows, gap["applied"] if gap else ())
+                b["start_cash_usd"], b["peak_basis_usd"] = str(base), str(base)
+                self._save(b, "BASELINE", {"usdt": str(v), "first": True, **({"baseline_from_pending": True} if pre is not None and pre > 0 else {})})
+            elif b["pending"] is None:
+                # Nothing is parked, so nothing explains a change in the venue's cash: book it (``_book_gap``). A change below the tolerance is NOT a durable event and does NOT move the reference: the cash is compared
+                # with the last BOOKED read, so a slow bleed (60 idle reads of -0.2 USD, reproduced, was 12 USD that no review or streak ever saw) accumulates until it crosses the tolerance and is booked then.
+                gap = self._book_gap(b, v, now_ms)
+                if gap is not None:
+                    b["last_cash_usdt"], b["last_cash_ms"] = str(v), now_ms
+                    rows = [gap["entry"]] if gap["entry"] is not None else []
+                    self._save(b, "GAP" if rows else "BASELINE", {"usdt": str(v), "first": False, "gap": gap["entry"]["status"] if gap["entry"] is not None else "TRANSFERS_CONSUMED"}, rows, gap["applied"])
+            # a parked session: the same cash read is its settlement (``settle``); nothing to do here
             return b
 
     def _book_gap(self, b: Dict[str, Any], now: Decimal, now_ms: int) -> Optional[Dict[str, Any]]:
@@ -478,14 +487,20 @@ class CapitalBook:
         with self._locked():
             b = self.load()
             now = _d(usdt_now)
-            unchanged_cash = now is not None and _d(b.get("last_cash_usdt")) == now
-            if now is not None:
-                b["last_cash_usdt"], b["last_cash_ms"] = str(now), int(time.time() * 1000)
+            now_ms = int(time.time() * 1000)
             p = b.get("pending")
             if not p:
-                if not unchanged_cash:
-                    self._save(b, "BASELINE", {"usdt": None if now is None else str(now), "first": False, "via": "settle_no_pending"})
+                # nothing parked: the cash read is judged exactly as ``ensure_baseline`` judges it (a caller that settles without a baseline call must not silently OVERWRITE the reference, which would swallow the
+                # movement), and an unreadable read writes nothing at all (it used to append a durable, witnessed entry per call)
+                if now is not None and now > 0 and b["start_cash_usd"] is not None:
+                    gap = self._book_gap(b, now, now_ms)
+                    if gap is not None:
+                        b["last_cash_usdt"], b["last_cash_ms"] = str(now), now_ms
+                        rows = [gap["entry"]] if gap["entry"] is not None else []
+                        self._save(b, "GAP" if rows else "BASELINE", {"usdt": str(now), "first": False, "via": "settle_no_pending", "gap": gap["entry"]["status"] if gap["entry"] is not None else "TRANSFERS_CONSUMED"}, rows, gap["applied"])
                 return {"status": "NO_PENDING"}
+            if now is not None:
+                b["last_cash_usdt"], b["last_cash_ms"] = str(now), now_ms
             if now is None:
                 return {"status": "CASH_UNKNOWN"}                       # stays pending: nothing is credited on a cash read that failed
             parked_ms = int(p.get("cash_read_ms") or p.get("parked_ms") or 0)       # the instant the starting cash was READ (a deposit declared between that read and the park is not in it)
@@ -594,7 +609,7 @@ class CapitalBook:
                         raise BookRefused("ACCOUNT_MISMATCH", f"the book is bound to account {ref.get('account')}, not {self.anchor.account}")
                     adopt = self._from_dict({k: v for k, v in (view or {}).items() if k != "ledger_ref"})
                     self.anchor._preserve("pre-anchor")
-                return self.anchor.initialise(adopt=adopt, fresh_book=self._fresh(), owner=owner)
+                return self.anchor.initialise(adopt=adopt, fresh_book=self._fresh(), owner=owner, adopt_ref=(view or {}).get("ledger_ref") if status in ("legacy", "bound") else None)
         except AN.AnchorRefused as exc:
             raise BookRefused(exc.code, exc.detail) from None
 
@@ -615,6 +630,37 @@ class CapitalBook:
                 self.anchor._preserve("rejected")
                 self.anchor._heal(AN.rebuild(entries), entries[-1], "OWNER_REBUILD", None)
                 return "REBUILT"
+        except AN.AnchorRefused as exc:
+            raise BookRefused(exc.code, exc.detail) from None
+
+    def accept_older_lineage(self, owner: Mapping[str, Any]) -> Dict[str, Any]:
+        """The owner's RECORDED decision to continue from a lineage that is OLDER than what this root remembers (``ANCHOR_BEHIND_BOOK``: an older anchor directory was restored over a newer view or high-water mark).
+        Refused for every other state, and refused while a configured witness holds a newer head (``LOCAL_BEHIND_WITNESS``: nothing local may overrule it) or cannot be read when it is REQUIRED. The newer view and mark
+        are kept as ``*.rejected-newer.<ms>``; a lineage entry (ACK_OLDER) carries the facts of what was discarded and the owner's gate facts, and the book then requires a review (``ROLLBACK_ACCEPTED``,
+        acknowledged with ``--ack-review``) before any entry. The streak, halt, realised result and lifetime stop are those of the OLDER lineage: this is the rollback, made deliberate, visible and permanent in
+        the lineage instead of silent (the cash the venue no longer matches is booked by the next session's idle-window GAP, but a faucet top-up hides that, which is why a review is required)."""
+        if self.anchor is None:
+            raise BookRefused("NOT_ANCHORED", "a bare book has no lineage")
+        try:
+            with self._locked():
+                an = self.anchor
+                try:
+                    an.open_view()
+                    return {"status": "NOTHING_TO_ACCEPT"}
+                except AN.AnchorRefused as exc:
+                    if exc.code != "ANCHOR_BEHIND_BOOK":
+                        raise
+                an.check_witness(publish=False)                                              # a witness that knows a newer head refuses HERE, before anything is written
+                entries = an.entries()
+                discarded = an.newer_facts()
+                an._preserve("rejected-newer")
+                an._preserve_path(an.hwm_path, "rejected-newer")
+                b = AN.rebuild(entries)
+                prev = b.get("review_required")
+                b["review_required"] = {"code": "ROLLBACK_ACCEPTED", "session_id": None, "delta_usd": None, "known_usd": None, "set_ms": int(time.time() * 1000), "older_head_seq": entries[-1]["seq"],
+                                        "discarded": discarded, **({"previous_review": prev} if isinstance(prev, dict) else {})}
+                self._save(b, "ACK_OLDER", {"discarded": discarded, "owner": dict(owner), "older_head_seq": entries[-1]["seq"]})
+                return {"status": "ACCEPTED", "older_head_seq": entries[-1]["seq"], "discarded": discarded}
         except AN.AnchorRefused as exc:
             raise BookRefused(exc.code, exc.detail) from None
 

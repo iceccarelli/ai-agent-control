@@ -22,20 +22,66 @@ def _production_files():
                 yield os.path.join(root, f)
 
 
+def _capital_book_offences(source: str):
+    """Every way a module can build an ANCHOR-LESS ``CapitalBook``: the call with fewer than two arguments or with ``None`` as the anchor, through the plain name, an attribute (``CC.CapitalBook``), an alias
+    (``from ms_capital import CapitalBook as CB``; ``CB = CC.CapitalBook``) or ``getattr(module, "CapitalBook")``. ``CapitalBook.anchored(...)`` and ``CapitalBook(root, anchor)`` are fine."""
+    tree = ast.parse(source)
+    names = {"CapitalBook"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names |= {a.asname for a in node.names if a.name == "CapitalBook" and a.asname}
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            v = node.value
+            if (isinstance(v, ast.Name) and v.id in names) or (isinstance(v, ast.Attribute) and v.attr == "CapitalBook"):
+                names.add(node.targets[0].id)
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name) and f.id == "getattr" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value == "CapitalBook":
+                out.append((node.lineno, "getattr(.., 'CapitalBook')"))
+                continue
+            name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+            if name in names or (isinstance(f, ast.Attribute) and f.attr == "CapitalBook"):
+                anchor = node.args[1] if len(node.args) > 1 else next((k.value for k in node.keywords if k.arg == "anchor"), None)
+                if anchor is None or (isinstance(anchor, ast.Constant) and anchor.value is None):
+                    out.append((node.lineno, "no anchor"))
+    return out
+
+
 def test_no_production_code_constructs_a_bare_capital_book():
     offenders = []
     for path in _production_files():
         rel = os.path.relpath(path, BOT)
         if rel == os.path.join("tools", "ms_capital.py"):
             continue                                                          # the class itself (its factory builds the anchored instance)
-        tree = ast.parse(open(path, encoding="utf-8").read())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                f = node.func
-                name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
-                if name == "CapitalBook" and len(node.args) + len(node.keywords) < 2:
-                    offenders.append((rel, node.lineno))
-    assert offenders == [], f"a bare CapitalBook(root) outside ms_capital.py: {offenders}. Open it with CapitalBook.anchored (ms_testnet_autopilot._open_book)."
+        for lineno, why in _capital_book_offences(open(path, encoding="utf-8").read()):
+            offenders.append((rel, lineno, why))
+    assert offenders == [], (f"an anchor-less CapitalBook outside ms_capital.py: {offenders}. Production opens it with CapitalBook.anchored (ms_testnet_autopilot._open_book for a session; the read-only decision context and "
+                             "the owner's capital CLI build it with an Anchor).")
+
+
+def test_the_construction_check_finds_every_planted_spelling_and_accepts_the_anchored_ones():
+    bad = {
+        "plain": "import ms_capital as CC\nb = CC.CapitalBook(root)\n",
+        "bare name": "from ms_capital import CapitalBook\nb = CapitalBook(root)\n",
+        "none anchor": "from ms_capital import CapitalBook\nb = CapitalBook(root, None)\n",
+        "none keyword": "from ms_capital import CapitalBook\nb = CapitalBook(root, anchor=None)\n",
+        "alias import": "from ms_capital import CapitalBook as CB\nb = CB(root)\n",
+        "alias assignment": "import ms_capital as CC\nCB = CC.CapitalBook\nb = CB(root)\n",
+        "getattr": "import ms_capital as CC\nb = getattr(CC, 'CapitalBook')(root)\n",
+        "no anchor keyword only": "import ms_capital as CC\nb = CC.CapitalBook(root=r)\n",
+    }
+    for label, src in bad.items():
+        assert _capital_book_offences(src), f"not found: {label}"
+    good = {
+        "anchored": "import ms_capital as CC\nb = CC.CapitalBook.anchored(root, account_ref=a)\n",
+        "with an anchor": "import ms_capital as CC\nb = CC.CapitalBook(root, anchor)\n",
+        "anchor keyword": "import ms_capital as CC\nb = CC.CapitalBook(root, anchor=an)\n",
+        "alias with an anchor": "from ms_capital import CapitalBook as CB\nb = CB(root, an)\n",
+    }
+    for label, src in good.items():
+        assert _capital_book_offences(src) == [], f"flagged: {label}"
 
 
 def test_every_save_in_the_book_names_a_lineage_kind_that_exists():

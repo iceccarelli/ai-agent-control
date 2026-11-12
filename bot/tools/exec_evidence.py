@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -639,7 +640,7 @@ class RestClient:
             s = exc.code
             retryable = s in (401, 403, 404, 408, 425, 429) or s >= 500
             raise RestError("http_error", s, code, retryable) from None
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:         # HTTPException: a malformed status line or a short read is a network failure too, never an escape
             # the reason text is scrubbed, then dropped: only the exception class is kept
             self._scrub(str(exc))
             raise RestError("network:" + type(exc).__name__) from None

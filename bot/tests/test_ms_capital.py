@@ -352,7 +352,7 @@ def test_halt_and_drawdown_acknowledgements_are_reachable_only_from_the_owner_cl
     """Red-team MED: the autopilot must never clear its own capital stop. Only the `capital --ack-*` CLI branch may call the acknowledgements; no other function in the tools tree does."""
     import ast
     # every method that clears a stop, re-bases the drawdown or changes what the book counts as cash/sizing: the autopilot's loop, run_once and the session tool never call them (red-team F2)
-    OWNER_ONLY = ("acknowledge_halt", "acknowledge_drawdown", "acknowledge_review", "declare_transfer", "set_reserve_fraction", "initialise", "rebuild_view", "rebaseline")
+    OWNER_ONLY = ("acknowledge_halt", "acknowledge_drawdown", "acknowledge_review", "declare_transfer", "set_reserve_fraction", "initialise", "rebuild_view", "rebaseline", "accept_older_lineage")
     tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
     offenders = []
     for fn in sorted(os.listdir(tools)):

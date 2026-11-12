@@ -393,7 +393,11 @@ def test_a_deleted_anchor_with_a_bound_book_refuses_instead_of_starting_clean(wo
     with pytest.raises(CC.BookRefused) as e:
         opened(world)
     assert e.value.code == "ANCHOR_MISSING_BOOK_BOUND"
-    assert stopped(CC.CapitalBook(world.root)) or True            # (a bare read of the bound view is still possible; only writes are refused)
+    bare = CC.CapitalBook(world.root)
+    assert stopped(bare), "a bare READ of the bound view is still possible, and it says the stop is active"
+    with pytest.raises(CC.BookRefused) as e2:
+        bare.ensure_baseline("100")                                  # only WRITES are refused
+    assert e2.value.code == "BARE_WRITE_TO_BOUND_BOOK"
 
 
 def test_a_deleted_anchor_AND_a_deleted_book_is_the_same_as_a_new_account_and_needs_the_owner(world):
@@ -577,11 +581,54 @@ def test_cash_that_rose_between_sessions_is_unverified_excess_not_profit(world):
     assert cb["review_required"] is None
 
 
-def test_noise_below_the_gap_tolerance_books_nothing(world):
+def _lineage_lines(world):
+    return open(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")).read().splitlines()
+
+
+def test_noise_below_the_gap_tolerance_books_nothing_writes_nothing_and_does_not_move_the_reference(world):
     book = genesis(world)
     book.ensure_baseline("232")
+    n = len(_lineage_lines(world))
     book.ensure_baseline("232.10")
-    assert book.load()["history"] == [] and book.load()["last_cash_usdt"] == "232.10"
+    cb = book.load()
+    assert cb["history"] == [] and cb["last_cash_usdt"] == "232", "the reference stays at the last BOOKED read (it used to follow the noise)"
+    assert len(_lineage_lines(world)) == n, "noise is not a durable event"
+
+
+def test_a_slow_bleed_below_the_tolerance_is_booked_once_it_adds_up_not_swallowed_read_by_read(world):
+    """Red team, finding 10: 60 idle reads of -0.2 USD each overwrote the reference every time and 12 USD vanished with no booking, no streak and no review."""
+    book = genesis(world)
+    book.ensure_baseline("232")
+    cash = D("232")
+    for _ in range(60):
+        cash -= D("0.2")
+        book.ensure_baseline(str(cash))
+    cb = book.load()
+    assert D(cb["realised_usd"]) == D("-12.0") and cb["halted"] is True and cb["review_required"]["code"] == "ACCOUNT_CASH_UNEXPLAINED", cb["realised_usd"]
+
+
+def test_settling_with_nothing_parked_books_a_big_move_instead_of_overwriting_the_reference_and_an_unreadable_read_writes_nothing(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    n = len(_lineage_lines(world))
+    assert book.settle(None)["status"] == "NO_PENDING" and len(_lineage_lines(world)) == n, "an unreadable cash read appended a durable, witnessed entry per call"
+    assert book.settle("232.10")["status"] == "NO_PENDING" and len(_lineage_lines(world)) == n and book.load()["last_cash_usdt"] == "232"
+    book.settle("200")                                                                  # a caller that settles WITHOUT a baseline call must not swallow a 32 USD fall
+    cb = book.load()
+    assert D(cb["realised_usd"]) == D("-32") and cb["review_required"]["code"] == "ACCOUNT_CASH_UNEXPLAINED" and cb["history"][-1]["window"] == "IDLE_GAP"
+
+
+def test_a_rebaseline_between_a_settle_and_a_park_baselines_from_the_parked_sessions_starting_cash(world):
+    """Red team, finding 10 (a23): the new epoch's baseline was the POST-session cash (202), and the session's own -5 was then booked a second time."""
+    book = genesis(world)
+    book.ensure_baseline("207")
+    assert book.settle("207")["status"] == "NO_PENDING"
+    book.rebaseline("a reason of my own about the wallet reset", {"test": True})
+    assert book.park("s1", "207", None, False, False)                                    # the cycle that had already read its cash goes on to park
+    book.ensure_baseline("202")                                                          # the session lost 5: its result is the next read
+    assert book.load()["start_cash_usd"] == "207", "the baseline is the epoch's true start, not the cash after the session"
+    r = book.settle("202")
+    assert D(r["delta_usd"]) == D("-5") and D(book.load()["realised_usd"]) == D("-5") and D(book.load()["peak_basis_usd"]) == D("207")
 
 
 def test_a_declared_deposit_explains_the_idle_window_and_is_consumed(world):
@@ -666,7 +713,7 @@ def test_the_unattended_autopilot_refuses_a_book_with_no_lineage_and_never_creat
     assert not os.path.exists(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"))
 
 
-# --------------------------------------------------------------------------------- the remote witness (interface; the Supabase side needs an owner-applied migration)
+# --------------------------------------------------------------------------------- the remote witness (the interface and a recording fake; the Supabase implementation needs NO migration, see test_ms_capital_witness.py)
 class FakeWitness:
     configured = True
 
@@ -1029,12 +1076,439 @@ def test_two_owners_racing_the_first_genesis_produce_exactly_one_lineage(world):
 def test_the_loops_classification_of_anchor_refusals_incident_versus_owner_action_versus_transient():
     """OWNER_AUTHORITY_REFUSALS is matched with startswith: an incident code must never be classified as 'wait for the owner' (it would be retried quietly instead of alerting), and the three owner-action codes and two
     transient ones must be."""
-    codes_owner = ("ACCOUNT_NOT_INITIALISED", "BOOK_UNANCHORED", "ACCOUNT_IDENTITY_UNAVAILABLE", "WITNESS_UNAVAILABLE", "LOCK_TIMEOUT")
+    codes_owner = ("ACCOUNT_NOT_INITIALISED", "BOOK_UNANCHORED", "ACCOUNT_IDENTITY_UNAVAILABLE", "WITNESS_UNAVAILABLE", "LOCK_TIMEOUT", "LINEAGE_CHANGED_UNDER_COMMIT")
     incidents = ("ACCOUNT_MISMATCH", "VIEW_TAMPERED", "VIEW_UNBOUND", "ANCHOR_BEHIND_BOOK", "ANCHOR_CORRUPT", "ANCHOR_MISSING_BOOK_BOUND", "LOCAL_BEHIND_WITNESS", "LINEAGE_FORKED", "WITNESS_MISCONFIGURED",
-                 "BARE_WRITE_TO_BOUND_BOOK", "GENESIS_REFUSED_LINEAGE_EXISTS")
+                 "BARE_WRITE_TO_BOUND_BOOK", "GENESIS_REFUSED_LINEAGE_EXISTS", "GENESIS_REFUSED_ROOT_REMEMBERS_LINEAGE")
     owner_side = lambda why: any(why.startswith(p) for p in AP.OWNER_AUTHORITY_REFUSALS)          # noqa: E731
     for c in codes_owner:
         assert owner_side("CAPITAL_ANCHOR_REFUSED:" + c), c
     for c in incidents:
         assert not owner_side("CAPITAL_ANCHOR_REFUSED:" + c), c
     assert set(AP.NO_ALERT_ANCHOR_CODES) == set(codes_owner)
+
+
+# =====================================================================================================================================================================================================
+# ROUND 10, INDEPENDENT RED TEAM. Every test below was written against the tree that had the finding (each failed first) and has a mutant that now dies (see the PR description).
+# =====================================================================================================================================================================================================
+def _snapshot_dir(src, dst):
+    shutil.copytree(src, dst)
+    return dst
+
+
+def _put_back(dst, snap):
+    shutil.rmtree(dst)
+    shutil.copytree(snap, dst)
+
+
+# --------------------------------------------------------------------------------- HIGH 1: restoring ONLY the anchor directory, then deleting the view, was the rollback itself
+def test_restoring_only_the_anchor_directory_and_then_deleting_the_view_cannot_roll_the_book_back(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")                   # the second-volume snapshot the RUNBOOK recommends
+    drive_to_lifetime_stop(book)
+    assert stopped(book)
+    _put_back(world.anchor, snap)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_BEHIND_BOOK"
+    os.unlink(os.path.join(world.root, "capital.json"))                               # the natural 'fix' for a refused view: it is only a view
+    with pytest.raises(CC.BookRefused) as e2:
+        opened(world)
+    assert e2.value.code == "ANCHOR_BEHIND_BOOK" and "capital.json" in e2.value.detail, "the root's own high-water mark refuses it"
+    assert not os.path.exists(os.path.join(world.root, "capital.json")), "a refusal recreates nothing"
+
+
+def test_the_same_attack_cannot_resurrect_a_four_loss_halt_either(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    cash = D("232")
+    for n in range(1, 5):
+        losing_session(book, n, str(cash), "2.5")
+        cash -= D("2.5")
+    assert book.load()["halted"] is True
+    _put_back(world.anchor, snap)
+    os.unlink(os.path.join(world.root, "capital.json"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_BEHIND_BOOK"
+
+
+def test_the_mark_does_not_get_in_the_way_of_ordinary_healing(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    old_root = _snapshot_dir(world.root, world.tmp / "root_backup")
+    drive_to_lifetime_stop(book)
+    os.unlink(book.path)                                                              # the view is gone, the lineage and the mark agree: it heals
+    again = opened(world)
+    assert stopped(again) and again.anchor.rebuilt == "NO_VIEW"
+    _put_back(world.root, old_root)                                                   # an OLDER root (view AND mark older than the lineage) heals forward
+    assert stopped(opened(world))
+    assert json.load(open(os.path.join(world.root, "capital_hwm.json")))["seq"] == len(_lineage_lines(world)) - 1, "the heal brings the mark forward too"
+
+
+def test_the_mark_is_written_by_every_commit_and_by_a_heal_and_a_read_only_open_writes_nothing(world):
+    book = genesis(world)
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    assert json.load(open(hwm))["seq"] == 0
+    book.ensure_baseline("232")
+    d = json.load(open(hwm))
+    head = _lineage_lines(world)[-1]
+    assert d["seq"] == 1 and d["head"] == json.loads(head)["h"] and d["account"] == ACCT
+    os.unlink(hwm)
+    ro = opened(world, read_only=True)
+    assert not os.path.exists(hwm), "a read-only open writes nothing"
+    assert ro.load()["start_cash_usd"] == "232"
+    ro.anchor._write_hwm(5, "a" * 64)
+    assert not os.path.exists(hwm), "and the write itself refuses on a read-only anchor"
+    opened(world)                                                                     # a normal open with the mark missing: nothing to compare with, the view equals the head, no write needed
+    book.park("s1", "232", None, False, False)
+    assert json.load(open(hwm))["seq"] == 2
+
+
+def test_a_mark_that_names_another_head_than_the_lineage_holds_there_is_a_fork(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    d = json.load(open(hwm))
+    d["head"] = "ab" * 32
+    json.dump(d, open(hwm, "w"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "LINEAGE_FORKED"
+
+
+def test_a_mark_of_another_account_or_one_that_cannot_be_read_refuses_and_changes_nothing(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    good = open(hwm).read()
+    d = json.loads(good)
+    d["account"] = OTHER
+    json.dump(d, open(hwm, "w"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ACCOUNT_MISMATCH"
+    for junk in ("not json", json.dumps({**json.loads(good), "seq": -1}), json.dumps({**json.loads(good), "head": "short"}), json.dumps({**json.loads(good), "schema": "other"}), "[" * 5000):
+        open(hwm, "w").write(junk)
+        with pytest.raises(CC.BookRefused) as e2:
+            opened(world)
+        assert e2.value.code == "VIEW_TAMPERED", junk[:20]
+        assert open(hwm).read() == junk, "nothing was repaired"
+    open(hwm, "w").write(good)
+    assert opened(world).load()["start_cash_usd"] == "232"
+
+
+def test_a_lost_anchor_directory_that_the_root_remembers_refuses_and_a_fresh_genesis_is_refused_too(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    os.unlink(book.path)
+    shutil.rmtree(world.anchor)                                                       # the whole anchor volume came back empty, and the view is gone as well
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_MISSING_BOOK_BOUND" and "restore it" in e.value.detail
+    with pytest.raises(CC.BookRefused) as e2:
+        CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).initialise({"test": True})
+    assert e2.value.code == "GENESIS_REFUSED_ROOT_REMEMBERS_LINEAGE", "a new history would be the reset this exists to prevent"
+    assert not os.path.exists(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"))
+
+
+def test_a_lost_anchor_directory_with_the_view_that_the_mark_describes_may_be_adopted_but_an_older_view_may_not(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    old_view = open(book.path, "rb").read()
+    drive_to_lifetime_stop(book)
+    new_view = open(book.path, "rb").read()
+    shutil.rmtree(world.anchor)
+    open(book.path, "wb").write(old_view)                                             # a restored OLD view: older than what the root last saw
+    with pytest.raises(CC.BookRefused) as e:
+        CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).initialise({"test": True})
+    assert e.value.code == "GENESIS_REFUSED_ROOT_REMEMBERS_LINEAGE"
+    open(book.path, "wb").write(new_view)                                             # the view the root last saw: the lineage is lost, the book is not: adopted WHOLE, every stop kept
+    CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).initialise({"test": True})
+    assert stopped(opened(world))
+
+
+def test_a_root_that_belongs_to_another_account_cannot_be_given_a_new_lineage(world):
+    genesis(world)
+    with pytest.raises(CC.BookRefused) as e:
+        CC.CapitalBook(world.root, AN.Anchor(world.root, OTHER, "testnet", world.anchor)).initialise({"test": True})
+    assert e.value.code == "ACCOUNT_MISMATCH"
+
+
+# --------------------------------------------------------------------------------- the owner's RECORDED way out of ANCHOR_BEHIND_BOOK
+def _behind_world(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    _put_back(world.anchor, snap)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_BEHIND_BOOK"
+    return CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+
+
+def test_accepting_the_older_lineage_is_recorded_kept_and_demands_a_review(world):
+    owner_book = _behind_world(world)
+    r = owner_book.accept_older_lineage({"gate": "TEST"})
+    assert r["status"] == "ACCEPTED" and r["discarded"]["view"]["realised_usd"] is not None and D(r["discarded"]["view"]["realised_usd"]) <= -AN_STOP()
+    after = opened(world)
+    cb = after.load()
+    assert cb["review_required"]["code"] == "ROLLBACK_ACCEPTED" and cb["review_required"]["discarded"]["hwm"]["seq"] > r["older_head_seq"]
+    assert not stopped(after), "the OLDER lineage's state is what continues (that is what accepting it means): the review is the guard"
+    entries = AN.Lineage(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"), ACCT, "testnet").read()
+    assert entries[-1]["kind"] == "ACK_OLDER" and entries[-1]["facts"]["discarded"]["view"]["seq"] > entries[-1]["facts"]["older_head_seq"], "the lineage itself remembers what was discarded"
+    kept = sorted(os.listdir(world.root))
+    assert any(n.startswith("capital.json.rejected-newer.") for n in kept) and any(n.startswith("capital_hwm.json.rejected-newer.") for n in kept), kept
+    assert json.load(open(os.path.join(world.root, "capital_hwm.json")))["seq"] == entries[-1]["seq"]
+
+
+def test_accepting_changes_nothing_when_the_book_is_not_behind_and_is_not_a_way_around_any_other_refusal(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    ob = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    n = len(_lineage_lines(world))
+    assert ob.accept_older_lineage({})["status"] == "NOTHING_TO_ACCEPT" and len(_lineage_lines(world)) == n
+    v = json.load(open(book.path))
+    v["realised_usd"] = "99"
+    json.dump(v, open(book.path, "w"))                                                # an edited view is VIEW_TAMPERED: that is --rebuild-view's business, not this act's
+    with pytest.raises(CC.BookRefused) as e:
+        ob.accept_older_lineage({})
+    assert e.value.code == "VIEW_TAMPERED" and len(_lineage_lines(world)) == n
+
+
+def test_a_witness_that_knows_the_newer_head_refuses_the_acceptance_before_anything_is_touched(world):
+    w = FakeWitness()
+    book = genesis(world, witness=w)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    _put_back(world.anchor, snap)
+    ob = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor, witness=w))
+    before = sorted(os.listdir(world.root)), open(os.path.join(world.root, "capital.json")).read()
+    with pytest.raises(CC.BookRefused) as e:
+        ob.accept_older_lineage({})
+    assert e.value.code == "LOCAL_BEHIND_WITNESS"
+    assert (sorted(os.listdir(world.root)), open(os.path.join(world.root, "capital.json")).read()) == before, "nothing was moved, copied or written"
+
+
+def test_the_accept_command_needs_a_terminal_the_typed_line_and_is_audited(world, capsys):
+    import re
+    _behind_world(world)
+    state = {}
+
+    def typed(_p):
+        m = re.search(r"^(CONFIRM .+)$", capsys.readouterr().out, flags=re.M)
+        state["line"] = m.group(1).strip() if m else ""
+        return state["line"] + (" tampered" if state.get("wrong") else "")
+
+    def run(tty=True):
+        return AP.main(["capital", "--root", world.root, "--accept-older-lineage"], env={"CAPITAL_ANCHOR_DIR": world.anchor}, isatty=lambda: tty, input_fn=typed, uid=0)
+
+    assert run(tty=False) == 2
+    with pytest.raises(CC.BookRefused):
+        opened(world)
+    state["wrong"] = True
+    assert run() == 2
+    with pytest.raises(CC.BookRefused):
+        opened(world)
+    state["wrong"] = False
+    assert run() == 0
+    assert "newer_view_seq=" in state["line"] and "hwm_seq=" in state["line"] and "refusal=ANCHOR_BEHIND_BOOK" in state["line"], state["line"]
+    assert opened(world).load()["review_required"]["code"] == "ROLLBACK_ACCEPTED"
+    rows = [json.loads(l) for l in open(os.path.join(world.root, "marker_log.jsonl"))]
+    assert [r["action"] for r in rows if r["marker"] == "CAPITAL_BOOK"].count("APPLIED") == 1 and any(r["action"] == "REFUSED_NO_TTY" for r in rows)
+
+
+def test_a_review_rollback_accepted_is_cleared_only_by_the_owners_acknowledgement(world):
+    owner_book = _behind_world(world)
+    owner_book.accept_older_lineage({})
+    book = opened(world)
+    assert book.load()["review_required"] is not None
+    assert book.acknowledge_review() is True and book.load()["review_required"] is None
+
+
+# --------------------------------------------------------------------------------- MEDIUM 4: two committers on one lineage (the lock FILE can be unlinked) cannot both append
+def test_two_committers_with_a_stale_lock_cannot_append_the_same_sequence_twice(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    other = opened(world, world.root2)                                                # a second process: reads the head BEFORE the first commits
+    with other._locked():
+        other.anchor.open_view()
+        other.anchor.entries()
+        os.unlink(os.path.join(world.anchor, f"lineage-{ACCT}.lock"))                 # a 'clean stale locks' script ran while it held the lock
+        book2 = opened(world)                                                         # and a first writer gets a fresh lock and commits
+        assert book2.park("s1", "232", None, False, False)
+        with pytest.raises(AN.AnchorRefused) as e:
+            other.anchor.commit({**other.anchor.entries()[-1]["state"], "history": [], "transfers_applied": []}, "BASELINE", {})
+        assert e.value.code == "LINEAGE_CHANGED_UNDER_COMMIT"
+    entries = AN.Lineage(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"), ACCT, "testnet").read()           # the chain still verifies: no [0,1,2,2]
+    assert [e["seq"] for e in entries] == list(range(len(entries)))
+    assert opened(world).load()["pending"]["session_id"] == "s1"
+
+
+def test_an_append_that_was_never_preceded_by_a_verified_read_is_refused(world):
+    genesis(world)
+    lin = AN.Lineage(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"), ACCT, "testnet")
+    with pytest.raises(AN.AnchorRefused) as e:
+        lin.append({"x": 1})
+    assert e.value.code == "LINEAGE_CHANGED_UNDER_COMMIT" and "not read and verified" in e.value.detail
+
+
+# --------------------------------------------------------------------------------- MEDIUM 5: the owner CLI's information read must never repair a tail another process is writing
+def test_the_owner_clis_information_read_never_truncates_a_tail_that_is_being_written(world, monkeypatch):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    path = os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")
+    before = open(path, "rb").read()
+    half = b'{"schema": "capital_lineage.v1", "seq": 2, "pre'                          # a writer is in the middle of an append
+    monkeypatch.setattr(AN, "LOCK_TIMEOUT_S", 0.2)
+    with book._locked():                                                              # ... and holds the lineage lock while it does
+        with open(path, "ab") as fh:
+            fh.write(half)
+        rc = AP.main(["capital", "--root", world.root, "--anchor-init"], env={"CAPITAL_ANCHOR_DIR": world.anchor}, isatty=lambda: False, input_fn=lambda _p: "", uid=0)
+        assert rc == 2
+        assert open(path, "rb").read() == before + half, "the half-written entry is still there: the information read of the owner CLI runs outside the lock and must never repair (it truncated the writer's entry)"
+    assert not os.path.exists(path + ".torn")
+
+
+# --------------------------------------------------------------------------------- MEDIUM 6: a REQUIRED witness that is down when the owner re-baselines: the act STANDS and the owner is told so
+def test_a_rebaseline_with_a_required_witness_that_is_down_says_applied_locally_not_refused(world, capsys):
+    import re
+    w = FakeWitness(required=True)
+    book = genesis(world, witness=w)
+    drive_to_lifetime_stop(book)
+    w.down = True
+    state = {}
+
+    def typed(_p):
+        m = re.search(r"^(CONFIRM .+)$", capsys.readouterr().out, flags=re.M)
+        state["line"] = m.group(1).strip() if m else ""
+        return state["line"]
+
+    import ms_capital_anchor as _AN
+    orig = _AN.witness_from_env
+    _AN.witness_from_env = lambda env: w
+    try:
+        rc = AP.main(["capital", "--root", world.root, "--rebaseline", "--reason", "a reason of my own that is long enough"], env={"CAPITAL_ANCHOR_DIR": world.anchor}, isatty=lambda: True, input_fn=typed, uid=0)
+    finally:
+        _AN.witness_from_env = orig
+    err = capsys.readouterr().err
+    assert rc == 0 and "APPLIED LOCALLY" in err and "nothing was changed" not in err, err
+    assert opened(world).load()["epoch"] == 1
+
+
+# --------------------------------------------------------------------------------- LOW 14: an unrecognised CAPITAL_WITNESS_REQUIRED is a refusal, never a silent 'optional'
+@pytest.mark.parametrize("val,expect", [("1", True), ("true", True), ("YES", True), ("on", True), ("", False), ("0", False), ("false", False), ("No", False), ("off", False)])
+def test_witness_required_accepts_the_documented_spellings(val, expect):
+    assert AN.witness_required({"CAPITAL_WITNESS_REQUIRED": val}) is expect
+
+
+@pytest.mark.parametrize("val", ["enabled", "required", "2", "y", "truee"])
+def test_witness_required_refuses_anything_else(val):
+    with pytest.raises(AN.AnchorRefused) as e:
+        AN.witness_required({"CAPITAL_WITNESS_REQUIRED": val})
+    assert e.value.code == "WITNESS_MISCONFIGURED"
+    with pytest.raises(AN.AnchorRefused):
+        AN.witness_from_env({"CAPITAL_WITNESS": "supabase", "CAPITAL_WITNESS_REQUIRED": val})
+
+
+# --------------------------------------------------------------------------------- red team, finding 9: branches that carried the design and that no test noticed (each pinned by a mutant that now dies)
+def test_a_failed_lineage_append_leaves_the_view_and_the_mark_untouched_the_append_is_the_commit_point(world, monkeypatch):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    view_before, hwm_before = open(book.path, "rb").read(), open(hwm, "rb").read()
+
+    def full_disk(self, entry, *a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(AN.Lineage, "append", full_disk)
+    with pytest.raises(OSError):
+        book.park("s1", "232", None, False, False)
+    assert open(book.path, "rb").read() == view_before and open(hwm, "rb").read() == hwm_before, "the view (or the mark) was written BEFORE the lineage held the entry"
+    monkeypatch.undo()
+    assert opened(world).load()["pending"] is None
+
+
+def test_a_junk_line_in_the_middle_and_a_newline_terminated_junk_tail_are_corruption_and_only_an_unterminated_tail_is_a_torn_append(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    book.park("s1", "232", None, False, False)
+    path = os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")
+    original = open(path, "rb").read()
+    lines = original.decode().splitlines()
+    assert len(lines) >= 3
+    mid = list(lines)
+    mid[1] = "this is not json"
+    open(path, "w").write("\n".join(mid) + "\n")
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_CORRUPT" and "line 1" in e.value.detail and open(path).read() == "\n".join(mid) + "\n" and not os.path.exists(path + ".torn")
+    open(path, "wb").write(original + b"x\n")                                          # a stray terminated line (`echo x >> lineage`): never silently dropped as 'torn'
+    with pytest.raises(CC.BookRefused) as e2:
+        opened(world)
+    assert e2.value.code == "ANCHOR_CORRUPT" and open(path, "rb").read() == original + b"x\n" and not os.path.exists(path + ".torn")
+    open(path, "wb").write(original + b'{"torn')                                       # an UNTERMINATED tail is an append that never completed: set aside as evidence and dropped
+    opened(world)
+    assert open(path, "rb").read() == original and os.path.exists(path + ".torn")
+
+
+@pytest.mark.parametrize("field,value", [("head", "ab" * 32), ("digest", "cd" * 32)])
+def test_each_part_of_the_views_reference_is_checked_on_its_own(world, field, value):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    d = json.load(open(book.path))
+    d["ledger_ref"][field] = value
+    json.dump(d, open(book.path, "w"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "VIEW_TAMPERED"
+
+
+def test_a_symlinked_lineage_is_never_appended_through(world, tmp_path):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    path = os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")
+    target = str(tmp_path / "elsewhere.jsonl")
+    shutil.copy(path, target)
+    os.unlink(path)
+    os.symlink(target, path)
+    before = open(target, "rb").read()
+    with pytest.raises(OSError):
+        book.park("s1", "232", None, False, False)
+    assert open(target, "rb").read() == before
+
+
+@pytest.mark.parametrize("move,booked", [("0.24", False), ("0.26", True), ("-0.24", False), ("-0.26", True)])
+def test_the_idle_gap_tolerance_is_a_quarter_dollar_on_both_sides(world, move, booked):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    book.ensure_baseline(str(D("232") + D(move)))
+    assert bool(book.load()["history"]) is booked
+
+
+def test_the_anchor_init_typed_line_lists_the_other_lineages_in_the_anchor_directory(world, capsys):
+    """Red team, finding 13: under the KEY_ID fallback a rotated key is a NEW account, and a fresh init would clear the stops; the owner must SEE the lineages that already exist before attesting a new one."""
+    import re
+    genesis(world)                                                                     # account ACCT already has a lineage in this anchor directory
+    state = {}
+
+    def typed(_p):
+        m = re.search(r"^(CONFIRM .+)$", capsys.readouterr().out, flags=re.M)
+        state["line"] = m.group(1).strip() if m else ""
+        return ""
+    rc = AP.main(["capital", "--root", world.root2, "--account", OTHER, "--anchor-init"], env={"CAPITAL_ANCHOR_DIR": world.anchor}, isatty=lambda: True, input_fn=typed, uid=0)
+    assert rc == 2
+    assert "other_lineages=" in state["line"] and ACCT[:13] in state["line"], state["line"]
+
+
+def test_a_deeply_nested_capital_json_does_not_crash_the_offline_account_resolution(world):
+    os.makedirs(world.root)
+    open(os.path.join(world.root, "capital.json"), "w").write("[" * 200_000)
+    assert AN.resolve_account(world.root, world.anchor) is None
+
+
+def test_the_status_command_reports_an_unrecognised_witness_required_value_instead_of_raising():
+    assert AP._witness_required_for_status({"CAPITAL_WITNESS_REQUIRED": "enabled"}) == "INVALID"
+    assert AP._witness_required_for_status({"CAPITAL_WITNESS_REQUIRED": "on"}) is True and AP._witness_required_for_status({}) is False

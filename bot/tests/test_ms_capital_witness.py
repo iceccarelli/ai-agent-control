@@ -42,6 +42,9 @@ class FakePostgrest:
         self.invisible = False
         self.fail = 0                           # next N requests answer 500 (with the apikey echoed, to prove it is scrubbed)
         self.redirect = False
+        self.json_blind = False                 # a GET whose filter is a JSON path (payload->>x) answers [] for rows that DO exist (the head query is the one thing never run against the real PostgREST)
+        self.garbage = False                    # the answer is not HTTP at all (a malformed status line)
+        self.lag = 0                            # the head query hides the newest N capital rows (a read replica that has not caught up with the write)
 
     def put(self, row):
         cur = self.rows.get(row["event_id"])
@@ -61,10 +64,14 @@ class FakePostgrest:
             rows = [r for r in rows if r["kind"] == q["kind"].removeprefix("eq.")]
         for k, v in q.items():
             if k.startswith("payload->>"):
+                if self.json_blind:
+                    return []
                 f = k.split(">>", 1)[1]
                 rows = [r for r in rows if str(r["payload"].get(f)) == v.removeprefix("eq.")]
         if q.get("order") == "seq.desc":
             rows.sort(key=lambda r: -r["seq"])
+            if self.lag and any(k.startswith("payload->>") for k in q):
+                rows = rows[self.lag:]
         rows = rows[: int(q.get("limit", "1000"))]
         return [] if self.invisible else [{"seq": r["seq"], "payload": r["payload"], "event_id": r["event_id"]} for r in rows]
 
@@ -87,6 +94,11 @@ def pg():
 
         def _common(self, method):
             f.requests.append((method, self.path, {k.lower(): v for k, v in self.headers.items()}))
+            if f.garbage:
+                self.wfile.write(b"NOT-HTTP garbage\r\n\r\n")
+                self.wfile.flush()
+                self.close_connection = True
+                return False
             if f.redirect:
                 self.send_response(302)
                 self.send_header("Location", "http://127.0.0.1:9/elsewhere")
@@ -318,3 +330,94 @@ def test_witness_from_env_modes():
         AN.witness_from_env({"CAPITAL_WITNESS": "carrier-pigeon"})
     w = AN.witness_from_env({"CAPITAL_WITNESS": "supabase", "CAPITAL_WITNESS_REQUIRED": "1", "SUPABASE_URL": "https://abcdefghij.supabase.co", "SUPABASE_SERVICE_ROLE_KEY": KEY, "SUPABASE_OWNER_ID": OWNER})
     assert w.configured and w.required and repr(w.client).count(KEY) == 0
+
+
+# =====================================================================================================================================================================================================
+# ROUND 10, INDEPENDENT RED TEAM (witness findings). Each failed first against the tree that had the finding.
+# =====================================================================================================================================================================================================
+def test_a_head_that_the_server_accepted_but_a_read_cannot_return_is_a_readback_failure_not_an_ok(pg):
+    """The head query's JSON-path filter is the one request never run against the real PostgREST. If it answers [] for rows that exist, every 'witness: OK' is a publish nobody reads."""
+    w = witness(pg)
+    w.head(ACCT)                                      # the canary (a plain event_id read) proves visibility
+    pg.json_blind = True
+    with pytest.raises(AN.WitnessError) as e:
+        w.publish(ACCT, entry(0, "GENESIS"))
+    assert "READBACK_FAILED" in str(e.value)
+    pg.json_blind = False
+    w.publish(ACCT, entry(0, "GENESIS"))              # and a working read acknowledges it (the earlier write was UNCHANGED)
+    assert w.head(ACCT)[0] == 0
+
+
+def test_a_rolled_back_volume_is_refused_by_a_required_witness_whose_head_query_is_blind_instead_of_opening_as_ok(pg, world):
+    import shutil
+    w = witness(pg, required=True)
+    book = genesis(world, w)
+    book.ensure_baseline("232")
+    snap = world.tmp / "snap"
+    shutil.copytree(world.anchor, snap / "anchor")
+    shutil.copytree(world.root, snap / "root")
+    book.park("s1", "232", "-9", True, True)
+    book.settle("223")
+    pg.json_blind = True                              # the head query now answers [] although the rows exist
+    shutil.rmtree(world.anchor)
+    shutil.rmtree(world.root)
+    shutil.copytree(snap / "anchor", world.anchor)
+    shutil.copytree(snap / "root", world.root)
+    with pytest.raises(CC.BookRefused) as e:
+        CC.CapitalBook.anchored(world.root, account_ref=ACCT, venue="testnet", anchor_dir=world.anchor, witness=w)
+    assert e.value.code == "WITNESS_UNAVAILABLE", "it used to open: state OK, realised 0, nothing refused"
+
+
+def test_a_malformed_http_answer_is_a_network_error_of_the_client_not_an_escape(pg):
+    pg.garbage = True
+    c = XE.RestClient(pg.url, KEY, allow_insecure_loopback_for_tests=True, sleep=lambda s: None, retries=0)
+    with pytest.raises(XE.RestError) as e:
+        c.select("exec_events", {"select": "seq"})
+    assert e.value.kind.startswith("network:") and KEY not in str(e.value)
+    with pytest.raises(AN.WitnessError):
+        witness(pg).head(ACCT)
+
+
+class _Boom:
+    """A witness that raises something that is NOT a WitnessError (a third-party bug, a decoding error, a malformed status line that slipped through)."""
+    configured = True
+
+    def __init__(self, required=False, exc=None):
+        self.required = required
+        self.exc = exc or __import__("http.client").client.BadStatusLine("garbage")
+
+    def head(self, account):
+        raise self.exc
+
+    def publish(self, account, entry):
+        raise self.exc
+
+
+@pytest.mark.parametrize("exc", [__import__("http.client").client.BadStatusLine("x"), ValueError("decode"), RuntimeError("bug"), KeyError("k")])
+def test_an_unexpected_witness_exception_never_escapes_after_the_commit_point_and_a_required_one_refuses_cleanly(world, exc):
+    w = _Boom(required=False, exc=exc)
+    an = AN.Anchor(world.root, ACCT, "testnet", world.anchor)
+    CC.CapitalBook(world.root, an).initialise({"test": True})                         # no witness at GENESIS
+    book = CC.CapitalBook.anchored(world.root, account_ref=ACCT, venue="testnet", anchor_dir=world.anchor, witness=w)   # optional + raising: opens, state says so
+    assert book.anchor.witness_state == "UNAVAILABLE"
+    book.ensure_baseline("232")                                                       # a commit is durable and returns normally; the witness's failure is recorded
+    assert book.load()["start_cash_usd"] == "232" and book.anchor.witness_state == "UNAVAILABLE"
+    w.required = True
+    with pytest.raises(CC.BookRefused) as e:
+        CC.CapitalBook.anchored(world.root, account_ref=ACCT, venue="testnet", anchor_dir=world.anchor, witness=w)
+    assert e.value.code == "WITNESS_UNAVAILABLE"
+    with pytest.raises(CC.BookRefused) as e2:
+        book.barrier()
+    assert e2.value.code == "WITNESS_UNAVAILABLE"
+
+
+def test_a_read_that_lags_the_write_is_not_an_acknowledgement(pg):
+    w = witness(pg)
+    w.publish(ACCT, entry(0, "GENESIS"))
+    pg.lag = 1                                       # the head query cannot see the row that was just written
+    with pytest.raises(AN.WitnessError) as e:
+        w.publish(ACCT, entry(1))
+    assert "READBACK_FAILED" in str(e.value)
+    pg.lag = 0
+    w.publish(ACCT, entry(1))
+    assert w.head(ACCT)[0] == 1

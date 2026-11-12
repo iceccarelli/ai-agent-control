@@ -28,8 +28,9 @@ WHAT REFUSES (every refusal is a stable code, no refusal rewrites anything, noth
   LOCAL_BEHIND_WITNESS / LINEAGE_FORKED / WITNESS_UNAVAILABLE   the optional remote witness (below)
 
 THE REMOTE WITNESS (optional, owner-controlled). A witness holds the account's lineage head OUTSIDE this machine and refuses a second head at an existing sequence; with it a whole-volume rollback (which no
-local copy can show) becomes LOCAL_BEHIND_WITNESS and a forked copy becomes LINEAGE_FORKED. The interface is here; the Supabase implementation needs a migration only the owner can apply, so until it is applied
-the witness is NOT_CONFIGURED and every report says so. Nothing in this module reaches the network by itself.
+local copy can show) becomes LOCAL_BEHIND_WITNESS and a forked copy becomes LINEAGE_FORKED. The interface is here; the Supabase implementation (``ms_capital_witness.py``) needs NO migration (it uses the executor
+lease's own ``carry.exec_event_put`` compare-and-swap writer and the service role's read of ``carry.exec_events``). The witness is NOT_CONFIGURED until the owner sets ``CAPITAL_WITNESS=supabase`` and the Supabase
+variables on the machine, and every report says so. Nothing in THIS module reaches the network by itself.
 
 HONEST LIMITS (the threat boundary). (1) An operator who can replace EVERY local file (the lineage, its lock, the view) and has no witness to answer to can still forge a consistent history; the lineage makes
 that deliberate and visible, not impossible. (2) With no witness, a consistent rollback of the whole volume restores an older lineage; the next settlement's venue cash read re-books the cash that went
@@ -59,15 +60,18 @@ VIEW_NAME = "capital.json"
 GENESIS_HASH = "00" * 32
 HISTORY_MAX = 200                      # the book's history / applied-transfer window (ms_capital.HISTORY_MAX is this value)
 ANCHOR_ENV = "CAPITAL_ANCHOR_DIR"
-WITNESS_ENV = "CAPITAL_WITNESS"        # "" / "off" = not configured; "supabase" = the Supabase RPC witness (needs the owner-applied migration)
+WITNESS_ENV = "CAPITAL_WITNESS"        # "" / "off" = not configured; "supabase" = the Supabase witness (ms_capital_witness.py; NO migration: it rides on the executor lease's exec_event_put)
 WITNESS_REQUIRED_ENV = "CAPITAL_WITNESS_REQUIRED"
-KINDS = frozenset({"GENESIS", "BASELINE", "RESERVE", "TRANSFER", "PARK", "UPDATE_PENDING", "SETTLE", "GAP", "ACK_HALT", "ACK_REVIEW", "ACK_DRAWDOWN", "REBASELINE"})
+KINDS = frozenset({"GENESIS", "BASELINE", "RESERVE", "TRANSFER", "PARK", "UPDATE_PENDING", "SETTLE", "GAP", "ACK_HALT", "ACK_REVIEW", "ACK_DRAWDOWN", "REBASELINE", "ACK_OLDER"})
+HWM_NAME = "capital_hwm.json"          # the ROOT's own memory of the newest lineage head it has seen (see ``Anchor._write_hwm``)
+HWM_SCHEMA = "capital_hwm.v1"
 _ACCOUNT_RE = re.compile(r"^acct_[0-9a-f]{24}$")
 _UID_RE = re.compile(r"^[0-9]{1,20}$")
 _BIG = ("history", "transfers_applied")           # the two growing lists: rebuilt from the entries' deltas, never copied whole into every entry
 
 
-LOCK_TIMEOUT_S = 30.0                 # a holder that does not let go in this long is stuck (a witness call in flight is bounded well below it): the caller refuses, it never hangs forever
+LOCK_TIMEOUT_S = 30.0                 # a holder that does not let go in this long is stuck or is waiting on the witness (each request is bounded at 10 s with one retry and a head costs up to six requests, so a BLACKHOLED
+                                      # witness can hold the lock for about two minutes): the OTHER caller refuses LOCK_TIMEOUT (transient: no ALERT, the next cycle retries), it never hangs forever
 
 
 def flock_with_timeout(fd: int, timeout_s: float, what: str) -> None:
@@ -154,11 +158,26 @@ def anchor_dir_for(env: Optional[Mapping[str, str]] = None, *, default_home_file
     return os.path.join(base, "capital_anchor")
 
 
+_REQUIRED_TRUE = ("1", "true", "yes", "on")
+_REQUIRED_FALSE = ("", "0", "false", "no", "off")
+
+
+def witness_required(env: Mapping[str, str]) -> bool:
+    """``CAPITAL_WITNESS_REQUIRED``: 1/true/yes/on = required, unset or 0/false/no/off = optional, ANYTHING else is a refusal (a value such as ``enabled`` used to read as 'optional', and a session then went on
+    unwitnessed while the owner believed it could not)."""
+    v = (env.get(WITNESS_REQUIRED_ENV) or "").strip().lower()
+    if v in _REQUIRED_TRUE:
+        return True
+    if v in _REQUIRED_FALSE:
+        return False
+    raise AnchorRefused("WITNESS_MISCONFIGURED", f"{WITNESS_REQUIRED_ENV} must be 1/true/yes/on or 0/false/no/off, not {v[:20]!r}")
+
+
 def witness_from_env(env: Mapping[str, str]) -> Any:
-    """The configured remote witness, or ``NoWitness``. ``CAPITAL_WITNESS=supabase`` selects the Supabase RPC witness (its migration is the OWNER's to apply: ``docs/MONEY_MISSION.md``); ``CAPITAL_WITNESS_REQUIRED=1``
+    """The configured remote witness, or ``NoWitness``. ``CAPITAL_WITNESS=supabase`` selects the Supabase witness (it needs no migration; the owner sets the Supabase variables on the machine: ``docs/MONEY_MISSION.md``); ``CAPITAL_WITNESS_REQUIRED=1``
     makes an unreachable witness a refusal. A witness that was asked for and cannot be built is a refusal, never a silent NoWitness."""
     mode = (env.get(WITNESS_ENV) or "").strip().lower()
-    required = (env.get(WITNESS_REQUIRED_ENV) or "").strip().lower() in ("1", "true", "yes")
+    required = witness_required(env)
     if mode in ("", "off", "none"):
         if required:
             raise AnchorRefused("WITNESS_MISCONFIGURED", f"{WITNESS_REQUIRED_ENV} is set but no witness is configured ({WITNESS_ENV})")
@@ -224,6 +243,7 @@ class Lineage:
 
     def __init__(self, path: str, account: str, venue: str) -> None:
         self.path, self.account, self.venue = path, account, venue
+        self.read_size: Optional[int] = None                           # the byte length of the VERIFIED file at the last read: an append is only allowed onto exactly that (compare-and-append)
 
     def exists(self) -> bool:
         return os.path.lexists(self.path) and os.path.getsize(self.path) > 0
@@ -233,6 +253,7 @@ class Lineage:
             with open(self.path, "rb") as fh:
                 data = fh.read()
         except FileNotFoundError:
+            self.read_size = 0
             return []
         except OSError as exc:
             raise AnchorRefused("ANCHOR_CORRUPT", f"the lineage cannot be read ({type(exc).__name__})") from None
@@ -259,6 +280,7 @@ class Lineage:
                 raise AnchorRefused("ACCOUNT_MISMATCH" if why.startswith("ACCOUNT") else "ANCHOR_CORRUPT", why)
             out.append(e)
             prev = e["h"]
+        self.read_size = len(data) - len(torn) if torn is not None and repair_torn else len(data)
         if torn is not None and repair_torn:
             self._set_aside(torn, len(data) - len(torn))
         return out
@@ -298,22 +320,29 @@ class Lineage:
         print(f"CAPITAL_LINEAGE_TORN_TAIL_DROPPED: {len(text)} bytes of an unfinished append were set aside in {os.path.basename(self.path)}.torn; every earlier entry verified", file=sys.stderr)
 
     def append(self, entry: Mapping[str, Any]) -> None:
-        """Durable append: the line (and a newline first when the file ends without one), fsynced; the directory is fsynced when the file is created."""
+        """Durable COMPARE-AND-APPEND: the line (and a newline first when the file ends without one), fsynced; the directory is fsynced when the file is created. It is allowed only onto exactly the bytes the last
+        ``read`` verified, and it takes the DATA FILE's own lock for the check and the write: the lock FILE of ``Anchor.locked`` can be unlinked away by a "clean stale locks" script, after which a second committer
+        read the same head and appended a second entry with the same sequence (reproduced: the lineage ended [0,1,2,2] and every later open was ANCHOR_CORRUPT). Now the second writer finds the file longer than it
+        verified and refuses (LINEAGE_CHANGED_UNDER_COMMIT, transient: its next cycle re-reads and extends the real head)."""
+        if self.read_size is None:
+            raise AnchorRefused("LINEAGE_CHANGED_UNDER_COMMIT", "the lineage was not read and verified before this append")
         line = (_canon(entry) + "\n").encode("utf-8")
         created = not os.path.lexists(self.path)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            if not created and os.path.getsize(self.path) > 0:
-                with open(self.path, "rb") as rh:
-                    rh.seek(-1, os.SEEK_END)
-                    if rh.read(1) != b"\n":
-                        line = b"\n" + line
+            flock_with_timeout(fd, LOCK_TIMEOUT_S, "the capital lineage file")
+            size = os.fstat(fd).st_size
+            if size != self.read_size:
+                raise AnchorRefused("LINEAGE_CHANGED_UNDER_COMMIT", f"the lineage is {size} bytes, not the {self.read_size} this commit verified: another writer appended; nothing was written")
+            if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+                line = b"\n" + line
             n = os.write(fd, line)
             if n != len(line):
                 raise OSError("short write to the capital lineage")
             os.fsync(fd)
+            self.read_size = size + len(line)
         finally:
-            os.close(fd)
+            os.close(fd)                                                # closing releases the file lock
         if created:
             _fsync_dir(os.path.dirname(self.path))
 
@@ -336,6 +365,7 @@ class Anchor:
         self.witness = witness if witness is not None else NoWitness()
         self.verify_only = verify_only
         self.view_path = os.path.join(root, VIEW_NAME)
+        self.hwm_path = os.path.join(root, HWM_NAME)
         self.lineage = Lineage(os.path.join(anchor_dir, f"lineage-{account}.jsonl"), account, venue)
         self._lock_path = os.path.join(anchor_dir, f"lineage-{account}.lock")
         self._entries: Optional[List[Dict[str, Any]]] = None     # the verified entries inside one locked scope
@@ -400,6 +430,29 @@ class Anchor:
             return "legacy", d
         return "bound", d
 
+    # ---- the root's HIGH-WATER MARK. The lineage lives in ONE directory and the view in ANOTHER (a second volume is the supported layout), and a view is rebuilt from the lineage when it is missing. Restoring only the
+    # anchor directory and then deleting ``capital.json`` (the natural "fix" for a refused view) therefore healed to the OLDER head: the rollback itself, reproduced end to end (the lifetime stop and a 4-loss halt both
+    # gone). The root now also remembers, in a file of its own, the newest head it has seen: a lineage that ends BELOW it refuses (ANCHOR_BEHIND_BOOK) whether or not the view exists. It is a floor, not a lock:
+    # whoever deletes the mark AND the view as well (or restores the whole volume) is not stopped by it; that takes a deliberate act, and the witness is what stops it.
+    def _read_hwm(self) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """('absent'|'unreadable'|'ok', record)."""
+        try:
+            with open(self.hwm_path, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except FileNotFoundError:
+            return "absent", None
+        except (OSError, ValueError, RecursionError):
+            return "unreadable", None
+        if (not isinstance(d, dict) or d.get("schema") != HWM_SCHEMA or not is_account_ref(d.get("account")) or isinstance(d.get("seq"), bool) or not isinstance(d.get("seq"), int) or d["seq"] < 0
+                or not isinstance(d.get("head"), str) or not re.fullmatch(r"[0-9a-f]{64}", d["head"])):
+            return "unreadable", None
+        return "ok", d
+
+    def _write_hwm(self, seq: int, head: str) -> None:
+        if self.verify_only:
+            return
+        ES.write_json_atomic(self.hwm_path, {"schema": HWM_SCHEMA, "account": self.account, "seq": int(seq), "head": head})
+
     def entries(self) -> List[Dict[str, Any]]:
         if self._entries is None:
             self._entries = self.lineage.read(repair_torn=not self.verify_only)
@@ -419,10 +472,18 @@ class Anchor:
             bound_to = (view.get("ledger_ref") or {}).get("account")            # type: ignore[union-attr]
             if bound_to != self.account or view.get("account") not in (None, self.account):   # type: ignore[union-attr]
                 raise AnchorRefused("ACCOUNT_MISMATCH", f"the book is bound to account {bound_to}, not {self.account}: a state directory belongs to the account it was created for")
+        hw_status, hw = self._read_hwm()
+        if hw_status == "unreadable":
+            raise AnchorRefused("VIEW_TAMPERED", f"the root's high-water mark ({HWM_NAME}) cannot be read; nothing was changed (the owner decides: capital --rebuild-view)")
+        if hw is not None and hw["account"] != self.account:
+            raise AnchorRefused("ACCOUNT_MISMATCH", f"this root's high-water mark belongs to account {hw['account']}, not {self.account}: a state directory belongs to the account it was created for")
         if not entries:
             if status == "bound":
                 ref = view.get("ledger_ref") or {}               # type: ignore[union-attr]
                 raise AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", f"the book names lineage {ref.get('account')} seq {ref.get('seq')} head {str(ref.get('head'))[:12]}, and no lineage exists at {self.lineage.path}")
+            if hw is not None:
+                raise AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", f"this root last saw lineage {hw['account']} seq {hw['seq']} head {hw['head'][:12]}, and no lineage exists at {self.lineage.path}: the anchor directory was lost or "
+                                                                 "restored empty; restore it (a new history would be the reset this exists to prevent)")
             self._propose(adopt=status in ("legacy", "unreadable"))
             if status in ("legacy", "unreadable"):
                 raise AnchorRefused("BOOK_UNANCHORED", "a capital book exists with no lineage: only the owner can adopt it (capital --anchor-init)")
@@ -431,6 +492,12 @@ class Anchor:
         replay = rebuild(entries)
         if book_digest(replay) != head["book_digest"]:
             raise AnchorRefused("ANCHOR_CORRUPT", "the lineage does not reproduce the book digest it attests at its head")
+        if hw is not None:
+            if hw["seq"] > head["seq"]:
+                raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"this root last saw the lineage at seq {hw['seq']} and the lineage ends at seq {head['seq']}: an older anchor was restored. Deleting capital.json does not change "
+                                                          "that (capital --accept-older-lineage is the owner's recorded decision to continue from the older one)")
+            if entries[hw["seq"]]["h"] != hw["head"]:
+                raise AnchorRefused("LINEAGE_FORKED", f"this root last saw a different head at lineage seq {hw['seq']} than the lineage holds there: the lineage is another history than the one this root has been following")
         if status == "absent":
             return self._heal(replay, head, "NO_VIEW", None)
         if status == "unreadable":
@@ -460,21 +527,38 @@ class Anchor:
         if self.verify_only:
             return view                                           # a read-only open reports what the view WOULD be and writes nothing
         ES.write_json_atomic(self.view_path, view)
+        self._write_hwm(head["seq"], head["h"])
         self.audit("VIEW_REBUILT", {"why": why, "from_seq": from_seq, "to_seq": head["seq"], "head": head["h"][:16]})
         return dict(view)
 
     def _preserve(self, tag: str) -> None:
         """Keep an unreadable or stale view as evidence before it is replaced."""
-        if self.verify_only or not os.path.lexists(self.view_path):
+        self._preserve_path(self.view_path, tag)
+
+    def _preserve_path(self, path: str, tag: str) -> None:
+        if self.verify_only or not os.path.lexists(path):
             return
-        dst = f"{self.view_path}.{tag}.{int(self.clock())}"
+        dst = f"{path}.{tag}.{int(self.clock())}"
         try:
-            with open(self.view_path, "rb") as src, open(dst, "xb") as out:
+            with open(path, "rb") as src, open(dst, "xb") as out:
                 out.write(src.read())
                 out.flush()
                 os.fsync(out.fileno())
         except OSError as exc:
             print(f"CAPITAL_VIEW_EVIDENCE_NOT_KEPT: {type(exc).__name__}", file=sys.stderr)
+
+    def newer_facts(self) -> Dict[str, Any]:
+        """What this ROOT remembers that is not in the lineage (read-only): the view's sequence and figures and the high-water mark. Shown to the owner before ``capital --accept-older-lineage`` and kept in the entry that
+        records the decision. Nothing secret: sequences, a short head and the stop-relevant figures."""
+        st, view = self._read_view()
+        hs, hw = self._read_hwm()
+        out: Dict[str, Any] = {"view": None, "hwm": None}
+        if st == "bound" and isinstance(view, dict):
+            ref = view.get("ledger_ref") or {}
+            out["view"] = {"seq": ref.get("seq"), "head": str(ref.get("head"))[:16], "realised_usd": view.get("realised_usd"), "loss_streak": view.get("loss_streak"), "halted": view.get("halted"), "epoch": view.get("epoch")}
+        if hs == "ok" and hw is not None:
+            out["hwm"] = {"seq": hw["seq"], "head": hw["head"][:16]}
+        return out
 
     def _propose(self, adopt: bool) -> None:
         """Leave the owner what ``capital --anchor-init`` needs: the account reference this session saw. Convenience only: the next session re-verifies the account against the venue, so a wrong proposal can only be refused."""
@@ -510,6 +594,7 @@ class Anchor:
         self._seen = (len(entries), entry["h"])
         crash_hook("after_append")
         ES.write_json_atomic(self.view_path, {**b, "ledger_ref": {"account": self.account, "seq": seq, "head": entry["h"], "digest": entry["book_digest"]}})
+        self._write_hwm(seq, entry["h"])
         crash_hook("after_view")
         self._publish(entries)
         crash_hook("after_witness")
@@ -519,6 +604,21 @@ class Anchor:
     def _ref(self, h: str) -> str:
         f = getattr(self.witness, "ref_of", None)
         return f(h) if callable(f) else h
+
+    def _wcall(self, name: str, fn: Callable[..., Any], *args: Any) -> Any:
+        """EVERY witness call goes through here. Whatever a witness raises that is not already a ``WitnessError`` (a malformed HTTP status line, a decoding error, a bug in a third-party witness) becomes one: the
+        contract is that a witness can only make the system REFUSE, never crash it after the commit point (reproduced: an optional witness's ``BadStatusLine`` escaped ``anchored()`` after the commit was durable
+        and the loop counted it as an unexpected exception instead of a transient pause)."""
+        try:
+            return fn(*args)
+        except WitnessError:
+            raise
+        except Exception as exc:                                              # noqa: BLE001
+            raise WitnessError(f"the witness raised {type(exc).__name__} in {name}") from None
+
+    def remote_head(self) -> Optional[Tuple[int, str]]:
+        """(seq, ref) the configured witness holds for this account, None when it holds none. ``WitnessError`` when it cannot say. Read-only."""
+        return self._wcall("head", self.witness.head, self.account)
 
     def check_witness(self, *, publish: bool = True) -> str:
         """Compare the local head with the witness and publish the head when the witness is behind. LOCAL_BEHIND_WITNESS (the local lineage is OLDER than what the witness holds: a rollback or a replaced volume),
@@ -531,7 +631,7 @@ class Anchor:
         required = bool(getattr(w, "required", False))
         entries = self.entries()
         try:
-            rh = w.head(self.account)
+            rh = self.remote_head()
         except WitnessError as exc:
             self.witness_state = "UNAVAILABLE"
             if required:
@@ -545,7 +645,7 @@ class Anchor:
                 raise AnchorRefused("LINEAGE_FORKED", f"the witness holds a different head at seq {rseq} than the local lineage")
         if publish and entries and (rh is None or rh[0] < len(entries) - 1):
             try:
-                w.publish(self.account, entries[-1])                      # the HEAD only: the witness needs the position, not the whole history
+                self._wcall("publish", w.publish, self.account, entries[-1])      # the HEAD only: the witness needs the position, not the whole history
             except WitnessConflict:
                 raise AnchorRefused("LINEAGE_FORKED", f"the witness holds a different head at seq {len(entries) - 1} than the local lineage") from None
             except WitnessError as exc:
@@ -563,7 +663,7 @@ class Anchor:
         if not getattr(w, "configured", False) or not entries:
             return
         try:
-            w.publish(self.account, entries[-1])
+            self._wcall("publish", w.publish, self.account, entries[-1])
             self.witness_state = "OK"
         except WitnessConflict:
             self.witness_state = "FORKED"
@@ -572,15 +672,25 @@ class Anchor:
             self.witness_state = "UNAVAILABLE"
 
     # ---- the one place the owner's act creates a lineage
-    def initialise(self, *, adopt: Optional[Mapping[str, Any]], fresh_book: Mapping[str, Any], owner: Mapping[str, Any]) -> Dict[str, Any]:
-        """GENESIS. Inside ``locked()``. Refused when a lineage exists or when a configured witness knows the account (or cannot be read). ``adopt`` is a validated pre-anchor book (kept whole, with its digest); the
-        owner's gate facts are recorded in the entry."""
+    def initialise(self, *, adopt: Optional[Mapping[str, Any]], fresh_book: Mapping[str, Any], owner: Mapping[str, Any], adopt_ref: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """GENESIS. Inside ``locked()``. Refused when a lineage exists, when a configured witness knows the account (or cannot be read), or when THIS ROOT remembers a lineage for the account (its high-water mark)
+        that is not the very book being adopted: a lineage that was lost or restored empty is a disaster to repair, not a new account, and a fresh history would be the reset this module exists to prevent.
+        ``adopt`` is a validated pre-anchor book (kept whole, with its digest; ``adopt_ref`` is the ``ledger_ref`` its file carried, if any); the owner's gate facts are recorded in the entry."""
         if self.entries():
             raise AnchorRefused("GENESIS_REFUSED_LINEAGE_EXISTS", "this account already has a lineage; it can only be extended, never re-created")
+        hw_status, hw = self._read_hwm()
+        if hw_status == "unreadable":
+            raise AnchorRefused("VIEW_TAMPERED", f"the root's high-water mark ({HWM_NAME}) cannot be read; a new lineage is not created over it")
+        if hw is not None:
+            if hw["account"] != self.account:
+                raise AnchorRefused("ACCOUNT_MISMATCH", f"this root belongs to account {hw['account']}, not {self.account}: use a root of its own for another account")
+            if not (adopt is not None and isinstance(adopt_ref, Mapping) and adopt_ref.get("seq") == hw["seq"] and adopt_ref.get("head") == hw["head"]):
+                raise AnchorRefused("GENESIS_REFUSED_ROOT_REMEMBERS_LINEAGE", f"this root last saw this account's lineage at seq {hw['seq']} (head {hw['head'][:12]}) and no lineage exists now: restore the anchor directory; a new "
+                                                                              "history would reset every stop")
         w = self.witness
         if getattr(w, "configured", False):
             try:
-                rh = w.head(self.account)
+                rh = self.remote_head()
             except WitnessError as exc:
                 raise AnchorRefused("WITNESS_UNAVAILABLE", f"the remote witness could not be read ({str(exc)[:80]}); a new lineage cannot be created blind") from None
             if rh is not None:

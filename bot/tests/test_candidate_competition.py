@@ -310,3 +310,35 @@ def test_a_short_cash_series_does_not_crash_the_verdict_and_is_stated_unknown(mo
     assert verdict == "INSUFFICIENT_DATA" and any("CASH_UNKNOWN" in x for x in reasons) and policies["long_hold_vs_cash"] == CR.UNKNOWN
     p51 = {p["policy"]: p for p in CC_.btc_policies(econ)}["unconditional_51_print_hold"]
     assert p51["verdict"] == "INSUFFICIENT_DATA" and "CASH_UNKNOWN" in p51["note"]
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ROUND 10, INDEPENDENT RED TEAM, finding 3: the ROW's basis label must be the one the summary computed
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+def _stub_xs(monkeypatch, nominal, blocks):
+    fam = {"verdict": "INSUFFICIENT_DATA", "status": "WALK_FORWARD_DONE", "is_carry": False, "independent_holding_rows": 80, "oos_mean_total_bps_per_row": nominal, "vs_cash": blocks,
+           "survivorship": "SURVIVORS_ONLY", "n_variants_counted": 5, "reason": "x"}
+    res = {"status": "EVALUATED", "evaluation": {"families": {"PERP_FUNDING_SPREAD": fam}, "survivorship": "SURVIVORS_ONLY", "input": {"holdout": {"status": "RESERVED"}}}}
+    monkeypatch.setattr(CC_, "run_cross_sectional", lambda *a, **k: res)
+
+
+def _xs_row(tmp_path):
+    _reset()
+    rep = CC_.run_competition(ledger_dir=str(tmp_path))
+    return row(rep, "cross_sectional_funding")
+
+
+def test_the_cross_sectional_row_says_excess_over_cash_in_bps_of_capital_when_a_cash_source_was_applied(tmp_path, monkeypatch):
+    blk = lambda x: {"verdict": "INSUFFICIENT_DATA", "status": "WALK_FORWARD_DONE", "oos_mean_excess_bps_of_capital_per_row": x, "capital_per_gross_notional": 1.02}      # noqa: E731
+    _stub_xs(monkeypatch, 30.0, {"HISTORICAL": blk(-2.0)})
+    r = _xs_row(tmp_path)
+    assert r["net_edge"]["value_bps"] == -2.0
+    assert "EXCESS_OVER_CASH_BPS_OF_CAPITAL" in r["net_edge"]["basis"] and "NOMINAL" not in r["net_edge"]["basis"], r["net_edge"]["basis"]
+    assert "HISTORICAL" in r["net_edge"]["basis"], "which cash source the figure is against"
+
+
+def test_the_cross_sectional_row_says_nominal_and_not_a_comparison_with_cash_when_none_was_applied(tmp_path, monkeypatch):
+    _stub_xs(monkeypatch, 30.0, {})
+    r = _xs_row(tmp_path)
+    assert r["net_edge"]["value_bps"] == 30.0
+    assert "NOMINAL_BPS_OF_GROSS_NOTIONAL" in r["net_edge"]["basis"] and "NOT a comparison with cash" in r["net_edge"]["basis"] and "EXCESS_OVER_CASH" not in r["net_edge"]["basis"], r["net_edge"]["basis"]

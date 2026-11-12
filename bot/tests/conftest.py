@@ -57,6 +57,7 @@ _SAVED_ENV = {} if _ALLOW_NETWORK else {
 # therefore set for the WHOLE SESSION here, at import (before any module is collected and before any subprocess is started), and a session-end check fails the run if the real files changed anyway.
 # ---------------------------------------------------------------------------
 _REAL_OWNER_HOME = os.path.join(os.path.expanduser("~"), ".ai-agent-control")
+_REAL_CANDIDATE_LEDGERS = os.path.join(os.path.expanduser("~"), ".cache", "ai-agent-control", "candidate_ledgers")        # where candidate_readiness / candidate_competition write when CANDIDATE_LEDGER_DIR is unset
 _OWNER_STATE_VARS = ("HISTORY_HOLDOUT_LEDGER", "CANDIDATE_LEDGER_DIR", "CAPITAL_ANCHOR_DIR")
 _OWNER_STATE_ORIG = {k: os.environ.get(k) for k in _OWNER_STATE_VARS}
 _SESSION_OWNER_STATE = tempfile.mkdtemp(prefix="bot_tests_owner_state_")
@@ -80,6 +81,11 @@ def _real_owner_state_fingerprint():
         out.append(("capital_anchor/", tuple(sorted((n, os.stat(os.path.join(anchor, n)).st_size) for n in os.listdir(anchor)))))
     except OSError:
         out.append(("capital_anchor/", None))
+    ledgers = _REAL_CANDIDATE_LEDGERS
+    try:
+        out.append(("candidate_ledgers/", tuple(sorted((n, os.stat(os.path.join(ledgers, n)).st_size) for n in os.listdir(ledgers)))))
+    except OSError:
+        out.append(("candidate_ledgers/", None))
     return tuple(out)
 
 

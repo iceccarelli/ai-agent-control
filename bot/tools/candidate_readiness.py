@@ -1907,6 +1907,7 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
         test_idx.extend((pick, i) for i in f.test)                                           # type: ignore[arg-type]
     st = RH.significance(oos)
     m = ledger.n_variants
+    m_nominal = m                                                      # what the NOMINAL p-value below is adjusted for (reported as n_variants_used_for_nominal_p)
     adj = SP.adjust_pvalues([st["p_one_sided"]], "holm", alpha=alpha, n_tested=m)["adjusted"][0]
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
@@ -1926,14 +1927,15 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
             blk = _vs_cash_walk_forward(basis, kind=kind, is_carry=spec["is_carry"], selectable=sorted(selectable), by_t=by_t, common_sorted=common_sorted, hold_days=hold_days, ledger=ledger, params_of=params_of,
                                         alpha=alpha, min_rows=min_rows)
             out["vs_cash"][basis.label] = blk
-        m = ledger.n_variants                                          # the family grew by the cash-adjusted variants: reported (and used by their own Holm), the nominal verdict above is unchanged
+        m = ledger.n_variants                                          # the family grew by the cash-adjusted variants: reported (and used by their own Holm); THIS run's nominal p-value used n_variants_used_for_nominal_p.
+        #                                                                A LATER nominal run on the same persistent ledger starts from the larger count (the ledger remembers every trial): conservative, never a promotion.
         rejecting = sorted(lbl for lbl, b in out["vs_cash"].items() if b.get("verdict") == "REJECTED")
         if rejecting and verdict != "REJECTED" and not (unpriced or unkeyed):
             verdict = "REJECTED"
             out["rejected_vs_cash"] = rejecting
     out["reject_early"] = early if early_applied else None
     out["reject_early_suppressed_by_cap"] = bool(early and not early_applied and verdict != "REJECTED")
-    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(results), "correction": "holm",
+    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_used_for_nominal_p": m_nominal, "n_variants_tried_in_call": len(results), "correction": "holm",
                 "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean, "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"],
                 "p_adjusted": adj, "selected_per_fold": chosen, "oos_book_analytics": book_analytics(oos_rows),
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",

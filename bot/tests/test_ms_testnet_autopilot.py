@@ -17,6 +17,7 @@ import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
 import capital_testkit as CT  # noqa: E402
 import ms_capital as CC  # noqa: E402
+import ms_capital_anchor as AN  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
 
@@ -1665,14 +1666,29 @@ def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_a
     assert open(book.path).read() == before, "a read-only evaluation never rewrites the book"
 
 
-def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w):
+def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_reset(w, monkeypatch):
+    """THE REFUSAL A SESSION REALLY GETS. The test world auto-initialises an account (the owner's one-time act), which turned this into ``BOOK_UNREADABLE``, a code only the OWNER's ``--anchor-init`` raises: production
+    answers BOOK_UNANCHORED (a pre-anchor file that cannot be adopted), a PAUSE with no ALERT, and the owner's own command is what refuses to adopt it (next test)."""
+    monkeypatch.setattr(AP, "_open_book", w.production_open_book)
     _profit_world(w)
     root = w.tmp / "eng_corrupt"
     os.makedirs(root)
     (root / "capital.json").write_text("{corrupt")
     res, _got = _collect(w, eng_name="eng_corrupt")
-    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:BOOK_UNREADABLE"], res      # no lineage to rebuild it from and nothing the owner could adopt: not reset, not guessed
-    assert (root / "capital.json").read_text() == "{corrupt" and not w.requests_to("/v5/order/create")
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:BOOK_UNANCHORED"], res
+    assert (root / "capital.json").read_text() == "{corrupt" and not w.requests_to("/v5/order/create"), "not reset, not guessed, nothing placed"
+    assert not ES.EngineState(str(root), lambda: 0).has("ALERT"), "an owner-action refusal is a PAUSE; the owner then decides"
+
+
+def test_the_owners_anchor_init_refuses_to_adopt_a_book_it_cannot_read_and_leaves_it_alone(w, tmp_path):
+    root = tmp_path / "eng_unreadable"
+    os.makedirs(root)
+    (root / "capital.json").write_text("{corrupt")
+    book = CC.CapitalBook(str(root), AN.Anchor(str(root), CT.ACCOUNT, "testnet", AN.anchor_dir_for(os.environ)))
+    with pytest.raises(CC.BookRefused) as e:
+        book.initialise({"test": True})
+    assert e.value.code == "BOOK_UNREADABLE" and (root / "capital.json").read_text() == "{corrupt"
+    assert not os.path.exists(os.path.join(AN.anchor_dir_for(os.environ), f"lineage-{CT.ACCOUNT}.jsonl")), "no lineage was created over a record nobody could read"
 
 
 def test_a_finished_session_appends_one_chained_feedback_row_and_the_quality_command_reports_it(w, capsys):

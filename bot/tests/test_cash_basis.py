@@ -213,3 +213,20 @@ def test_the_cli_says_when_no_cash_was_applied(tmp_path, capsys):
     import candidate_competition as CC_
     assert CC_.main(["--ledger-dir", str(tmp_path / "led"), "--no-historical-cash"]) == 0
     assert "NOTE" not in capsys.readouterr().out
+
+
+def test_the_nominal_p_value_says_how_many_variants_it_was_adjusted_for_and_a_shared_ledger_makes_a_later_nominal_run_more_conservative(tmp_path):
+    """Red team, finding 8: the JSON reported n_variants_counted=6 beside a nominal p_adjusted computed with m=4, and a later nominal-only run on the same ledger silently used 6 (p_adj 0.265 -> 0.398)."""
+    lp = str(tmp_path / "shared.jsonl")
+    fresh()
+    ser = _world(1300, edge=2.5, beta_mkt=False)
+    plain = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, **KW)
+    assert plain["n_variants_used_for_nominal_p"] == plain["n_variants_counted"]
+    fresh()
+    with_cash = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, cash_bases=[basis(0.04)], **KW)
+    assert with_cash["n_variants_used_for_nominal_p"] == plain["n_variants_counted"] and with_cash["n_variants_counted"] > with_cash["n_variants_used_for_nominal_p"]
+    assert with_cash["p_adjusted"] == plain["p_adjusted"], "the nominal p of the run that added the cash variants is unchanged"
+    fresh()
+    later = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, **KW)
+    assert later["n_variants_used_for_nominal_p"] == with_cash["n_variants_counted"], "the ledger remembers every trial: a later nominal run is adjusted for all of them"
+    assert later["p_adjusted"] >= plain["p_adjusted"], "more conservative, never less"

@@ -51,3 +51,9 @@ def test_the_session_end_check_sees_a_change_to_the_real_owner_state(monkeypatch
     before = CF._real_owner_state_fingerprint()
     (fake_home / "history_holdout.jsonl").write_text("{}\n")
     assert CF._real_owner_state_fingerprint() != before
+    fake_ledgers = tmp_path / "cache" / "candidate_ledgers"                       # the candidate ledgers are a second place a research run writes when its directory variable is unset
+    fake_ledgers.mkdir(parents=True)
+    monkeypatch.setattr(CF, "_REAL_CANDIDATE_LEDGERS", str(fake_ledgers))
+    before2 = CF._real_owner_state_fingerprint()
+    (fake_ledgers / "cash_and_carry.jsonl").write_text("{}\n")
+    assert CF._real_owner_state_fingerprint() != before2

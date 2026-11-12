@@ -287,3 +287,66 @@ def test_the_witness_check_command_is_read_only_and_reports_a_rollback(tmp_path,
     out = json.loads(capsys.readouterr().out)
     assert rc == 2 and out["witness"] == "LOCAL_BEHIND_WITNESS", out
     assert open(lineage, "rb").read() == before and 1 not in wit.rows[CT.ACCOUNT], "checking publishes and writes nothing"
+
+
+# =====================================================================================================================================================================================================
+# ROUND 10, INDEPENDENT RED TEAM (loop and session classification)
+# =====================================================================================================================================================================================================
+def test_a_lock_timeout_inside_the_park_is_a_transient_anchor_refusal_not_an_unreadable_book(w, monkeypatch):
+    """park() used to DROP the anchor's code: a lock that did not free up in time became CAPITAL_BOOK_UNREADABLE, which is neither owner-side nor transient (three in a row would raise the repeated-refusal ALERT)."""
+    _profit_world(w)
+    eng = w.tmp / "eng"
+    CT.anchored(str(eng))
+
+    def stuck(self, *a, **k):
+        raise CC.BookRefused("LOCK_TIMEOUT", "the capital lineage lock is held by another process")
+    monkeypatch.setattr(CC.CapitalBook, "park", stuck)
+    res = session(w, eng)
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:LOCK_TIMEOUT"], res
+    assert not posts(w) and not ES.EngineState(str(eng), lambda: 0).has("ALERT")
+    assert any(res["why"][0].startswith(p) for p in AP.OWNER_AUTHORITY_REFUSALS), "the loop classifies it as owner-side/transient: it neither alerts nor counts as an unexpected refusal"
+
+
+def _loop_with(tmp_path, reasons, n=6):
+    seq = list(reasons)
+    last = reasons[-1]
+
+    def once(env, **kw):
+        return {"result": "REFUSED", "why": [seq.pop(0) if seq else last]}
+
+    t = [1_700_000_000_000]
+
+    def clock():
+        t[0] += 1000
+        return t[0]
+    root = str(tmp_path / ("loop_" + reasons[0].replace(":", "_")))
+    AP.loop({}, root=root, once=once, clock=clock, sleep=lambda s: None, out=[].append, max_iterations=n, recover_fn=lambda env, **k: (True, [], {"venue_read_complete": True, "reconciled_ms": 1}))
+    eng = ES.EngineState(root, clock)
+    return eng.has("ALERT"), eng.read("ALERT") or {}
+
+
+@pytest.mark.parametrize("code", sorted(AP.NO_ALERT_ANCHOR_CODES))
+def test_the_loop_given_an_owner_action_or_transient_anchor_refusal_six_times_raises_no_alert(tmp_path, code):
+    alerted, alert = _loop_with(tmp_path, ["CAPITAL_ANCHOR_REFUSED:" + code])
+    assert alerted is False, (code, alert)
+
+
+@pytest.mark.parametrize("code", ["ACCOUNT_MISMATCH", "VIEW_TAMPERED", "ANCHOR_BEHIND_BOOK", "ANCHOR_CORRUPT", "ANCHOR_MISSING_BOOK_BOUND", "LOCAL_BEHIND_WITNESS", "LINEAGE_FORKED", "WITNESS_MISCONFIGURED"])
+def test_the_loop_given_an_incident_anchor_refusal_repeatedly_raises_an_alert(tmp_path, code):
+    alerted, alert = _loop_with(tmp_path, ["CAPITAL_ANCHOR_REFUSED:" + code])
+    assert alerted is True, code
+
+
+def test_the_decision_record_and_the_evidence_event_state_the_epoch_and_the_result_over_all_epochs(w):
+    import exec_lifecycle as EL
+    book = CT.anchored(str(w.tmp / "eng_epochs"))
+    book.ensure_baseline("232")
+    for n in range(1, 3):
+        book.park(f"s{n}", str(232 - 5 * (n - 1)), "-5", True, True)
+        book.settle(str(232 - 5 * n))
+    book.rebaseline("a reason of my own about the wallet reset", {"test": True})
+    rep = book.report()
+    ev = EL.capital_book(rep)
+    assert ev[2]["epoch"] == 1 and D(ev[2]["all_epochs_verified_result_usd"]) == D("-10"), "a new epoch must never read as a fresh account"
+    ctx = AP._decision_context(str(w.tmp / "eng_epochs"), "0")
+    assert ctx["portfolio"]["epoch"] == 1 and D(ctx["portfolio"]["all_epochs_verified_result_usd"]) == D("-10"), ctx["portfolio"]

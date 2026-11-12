@@ -162,7 +162,8 @@ def test_a_corrupt_but_parsable_execution_row_does_not_kill_the_session_with_the
                          "execFee": "0", "feeCurrency": "USDT", "isMaker": False, "execTime": str(w.clock.now()), "execType": "Trade"})
     S._step_once(ctx, run, rec)                                                   # must not raise
     assert any(u["exec_id"] == "E999001" for u in run.ex.unattributed), "the corrupt row is kept as evidence, not dropped silently"
-    assert run.ledger.pnl()["fees"] is not None or True
+    run.feed_ledger()
+    assert run.ledger.pnl()["fees"] is not None, "the corrupt row changed nothing the ledger holds: the real fills' fees are still a known number"
 
 
 # ------------------------------------------------------------------------------------------------ boundary fuzz: invariants of the parser, not a count of findings

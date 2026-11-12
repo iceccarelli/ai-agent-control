@@ -43,6 +43,7 @@ class World:
         # the autopilot's default engine root is ~/.ai-agent-control/ms_autopilot, computed at import from the REAL home: a test that did not pass --root / engine_root used to read and write the developer's (or the
         # CI job's) real capital book, and one test's book leaked into the next. Every world gets its own default root.
         monkeypatch.setattr(AP, "DEFAULT_ROOT", str(tmp_path / "default_engine_root"))
+        self.production_open_book = AP._open_book                          # what production runs: a test that must see the REFUSAL a session really gets puts it back (monkeypatch.setattr(AP, "_open_book", w.production_open_book))
         if owner_initialised_account:
             # THE OWNER HAS RUN `capital --anchor-init` for this account (production refuses a session on an account with no capital lineage: ms_capital_anchor). The world models that one-time owner act by creating
             # the lineage the first time a session asks for the book (adopting a book a test seeded in the root); a test about the refusal builds the world with owner_initialised_account=False.

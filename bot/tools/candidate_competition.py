@@ -324,7 +324,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
         elif name == "cross_sectional_funding":
             verdict, reasons = xs["verdict"], xs["reasons"] + [x for x in reasons if "UNIVERSE_DIR_REQUIRED" in x]
             net = xs["net_edge"]
-            net_basis = ("OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: best family's out-of-sample mean net bps per 7-day row (perp-only families are NOT carry)" if net is not None else
+            # the row's label is the one the summary computed (it was hard-coded as 'net bps per 7-day row', so an EXCESS over cash in bps of CAPITAL sat in the row labelled as a nominal figure)
+            net_basis = (f"OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: {xs['net_edge_basis']}; out-of-sample mean per 7-day row (perp-only families are NOT carry)" if net is not None else
                          "UNKNOWN: not evaluated, or too few holding rows for a test (descriptive in-sample figures are in families[])")
             extra["families"] = xs["families"]
             extra["survivorship"] = xs["survivorship"]          # the table must show it: a survivors-only cross-section flatters every net edge it prints

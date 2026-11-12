@@ -155,3 +155,39 @@ def test_a_perp_entry_execution_the_list_does_not_show_never_publishes_a_zero_fu
     q = json.load(open(os.path.join(w.state_dir, "execution_quality.json")))
     row = EQ.feedback_row(session="s", at_ms=1, decision_id=None, quality=q, funding=fs, edge={"expected_funding_bps": "5.6"}, flat_verified=True)
     assert row["realised_funding_bps"] is None and row["funding_booked_usd"] is None, row
+
+
+def test_a_suppressed_funding_document_publishes_no_booked_amount_in_any_event(tmp_path):
+    """Red team, finding 11: after the session withdrew the funding document ('suppressed'), the FUNDING_SETTLEMENT events were still built from its prints and said BOOKED 0.48 beside a record that said UNKNOWN."""
+    import json
+    import exec_lifecycle as EL
+    import ms_testnet_session as S
+    doc = {"schema": "funding_settlement_session.v1", "at_ms": 1, "recognitions": [{"symbol": "BTCUSDT", "sign_hypothesis": "H1", "prints_available": 1, "window": {"a": 1, "b": 2}, "all_prints_resolved": True,
+                                                                                    "booked_usd": "0.48", "flags": [], "unmatched_rows": [],
+                                                                                    "prints": [{"ts_ms": 5, "rate": "0.0001", "signed_position_qty": "-0.002", "status": "BOOKED", "amount_usd": "0.48", "expected_usd": "0.48",
+                                                                                                "row_id": "abc", "wallet": {"status": "MATCH", "delta_usd": "0"}, "reason": ""}]}]}
+    path = tmp_path / "funding.json"
+    path.write_text(json.dumps(doc))
+
+    class _Ctx:
+        def path(self, name):
+            return str(path)
+
+        def out(self, m):
+            pass
+
+    class _Stub:
+        ctx = _Ctx()
+    S.Run._suppress_funding_doc(_Stub(), "FILLS_INCOMPLETE")
+    d = json.loads(path.read_text())
+    pr = d["recognitions"][0]["prints"][0]
+    assert d["suppressed"] == "FILLS_INCOMPLETE" and pr["status"] == "SUPPRESSED" and pr["amount_usd"] is None and pr["expected_usd"] is None
+    assert pr["was"]["amount_usd"] == "0.48", "what the venue said is kept as evidence, never published as a figure"
+    sett = [e for e in EL.funding_events(d) if e[1] == "FUNDING_SETTLEMENT"]
+    assert sett and all(not str(e[2]["status"]).startswith("BOOKED") and e[2]["amount_usd"] is None and e[2]["row_cash_if_h1_usd"] is None and e[2]["expected_usd"] is None for e in sett), sett
+    d2 = json.loads(json.dumps(doc))
+    d2["suppressed"] = "FILLS_INCOMPLETE"                                              # the events builder is defensive on its own: a document marked suppressed whose prints still say BOOKED
+    sett2 = [e for e in EL.funding_events(d2) if e[1] == "FUNDING_SETTLEMENT"]
+    assert sett2 and all(e[2]["amount_usd"] is None and e[2]["status"] == "SUPPRESSED" for e in sett2), sett2
+    d3 = json.loads(json.dumps(doc))                                                    # and an unsuppressed document is unchanged
+    assert [e[2]["amount_usd"] for e in EL.funding_events(d3) if e[1] == "FUNDING_SETTLEMENT"] == ["0.480000"]
