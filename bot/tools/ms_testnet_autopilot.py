@@ -330,7 +330,7 @@ def evaluate_readonly(env: Mapping[str, str], *, inner: Any = None, clock: Optio
 
 def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) -> Dict[str, Any]:
     """The pieces of a decision record that are not market inputs: the policy limits in force, the capital book's state (read only; NO_CAPITAL_BOOK when it has never been written) and the venue."""
-    limits = {"per_session_loss_ceiling_usd": str(AD.MAX_LOSS_CEILING_USD), "aggregate_notional_ceiling_usd": str(AD.AGGREGATE_CEILING_USD), "drawdown_stop_usd": str(CC.DRAWDOWN_STOP_USD),
+    limits = {"per_session_loss_ceiling_usd": str(AD.MAX_LOSS_CEILING_USD), "aggregate_notional_ceiling_usd": str(AD.AGGREGATE_CEILING_USD), "drawdown_stop_usd": str(CC.DRAWDOWN_STOP_USD), "lifetime_loss_stop_usd": str(CC.LIFETIME_LOSS_STOP_USD),
               "min_net_edge_bps": str(EG.MIN_NET_EDGE_BPS), "funding_haircut": str(EG.FUNDING_HAIRCUT), "owner_funding_floor_bps": floor, "grant_max_notional_usd": grant_max,
               "entries_stop_at_consecutive_losses": CC.LOSS_STREAK_STOP, "size_halved_at_consecutive_losses": CC.LOSS_STREAK_HALF}
     portfolio: Dict[str, Any] = {"status": "NO_CAPITAL_BOOK"}
@@ -338,7 +338,7 @@ def _decision_context(root: Optional[str], floor: Any, grant_max: Any = None) ->
         if root and os.path.exists(os.path.join(root, "capital.json")):
             r = CC.CapitalBook(root).report()
             portfolio = {"status": "BOOK", "sizing_basis_usd": r.get("sizing_basis_usd"), "verified_result_usd": r.get("verified_realised_usd"), "lifecycles_settled": r.get("lifecycles_settled"),
-                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "pending_session": bool(r.get("pending")),
+                         "loss_streak": r.get("loss_streak"), "halted": r.get("halted"), "max_drawdown_now_usd": r.get("max_drawdown_now_usd"), "lifetime_loss_stop_active": r.get("lifetime_loss_stop_active"), "pending_session": bool(r.get("pending")),
                          "review_required": (r.get("review_required") or {}).get("code") if isinstance(r.get("review_required"), dict) else None}
     except Exception:                                              # noqa: BLE001 - an unreadable book is stated, never guessed
         portfolio = {"status": "BOOK_UNREADABLE"}
@@ -353,6 +353,8 @@ def _book_stops(portfolio: Mapping[str, Any]) -> List[str]:
         out.append("CAPITAL_REVIEW_OPEN")
     if portfolio.get("halted"):
         out.append("CAPITAL_BOOK_HALTED")
+    if portfolio.get("lifetime_loss_stop_active"):
+        out.append("CAPITAL_LIFETIME_LOSS_STOP")                          # no acknowledgement lifts this one
     if portfolio.get("status") == "BOOK_UNREADABLE":
         out.append("CAPITAL_BOOK_UNREADABLE")
     return out
@@ -525,7 +527,8 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
                                                          "delta_usd": review.get("delta_usd") or settled.get("delta_usd")})
         return _res("REFUSED", ["ACCOUNT_CASH_UNEXPLAINED"], state_dir=d, capital=settled)
     alloc = CC.allocate(grant_max_usd=g["max_notional_usd"], ceiling_usd=AD.AGGREGATE_CEILING_USD, open_gross_usd=0, available_usdt=usdt_now, basis=book.sizing_basis(cb), start_cash=CC._d(cb["start_cash_usd"]),
-                        loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]))
+                        loss_streak=int(cb["loss_streak"]), drawdown_usd=book.drawdown(cb), profit_seeking=session_class == "PROFIT_SEEKING", halted=bool(cb["halted"]),
+                        realised_usd=CC._d(cb["realised_usd"]))
     S._write_json(os.path.join(d, "edge_verdict.json"), {"session_class": session_class, "label": "TESTNET_MECHANICS_NOT_AN_OPPORTUNITY" if session_class == "TESTNET_MECHANICS" else "PROFIT_SEEKING_CANDIDATE",
                                                           "edge": verdict.as_dict(), "allocation": alloc.as_dict(), "capital_settlement": settled})
     emit(EL.capital_settled(settled))
@@ -1200,6 +1203,109 @@ def cmd_clear_alert(env: Mapping[str, str], root: str, clock: Callable[[], int],
     return 0
 
 
+# ---------------------------------------------------------------------------------------------------- the owner gate (red-team F2)
+def _token(v: Any) -> str:
+    return re.sub(r"\s+", "_", str(v))
+
+
+def gate_line(action: str, facts: Mapping[str, Any]) -> str:
+    """The line the owner must type: the action and the CURRENT machine facts it acknowledges, so a line typed for an older state (or by a script that never read the state) does not match."""
+    return "CONFIRM " + action + "".join(f" {k}={_token(v)}" for k, v in facts.items())
+
+
+class OwnerGate:
+    """Clearing a halt, resuming the owner's own stop, changing the reserve or declaring a transfer is the OWNER's act: it needs an interactive terminal and a typed line that embeds the current facts.
+    Every attempt leaves an fsynced row in ``marker_log.jsonl`` (before/after state, tty, uid); the row that announces an action is written BEFORE it, so a log that cannot be written changes nothing.
+    This is deliberate friction against an unattended or scripted caller, like the grant's typed reference: it is not a cryptographic proof of who typed."""
+
+    def __init__(self, root: str, clock: Callable[[], int], *, isatty: Optional[Callable[[], bool]] = None, input_fn: Optional[Callable[[str], str]] = None, uid: Optional[int] = None,
+                 out: Callable[[str], None] = print, marker: str = "CAPITAL_BOOK", env: Optional[Mapping[str, str]] = None) -> None:
+        self.eng = ES.EngineState(root, clock)
+        self.clock = clock
+        self.isatty = isatty if isatty is not None else (lambda: sys.stdin.isatty())
+        self.input_fn = input_fn if input_fn is not None else input
+        self.uid = os.getuid() if uid is None else uid
+        self.out, self.marker = out, marker
+        self.env = env or {}
+        self._base: Dict[str, Any] = {}
+        self._action = ""
+
+    def _how(self) -> Dict[str, Any]:
+        """What can be told apart afterwards between a person and a script that reads the printed line back through a pseudo-terminal: the parent process and whether the session came in over SSH."""
+        ppid = os.getppid()
+        try:
+            with open(f"/proc/{ppid}/cmdline", "rb") as fh:
+                parent = fh.read(300).replace(b"\0", b" ").decode("utf-8", "replace").strip() or None
+        except OSError:
+            parent = None
+        return {"ppid": ppid, "parent_cmd": parent, "ssh": bool(self.env.get("SSH_CONNECTION") or self.env.get("SSH_TTY"))}
+
+    def refuse_multiple(self, actions: Sequence[str]) -> int:
+        """Several owner actions in one command are refused whole: nothing is applied, so nothing is half-applied."""
+        self._base = {"action": "MULTIPLE", "actions": list(actions), "tty": bool(self.isatty()), "uid": self.uid, **self._how()}
+        self._best_effort("REFUSED_MULTIPLE")
+        self.out("refused: give one owner action per command (you asked for " + ", ".join(actions) + "); nothing was changed")
+        return 2
+
+    def _audit(self, action: str, payload: Mapping[str, Any]) -> None:
+        self.eng.audit(self.marker, action, dict(payload))
+
+    def confirm(self, action: str, facts: Mapping[str, Any], before: Mapping[str, Any]) -> Optional[int]:
+        """None = confirmed, go ahead. An int = the exit code to return; NOTHING was changed."""
+        tty, line = bool(self.isatty()), gate_line(action, facts)
+        self._action, self._base = action, {"action": action, "tty": tty, "uid": self.uid, "line": line, "before": dict(before), **self._how()}
+        if not tty:
+            self._best_effort("REFUSED_NO_TTY")
+            self.out(f"refused: {action} is owner-only: it needs an interactive terminal and the line it then shows you typed in (nothing was changed). Open an interactive session "
+                     "(`fly ssh console -a <app>`, without -C) and run it there.")
+            return 2
+        self.out(f"OWNER ACTION {action}: " + json.dumps(dict(facts), sort_keys=True, default=str))
+        self.out("Type exactly the line below to confirm. It embeds the state as it is NOW: a line for an older state, or one nobody read, does not work.")
+        self.out(line)
+        asked_ms = int(self.clock())
+        try:
+            typed = self.input_fn("> ").strip()
+        except (EOFError, KeyboardInterrupt, OSError):
+            self._best_effort("REFUSED_NO_INPUT")
+            self.out("refused: no line was typed (end of input); nothing was changed")
+            return 2
+        self._base["elapsed_ms"] = int(self.clock()) - asked_ms          # prompt -> answer: a pasted line is fast, a script is faster, a person reading the facts is not
+        if typed != line:
+            self._best_effort("REFUSED_MISMATCH")
+            self.out("refused: the typed line does not match the current state (nothing was changed)")
+            return 2
+        try:
+            self._audit("INTENT", self._base)
+        except OSError as exc:
+            self.out(f"refused: the audit log could not be written ({type(exc).__name__}); nothing was changed")
+            return 1
+        return None
+
+    def done(self, outcome: str, after: Mapping[str, Any]) -> bool:
+        """The row that closes the action. False (and a loud message) when it cannot be written: the action HAS happened, the INTENT row says so."""
+        try:
+            self._audit(outcome, {**self._base, "after": dict(after)})
+        except OSError as exc:
+            self.out(f"WARNING: {self._action} was applied but its closing audit row could not be written ({type(exc).__name__}); the INTENT row in marker_log.jsonl records it")
+            return False
+        return True
+
+    def _best_effort(self, action: str) -> None:
+        try:
+            self._audit(action, self._base)
+        except OSError:
+            pass
+
+
+def _book_state(cbk: "CC.CapitalBook") -> Dict[str, Any]:
+    b = cbk.load()
+    hist = b.get("history") or []
+    dd = cbk.drawdown(b)
+    return {"halted": bool(b.get("halted")), "loss_streak": int(b.get("loss_streak", 0)), "realised_usd": b.get("realised_usd"), "drawdown_usd": None if dd is None else str(dd),
+            "basis_usd": None if cbk.basis(b) is None else str(cbk.basis(b)), "review_code": (b.get("review_required") or {}).get("code"), "reserve_fraction": b.get("reserve_fraction"),
+            "transfers_pending": len(b.get("transfers_pending") or []), "last_session": (hist[-1].get("session_id") if hist else None)}
+
+
 # ---------------------------------------------------------------------------------------------------- the owner's grant (interactive)
 def cmd_grant(a: argparse.Namespace, *, input_fn: Callable[[str], str] = input, now_ms: Optional[int] = None, out: Callable[[str], None] = print) -> int:
     now = int(time.time() * 1000) if now_ms is None else now_ms
@@ -1291,7 +1397,7 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int:
+def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty: Optional[Callable[[], bool]] = None, input_fn: Optional[Callable[[str], str]] = None, uid: Optional[int] = None) -> int:
     a = _parser().parse_args(list(argv) if argv is not None else None)
     e = dict(env)
     clock = lambda: int(time.time() * 1000)                         # noqa: E731
@@ -1316,16 +1422,36 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         except CC.BookUnreadable as exc:
             print(f"capital book unreadable: {exc}\nInspect the file; if it is genuinely lost or damaged, move it aside DELIBERATELY (it is the record of your halts and losses; nothing here overwrites it).", file=sys.stderr)
             return 2
-        if a.ack_halt:
-            print("halt acknowledged" if cbk.acknowledge_halt() else "no halt to acknowledge")
-        if a.ack_review:
-            print("review acknowledged" if cbk.acknowledge_review() else "no review to acknowledge")
-        if a.ack_drawdown:
-            print("drawdown acknowledged" if cbk.acknowledge_drawdown() else "no drawdown to acknowledge")
-        if a.reserve_fraction is not None:
-            print("reserve set" if cbk.set_reserve_fraction(a.reserve_fraction) else "refused: reserve must be between 0 and 0.9")
-        if a.declare_transfer:
-            print("transfer declared" if cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]) else "refused or already declared")
+        # (flag given, action, the facts the typed line must embed [read from the book AS IT IS when this step runs], the change, the words for done / nothing to do)
+        steps = [
+            (a.ack_halt, "ACK-HALT", lambda st: {"loss_streak": st["loss_streak"], "realised_usd": st["realised_usd"], "last_session": st["last_session"]}, cbk.acknowledge_halt,
+             "halt acknowledged", "no halt to acknowledge"),
+            (a.ack_review, "ACK-REVIEW", lambda st: {"review_code": st["review_code"], "last_session": st["last_session"], "realised_usd": st["realised_usd"]}, cbk.acknowledge_review,
+             "review acknowledged", "no review to acknowledge"),
+            (a.ack_drawdown, "ACK-DRAWDOWN", lambda st: {"drawdown_usd": st["drawdown_usd"], "basis_usd": st["basis_usd"], "last_session": st["last_session"]}, cbk.acknowledge_drawdown,
+             "drawdown acknowledged", "no drawdown to acknowledge"),
+            (a.reserve_fraction is not None, "SET-RESERVE", lambda st: {"from": st["reserve_fraction"], "to": a.reserve_fraction}, lambda: cbk.set_reserve_fraction(a.reserve_fraction),
+             "reserve set", "refused: reserve must be between 0 and 0.9"),
+            (bool(a.declare_transfer), "DECLARE-TRANSFER", lambda st: {"event": a.declare_transfer[0], "usd": a.declare_transfer[1], "pending": st["transfers_pending"]},
+             lambda: cbk.declare_transfer(a.declare_transfer[0], a.declare_transfer[1]), "transfer declared", "refused or already declared"),
+        ]
+        owner: Optional[OwnerGate] = None                                  # built only when an owner action is asked for: printing the book touches nothing
+        asked = [action for given, action, *_rest in steps if given]
+        if len(asked) > 1:
+            return OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, env=e).refuse_multiple(asked)
+        for given, action, facts_of, apply, did, did_not in steps:
+            if not given:
+                continue
+            owner = owner or OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, env=e)
+            before = _book_state(cbk)
+            code = owner.confirm(action, facts_of(before), before)
+            if code is not None:
+                return code
+            applied = apply()
+            closed = owner.done("APPLIED" if applied else "NOOP", _book_state(cbk))
+            print(did if applied else did_not)
+            if not closed:
+                return 1
         print(json.dumps(cbk.report(), indent=2, sort_keys=True, default=str))
         return 0
     if a.cmd == "quality":
@@ -1354,9 +1480,31 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str]) -> int
         print(msg)
         return 0 if ok else 1
     if a.cmd == "resume":
-        return cmd_resume(a.root, clock, a.reason)
+        eng = ES.EngineState(a.root, clock)
+        owner_stops = [m for m in ("PAUSED", "STOP") if eng.has(m)]
+        if eng.has("ALERT") or not owner_stops:
+            return cmd_resume(a.root, clock, a.reason)                      # the deploy's own DRAIN / DRAINED stay scriptable (safe-deploy.sh); an open ALERT is refused inside
+        # PAUSED and STOP are the owner's OWN stops: clearing them needs the owner. A deploy that finds one still clears its own markers and leaves the stop where it is.
+        owner = OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, marker="OWNER_STOPS", env=e)
+        code = owner.confirm("RESUME", {"markers": ",".join(owner_stops)}, {"markers": owner_stops, "reason": a.reason})
+        if code is not None:
+            cleared = [m for m in ("DRAIN", "DRAINED") if eng.clear(m, a.reason)]
+            print(f"cleared: {cleared or 'nothing'}; left in place (owner-only, needs an interactive terminal): {owner_stops}")
+            return code
+        rc = cmd_resume(a.root, clock, a.reason)
+        return rc if owner.done("APPLIED" if rc == 0 else "NOT_APPLIED", {"markers": [m for m in ES.MARKERS if eng.has(m)], "rc": rc}) else 1
     if a.cmd == "clear-alert":
-        return cmd_clear_alert(e, a.root, clock, a.reason)
+        eng = ES.EngineState(a.root, clock)
+        if not eng.has("ALERT"):
+            return cmd_clear_alert(e, a.root, clock, a.reason)             # "no ALERT": nothing to clear
+        alert = eng.read("ALERT")
+        alert = alert if isinstance(alert, dict) else {}
+        owner = OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, marker="ALERT", env=e)
+        code = owner.confirm("CLEAR-ALERT", {"alert_code": alert.get("code") or "UNKNOWN", "alert_at_ms": alert.get("at_ms")}, {"alert": alert, "reason": a.reason})
+        if code is not None:
+            return code
+        rc = cmd_clear_alert(e, a.root, clock, a.reason)
+        return rc if owner.done("APPLIED" if rc == 0 and not eng.has("ALERT") else "NOT_APPLIED", {"alert_open": eng.has("ALERT"), "rc": rc}) else 1
     install_signal_handlers()
     telemetry, lease = build_runtime(e, a.root, clock)
     return loop(e, root=a.root, telemetry=telemetry, lease=lease)

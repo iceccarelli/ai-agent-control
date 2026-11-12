@@ -139,8 +139,11 @@ def test_the_capital_command_shows_the_review_and_acknowledges_it_only_when_aske
     out = capsys.readouterr().out
     assert '"review_required"' in out and "ACCOUNT_CASH_UNEXPLAINED" in out
     assert CC.CapitalBook(eng).load()["review_required"] is not None, "printing the book must not clear anything"
-    assert AP.main(["capital", "--root", eng, "--ack-review"], env={}) == 0
+    # the acknowledgement is the OWNER's act (an interactive terminal and the line it shows, test_owner_gate.py): here the terminal is injected and types the line the screen asked for
+    def owner_types(prompt: str) -> str:
+        return next(l for l in capsys.readouterr().out.splitlines() if l.startswith("CONFIRM "))
+    assert AP.main(["capital", "--root", eng, "--ack-review"], env={}, isatty=lambda: True, input_fn=owner_types) == 0
     out = capsys.readouterr().out
     assert "review acknowledged" in out and CC.CapitalBook(eng).load()["review_required"] is None
-    assert AP.main(["capital", "--root", eng, "--ack-review"], env={}) == 0
+    assert AP.main(["capital", "--root", eng, "--ack-review"], env={}, isatty=lambda: True, input_fn=owner_types) == 0
     assert "no review to acknowledge" in capsys.readouterr().out

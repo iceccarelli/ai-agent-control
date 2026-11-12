@@ -1046,6 +1046,23 @@ def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
     assert res["result"] in ("DONE", "SKIPPED") and "ALLOCATION_ZERO" not in "".join(res["why"])
 
 
+def test_the_lifetime_loss_stop_idles_the_engine_and_no_acknowledgement_resumes_it(w):
+    """Red-team F2: the owner's acknowledgements resume the loss-streak halt and the drawdown stop; the LIFETIME stop (verified net realised <= -2 x the drawdown stop) is not theirs to lift."""
+    _profit_world(w)
+    eng = str(w.tmp / "eng")
+    b = CC.CapitalBook(eng)
+    b.ensure_baseline("10000")
+    bk = b.load()
+    bk["realised_usd"], bk["losses_usd"], bk["halted"], bk["loss_streak"] = "-23.00", "-23.00", True, 4
+    b._save(bk)
+    w.fake.requests.clear()
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "SKIPPED" and "LIFETIME_LOSS_STOP" in "".join(res["why"]) and not [r for r in w.fake.requests if r[0] == "POST"], res["why"]
+    assert b.acknowledge_halt() is True and b.acknowledge_drawdown() in (True, False)
+    res, _ = _cycle_eng(w)
+    assert res["result"] == "SKIPPED" and "LIFETIME_LOSS_STOP" in "".join(res["why"]) and not [r for r in w.fake.requests if r[0] == "POST"], "acknowledged, and still stopped"
+
+
 # ---------------------------------------------------------------- the STALE EXECUTOR: a frozen process must be refused by the server before any entry order
 class SimServer:
     """The server's lease record: one holder at a time, a fencing token that only grows, expiry on the SERVER clock."""
@@ -1622,6 +1639,15 @@ def test_the_read_only_decision_names_an_open_review_a_halt_an_unreadable_book_a
     halted = _evaluate(w, notional_usd="200", engine_root=str(root))
     assert "CAPITAL_BOOK_HALTED" in halted["authority_gaps"] and "CAPITAL_REVIEW_OPEN" not in halted["authority_gaps"]
 
+    doc["halted"] = False
+    doc["realised_usd"] = "-22.20"
+    with open(book.path, "w") as fh:
+        _json.dump(doc, fh)
+    stopped = _evaluate(w, notional_usd="200", engine_root=str(root))
+    assert "CAPITAL_LIFETIME_LOSS_STOP" in stopped["authority_gaps"] and stopped["decision_record"]["portfolio_context"]["lifetime_loss_stop_active"] is True, "the stop no acknowledgement lifts is named"
+    from decimal import Decimal as D
+    assert D(stopped["decision_record"]["risk_limits"]["lifetime_loss_stop_usd"]) == D("22.20") == 2 * D(stopped["decision_record"]["risk_limits"]["drawdown_stop_usd"])
+
     with open(book.path, "w") as fh:
         fh.write("{broken")
     broken = _evaluate(w, notional_usd="200", engine_root=str(root))
@@ -1888,3 +1914,21 @@ def test_a_session_with_time_to_spare_still_enters_across_the_settlement(w, tmp_
     assert res["result"] == "DONE" and res["flat_verified"] is True and res["orders"] > 0               # positive control: the guard does not stop a session with time left
     log = os.path.join(str(tmp_path / "ap"), "exec_quality_log.jsonl")
     assert os.path.exists(log) and open(log).read().strip()                                          # a session that sent orders is a feedback sample
+
+
+@pytest.mark.parametrize("field,bad", [("realised_usd", "abc"), ("realised_usd", "NaN"), ("peak_basis_usd", "abc"), ("loss_streak", "x"), ("halted", "false")])
+def test_a_capital_book_with_a_nonsense_figure_stops_the_session_before_any_order_and_is_not_rewritten(w, field, bad):
+    """REPRODUCED (specialist E N1): a parsable book with realised_usd='abc' made the allocator size 200.00 where the honest book said LIFETIME_LOSS_STOP."""
+    _profit_world(w)
+    root = w.tmp / "eng_semantic"
+    b = CC.CapitalBook(str(root))
+    b.ensure_baseline("10000")
+    assert b.park("s1", "10000", "-30", True, True)
+    b.settle("9970")
+    doc = json.load(open(root / "capital.json"))
+    doc[field] = bad
+    text = json.dumps(doc)
+    (root / "capital.json").write_text(text)
+    res, _got = _collect(w, eng_name="eng_semantic")
+    assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_BOOK_UNREADABLE"], res
+    assert (root / "capital.json").read_text() == text and not w.requests_to("/v5/order/create")

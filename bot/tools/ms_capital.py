@@ -49,8 +49,16 @@ MARGIN_PER_USD = EM.hedged_pair_capital_usd(1, 1).value
 LOSS_STREAK_HALF = 2                   # from this many consecutive realised losses the size is halved
 LOSS_STREAK_STOP = 4                   # ... and at this many entries stop until the owner acknowledges
 DRAWDOWN_STOP_USD = D("11.10")         # twice the Testnet loss ceiling: peak basis minus basis at or beyond this stops entries
+#: The VERIFIED realised result (gains net of losses, since the book began) at or beyond which entries stop for good: twice the drawdown stop, four per-session loss ceilings. The loss-streak halt and
+#: the drawdown stop are the owner's to acknowledge after a review; this one is not, so an owner (or a script, or a habit) that acknowledges every stop cannot walk the account down without limit
+#: (red-team F2: five rounds of "four losses, ack-halt, ack-drawdown" reached -60 and the next size was still 198.80). It derives from the realised figure alone, which no acknowledgement edits; lifting
+#: it means starting a NEW book on purpose (move capital.json aside; RUNBOOKS), never a command.
+LIFETIME_LOSS_STOP_USD = DRAWDOWN_STOP_USD * 2
 TOLERANCE_USD = D("0.05")
 TOLERANCE_FRAC = D("0.05")
+#: A declared deposit or withdrawal is the OWNER'S UNVERIFIED CLAIM about cash that moved (the book has no network and cannot see the venue's transfer history). Nothing on this Testnet stack moves a
+#: million USD: a larger figure is a typo (or an attempt to make the delta arithmetic overflow), refused outright. A withdrawal is also refused when it exceeds the cash the book knows of.
+MAX_DECLARED_TRANSFER_USD = D("1000000")
 DEFAULT_RESERVE_FRACTION = D("0.25")  # of every VERIFIED realised gain, this share is withheld: it never enters the sizing basis (owner-configurable, 0..0.9)
 BOOK_SCHEMA = "capital_book.v1"
 HISTORY_MAX = 200
@@ -79,10 +87,15 @@ class Allocation:
 
 
 def allocate(*, grant_max_usd: Any, ceiling_usd: Any, open_gross_usd: Any, available_usdt: Any, basis: Optional[Decimal], start_cash: Optional[Decimal], loss_streak: int,
-             drawdown_usd: Optional[Decimal], profit_seeking: bool, halted: bool = False, leverage: int = 1) -> Allocation:
-    """The smallest of every limit; a missing input is a refusal, never a guess."""
+             drawdown_usd: Optional[Decimal], profit_seeking: bool, realised_usd: Optional[Decimal], halted: bool = False, leverage: int = 1) -> Allocation:
+    """The smallest of every limit; a missing input is a refusal, never a guess. ``realised_usd`` (the book's verified net result since it began) arms the lifetime stop no acknowledgement lifts. It is a
+    REQUIRED keyword and an unknown figure is a refusal: the stop used to be skipped when the argument was left out or unreadable."""
     reasons: List[str] = []
     gm, ce, og, av = _d(grant_max_usd), _d(ceiling_usd), _d(open_gross_usd), _d(available_usdt)
+    if realised_usd is None:
+        reasons.append("REALISED_UNKNOWN")
+    elif realised_usd <= -LIFETIME_LOSS_STOP_USD:
+        reasons.append("LIFETIME_LOSS_STOP")
     if halted:
         reasons.append("LOSS_STREAK_STOP_NOT_ACKNOWLEDGED")
     if None in (gm, ce, og) or gm is None or ce is None or og is None or gm <= 0 or ce <= 0 or og < 0:
@@ -157,7 +170,53 @@ class CapitalBook:
         missing = [k for k in ("start_cash_usd", "realised_usd", "loss_streak", "halted", "history", "pending") if k not in d]
         if missing:                                                    # schema-valid but stripped of the state that stops entries: also NOT a fresh book
             raise BookUnreadable(f"capital book {self.path!r} lacks {missing}; it is NOT treated as a fresh book")
-        return {**self._fresh(), **d}
+        book = {**self._fresh(), **d}
+        self._validate(book)
+        return book
+
+    def _validate(self, b: Mapping[str, Any]) -> None:
+        """Every figure the stops read must be what it claims to be. A book that PARSES but holds nonsense used to LOAD: ``_d`` reads "abc" or "NaN" as None (or 0), so a corrupted or tampered ``realised_usd``
+        made the basis, the drawdown check and the lifetime stop go silent (the allocator sized 200.00 where the honest book said LIFETIME_LOSS_STOP), and a string streak raised mid-session. A violation is
+        ``BookUnreadable`` like any other unreadable book: entries stop, the file is left untouched as evidence, and nothing is rewritten."""
+        def bad(name: str) -> None:
+            raise BookUnreadable(f"capital book {self.path!r} has an invalid {name}; it is NOT treated as a fresh book")
+
+        def number(v: Any, name: str, *, none_ok: bool = False, lo: Optional[Decimal] = None, hi: Optional[Decimal] = None, lo_open: bool = False) -> None:
+            if v is None and none_ok:
+                return
+            x = _d(v)
+            if x is None or (lo is not None and (x <= lo if lo_open else x < lo)) or (hi is not None and x > hi):
+                bad(name)
+
+        def rows(v: Any, name: str, need: Mapping[str, str]) -> None:
+            if not isinstance(v, list):
+                bad(name)
+            for e in v:
+                if not isinstance(e, dict):
+                    bad(name)
+                for k, kind in need.items():
+                    if (kind == "str" and not (isinstance(e.get(k), str) and e[k])) or (kind == "num" and _d(e.get(k)) is None):
+                        bad(f"{name}[].{k}")
+
+        for k in ("realised_usd", "gains_usd", "losses_usd", "unverified_excess_usd"):
+            number(b.get(k), k)
+        number(b.get("start_cash_usd"), "start_cash_usd", none_ok=True, lo=D(0), lo_open=True)
+        number(b.get("peak_basis_usd"), "peak_basis_usd", none_ok=True)
+        number(b.get("last_cash_usdt"), "last_cash_usdt", none_ok=True)
+        number(b.get("reserve_fraction"), "reserve_fraction", lo=D(0), hi=D("0.9"))
+        ls = b.get("loss_streak")
+        if isinstance(ls, bool) or not isinstance(ls, int) or ls < 0:
+            bad("loss_streak")
+        if not isinstance(b.get("halted"), bool):
+            bad("halted")
+        rows(b.get("history"), "history", {"session_id": "str", "credited_usd": "num"})
+        rows(b.get("transfers_pending"), "transfers_pending", {"event_id": "str", "amount_usd": "num"})
+        rows(b.get("transfers_applied"), "transfers_applied", {"event_id": "str", "amount_usd": "num"})
+        p = b.get("pending")
+        if p is not None:
+            rows([p], "pending", {"session_id": "str", "usdt_before": "num"})
+        if b.get("review_required") is not None and not isinstance(b["review_required"], dict):
+            bad("review_required")
 
     def _save(self, b: Mapping[str, Any]) -> None:
         ES.write_json_atomic(self.path, b)
@@ -209,12 +268,17 @@ class CapitalBook:
 
     # ---- owner-declared deposits / withdrawals: removed from the next delta (never a profit, never a mystery); idempotent by event id
     def declare_transfer(self, event_id: str, amount_usd: Any) -> bool:
+        """A declared transfer is an unverified claim: refused when it is zero, unreadable, beyond ``MAX_DECLARED_TRANSFER_USD``, or a withdrawal larger than the cash the book knows of (the last cash
+        read plus every transfer still pending). ``settle`` then keeps it from hiding a measured loss or raising a credit above the cash that rose."""
         a = _d(amount_usd)
-        if not event_id or a is None or a == 0:
+        if not event_id or a is None or a == 0 or abs(a) > MAX_DECLARED_TRANSFER_USD:
             return False
         with self._locked():
             b = self.load()
             if any(t["event_id"] == event_id for t in b["transfers_pending"] + b["transfers_applied"]):
+                return False
+            last = _d(b.get("last_cash_usdt"))
+            if a < 0 and last is not None and -a > last + sum((D(t["amount_usd"]) for t in b["transfers_pending"]), D(0)):
                 return False
             b["transfers_pending"] = list(b["transfers_pending"]) + [{"event_id": event_id, "amount_usd": str(a), "declared_ms": int(time.time() * 1000)}]
             self._save(b)
@@ -298,6 +362,23 @@ class CapitalBook:
             if (status == "UNEXPLAINED_CASH" or not flat) and credited > 0:   # unreconciled / not-flat profit never sizes anything; an unexplained or not-flat LOSS is still debited in full
                 excess, credited = excess + credited, D(0)
                 status = status if status == "UNEXPLAINED_CASH" else "NOT_FLAT_SESSION"
+            if transfers < 0:
+                # A declared WITHDRAWAL is the owner's unverified claim and it moves the settled delta UP by its size. It may explain cash that fell; it may not (1) hide a loss the ledger measured, nor
+                # (2) lift a credit above the cash that actually rose, and (3) where the ledger measured nothing at all it cannot be told from a loss it could not see, so the book asks for the owner's
+                # review instead of settling quietly. The ledger-vs-cash comparison is the book's only independent check of the ledger and a declaration blinds it for its window: nothing is CREDITED on the
+                # strength of one. All three only ever make the book more conservative, and they bind only a declared withdrawal counted for this session.
+                if known is not None and known < 0 and delta > known and credited > known:
+                    credited = known                                    # the measured loss is booked whole; the part of the cash change the book cannot place is the excess (visible, sizes nothing)
+                    excess = delta - credited
+                    if abs(delta - known) > tol:
+                        status = "UNEXPLAINED_CASH"                     # a review, never a silent SETTLED
+                raw_rise = max(now - before, D(0))
+                if credited > raw_rise:
+                    credited, excess = raw_rise, delta - raw_rise
+                    if excess > tol and status == "SETTLED":
+                        status = "UNVERIFIED_EXCESS"
+                if known is None and now < before and status == "SETTLED":
+                    status = "UNEXPLAINED_CASH"                         # the cash fell, the ledger has no net to compare it with, and a withdrawal is claimed to explain it: a review, nothing booked on a guess
             b["realised_usd"] = str((_d(b["realised_usd"]) or D(0)) + credited)
             if credited > 0:
                 b["gains_usd"] = str((_d(b["gains_usd"]) or D(0)) + credited)
@@ -328,10 +409,14 @@ class CapitalBook:
             return {"status": status, **entry}
 
     def acknowledge_halt(self) -> bool:
+        """The owner's explicit decision, after reviewing the losses, to let entries resume. The book keeps a row of what was acknowledged (it used to leave no trace anywhere). Nothing is credited."""
         with self._locked():
             b = self.load()
             if not b.get("halted"):
                 return False
+            last = (b.get("history") or [{}])[-1]
+            b.setdefault("halt_acknowledged", []).append({"at_ms": int(time.time() * 1000), "loss_streak": int(b.get("loss_streak", 0)), "realised_usd": b.get("realised_usd"),
+                                                          "last_session": last.get("session_id")})
             b["halted"], b["loss_streak"] = False, 0
             self._save(b)
             return True
@@ -372,4 +457,5 @@ class CapitalBook:
                 "sizing_basis_usd": None if sb is None else str(sb), "unverified_excess_usd": b["unverified_excess_usd"], "transfers_pending": b["transfers_pending"],
                 "lifecycles_settled": len(b["history"]), "wins": len(wins), "losses": len(losses), "profit_factor": None if gl == 0 else str((gp / gl).quantize(D("0.01"))),
                 "max_drawdown_now_usd": None if self.drawdown(b) is None else str(self.drawdown(b)), "loss_streak": b["loss_streak"], "halted": b["halted"], "review_required": b.get("review_required"), "pending": b["pending"],
+                "lifetime_loss_stop_usd": str(LIFETIME_LOSS_STOP_USD), "lifetime_loss_stop_active": (_d(b["realised_usd"]) or D(0)) <= -LIFETIME_LOSS_STOP_USD,
                 "label": "TESTNET SIMULATION: fake money; verified realised cash only; not real-world performance"}

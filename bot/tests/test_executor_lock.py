@@ -10,6 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 sys.path[:0] = [HERE, BOT, os.path.join(BOT, "tools")]
 
+import ms_execution as XE  # noqa: E402
 import ms_executor_lock as XL  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
@@ -204,12 +205,36 @@ def test_after_the_lift_exits_are_really_tried_again_and_only_NEW_rejections_cou
         if run.engine.groups[run.gid].halted_reason:
             break
     g = run.engine.groups[run.gid]
-    n = sum(1 for l in g.exit_legs() if l.status == "REJECTED")
+
+    def counted():                                                                                  # what counts toward the halt: the venue's REJECTIONS. A spot exit the session HELD behind its
+        return sum(1 for l in g.exit_legs() if l.status == "REJECTED" and l.reject_reason != XE.HELD_REASON)    # perp exit (the perp stayed open because the venue refused it) is not one
+    n = counted()
+    assert any(l.reject_reason == XE.HELD_REASON for l in g.exit_legs()), "the scenario must include a held spot exit, which is what the floor must not count"
     assert run.engine.clear_exit_halt(run.gid, w.clock.now()) == "EXIT_ORDERS_REJECTED" and g.exit_attempt_floor == n
-    m = sum(1 for l in g.exit_legs() if l.status == "REJECTED")
+    m = counted()
     assert m - n == n >= run.engine.policy.max_exit_attempts, (n, m)                               # a FRESH budget: as many new attempts as the first halt allowed (the old count no longer re-halts at once)
     assert g.halted_reason == "EXIT_ORDERS_REJECTED"                                               # and a venue that still refuses everything halts again, with the floor moved up
     assert run.engine.clear_exit_halt("no-such-group", w.clock.now()) is None
+
+
+def test_the_exit_halt_is_lifted_only_by_the_owners_confirmed_unwind_and_nothing_else_calls_it():
+    """Red-team F2: a halt lifts by the owner's hand only. ``clear_exit_halt`` has exactly one caller in the product, inside ``_reconcile_locked`` under ``ctx.args.unwind`` (which needs the plan digest)."""
+    import ast
+    tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+    calls = []
+    for fn in sorted(os.listdir(tools)):
+        if not fn.endswith(".py"):
+            continue
+        src = open(os.path.join(tools, fn), encoding="utf-8").read()
+        tree = ast.parse(src)
+        for f in ast.walk(tree):
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for n in ast.walk(f):
+                    if isinstance(n, ast.Attribute) and n.attr == "clear_exit_halt" and fn != "ms_execution.py":
+                        guards = [ast.get_source_segment(src, i.test) for i in ast.walk(f) if isinstance(i, ast.If) and any(n is c for c in ast.walk(i))]
+                        calls.append((fn, f.name, guards))
+    assert [(c[0], c[1]) for c in calls] == [("ms_testnet_session.py", "_reconcile_locked")], calls
+    assert any("ctx.args.unwind" in (g or "") for g in calls[0][2]), calls
 
 
 def test_only_exit_halts_are_lifted_a_conflicting_order_id_halt_stays(w):
