@@ -2642,6 +2642,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # What the capital behind the hedge could earn elsewhere; 0.0
             # unless an operator supplies a rate (none is invented).
             opportunity_cost_apr=float(cfg.CARRY_OPPORTUNITY_COST_APR),
+            # The funding exit: the original rule unless the owner chose the
+            # continuation exit (CARRY_EXIT_POLICY; in-sample evidence only).
+            exit_policy=str(cfg.CARRY_EXIT_POLICY),
             entries_enabled=bool(attach_strategy),
             # What that gate reads each held tick is kept (additive table, no
             # new venue request) so a later replay can run on the venue's own

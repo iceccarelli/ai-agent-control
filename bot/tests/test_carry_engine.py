@@ -455,3 +455,138 @@ def test_there_is_no_funding_floor_knob_that_nothing_reads():
     from carry_engine import CarryEngine
     assert "min_entry_funding_bps" not in inspect.signature(
         CarryEngine.__init__).parameters
+
+
+# ---------------------------------------------------------------------------
+# The continuation exit (Round 16). The legacy funding exit leaves after three
+# consecutive negative prints whatever they are worth; the continuation exit
+# leaves when the funding shortfall paid while holding reaches the priced round
+# trip. It changes ONLY the funding exit: it is opt-in and the default is the
+# original rule, bit for bit.
+# ---------------------------------------------------------------------------
+
+class TestContinuationExit:
+    @staticmethod
+    def _held(policy, **kw):
+        # The shared helper defaults to 5% borrow, which IS a holding cost
+        # (0.457 bps per print, charged by the rule). These tests state their
+        # own capital cost; the default here is none.
+        kw.setdefault("borrow_apr", 0.0)
+        eng = engine(FakeBroker(), exit_policy=policy, **kw)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=6.0)
+        assert eng.position is not None
+        return eng
+
+    def test_the_default_is_the_original_rule(self):
+        import inspect
+        assert inspect.signature(CarryEngine.__init__).parameters[
+            "exit_policy"].default == "funding_streak"
+        assert engine(FakeBroker()).exit_policy == "funding_streak"
+
+    def test_an_unknown_policy_is_refused(self):
+        with pytest.raises(ValueError):
+            engine(FakeBroker(), exit_policy="hold_forever")
+
+    def test_three_tiny_negative_prints_leave_under_the_legacy_rule(self):
+        eng = self._held("funding_streak")
+        for _ in range(2):
+            eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        assert d.action == "unwound" and d.reason == "FUNDING_INVERTED"
+
+    def test_three_tiny_negative_prints_do_not_pay_a_round_trip_to_leave(self):
+        eng = self._held("continuation")
+        for _ in range(3):
+            d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        assert eng.position is not None, d
+        assert d.action == "hold"
+        assert d.detail["exit_policy"] == "continuation"
+        assert d.detail["exit_shortfall_bps"] == pytest.approx(0.3)
+        assert eng.position.negative_funding_streak == 3   # still counted
+
+    def test_one_print_that_costs_a_round_trip_leaves_at_once(self):
+        eng = self._held("continuation")
+        rt = eng.round_trip_bps()
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-(rt + 1.0))
+        assert d.action == "unwound" and d.reason == "FUNDING_SHORTFALL"
+
+    def test_shortfall_accumulates_across_prints_and_leaves_at_the_round_trip(self):
+        eng = self._held("continuation")
+        rt = eng.round_trip_bps()
+        step = rt / 4.0 + 0.01
+        for i in range(3):
+            d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-step)
+            assert eng.position is not None, f"left early at print {i + 1}"
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-step)
+        assert d.action == "unwound" and d.reason == "FUNDING_SHORTFALL"
+
+    def test_a_dip_that_recovers_is_paid_back_and_never_leaves(self):
+        eng = self._held("continuation")
+        rt = eng.round_trip_bps()
+        for _ in range(10):
+            eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-rt * 0.6)
+            eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=rt * 0.7)
+        assert eng.position is not None
+        assert eng.position.exit_shortfall_bps == 0.0
+
+    def test_the_shortfall_is_kept_under_the_legacy_policy_for_the_trace(self):
+        eng = self._held("funding_streak")
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
+        assert eng.position.exit_shortfall_bps == pytest.approx(0.5)
+
+    def test_the_owner_cost_of_capital_charges_every_print_below_it(self):
+        """A print that pays less than holding costs adds the difference, even
+        when it is positive: funding of 0.1 bps does not pay a 0.4 bps hold."""
+        eng = self._held("continuation", opportunity_cost_apr=0.044)
+        c = 0.044 / 365.0 * 1e4 / 3.0
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=0.1)
+        assert eng.position.exit_shortfall_bps == pytest.approx(c - 0.1)
+
+    def test_the_shortfall_survives_a_restart(self):
+        eng = self._held("continuation")
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-2.0)
+        state = eng.to_state()
+        assert state["position"]["exit_shortfall_bps"] == pytest.approx(2.0)
+        again = engine(FakeBroker(), exit_policy="continuation", primed=False,
+                       borrow_apr=0.0)
+        again.restore(state)
+        assert again.position.exit_shortfall_bps == pytest.approx(2.0)
+
+    def test_a_ledger_without_the_field_restarts_the_shortfall_at_zero(self):
+        eng = self._held("continuation")
+        state = eng.to_state()
+        del state["position"]["exit_shortfall_bps"]
+        again = engine(FakeBroker(), exit_policy="continuation", primed=False,
+                       borrow_apr=0.0)
+        again.restore(state)
+        assert again.position.exit_shortfall_bps == 0.0
+        state["position"]["exit_shortfall_bps"] = float("nan")
+        again.restore(state)
+        assert again.position.exit_shortfall_bps == 0.0
+
+    def test_an_unpriced_round_trip_falls_back_to_the_legacy_exit(self):
+        """The venue will not state the fee: the continuation rule cannot judge,
+        so the ORIGINAL rule decides (never holding on an unmeasured number)."""
+        eng = self._held("continuation")
+
+        def unreadable():
+            raise RuntimeError("fee rates unreadable")
+        eng.round_trip_bps = unreadable
+        # one huge negative print: the continuation rule would leave, the
+        # legacy rule (needs three) holds
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
+        assert eng.position is not None and d.action == "hold"
+        for _ in range(2):
+            d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
+        assert d.action == "unwound" and d.reason == "FUNDING_INVERTED"
+
+    def test_the_outlook_names_the_rule_that_decides(self):
+        eng = self._held("continuation")
+        rules = {r["id"]: r for r in eng._exit_outlook(100_000.0)["rules"]}
+        assert rules["FUNDING_SHORTFALL"]["decides"] is True
+        assert rules["FUNDING_INVERTED"]["decides"] is False
+        assert rules["FUNDING_INVERTED"]["active"] is None
+        legacy = self._held("funding_streak")
+        rules = {r["id"]: r for r in legacy._exit_outlook(100_000.0)["rules"]}
+        assert rules["FUNDING_INVERTED"]["decides"] is True
+        assert rules["FUNDING_SHORTFALL"]["active"] is None

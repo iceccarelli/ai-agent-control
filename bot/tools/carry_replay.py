@@ -764,6 +764,77 @@ def denominator_report(trades: Sequence[Dict[str, Any]], rows: Sequence[Any], *,
     return out
 
 
+def owner_capital_view(d: Dict[str, Any], *, net_usd: float, years: float,
+                       leverage: float = 1.0,
+                       stated_apr: Optional[float] = None) -> Dict[str, Any]:
+    """The same net on the capital the repository's OWN rule commits to a hedged
+    pair, and the cost of capital that net can stand.
+
+    ``economic_model.hedged_pair_capital_usd`` is the one definition of the cash
+    a pair commits: the hedged coin in full + the perp margin (notional /
+    leverage) + the plan's buffer, 2.04x the notional at 1x leverage. The
+    headline return divides by the fixed ENTRY notional; the owner's alternative
+    is judged on the capital the strategy actually ties up, so this applies the
+    rule to the time-averaged MARKED notional the replay measured.
+
+    ``break_even_cost_of_capital_pct`` is that return: an alternative that earns
+    MORE than it on the same capital beats the book, one that earns less does
+    not. It is a threshold the owner compares with their own figure, not a rate
+    this software chose. ``stated_apr`` (the owner's, when given) is reported
+    beside it and never defaulted: unstated stays UNSTATED, never 0.0.
+
+    ASSUMED STRUCTURE: the margin is separate cash. If the venue counts the held
+    coin as the perp's collateral the committed capital is smaller and this
+    return larger; that is a venue fact (`_collateral_refusal`), not in the
+    corpus, so it is stated and not guessed."""
+    import economic_model as EM
+    avg = d.get("avg_marked_hedged_notional_usd")
+    out: Dict[str, Any] = {
+        "basis": "economic_model.hedged_pair_capital_usd on the time-averaged "
+                 "MARKED hedged notional",
+        "leverage_assumed": float(leverage),
+        "margin_structure": "SEPARATE_CASH_MARGIN (assumed; a venue that counts "
+                            "the held coin as collateral commits less)",
+        "cost_of_capital": {"state": "UNSTATED" if stated_apr is None
+                            else "STATED", "apr": stated_apr,
+                            "source": None if stated_apr is None
+                            else "--opportunity-cost-apr (the operator's)"}}
+    if not isinstance(avg, (int, float)) or not math.isfinite(avg) \
+            or avg <= 0 or not years or years <= 0:
+        out.update(available=False, why="the marked hedged notional could not "
+                   "be reproduced from the held prints")
+        return out
+    multiple = float(EM.hedged_pair_capital_usd(1, repr(float(leverage))).value)
+    committed = float(avg) * multiple
+    pct = 100.0 * net_usd / committed / years
+    out.update(available=True, capital_multiple_of_marked_notional=multiple,
+               avg_committed_capital_usd=committed,
+               net_return_on_committed_capital_pct_per_year=pct,
+               break_even_cost_of_capital_pct=pct)
+    if stated_apr is not None:
+        out["excess_over_stated_cost_pct_per_year"] = pct - 100.0 * stated_apr
+    return out
+
+
+def owner_capital_lines(v: Dict[str, Any]) -> List[str]:
+    if not v.get("available"):
+        return ["  owner capital: not claimed (" + str(v.get("why")) + ")"]
+    coc = v["cost_of_capital"]
+    lines = [
+        f"  owner capital (the repo's own commit rule: the hedged coin + perp margin at {v['leverage_assumed']:g}x + buffer "
+        f"= {v['capital_multiple_of_marked_notional']:.2f}x the marked notional, ${v['avg_committed_capital_usd']:,.0f} on average): "
+        f"{v['net_return_on_committed_capital_pct_per_year']:+.2f}%/yr",
+        f"    = the BREAK-EVEN cost of capital: an alternative that earns more than "
+        f"{v['break_even_cost_of_capital_pct']:.2f}%/yr on the same capital beats this book (margin assumed separate cash)"]
+    if coc["state"] == "UNSTATED":
+        lines.append("    COST OF CAPITAL UNSTATED (no --opportunity-cost-apr): nothing above is an excess over any alternative, and 0.0 "
+                     "is NOT assumed to be the owner's rate")
+    else:
+        lines.append(f"    stated cost of capital {100.0 * coc['apr']:.2f}%/yr ({coc['source']}): excess "
+                     f"{v['excess_over_stated_cost_pct_per_year']:+.2f}%/yr on the committed capital")
+    return lines
+
+
 def denominator_lines(d: Dict[str, Any]) -> List[str]:
     if d.get("drift_neutral_pct") is None:
         return ["  return bases: not claimed (the funding could not be reproduced from the held prints)"]
@@ -816,8 +887,20 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            trace: Optional[List[Dict[str, Any]]] = None,
            liquidation: Optional[LiquidationInputs] = None,
            require_liquidation_evidence: bool = False,
-           opportunity_cost_apr: float = 0.0) -> Dict[str, Any]:
+           opportunity_cost_apr: float = 0.0,
+           exit_policy: str = "funding_streak",
+           cost_of_capital_stated: bool = False) -> Dict[str, Any]:
     """Drive the real engine through `rows`. One bar, one `main.tick`.
+
+    ``cost_of_capital_stated`` says whether ``opportunity_cost_apr`` is the
+    operator's STATEMENT (True) or just the 0.0 default (False): the gate sees
+    the same number either way, but the report must not present an unstated
+    cost as a stated zero (`owner_capital_view`).
+
+    ``exit_policy`` ("funding_streak", the default, or "continuation") is
+    handed to the engine's constructor: the funding exit the production book
+    would run (see carry_costs.continuation_exit). The comparison between the
+    two on one corpus is IN-SAMPLE and can only reject.
 
     ``opportunity_cost_apr`` (default 0.0) is handed to the engine's
     constructor, so its entry gate charges it exactly as production would, and
@@ -869,6 +952,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         execution_mode=execution_mode, execution_style=execution_style,
         persist=lambda state: None,
         opportunity_cost_apr=opportunity_cost_apr,
+        exit_policy=exit_policy,
         # main.build_bot sets this True. The replay sets it whenever it can
         # answer the gate (evidence supplied) or has been told to behave as
         # production does without evidence (it then halts). Left off only for
@@ -1102,6 +1186,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "years": years,
         "notional_usd": notional, "borrow_apr": borrow_apr,
         "opportunity_cost_apr": float(opportunity_cost_apr),
+        "exit_policy": exit_policy,
         "opportunity_cost_usd": -opportunity_usd,
         "net_after_opportunity_cost_usd": net - opportunity_usd,
         "execution_mode": execution_mode, "execution_style": execution_style,
@@ -1118,7 +1203,11 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "fees_usd": -fees_usd, "borrow_usd": -borrow_usd,
         "net_usd": net,
         "net_annualised_pct": 100.0 * net / notional / years,
-        "denominators": denominator_report(trades, rows, net_usd=net, funding_usd=funding_usd, years=years, notional=notional),
+        "denominators": (_den := denominator_report(trades, rows, net_usd=net, funding_usd=funding_usd, years=years, notional=notional)),
+        "owner_capital": owner_capital_view(
+            _den, net_usd=net, years=years,
+            stated_apr=(float(opportunity_cost_apr)
+                        if cost_of_capital_stated else None)),
         "market_exposure_pct": 100.0 * held / span_days,
         "actions": actions, "reasons": reasons,
         # THE JOURNAL'S OWN ANSWER, built from balanced double-entry postings
@@ -1254,10 +1343,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--repo", default=ROOT)
     ap.add_argument("--notional", type=float, default=100_000.0)
     ap.add_argument("--borrow-apr", type=float, default=0.0)
-    ap.add_argument("--opportunity-cost-apr", type=float, default=0.0,
+    ap.add_argument("--opportunity-cost-apr", type=float, default=None,
                     help="the forgone return on the hedged capital, per year, "
                          "charged by the entry gate beside borrow (an "
                          "operator statement; the repo holds no rate)")
+    ap.add_argument("--exit-policy", choices=("funding_streak", "continuation"),
+                    default="funding_streak",
+                    help="the funding exit: 'funding_streak' (default) leaves "
+                         "after 3 consecutive negative prints; 'continuation' "
+                         "leaves when the funding shortfall paid while holding "
+                         "reaches the priced round trip (ski-rental). The "
+                         "comparison is in-sample evidence and can only reject")
     ap.add_argument("--mode", choices=("acquire", "overlay"),
                     default="overlay")
     ap.add_argument("--style", choices=("taker", "maker_first"),
@@ -1309,12 +1405,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.declare_isolated_leverage,
             f"--declare-isolated-leverage {args.declare_isolated_leverage:g} "
             "(operator-declared scenario)")
+    # an unsupplied cost of capital reaches the gate as 0.0 (its behaviour is
+    # unchanged) but is REPORTED as unstated, never as a stated zero
+    stated_cost = (0.0 if args.opportunity_cost_apr is None
+                   else args.opportunity_cost_apr)
     r = replay(rows, notional=args.notional, borrow_apr=args.borrow_apr,
                execution_mode=args.mode, execution_style=args.style,
                impact_bps=impact, max_entries_per_day=args.entries_per_day,
                liquidation=evidence,
                require_liquidation_evidence=args.require_liquidation_evidence,
-               opportunity_cost_apr=args.opportunity_cost_apr)
+               opportunity_cost_apr=stated_cost,
+               exit_policy=args.exit_policy,
+               cost_of_capital_stated=args.opportunity_cost_apr is not None)
 
     print("=" * 74)
     print("CARRY REPLAY — the ENGINE driven through history, not a model of it")
@@ -1326,7 +1428,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  book       {r['execution_mode'].upper()}/"
           f"{r['execution_style']}, ${r['notional_usd']:,.0f}, borrow "
           f"{r['borrow_apr'] * 100:.1f}%/yr, impact "
-          f"{r['impact_bps_per_leg']:.2f} bps/leg")
+          f"{r['impact_bps_per_leg']:.2f} bps/leg, exit "
+          f"{r['exit_policy']}")
     print()
     liq = r["liquidation"]
     if liq["production_equivalent"]:
@@ -1352,7 +1455,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"    = NET      ${r['net_usd']:12,.2f}   "
           f"{r['net_annualised_pct']:+.2f}%/yr   (modelled; omits the costs under not_modelled, not a total)")
     print(f"    opportunity cost of the capital  ${r['opportunity_cost_usd']:12,.2f}   "
-          f"-> net after it ${r['net_after_opportunity_cost_usd']:12,.2f}")
+          f"-> net after it ${r['net_after_opportunity_cost_usd']:12,.2f}   "
+          "(the entry gate's own base: 1.0x hedged notional, held prints only; "
+          "the owner-capital lines below use the committed capital)")
     if r.get("execution_cost_warning"):
         print(f"  !! {r['execution_cost_warning']}")
     print(f"  trades {r['trades']}, orders {r['orders']} "
@@ -1361,6 +1466,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for line in capital_lines(r["net_annualised_pct"]):
         print(line)
     for line in denominator_lines(r["denominators"]):
+        print(line)
+    for line in owner_capital_lines(r["owner_capital"]):
         print(line)
     for line in concentration_lines(r["concentration"], years=r["years"],
                                     notional=r["notional_usd"],
@@ -1408,7 +1515,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         sim = cb.simulate_settlements_series(
             rows, notional=args.notional, borrow_apr=args.borrow_apr,
             gated=True, impact_bps=impact, mode=args.mode,
-            opportunity_cost_apr=args.opportunity_cost_apr)
+            opportunity_cost_apr=stated_cost,
+            exit_policy=args.exit_policy)
         print("\n" + "=" * 74)
         print("DIFF — the engine against tools/carry_backtest.py")
         print("=" * 74)

@@ -612,6 +612,13 @@ class Config:
     #: who chose zero cannot be told from one who never decided. Reporting only;
     #: nothing in the entry gate reads it.
     CARRY_OPPORTUNITY_COST_APR_SUPPLIED: bool = False
+    #: The funding exit of the carry book. "funding_streak" (the default, the original rule) leaves
+    #: after three consecutive negative prints; "continuation" leaves when the funding shortfall paid
+    #: while holding reaches the priced round trip (carry_costs.continuation_exit). An explicit owner
+    #: choice: the evidence for "continuation" is IN-SAMPLE (Round 16) and it is never the default.
+    #: It changes only the funding exit; every margin, liquidation, venue and collateral exit is
+    #: unchanged.
+    CARRY_EXIT_POLICY: str = "funding_streak"
     #: "enforce" refuses an entry the net-benefit gate refuses; "observe" records
     #: what it WOULD refuse and lets the entry continue (an explicit operator
     #: choice for gathering evidence). Anything else is rejected at load.
@@ -1081,6 +1088,9 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
             env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
         CARRY_OPPORTUNITY_COST_APR_SUPPLIED=bool(
             str(env.get("CARRY_OPPORTUNITY_COST_APR") or "").strip()),
+        CARRY_EXIT_POLICY=parse_choice(
+            env, "CARRY_EXIT_POLICY", "funding_streak",
+            ("funding_streak", "continuation")),
         RISK_POLICY_PATH=parse_str(env, "RISK_POLICY_PATH", ""),
         CARRY_ENTRY_BENEFIT_MODE=parse_choice(
             env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")),

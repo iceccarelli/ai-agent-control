@@ -232,6 +232,12 @@ COLLATERAL_LOST_CONFIRM_TICKS = 2
 #: short enough to leave before a regime.
 NEGATIVE_FUNDING_EXIT_PRINTS = 3
 
+#: The exit reason of the CONTINUATION policy: the funding shortfall paid while
+#: holding reached the priced round trip (`carry_costs.continuation_exit`). A
+#: strategy exit like FUNDING_INVERTED, listed with it in
+#: `execution_record._NORMAL_EXIT_REASONS`.
+EXIT_FUNDING_SHORTFALL = "FUNDING_SHORTFALL"
+
 
 def _costs():
     """Import the gates lazily. carry_costs is pure and imports nothing from
@@ -552,6 +558,13 @@ class CarryPosition:
     opened_ms: int = 0
     funding_collected: float = 0.0
     negative_funding_streak: int = 0
+    #: The funding shortfall paid while holding, in bps of hedged notional: the
+    #: CUSUM `max(0, S + (capital cost - print))` over the prints this pair was
+    #: held through (`carry_costs.exit_shortfall_step`). It is maintained under
+    #: EVERY exit policy, so the decision trace can say what the continuation
+    #: rule would do while the legacy rule acts; only the `continuation`
+    #: policy decides on it.
+    exit_shortfall_bps: float = 0.0
 
     @property
     def cycle_id(self) -> str:
@@ -666,7 +679,8 @@ class CarryEngine:
                  capital_authority: Any = None,
                  entries_enabled: bool = True,
                  opportunity_cost_apr: Any = 0.0,
-                 close_executor: Any = None) -> None:
+                 close_executor: Any = None,
+                 exit_policy: str = "funding_streak") -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -699,6 +713,19 @@ class CarryEngine:
                 "positive, finite wait before it is cancelled and crossed")
         self.execution_style = execution_style
         self.maker_wait_s = wait
+        # THE FUNDING EXIT. "funding_streak" (the default) is the original rule:
+        # leave after NEGATIVE_FUNDING_EXIT_PRINTS consecutive negative prints.
+        # "continuation" leaves when the funding shortfall paid while holding
+        # reaches the priced round trip (carry_costs.continuation_exit): an
+        # explicit choice, never a default, because its evidence is IN-SAMPLE
+        # until forward settlements exist. It changes only the funding exit;
+        # every margin, liquidation, venue, cover and collateral exit is
+        # unchanged and independent of it.
+        if exit_policy not in _costs().EXIT_POLICIES:
+            raise ValueError(
+                f"{exit_policy!r} is not an exit policy "
+                f"{_costs().EXIT_POLICIES}")
+        self.exit_policy = exit_policy
         # F4 (0048). OFF by default so no existing caller changes behaviour,
         # and turned ON by build_bot, which is disclosed and asserted by a
         # test. A live book that cannot read its own liquidation price halts;
@@ -815,6 +842,7 @@ class CarryEngine:
                 "funding_collected": float(self.position.funding_collected),
                 "negative_funding_streak":
                     int(self.position.negative_funding_streak),
+                "exit_shortfall_bps": float(self.position.exit_shortfall_bps),
             }
         return {
             "book_state": self.state.value,
@@ -868,7 +896,9 @@ class CarryEngine:
                 opened_ms=int(position.get("opened_ms", 0)),
                 funding_collected=float(position.get("funding_collected", 0.0)),
                 negative_funding_streak=int(
-                    position.get("negative_funding_streak", 0)))
+                    position.get("negative_funding_streak", 0)),
+                exit_shortfall_bps=self._restored_shortfall(
+                    position.get("exit_shortfall_bps", 0.0)))
             self.state = BookState.HEDGED
             self._reseed_cost_basis()
         else:
@@ -905,6 +935,17 @@ class CarryEngine:
         self._restore_allowance(state.get("entry_days"))
         if self.position is not None:
             self._venue_verified_ms = int(time.time() * 1000)  # cold start checked it
+
+    @staticmethod
+    def _restored_shortfall(raw: Any) -> float:
+        """The persisted shortfall, or 0.0 when it is absent (a ledger written
+        before it existed) or unusable. Zero forgives at most one round trip of
+        bleed once; it can never make the continuation rule hold longer than
+        one fresh episode would."""
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                or not math.isfinite(raw) or raw < 0:
+            return 0.0
+        return float(raw)
 
     @classmethod
     def _restored_rates(cls, raw: Any) -> Optional[List[float]]:
@@ -1409,13 +1450,28 @@ class CarryEngine:
         def active(value, test):
             return None if value is None else bool(test(value))
 
+        continuation = (self.exit_policy
+                        == _costs().EXIT_POLICY_CONTINUATION)
+        shortfall = None if pos is None else float(pos.exit_shortfall_bps)
+        cached = self._last_round_trip
+        round_trip = None if cached is None else float(cached[0])
         rules = [
             {"id": "FUNDING_INVERTED", "action": "UNWIND",
              "threshold": NEGATIVE_FUNDING_EXIT_PRINTS,
              "unit": "consecutive negative settled prints",
-             "current": streak,
-             "active": active(streak,
-                              lambda v: v >= NEGATIVE_FUNDING_EXIT_PRINTS)},
+             "current": streak, "decides": not continuation,
+             "active": (None if continuation else active(
+                 streak, lambda v: v >= NEGATIVE_FUNDING_EXIT_PRINTS))},
+            {"id": EXIT_FUNDING_SHORTFALL, "action": "UNWIND",
+             "threshold": round_trip,
+             "unit": "bps of hedged notional: funding shortfall paid while "
+                     "holding vs the priced round trip (last priced by the "
+                     "entry path; the exit re-reads the venue's fee)",
+             "current": shortfall, "decides": continuation,
+             "exit_policy": self.exit_policy,
+             "active": (active(shortfall, lambda v: round_trip is not None
+                               and v >= round_trip)
+                        if continuation else None)},
             {"id": "MARGIN_HEADROOM", "action": "UNWIND",
              "threshold": self.min_margin_multiple, "unit": "x (margin multiple)",
              "current": margin, "read_ms": self._last_margin_ms,
@@ -1682,6 +1738,7 @@ class CarryEngine:
                     self.position.negative_funding_streak += 1
                 else:
                     self.position.negative_funding_streak = 0
+                self._accrue_exit_shortfall(funding_bps)
                 # Booked in memory HERE so that whichever gate acts below
                 # (halt, exit, rebalance) persists it with its own write; the
                 # write for a tick that only holds is made after the gates, so
@@ -1723,18 +1780,22 @@ class CarryEngine:
                 if failed is not None:
                     return failed
 
-            # The inversion exit is judged every tick (the streak is persisted
-            # with the print above), not only on the tick that booked it.
-            if (self.position.negative_funding_streak
-                    >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                return self._unwind(mark, "FUNDING_INVERTED")
+            # The funding exit is judged every tick (the streak and the
+            # shortfall are persisted with the print above), not only on the
+            # tick that booked it.
+            exit_reason = self._funding_exit_reason()
+            if exit_reason is not None:
+                return self._unwind(mark, exit_reason)
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,
                                  detail={"delta_fraction": drift,
                                          "funding_bps": funding_bps,
                                          "new_print": bool(held),
-                                         "collected": self.position.funding_collected})
+                                         "collected": self.position.funding_collected,
+                                         "exit_policy": self.exit_policy,
+                                         "exit_shortfall_bps":
+                                             self.position.exit_shortfall_bps})
 
         # THE GATES (0019/0021). Before this, the engine opened on ONE
         # condition: the last funding print cleared a threshold. That is a
@@ -1759,6 +1820,58 @@ class CarryEngine:
             decision.detail.setdefault(
                 "entry_audit", (econ.verdict.detail or {}).get("audit"))
         return decision
+
+    # -- the funding exit ---------------------------------------------------
+
+    def _accrue_exit_shortfall(self, funding_bps: float) -> None:
+        """Book one HELD print into the position's shortfall accumulator, under
+        every exit policy (so a trace can show what the continuation rule would
+        do while the legacy rule acts). An unusable capital cost or print
+        leaves the accumulator as it was and is logged, never read as zero."""
+        pos = self.position
+        c = _costs().capital_cost_bps_per_print(self.borrow_apr,
+                                                self.opportunity_cost_apr)
+        stepped = _costs().exit_shortfall_step(pos.exit_shortfall_bps,
+                                               funding_bps, c)
+        if stepped is None:
+            logger.warning("carry: the funding shortfall could not be "
+                           "advanced (capital cost %r, print %r)", c,
+                           funding_bps)
+            return
+        pos.exit_shortfall_bps = stepped
+
+    def _funding_exit_reason(self) -> Optional[str]:
+        """The reason to leave on FUNDING, or None to stay.
+
+        funding_streak: NEGATIVE_FUNDING_EXIT_PRINTS consecutive negative
+        prints, as it always was ("FUNDING_INVERTED").
+
+        continuation: the shortfall paid while holding reached the priced round
+        trip ("FUNDING_SHORTFALL"). The round trip is read from the venue's own
+        fee table, exactly as the entry gate prices it, and only when a
+        shortfall exists (a pair that is being paid needs no read). If the
+        economics cannot be judged (the venue will not state the fee, an input
+        is unusable) the LEGACY rule decides: an unjudgeable exit falls back
+        to the earlier, stricter rule, never to holding on an unmeasured
+        number."""
+        pos = self.position
+        legacy = (pos.negative_funding_streak >= NEGATIVE_FUNDING_EXIT_PRINTS)
+        if self.exit_policy != _costs().EXIT_POLICY_CONTINUATION:
+            return "FUNDING_INVERTED" if legacy else None
+        if pos.exit_shortfall_bps <= 0.0:
+            return None                      # funding is paying for the hold
+        try:
+            round_trip = self.round_trip_bps()
+        except Exception as exc:  # noqa: BLE001 - an unpriced exit falls back
+            logger.warning("carry: the round trip could not be priced for the "
+                           "continuation exit (%s: %s); the legacy funding "
+                           "exit decides", type(exc).__name__, exc)
+            return "FUNDING_INVERTED" if legacy else None
+        verdict = _costs().continuation_exit(
+            shortfall_bps=pos.exit_shortfall_bps, round_trip_bps=round_trip)
+        if verdict.close is None:
+            return "FUNDING_INVERTED" if legacy else None
+        return EXIT_FUNDING_SHORTFALL if verdict.close else None
 
     # -- actions ----------------------------------------------------------
 

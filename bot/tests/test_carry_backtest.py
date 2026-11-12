@@ -743,3 +743,51 @@ class TestTheOverlayModeCostsLess:
         r = cb.simulate(REPO, mode=cb.OVERLAY, borrow_apr=0.0)
         assert r["execution_mode"] == "overlay"
         assert r["round_trip_bps"] == pytest.approx(11.0)
+
+
+# ---------------------------------------------------------------------------
+# The continuation exit (Round 16) in the settlement simulator. It calls the
+# SAME pure functions the engine calls (carry_costs.exit_shortfall_step /
+# continuation_exit), so the two cannot disagree about the rule.
+# ---------------------------------------------------------------------------
+
+class TestTheContinuationExitInTheSimulator:
+    @staticmethod
+    def _series(rates):
+        return [_st(i, r) for i, r in enumerate(rates)]
+
+    # rich funding to enter, a mild dip of three small negative prints, then rich again
+    RATES = [0.0004] * 6 + [-0.00001] * 3 + [0.0004] * 12
+
+    def test_legacy_leaves_on_the_dip_and_continuation_stays_through_it(self):
+        rows = self._series(self.RATES)
+        common = dict(rows=rows, notional=100_000.0, gated=True, mode="overlay",
+                      latency_rows=0, borrow_apr=0.0)
+        legacy = cb.simulate_settlements_series(**common)
+        cont = cb.simulate_settlements_series(**common,
+                                              exit_policy="continuation")
+        assert legacy["exit_policy"] == "funding_streak"
+        assert cont["exit_policy"] == "continuation"
+        assert any(t["reason"] == "FUNDING_INVERTED"
+                   for t in legacy["trade_log"])
+        # the dip (0.1 bps x 3 = 0.3 bps) is far below the 11 bps round trip
+        assert not any(t["reason"] == "FUNDING_INVERTED"
+                       for t in cont["trade_log"])
+        assert cont["trades"] <= legacy["trades"]
+
+    def test_the_default_is_the_original_rule(self):
+        import inspect
+        sig = inspect.signature(cb.simulate_settlements_series)
+        assert sig.parameters["exit_policy"].default == "funding_streak"
+
+    def test_an_unknown_policy_is_refused(self):
+        with pytest.raises(ValueError):
+            cb.simulate_settlements_series(self._series(self.RATES),
+                                           exit_policy="hold_forever")
+
+    def test_a_big_negative_print_leaves_on_the_first_print(self):
+        rates = [0.0004] * 6 + [-0.0030] + [0.0004] * 6    # -30 bps in one print
+        r = cb.simulate_settlements_series(
+            self._series(rates), notional=100_000.0, gated=True, mode="overlay",
+            latency_rows=0, borrow_apr=0.0, exit_policy="continuation")
+        assert any(t["reason"] == "FUNDING_INVERTED" for t in r["trade_log"])

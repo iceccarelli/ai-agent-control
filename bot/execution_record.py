@@ -114,7 +114,8 @@ ROUTES = (ROUTE_NORMAL_ENTRY, ROUTE_NORMAL_EXIT, ROUTE_PROTECTIVE_CLOSE,
           ROUTE_UNBOOKED, ROUTE_UNCLASSIFIED_EXIT)
 
 #: Exit reasons that are the strategy (or a scheduled drill) choosing to leave.
-_NORMAL_EXIT_REASONS = frozenset({"FUNDING_INVERTED", "DRILL_COMPLETE"})
+_NORMAL_EXIT_REASONS = frozenset({"FUNDING_INVERTED", "FUNDING_SHORTFALL",
+                                  "DRILL_COMPLETE"})
 #: Exit reasons that are the book protecting itself. Matched as prefixes.
 _PROTECTIVE_EXIT_PREFIXES = ("MARGIN_", "ACCOUNT_MM_RATE_", "LIQUIDATION_",
                              "COLLATERAL_LOST_",

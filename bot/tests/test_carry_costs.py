@@ -192,3 +192,91 @@ class TestThePerpDiscountBound:
     def test_a_small_discount_inside_the_budget_is_allowed(self):
         v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(-20.0))
         assert v.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# The continuation exit (Round 16): leave when the funding shortfall paid while
+# holding reaches the priced round trip (ski-rental / CUSUM). No free parameter.
+# ---------------------------------------------------------------------------
+
+class TestTheFundingShortfallAccumulator:
+    def test_capital_cost_per_print_is_the_gates_own_daily_unit(self):
+        # 4.4%/yr = 4.4/365*1e4 bps/day = 1.2055 bps/day = 0.4018 bps per 8h
+        assert cc.capital_cost_bps_per_print(0.0, 0.044) == pytest.approx(
+            0.044 / 365.0 * 1e4 / 3.0)
+        # borrow and opportunity cost are the same kind of cost, added
+        assert cc.capital_cost_bps_per_print(0.05, 0.044) == pytest.approx(
+            (0.05 + 0.044) / 365.0 * 1e4 / 3.0)
+        assert cc.capital_cost_bps_per_print(0.0, 0.0) == 0.0
+
+    @pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), -0.01,
+                                     "x", True])
+    def test_an_unusable_capital_cost_is_unknown_never_zero(self, bad):
+        assert cc.capital_cost_bps_per_print(bad, 0.0) is None
+        assert cc.capital_cost_bps_per_print(0.0, bad) is None
+
+    def test_a_print_below_the_capital_cost_adds_the_gap(self):
+        # c = 0.4, f = 0.1: the pair earns 0.3 less than holding costs
+        assert cc.exit_shortfall_step(0.0, 0.1, 0.4) == pytest.approx(0.3)
+        assert cc.exit_shortfall_step(2.0, -1.0, 0.0) == pytest.approx(3.0)
+
+    def test_a_print_above_the_capital_cost_pays_the_shortfall_down_to_zero(self):
+        assert cc.exit_shortfall_step(2.0, 1.5, 0.0) == pytest.approx(0.5)
+        assert cc.exit_shortfall_step(2.0, 9.0, 0.0) == 0.0   # never negative
+
+    @pytest.mark.parametrize("args", [(None, 1.0, 0.0), (0.0, float("nan"), 0.0),
+                                      (0.0, 1.0, None), (-1.0, 1.0, 0.0),
+                                      (0.0, float("inf"), 0.0)])
+    def test_an_unusable_input_advances_nothing(self, args):
+        assert cc.exit_shortfall_step(*args) is None
+
+    def test_a_recovering_dip_never_costs_a_round_trip(self):
+        """Oscillation around zero funding (the churn case) leaves the pair in:
+        every dip is paid back before it reaches the round trip."""
+        rt, s = 11.0, 0.0
+        # a mean-zero pattern: every dip is paid back by the next rich prints
+        # (a pattern with net NEGATIVE funding does accumulate, and must)
+        for f in [-3.0, -3.0, 6.0, -4.0, -4.0, 8.0] * 20:
+            s = cc.exit_shortfall_step(s, f, 0.0)
+            assert not cc.continuation_exit(shortfall_bps=s,
+                                            round_trip_bps=rt)
+
+    def test_the_bleed_in_one_episode_is_bounded_by_the_round_trip(self):
+        """The structural guarantee: whatever the funding does, the shortfall
+        paid before the rule fires is below RT plus one print's shortfall."""
+        import random
+        rng = random.Random(1610)
+        rt = 11.0
+        for _ in range(200):
+            s, paid = 0.0, 0.0
+            for _ in range(400):
+                f = rng.gauss(-0.5, 2.0)
+                s = cc.exit_shortfall_step(s, f, 0.0)
+                paid = s
+                if cc.continuation_exit(shortfall_bps=s, round_trip_bps=rt):
+                    break
+            assert paid < rt + 15.0      # RT + the largest single shortfall seen
+
+
+class TestTheContinuationVerdict:
+    def test_it_leaves_exactly_when_the_shortfall_reaches_the_round_trip(self):
+        v = cc.continuation_exit(shortfall_bps=11.0, round_trip_bps=11.0)
+        assert v.close is True and bool(v) is True
+        assert v.reason == "SHORTFALL_REACHED_ROUND_TRIP"
+        assert v.switching_cost_bps == 11.0
+
+    def test_it_stays_below_the_round_trip(self):
+        v = cc.continuation_exit(shortfall_bps=10.999, round_trip_bps=11.0)
+        assert v.close is False and bool(v) is False
+        assert v.reason == "SHORTFALL_BELOW_ROUND_TRIP"
+
+    @pytest.mark.parametrize("s,rt", [(None, 11.0), (1.0, None), (1.0, 0.0),
+                                      (1.0, -1.0), (float("nan"), 11.0),
+                                      (1.0, float("inf")), (-1.0, 11.0)])
+    def test_an_unjudgeable_exit_says_so_so_the_caller_falls_back(self, s, rt):
+        v = cc.continuation_exit(shortfall_bps=s, round_trip_bps=rt)
+        assert v.close is None and bool(v) is False
+        assert v.reason == "EXIT_INPUT_INVALID"
+
+    def test_the_policies_are_the_two_the_engine_accepts(self):
+        assert cc.EXIT_POLICIES == ("funding_streak", "continuation")

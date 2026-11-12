@@ -742,6 +742,104 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
                         smoothed_funding_bps=smoothed, detail=detail)
 
 
+# -- the exit: when does HOLDING stop paying for itself? -------------------------
+#
+# THE LEGACY EXIT looks at the SIGN of three consecutive prints. It never asks
+# what leaving costs: a -0.01 bp print counts like a -10 bp one, and in the
+# 4.1-year replay 35 of the 48 completed trades were followed by a re-entry
+# within a week of the exit (consecutive rows of `carry_replay`'s trade list;
+# Round 16), each paying the round trip again. The entry gate prices the round
+# trip; the exit must price it too.
+#
+# THE CONTINUATION EXIT compares the value of staying with the value of
+# leaving, with the one idea that needs no forecast: the SKI-RENTAL rule. While
+# the funding the pair collects falls short of what holding costs (the capital
+# cost, `c`, per print), the shortfall is rent. Leaving costs the round trip
+# (RT: exit now, re-enter later). Stay while the rent paid this episode is below
+# RT, leave when it reaches RT. It is the CUSUM  S' = max(0, S + (c - f)); close
+# when S >= RT. Its guarantee is structural, not fitted: the bleed in one
+# episode is at most RT plus one print, whatever the funding does next, and a
+# dip that recovers (S falls back to 0) never costs a round trip.
+#
+# NO FREE PARAMETER: RT is the account's own priced round trip (the number the
+# entry gate already uses) and c is the owner's stated cost of capital (borrow +
+# opportunity cost, the entry gate's own inputs). The decision uses only prints
+# already settled, so it has no lookahead. The legacy exit stays the default;
+# this one is selected explicitly (`CarryEngine(exit_policy=...)`) and is
+# IN-SAMPLE evidence only until it has forward evidence (see the engine).
+
+EXIT_POLICY_FUNDING_STREAK = "funding_streak"
+EXIT_POLICY_CONTINUATION = "continuation"
+EXIT_POLICIES = (EXIT_POLICY_FUNDING_STREAK, EXIT_POLICY_CONTINUATION)
+
+
+def capital_cost_bps_per_print(borrow_apr: Any,
+                               opportunity_cost_apr: Any) -> Optional[float]:
+    """What holding the hedged notional costs per funding print, in bps:
+    (borrow + opportunity cost) / 365 / FUNDING_PERIODS_PER_DAY x 1e4, the same
+    units and treatment the entry gate charges per day. None (UNKNOWN, never
+    zero) when either input is unusable or negative."""
+    if isinstance(borrow_apr, bool) or isinstance(opportunity_cost_apr, bool):
+        return None                  # True is not 1.0 of anything
+    b, o = _usable(borrow_apr), _usable(opportunity_cost_apr)
+    if b is None or o is None or b < 0 or o < 0:
+        return None
+    per_print = (b + o) / 365.0 * 1e4 / FUNDING_PERIODS_PER_DAY
+    return per_print if math.isfinite(per_print) else None
+
+
+def exit_shortfall_step(shortfall_bps: Any, funding_bps: Any,
+                        capital_cost_bps: Any) -> Optional[float]:
+    """One settled print into the shortfall accumulator:
+    S' = max(0, S + (c - f)), all in bps of hedged notional per print. A print
+    that pays more than holding costs pays the shortfall DOWN (never below 0);
+    one that pays less adds to it. None when any input is unusable (the caller
+    keeps the accumulator and says so; it never substitutes zero)."""
+    if any(isinstance(x, bool) for x in (shortfall_bps, funding_bps,
+                                         capital_cost_bps)):
+        return None
+    s, f, c = _usable(shortfall_bps), _usable(funding_bps), _usable(capital_cost_bps)
+    if s is None or f is None or c is None or s < 0:
+        return None
+    nxt = max(0.0, s + (c - f))
+    return nxt if math.isfinite(nxt) else None
+
+
+@dataclass(frozen=True)
+class ExitVerdict:
+    """Leave or stay, and the arithmetic. ``close`` is None when the verdict
+    cannot be judged (an unusable input): the caller then falls back to the
+    legacy exit instead of holding on a number nobody measured."""
+
+    close: Optional[bool]
+    reason: str
+    shortfall_bps: Optional[float] = None
+    switching_cost_bps: Optional[float] = None
+
+    def __bool__(self) -> bool:
+        return self.close is True
+
+
+def continuation_exit(*, shortfall_bps: Any, round_trip_bps: Any) -> ExitVerdict:
+    """VALUE OF CONTINUING vs VALUE OF CLOSING NOW, as the ski-rental rule.
+
+    Closing costs the round trip (exit now, re-enter if the carry returns); the
+    funding shortfall already paid while holding is the cost of having stayed.
+    Leave when the second has reached the first; before that, leaving would
+    pay a round trip to stop a bleed that has cost less than a round trip."""
+    if isinstance(shortfall_bps, bool) or isinstance(round_trip_bps, bool):
+        return ExitVerdict(None, "EXIT_INPUT_INVALID")
+    s, rt = _usable(shortfall_bps), _positive_finite(round_trip_bps)
+    if s is None or s < 0 or rt is None:
+        return ExitVerdict(None, "EXIT_INPUT_INVALID",
+                           shortfall_bps=s, switching_cost_bps=rt)
+    if s >= rt:
+        return ExitVerdict(True, "SHORTFALL_REACHED_ROUND_TRIP",
+                           shortfall_bps=s, switching_cost_bps=rt)
+    return ExitVerdict(False, "SHORTFALL_BELOW_ROUND_TRIP",
+                       shortfall_bps=s, switching_cost_bps=rt)
+
+
 # -- decision observability: what was known when the gate answered --------------
 
 def decision_audit(*, funding_prints_bps: Sequence[float], perp: Any, spot: Any,

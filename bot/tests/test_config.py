@@ -496,3 +496,28 @@ def test_a_typo_in_a_safety_flag_on_a_mapping_config_is_never_read_as_live():
                "BYBIT_API_KEY": "k", "BYBIT_API_SECRET": "s"}
     allowed, why = C.is_live_authorized(mapping)
     assert allowed is False and "LIVE_BLOCKED" in why
+
+
+# ---------------------------------------------------------------------------
+# Round 16: the funding exit is an explicit owner choice, never a default.
+# ---------------------------------------------------------------------------
+
+def test_the_funding_exit_defaults_to_the_original_rule_and_accepts_only_two_values():
+    import config as _config
+    assert _config.load({}).CARRY_EXIT_POLICY == "funding_streak"
+    assert _config.load({"CARRY_EXIT_POLICY": "CONTINUATION"}
+                        ).CARRY_EXIT_POLICY == "continuation"
+    with pytest.raises(_config.ConfigError):
+        _config.load({"CARRY_EXIT_POLICY": "hold_forever"})
+
+
+def test_the_fingerprint_records_the_exit_policy_and_whether_a_cost_of_capital_was_stated():
+    import config as _config
+    import fingerprint as fp
+    summary = fp.config_summary(_config.load({"CARRY_EXIT_POLICY": "continuation",
+                                              "CARRY_OPPORTUNITY_COST_APR": "0.04"}))
+    assert summary["CARRY_EXIT_POLICY"] == "continuation"
+    assert summary["CARRY_OPPORTUNITY_COST_APR"] == 0.04
+    assert summary["CARRY_OPPORTUNITY_COST_APR_SUPPLIED"] is True
+    bare = fp.config_summary(_config.load({}))
+    assert bare["CARRY_OPPORTUNITY_COST_APR_SUPPLIED"] is False
