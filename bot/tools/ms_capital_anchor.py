@@ -70,8 +70,9 @@ _UID_RE = re.compile(r"^[0-9]{1,20}$")
 _BIG = ("history", "transfers_applied")           # the two growing lists: rebuilt from the entries' deltas, never copied whole into every entry
 
 
-LOCK_TIMEOUT_S = 30.0                 # a holder that does not let go in this long is stuck or is waiting on the witness (each request is bounded at 10 s with one retry and a head costs up to six requests, so a BLACKHOLED
-                                      # witness can hold the lock for about two minutes): the OTHER caller refuses LOCK_TIMEOUT (transient: no ALERT, the next cycle retries), it never hangs forever
+LOCK_TIMEOUT_S = 30.0                 # a holder that does not let go in this long is stuck or is waiting on the witness (each request is bounded at 10 s with one retry; an open with a witness is a head read, a first-contact
+                                      # canary and a publish of one write plus up to three read-backs, so a BLACKHOLED witness can hold the lock for well over a minute): the OTHER caller refuses LOCK_TIMEOUT (transient:
+                                      # no ALERT, the next cycle retries), it never hangs forever
 
 
 def flock_with_timeout(fd: int, timeout_s: float, what: str) -> None:
@@ -280,7 +281,8 @@ class Lineage:
                 raise AnchorRefused("ACCOUNT_MISMATCH" if why.startswith("ACCOUNT") else "ANCHOR_CORRUPT", why)
             out.append(e)
             prev = e["h"]
-        self.read_size = len(data) - len(torn) if torn is not None and repair_torn else len(data)
+        # a read that did NOT repair a torn tail is no basis for an append (it would land after the torn bytes: a corrupt middle line)
+        self.read_size = len(data) if torn is None else (len(data) - len(torn) if repair_torn else None)
         if torn is not None and repair_torn:
             self._set_aside(torn, len(data) - len(torn))
         return out
@@ -297,7 +299,7 @@ class Lineage:
             return f"MUTATED_AT_{i}"
         if e.get("account") != self.account or e.get("venue") != self.venue:
             return f"ACCOUNT_OR_VENUE_MISMATCH_AT_{i}"
-        if e.get("kind") not in KINDS or not isinstance(e.get("state"), dict) or not isinstance(e.get("book_digest"), str):
+        if e.get("kind") not in KINDS or not isinstance(e.get("state"), dict) or not isinstance(e.get("facts"), dict) or not isinstance(e.get("book_digest"), str):
             return f"MALFORMED_AT_{i}"
         for k in ("history_add", "transfers_applied_add"):
             if not isinstance(e.get(k), list):
@@ -470,17 +472,20 @@ class Anchor:
 
     @staticmethod
     def _discarded(entries: Sequence[Mapping[str, Any]]) -> set:
-        """(sequence, 16-hex head) of every history an ``ACK_OLDER`` entry of this lineage recorded as DISCARDED (the owner's ``capital --accept-older-lineage``). A root whose view or mark still names one of
-        them is not tampered with and not forked: it has simply not heard of the owner's decision yet (another root of the account, or a crash inside the act), and is healed forward from the lineage."""
+        """(sequence, FULL head) of every history an ``ACK_OLDER`` entry of this lineage recorded as DISCARDED (the owner's ``capital --accept-older-lineage``). A root whose view or mark still names exactly one of
+        them is not tampered with and not forked: it has simply not heard of the owner's decision yet (another root of the account, or a crash inside the act), and is healed forward from the lineage. The match is
+        exact (sequence and the whole 64-hex head): a head that merely starts alike is not recorded."""
         out: set = set()
         for e in entries:
             if e.get("kind") != "ACK_OLDER":
                 continue
-            d = (e.get("facts") or {}).get("discarded")
+            facts = e.get("facts")
+            d = facts.get("discarded") if isinstance(facts, Mapping) else None
             for k in ("view", "hwm"):
                 x = d.get(k) if isinstance(d, Mapping) else None
-                if isinstance(x, Mapping) and isinstance(x.get("seq"), int) and not isinstance(x.get("seq"), bool) and isinstance(x.get("head"), str):
-                    out.add((x["seq"], x["head"][:16]))
+                if (isinstance(x, Mapping) and isinstance(x.get("seq"), int) and not isinstance(x.get("seq"), bool) and isinstance(x.get("head_full"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", x["head_full"])):
+                    out.add((x["seq"], x["head_full"]))
         return out
 
     # ---- the open: the case table that decides whether the book may be used
@@ -518,26 +523,29 @@ class Anchor:
         discarded = self._discarded(entries)
         stale: List[str] = []                                              # what the root remembers that the owner has RECORDED as discarded: healed forward, never refused
         vs = None
+        view_malformed = False
         if ref is not None:
             vs = ref.get("seq")
             if isinstance(vs, bool) or not isinstance(vs, int) or vs < 0:
-                raise AnchorRefused("VIEW_TAMPERED", "the book's ledger_ref is malformed")
-            if vs > head["seq"]:
-                if (vs, str(ref.get("head"))[:16]) not in discarded:
+                view_malformed = True                                       # judged AFTER the mark below: a damaged view must not mask what the mark says (third pass, N3-1)
+            elif vs > head["seq"]:
+                if (vs, str(ref.get("head"))) not in discarded:
                     raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"the book is at seq {vs} and the lineage ends at seq {head['seq']}: an older anchor was restored, or entries were removed")
                 stale.append("view")
         if hw_status == "unreadable":
             raise AnchorRefused("VIEW_TAMPERED", f"the root's high-water mark ({HWM_NAME}) cannot be read; nothing was changed (the owner decides: capital --rebuild-view)")
         if hw is not None:
             if hw["seq"] > head["seq"]:
-                if (hw["seq"], hw["head"][:16]) not in discarded:
+                if (hw["seq"], hw["head"]) not in discarded:
                     raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"this root last saw the lineage at seq {hw['seq']} and the lineage ends at seq {head['seq']}: an older anchor was restored. Deleting capital.json does not change "
                                                               "that (capital --accept-older-lineage is the owner's recorded decision to continue from the older one)")
                 stale.append("mark")
             elif entries[hw["seq"]]["h"] != hw["head"]:
-                if (hw["seq"], hw["head"][:16]) not in discarded:
+                if (hw["seq"], hw["head"]) not in discarded:
                     raise AnchorRefused("LINEAGE_FORKED", f"this root last saw a different head at lineage seq {hw['seq']} than the lineage holds there: the lineage is another history than the one this root has been following")
                 stale.append("mark")
+        if view_malformed:
+            raise AnchorRefused("VIEW_TAMPERED", "the book's ledger_ref is malformed")
         if status == "absent":
             return self._heal(replay, head, "NO_VIEW", None)
         if status == "unreadable":
@@ -549,10 +557,13 @@ class Anchor:
         if vs <= head["seq"]:
             at = entries[vs]
             if ref.get("head") != at["h"] or ref.get("digest") != at["book_digest"] or book_digest(view) != at["book_digest"]:     # type: ignore[arg-type]
-                if (vs, str(ref.get("head"))[:16]) not in discarded:
+                # a RECORDED discard excuses a view that names ANOTHER head at this sequence; a view that names the lineage's own head and does not match its content is edited, whatever was recorded (third pass, L-3)
+                if ref.get("head") == at["h"] or (vs, str(ref.get("head"))) not in discarded:
                     raise AnchorRefused("VIEW_TAMPERED", f"the book does not match what the lineage attested at seq {vs}")
                 stale.append("view")
             elif vs == head["seq"] and not stale:
+                if hw is None or hw["seq"] != head["seq"]:
+                    self._write_hwm(head["seq"], head["h"])             # a missing or one-behind mark (a deleted file, a crash between the view write and the mark write) is brought to the head the root has just verified
                 return dict(view)                                       # type: ignore[arg-type]
         if stale:
             if "view" in stale:
@@ -603,9 +614,10 @@ class Anchor:
         out: Dict[str, Any] = {"view": None, "hwm": None}
         if st == "bound" and isinstance(view, dict):
             ref = view.get("ledger_ref") or {}
-            out["view"] = {"seq": ref.get("seq"), "head": str(ref.get("head"))[:16], "realised_usd": view.get("realised_usd"), "loss_streak": view.get("loss_streak"), "halted": view.get("halted"), "epoch": view.get("epoch")}
+            out["view"] = {"seq": ref.get("seq"), "head": str(ref.get("head"))[:16], "head_full": str(ref.get("head")), "realised_usd": view.get("realised_usd"), "loss_streak": view.get("loss_streak"),
+                           "halted": view.get("halted"), "epoch": view.get("epoch")}
         if hs == "ok" and hw is not None:
-            out["hwm"] = {"seq": hw["seq"], "head": hw["head"][:16]}
+            out["hwm"] = {"seq": hw["seq"], "head": hw["head"][:16], "head_full": hw["head"]}
         return out
 
     def _propose(self, adopt: bool) -> None:

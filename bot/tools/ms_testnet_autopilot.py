@@ -1548,7 +1548,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
                 n = None
             newer = cbk.anchor.newer_facts()                                  # type: ignore[union-attr]
             others = [x for x in AN.lineage_accounts(adir) if x != acct]
-            wfacts: Dict[str, Any] = {"witness_state": "NOT_CONFIGURED", "witness_head_seq": None}
+            wfacts: Dict[str, Any] = {"witness_state": "NOT_CONFIGURED" if not getattr(witness, "configured", False) else "NOT_READ", "witness_head_seq": None}
             if with_witness and getattr(witness, "configured", False):        # an act that discards history reads the witness BEFORE the typed line: the owner types what the witness said
                 try:
                     wfacts["witness_state"] = cbk.anchor.check_witness(publish=False)        # type: ignore[union-attr]
@@ -1649,7 +1649,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
                 continue
             owner = owner or OwnerGate(a.root, clock, isatty=isatty, input_fn=input_fn, uid=uid, env=e)
             try:
-                before = lineage_state(with_witness=action == "ACCEPT-OLDER-LINEAGE") if action in LINEAGE_ACTS else _book_state(cbk)
+                before = lineage_state(with_witness=action == "ACCEPT-OLDER-LINEAGE" and bool(owner.isatty())) if action in LINEAGE_ACTS else _book_state(cbk)      # no terminal: the gate refuses at once, so the witness is not even read
             except CC.BookUnreadable as exc:                                # a refused book is not a traceback: nothing was changed
                 print(f"capital book refused: {getattr(exc, 'code', 'UNREADABLE')}: {getattr(exc, 'detail', str(exc))}\nNothing was changed. The autopilot refuses on this too. See bot/RUNBOOKS.md (capital lineage).", file=sys.stderr)
                 return 2

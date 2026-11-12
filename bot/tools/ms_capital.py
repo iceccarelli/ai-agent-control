@@ -607,6 +607,9 @@ class CapitalBook:
                     ref = (view or {}).get("ledger_ref")
                     if isinstance(ref, dict) and ref.get("account") != self.anchor.account:
                         raise BookRefused("ACCOUNT_MISMATCH", f"the book is bound to account {ref.get('account')}, not {self.anchor.account}")
+                    if isinstance(ref, dict) and ref.get("digest") != AN.book_digest(view or {}):
+                        # a bound view carries the digest of the book it attested; adopting one whose content no longer matches would adopt an EDITED record (realised 0 / streak 0 were adopted whole) as the account's history
+                        raise BookRefused("VIEW_TAMPERED", "the bound book does not match the digest it attested: it was edited, so it is not adopted as the account's history (restore the anchor directory)")
                     adopt = self._from_dict({k: v for k, v in (view or {}).items() if k != "ledger_ref"})
                     self.anchor._preserve("pre-anchor")
                 return self.anchor.initialise(adopt=adopt, fresh_book=self._fresh(), owner=owner, adopt_ref=(view or {}).get("ledger_ref") if status in ("legacy", "bound") else None)
@@ -633,7 +636,7 @@ class CapitalBook:
                     raise AN.AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", "no lineage exists: there is nothing to rebuild a view from")
                 nf = an.newer_facts()
                 ahead = [k for k in ("view", "hwm") if nf.get(k) and isinstance(nf[k].get("seq"), int) and nf[k]["seq"] > entries[-1]["seq"]]
-                if ahead and not (an._discarded(entries) >= {(nf[k]["seq"], nf[k]["head"]) for k in ahead}):
+                if ahead and not (an._discarded(entries) >= {(nf[k]["seq"], nf[k]["head_full"]) for k in ahead}):
                     raise AN.AnchorRefused("ANCHOR_BEHIND_BOOK", f"this root remembers lineage seq {max(nf[k]['seq'] for k in ahead)} ({'/'.join(ahead)}) and the lineage ends at seq {entries[-1]['seq']}: an older anchor was "
                                                                  "restored. Nothing was rebuilt (see capital --accept-older-lineage)")
                 an._preserve("rejected")
@@ -659,7 +662,9 @@ class CapitalBook:
                     an.open_view()
                     return {"status": "NOTHING_TO_ACCEPT"}
                 except AN.AnchorRefused as exc:
-                    if exc.code != "ANCHOR_BEHIND_BOOK":
+                    # ANCHOR_BEHIND_BOOK (an older anchor was restored) and LINEAGE_FORKED (the lineage is another history than the one this root followed: an acceptance that was undone by restoring the newer anchor, or two roots
+                    # that followed different histories). open_view raises LINEAGE_FORKED only for the ROOT's own mark; a fork against the WITNESS is judged by check_witness below and is never accepted here.
+                    if exc.code not in ("ANCHOR_BEHIND_BOOK", "LINEAGE_FORKED"):
                         raise
                 wstate = an.check_witness(publish=False)                                     # a witness that knows a newer head refuses HERE, before anything is written
                 if getattr(an.witness, "configured", False) and wstate == "UNAVAILABLE":

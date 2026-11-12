@@ -1775,3 +1775,252 @@ def test_the_rebuild_view_line_names_the_newer_view_and_mark(world, capsys):
     _behind_world(world)
     rc, line = _typed_line(world, capsys, ["--rebuild-view"], answer="not the line")
     assert rc == 2 and "newer_view_seq=" in line and "hwm_seq=" in line, line
+
+
+# =====================================================================================================================================================================================================
+# ROUND 10, THIRD RED-TEAM PASS (the delta of cycle 4): no new HIGH; one MEDIUM sibling of NEW-1 (a damaged view's sequence masked the mark), one test gap, and low items. Each fixed test-first.
+# =====================================================================================================================================================================================================
+def _damage_view_sequence(world):
+    d = json.load(open(os.path.join(world.root, "capital.json")))
+    d["ledger_ref"]["seq"] = "x"                                                       # valid JSON, a ledger_ref whose sequence is not a number
+    json.dump(d, open(os.path.join(world.root, "capital.json"), "w"))
+
+
+def test_a_damaged_view_sequence_cannot_mask_a_forked_mark_and_rebuild_view_does_not_adopt_the_other_history(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    d = json.load(open(hwm))
+    d["head"] = "ab" * 32                                                              # the lineage is another history than the one this root followed
+    json.dump(d, open(hwm, "w"))
+    _damage_view_sequence(world)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "LINEAGE_FORKED", "it was VIEW_TAMPERED, and --rebuild-view then replaced the forked mark and the view with the lineage head"
+    view_before, mark_before = open(os.path.join(world.root, "capital.json"), "rb").read(), open(hwm, "rb").read()
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    with pytest.raises(CC.BookRefused) as e2:
+        owner.rebuild_view()
+    assert e2.value.code == "LINEAGE_FORKED" and open(os.path.join(world.root, "capital.json"), "rb").read() == view_before and open(hwm, "rb").read() == mark_before
+
+
+def test_a_damaged_view_sequence_with_a_mark_that_is_ahead_is_behind_the_book_and_the_owner_can_accept(world):
+    _lost_ground(world)
+    _damage_view_sequence(world)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_BEHIND_BOOK", "it was VIEW_TAMPERED, a circle: rebuild_view said behind, accept said tampered"
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    assert owner.accept_older_lineage({})["status"] == "ACCEPTED"
+    assert opened(world).load()["review_required"]["code"] == "ROLLBACK_ACCEPTED"
+
+
+def test_a_damaged_view_sequence_with_a_damaged_mark_is_tampered_and_nothing_readable_remembers_more(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    open(os.path.join(world.root, "capital_hwm.json"), "w").write("not json")
+    _damage_view_sequence(world)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "VIEW_TAMPERED"
+
+
+# --------------------------------------------------------------------------------- the halves of rebuild_view's guard, each pinned alone (third pass, N3-2)
+def _force_tamper(monkeypatch):
+    """open_view says VIEW_TAMPERED whatever the files hold: it isolates the guard INSIDE rebuild_view from the order in which open_view judges the evidence"""
+    monkeypatch.setattr(AN.Anchor, "open_view", lambda self: (_ for _ in ()).throw(AN.AnchorRefused("VIEW_TAMPERED", "forced")))
+
+
+@pytest.mark.parametrize("keep", ["view", "mark"])
+def test_rebuild_view_refuses_when_only_the_view_or_only_the_mark_is_ahead(world, monkeypatch, keep):
+    _lost_ground(world)
+    if keep == "view":
+        os.unlink(os.path.join(world.root, "capital_hwm.json"))
+    else:
+        os.unlink(os.path.join(world.root, "capital.json"))
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    before = sorted(os.listdir(world.root))
+    _force_tamper(monkeypatch)
+    with pytest.raises(CC.BookRefused) as e:
+        owner.rebuild_view()
+    assert e.value.code == "ANCHOR_BEHIND_BOOK" and sorted(os.listdir(world.root)) == before
+
+
+def test_rebuild_view_with_no_lineage_has_nothing_to_rebuild_from(world, monkeypatch):
+    genesis(world)
+    shutil.rmtree(world.anchor)
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    _force_tamper(monkeypatch)
+    with pytest.raises(CC.BookRefused) as e:
+        owner.rebuild_view()
+    assert e.value.code == "ANCHOR_MISSING_BOOK_BOUND"
+
+
+def test_rebuild_view_may_proceed_when_everything_the_root_remembers_ahead_was_recorded_as_discarded(world, monkeypatch):
+    root_c, _ = _two_roots_after_an_accept(world)
+    owner = CC.CapitalBook(root_c, AN.Anchor(root_c, ACCT, "testnet", world.anchor))     # root C still names the discarded view
+    _force_tamper(monkeypatch)
+    assert owner.rebuild_view() == "REBUILT", "a recorded discard is not 'remembering more than the lineage holds'"
+
+
+# --------------------------------------------------------------------------------- the recorded discard is EXACT (whole head), per half, and never excuses an edited view of the lineage's own head
+def _two_roots_after_an_accept(world):
+    """root A accepts; roots B (mark only) and C (view only) still name the two DISCARDED states, which differ because A's mark was one entry behind its view"""
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    entries = AN.Lineage(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"), ACCT, "testnet").read()
+    n = entries[-1]["seq"]
+    root_c = str(world.tmp / "rootC")
+    opened(world, world.root2)
+    opened(world, root_c)
+    prev_mark = {"schema": AN.HWM_SCHEMA, "account": ACCT, "seq": n - 1, "head": entries[n - 1]["h"]}
+    json.dump(prev_mark, open(os.path.join(world.root, "capital_hwm.json"), "w"))     # A's mark is one entry behind its view: the two discarded halves differ
+    os.unlink(os.path.join(world.root2, "capital.json"))                               # B keeps only a mark
+    json.dump(prev_mark, open(os.path.join(world.root2, "capital_hwm.json"), "w"))
+    os.unlink(os.path.join(root_c, "capital_hwm.json"))                                # C keeps only a view
+    _put_back(world.anchor, snap)
+    CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).accept_older_lineage({})
+    return root_c, entries
+
+
+def test_a_root_holding_only_the_discarded_mark_or_only_the_discarded_view_is_healed_forward(world):
+    root_c, _ = _two_roots_after_an_accept(world)
+    assert opened(world, world.root2).load()["review_required"]["code"] == "ROLLBACK_ACCEPTED"              # the MARK half of the record
+    assert opened(world, root_c).load()["review_required"]["code"] == "ROLLBACK_ACCEPTED"                    # the VIEW half of the record
+
+
+def test_a_head_that_only_starts_like_a_recorded_one_is_not_recorded(world):
+    root_c, entries = _two_roots_after_an_accept(world)
+    d = json.load(open(os.path.join(world.root2, "capital_hwm.json")))
+    d["head"] = d["head"][:16] + "0" * 48                                              # same sequence, same first 16 hex, another head
+    json.dump(d, open(os.path.join(world.root2, "capital_hwm.json"), "w"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world, world.root2)
+    assert e.value.code in ("ANCHOR_BEHIND_BOOK", "LINEAGE_FORKED")
+
+
+def test_a_recorded_discard_never_excuses_an_edited_view_that_names_the_lineages_own_entry(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    _put_back(world.anchor, snap)
+    entries = AN.Lineage(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"), ACCT, "testnet").read()
+    head = entries[-1]
+    genuine = {**AN.rebuild(entries), "ledger_ref": {"account": ACCT, "seq": head["seq"], "head": head["h"], "digest": head["book_digest"]}}
+    json.dump(genuine, open(os.path.join(world.root, "capital.json"), "w"))            # the view equals the older lineage's own head while the mark is ahead
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    r = owner.accept_older_lineage({})
+    assert r["discarded"]["view"]["head_full"] == head["h"], "the recorded view IS the lineage's own entry"
+    edited = dict(genuine)
+    edited["start_cash_usd"] = "99999"                                                 # content that is not what the lineage attested at that sequence (the older state had a 232 baseline)
+    json.dump(edited, open(os.path.join(world.root, "capital.json"), "w"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "VIEW_TAMPERED", "it healed forward silently: the tamper signal was lost"
+
+
+# --------------------------------------------------------------------------------- L-1: an entry's facts must be an object
+def test_a_chain_valid_entry_whose_facts_are_not_an_object_is_corruption_not_a_crash(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    path = os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")
+
+    def bad_facts(lines):
+        lines[-1]["kind"] = "ACK_OLDER"
+        lines[-1]["facts"] = [1, 2]
+    _rechain(path, bad_facts)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_CORRUPT" and "MALFORMED" in e.value.detail
+    assert AN.Anchor._discarded([{"kind": "ACK_OLDER", "facts": [1]}, {"kind": "ACK_OLDER", "facts": None}, {"kind": "ACK_OLDER", "facts": {"discarded": 5}}]) == set()
+
+
+# --------------------------------------------------------------------------------- L-6: an append never follows a read that left a torn tail in place
+def test_an_append_after_a_non_repairing_read_over_a_torn_tail_is_refused(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    path = os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")
+    with open(path, "ab") as fh:
+        fh.write(b'{"torn')
+    lin = AN.Lineage(path, ACCT, "testnet")
+    lin.read(repair_torn=False)
+    before = open(path, "rb").read()
+    with pytest.raises(AN.AnchorRefused) as e:
+        lin.append({"x": 1})
+    assert e.value.code == "LINEAGE_CHANGED_UNDER_COMMIT" and open(path, "rb").read() == before
+
+
+# --------------------------------------------------------------------------------- L-7: an EDITED bound view is not adopted as the account's history
+def test_an_edited_bound_view_is_not_adopted_when_the_lineage_is_lost(world):
+    book = genesis(world)
+    drive_to_lifetime_stop(book)
+    d = json.load(open(book.path))
+    d["realised_usd"] = "0"
+    d["loss_streak"] = 0
+    d["gains_usd"] = "0"                                                               # an edit that lifts the lifetime stop
+    json.dump(d, open(book.path, "w"))
+    shutil.rmtree(world.anchor)
+    with pytest.raises(CC.BookRefused) as e:
+        CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).initialise({"test": True})
+    assert e.value.code == "VIEW_TAMPERED"
+    assert not os.path.exists(os.path.join(world.anchor, f"lineage-{ACCT}.jsonl"))
+
+
+# --------------------------------------------------------------------------------- L-8: LINEAGE_FORKED against the ROOT's own mark has a recorded way out too
+def test_a_root_that_followed_an_accepted_history_and_meets_the_restored_newer_anchor_can_accept_the_lineage(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap_old = _snapshot_dir(world.anchor, world.tmp / "anchor_old")
+    drive_to_lifetime_stop(book)
+    snap_new = _snapshot_dir(world.anchor, world.tmp / "anchor_new")
+    _put_back(world.anchor, snap_old)
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    assert owner.accept_older_lineage({})["status"] == "ACCEPTED"                      # the owner continued from the older lineage ...
+    _put_back(world.anchor, snap_new)                                                  # ... and then the newer anchor volume turned up and was restored
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "LINEAGE_FORKED"
+    again = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    assert again.accept_older_lineage({})["status"] == "ACCEPTED"
+    final = opened(world)
+    assert stopped(final) and final.load()["review_required"]["code"] == "ROLLBACK_ACCEPTED", "the restored newer lineage continues, with the review the owner must acknowledge"
+
+
+def test_accepting_does_not_get_around_a_witness_that_disagrees_about_a_forked_mark(world):
+    w = FakeWitness()
+    book = genesis(world, witness=w)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    d = json.load(open(hwm))
+    d["head"] = "ab" * 32
+    json.dump(d, open(hwm, "w"))
+    w.rows[ACCT][1] = "ff" * 32                                                         # the witness holds ANOTHER head than the local lineage at seq 1
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor, witness=w))
+    before = sorted(os.listdir(world.root))
+    with pytest.raises(CC.BookRefused) as e:
+        owner.accept_older_lineage({})
+    assert e.value.code == "LINEAGE_FORKED" and sorted(os.listdir(world.root)) == before
+
+
+# --------------------------------------------------------------------------------- L-5: no terminal, no witness read
+def test_a_non_interactive_accept_does_not_read_the_witness_before_the_gate_refuses(world):
+    class Counting(FakeWitness):
+        heads = 0
+
+        def head(self, account):
+            Counting.heads += 1
+            return super().head(account)
+    w = Counting()
+    book = genesis(world, witness=w)
+    book.ensure_baseline("232")
+    Counting.heads = 0
+    orig = AN.witness_from_env
+    AN.witness_from_env = lambda env: w
+    try:
+        rc = AP.main(["capital", "--root", world.root, "--accept-older-lineage"], env={"CAPITAL_ANCHOR_DIR": world.anchor}, isatty=lambda: False, input_fn=lambda _p: "", uid=0)
+    finally:
+        AN.witness_from_env = orig
+    assert rc == 2 and Counting.heads == 0
