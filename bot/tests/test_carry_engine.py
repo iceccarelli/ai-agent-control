@@ -551,18 +551,79 @@ class TestContinuationExit:
                        borrow_apr=0.0)
         again.restore(state)
         assert again.position.exit_shortfall_bps == pytest.approx(2.0)
+        assert again.position.exit_shortfall_known is True
 
-    def test_a_ledger_without_the_field_restarts_the_shortfall_at_zero(self):
+    def test_a_ledger_without_the_shortfall_is_unknown_and_the_original_rule_decides(self):
+        """UNKNOWN is not zero. A pair restored without its shortfall (a ledger
+        written before it existed, or a value that is not a finite number) has
+        an unknown bleed already paid: forgiving it would hold the pair longer
+        than any fresh episode would. The ORIGINAL funding rule decides for it
+        until it closes."""
+        eng = self._held("continuation")
+        state = eng.to_state()
+        for bad in ("absent", float("nan"), -1.0, "x", True):
+            s = dict(state, position=dict(state["position"]))
+            if bad == "absent":
+                del s["position"]["exit_shortfall_bps"]
+            else:
+                s["position"]["exit_shortfall_bps"] = bad
+            again = engine(FakeBroker(), exit_policy="continuation",
+                           primed=False, borrow_apr=0.0)
+            again.restore(s)
+            assert again.position.exit_shortfall_bps == 0.0, bad
+            assert again.position.exit_shortfall_known is False, bad
+        # and the flag itself survives a second restart (never re-learned as 0)
+        again.position.exit_shortfall_known = False
+        third = engine(FakeBroker(), exit_policy="continuation", primed=False,
+                       borrow_apr=0.0)
+        third.restore(again.to_state())
+        assert third.position.exit_shortfall_known is False
+
+    def test_an_unknown_shortfall_leaves_on_three_negative_prints_even_though_they_are_tiny(self):
         eng = self._held("continuation")
         state = eng.to_state()
         del state["position"]["exit_shortfall_bps"]
         again = engine(FakeBroker(), exit_policy="continuation", primed=False,
                        borrow_apr=0.0)
         again.restore(state)
-        assert again.position.exit_shortfall_bps == 0.0
-        state["position"]["exit_shortfall_bps"] = float("nan")
-        again.restore(state)
-        assert again.position.exit_shortfall_bps == 0.0
+        again._funding_history = [6.0, 6.0, 6.0]
+        again._last_print_ms = eng._last_print_ms
+        again._stamp = eng._stamp          # the fixture's stamps continue after it
+        for _ in range(2):
+            again.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        d = again.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        assert d.action == "unwound" and d.reason == "FUNDING_INVERTED"
+
+    def test_settlements_missed_while_down_advance_the_shortfall(self):
+        """REVIEW FINDING (Round 16): the cold-start catch-up moved the negative
+        streak but never the shortfall, so a restart FORGAVE the bleed: N missed
+        negative prints cost nothing towards the continuation exit."""
+        eng = self._held("continuation")
+        rt = eng.round_trip_bps()
+        h8 = 8 * 3600 * 1000
+        last = eng._last_print_ms
+        eng._ledger_last_print_ms = last
+        miss = -(rt / 3.0 + 0.5)                    # three of them cost > a round trip
+        eng.venue_prints_at_start = [(miss, last + i * h8) for i in range(1, 5)]
+        assert eng._catch_up_missed_prints() == 3   # the newest is left for on_candle
+        assert eng.position.exit_shortfall_bps == pytest.approx(-3 * miss)
+        assert eng.position.exit_shortfall_bps > rt
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+        assert d.action == "unwound" and d.reason == "FUNDING_SHORTFALL"
+
+    def test_a_missed_dip_that_recovers_does_not_leave(self):
+        eng = self._held("continuation")
+        rt = eng.round_trip_bps()
+        h8 = 8 * 3600 * 1000
+        last = eng._last_print_ms
+        eng._ledger_last_print_ms = last
+        eng.venue_prints_at_start = [(-rt / 4.0, last + h8), (rt, last + 2 * h8),
+                                     (-rt / 4.0, last + 3 * h8),
+                                     (1.0, last + 4 * h8)]
+        assert eng._catch_up_missed_prints() == 3
+        assert eng.position.exit_shortfall_bps == pytest.approx(rt / 4.0 - 0.0)
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+        assert eng.position is not None and d.action == "hold"
 
     def test_an_unpriced_round_trip_falls_back_to_the_legacy_exit(self):
         """The venue will not state the fee: the continuation rule cannot judge,

@@ -565,6 +565,11 @@ class CarryPosition:
     #: rule would do while the legacy rule acts; only the `continuation`
     #: policy decides on it.
     exit_shortfall_bps: float = 0.0
+    #: False when the shortfall was NOT restored (a ledger written before it
+    #: existed, or a value that is not a finite number): the continuation exit
+    #: then cannot judge this pair and the ORIGINAL funding rule decides until
+    #: it closes. Forgiving an unknown bleed would be the unsafe direction.
+    exit_shortfall_known: bool = True
 
     @property
     def cycle_id(self) -> str:
@@ -843,6 +848,7 @@ class CarryEngine:
                 "negative_funding_streak":
                     int(self.position.negative_funding_streak),
                 "exit_shortfall_bps": float(self.position.exit_shortfall_bps),
+                "exit_shortfall_known": bool(self.position.exit_shortfall_known),
             }
         return {
             "book_state": self.state.value,
@@ -897,8 +903,12 @@ class CarryEngine:
                 funding_collected=float(position.get("funding_collected", 0.0)),
                 negative_funding_streak=int(
                     position.get("negative_funding_streak", 0)),
-                exit_shortfall_bps=self._restored_shortfall(
-                    position.get("exit_shortfall_bps", 0.0)))
+                exit_shortfall_bps=(self._restored_shortfall(
+                    position.get("exit_shortfall_bps")) or 0.0),
+                exit_shortfall_known=(
+                    self._restored_shortfall(position.get("exit_shortfall_bps"))
+                    is not None
+                    and bool(position.get("exit_shortfall_known", True))))
             self.state = BookState.HEDGED
             self._reseed_cost_basis()
         else:
@@ -937,14 +947,14 @@ class CarryEngine:
             self._venue_verified_ms = int(time.time() * 1000)  # cold start checked it
 
     @staticmethod
-    def _restored_shortfall(raw: Any) -> float:
-        """The persisted shortfall, or 0.0 when it is absent (a ledger written
-        before it existed) or unusable. Zero forgives at most one round trip of
-        bleed once; it can never make the continuation rule hold longer than
-        one fresh episode would."""
+    def _restored_shortfall(raw: Any) -> Optional[float]:
+        """The persisted shortfall, or None when it is absent (a ledger written
+        before it existed) or unusable. None is UNKNOWN, never zero: the
+        position is then marked `exit_shortfall_known=False` and the original
+        funding rule decides for it."""
         if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
                 or not math.isfinite(raw) or raw < 0:
-            return 0.0
+            return None
         return float(raw)
 
     @classmethod
@@ -1153,6 +1163,12 @@ class CarryEngine:
                 position.negative_funding_streak += 1
             else:
                 position.negative_funding_streak = 0
+            # A settlement missed while down is a print the pair was held
+            # through: it advances the continuation exit's shortfall exactly as
+            # a live print does. Without this a restart forgave the bleed (eight
+            # missed prints at -3 bps is 24 bps, over twice the round trip, and
+            # the pair stayed in).
+            self._accrue_exit_shortfall(rate)
         if missed:
             logger.warning(
                 "carry: counted %d funding settlement(s) missed while the "
@@ -1857,6 +1873,11 @@ class CarryEngine:
         pos = self.position
         legacy = (pos.negative_funding_streak >= NEGATIVE_FUNDING_EXIT_PRINTS)
         if self.exit_policy != _costs().EXIT_POLICY_CONTINUATION:
+            return "FUNDING_INVERTED" if legacy else None
+        if not pos.exit_shortfall_known:
+            # The shortfall of a restored pair was not persisted (or is not a
+            # number): the bleed already paid is unknown, so the continuation
+            # rule cannot judge it and the original rule decides.
             return "FUNDING_INVERTED" if legacy else None
         if pos.exit_shortfall_bps <= 0.0:
             return None                      # funding is paying for the hold

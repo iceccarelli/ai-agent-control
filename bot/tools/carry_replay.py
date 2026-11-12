@@ -1430,6 +1430,12 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{r['borrow_apr'] * 100:.1f}%/yr, impact "
           f"{r['impact_bps_per_leg']:.2f} bps/leg, exit "
           f"{r['exit_policy']}")
+    if r["exit_policy"] == "continuation" and not r["owner_capital"][
+            "cost_of_capital"]["state"] == "STATED":
+        print("  !! exit policy 'continuation' with NO stated cost of capital "
+              "(--opportunity-cost-apr): its shortfall is measured against a "
+              "cost of 0.0, i.e. capital is treated as FREE at the exit. A "
+              "production config REFUSES this combination.")
     print()
     liq = r["liquidation"]
     if liq["production_equivalent"]:

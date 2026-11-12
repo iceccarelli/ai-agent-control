@@ -340,6 +340,11 @@ def _print(a: Dict[str, Any]) -> None:
     print(f"  book   {a['mode'].upper()}/{a['style']}  ${a['notional_usd']:,.0f}  "
           f"round trip {a['round_trip_bps']:.1f} bps  borrow "
           f"{a['borrow_apr'] * 100:.1f}%/yr  exit policy {a['exit_policy']}")
+    if a["exit_policy"] == "continuation" and a["borrow_apr"] == 0.0:
+        print("  !! exit policy 'continuation' with no cost of capital: its "
+              "shortfall is measured against 0.0 (capital treated as FREE at "
+              "the exit; this tool takes no --opportunity-cost-apr, use "
+              "tools/carry_replay.py for a stated one)")
     if not a["liquidation"]["production_equivalent"]:
         print(f"  !! NOT PRODUCTION-EQUIVALENT: liquidation gate "
               f"{a['liquidation']['gate']} (no liqPrice/accountMMRate in the "

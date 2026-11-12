@@ -409,7 +409,8 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
 
     ``cycle`` keys read: cycle_id, outcome, evidence_class, overlay,
     hedged_qty, perp_entry_price, perp_exit_price, hold_days, net_usd,
-    revalue_usd, capital_committed_usd, fees_complete, funding_complete.
+    revalue_usd, mark_status, capital_committed_usd, fees_complete,
+    funding_complete.
     """
     cid = cycle.get("cycle_id")
     leg_class = str(cycle.get("evidence_class") or "UNAVAILABLE")
@@ -472,7 +473,16 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
         pair = None
     else:
         unhedged = qty * (p1 - p0)
-        pair = unhedged + increment
+        # The pair. With VERIFIED inventory marks it is MEASURED: the cash net
+        # plus the booked, never-sold inventory move, so the basis (perp vs
+        # spot) is in it. `unhedged + increment` takes the BTC's move from the
+        # perp fill prices, which cancels the price legs by construction and
+        # leaves the basis out (a -$265 per-cycle error at a +35 bps basis).
+        # Without verified marks it stays the derived figure it always was.
+        if reval and cycle.get("mark_status") == "VERIFIED":
+            pair = net + reval
+        else:
+            pair = unhedged + increment
         notional = qty * p0
         out["vs_unhedged_btc"] = {
             "available": True, "evidence_class": "HISTORICAL_SIMULATION",

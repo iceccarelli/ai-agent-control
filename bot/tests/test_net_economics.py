@@ -264,6 +264,35 @@ def test_net_positive_below_benchmark_is_not_called_profit():
     assert ne["verdict"]["code"] == "NET_POSITIVE_BELOW_BENCHMARK_RATE"
 
 
+def _six_profitable_cycles():
+    j = L.Journal()
+    cyc(j, 0, 10, funding=300.0, tag="a")          # net +190 on 110k
+    for i in range(1, 6):
+        cyc(j, 10 + 11 * i, 20 + 11 * i, funding=300.0, tag=f"x{i}")
+    cycles = perf.cycles_from_journal(j)
+    obs = [{"cycle_opened_ms": perf._cycle_ms(c["cycle_id"]),
+            "position_im_usd": 10_000.0} for c in cycles]
+    return j, obs
+
+
+def test_a_positive_net_with_no_benchmark_is_not_a_profit_claim():
+    """REVIEW FINDING (Round 16): with no --cash-apr the verdict read plain
+    NET_POSITIVE. The question is what the same capital earns elsewhere, and
+    nothing was told it: no alternative stated is not 'beats nothing'."""
+    j, obs = _six_profitable_cycles()
+    ne, _ = economics(j, obs=obs, apr=None)
+    v = ne["verdict"]
+    assert v["code"] == "NET_POSITIVE_BENCHMARK_UNSTATED"
+    assert "NOT a statement that the book beats" in v["statement"]
+
+
+def test_a_positive_net_ahead_of_a_stated_benchmark_is_net_positive():
+    j, obs = _six_profitable_cycles()
+    ne, _ = economics(j, obs=obs, apr=0.5)         # a 0.5%/yr alternative
+    assert ne["verdict"]["code"] == "NET_POSITIVE"
+    assert "ahead of the supplied benchmark rate" in ne["verdict"]["statement"]
+
+
 def test_report_carries_a_top_level_verdict_and_stays_valid(tmp_path, capsys):
     from persistence import StateStore
     j = L.Journal()
