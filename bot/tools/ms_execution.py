@@ -295,6 +295,13 @@ class GroupRuntime:
 
 
 HELD_REASON = "SPOT_EXIT_HELD_PERP_NOT_CLOSED"      # the session held a spot exit behind its perp exit: not a venue rejection
+#: Reasons of an exit the VENUE did not refuse: the session held it (above), or the executor could not READ something it needs before it can send (``FILTERS_UNAVAILABLE``: nothing reached the venue). Neither counts toward
+#: ``max_exit_attempts`` and neither is re-sent inside the step that produced it; the session's exit window bounds how long it may last (round-10 specialist, A6: such refusals halted a group with the perp open).
+UNCOUNTED_EXIT_REASONS = (HELD_REASON, "FILTERS_UNAVAILABLE")
+
+
+def counts_as_rejection(l: Any) -> bool:
+    return l.status == REJECTED and not str(l.reject_reason).startswith(UNCOUNTED_EXIT_REASONS)
 
 
 def _poskey(category: str, symbol: str) -> str:
@@ -617,7 +624,7 @@ class ExecutionEngine:
         g = self.groups.get(group_id)
         if g is None or g.halted_reason != "EXIT_ORDERS_REJECTED":
             return None
-        rejected = sum(1 for l in g.exit_legs() if l.status == REJECTED and l.reject_reason != HELD_REASON)
+        rejected = sum(1 for l in g.exit_legs() if counts_as_rejection(l))
         self._emit("HALT_GROUP", group_id, now_ms, {"reason": "", "exit_floor": rejected})
         self._settle(g, now_ms)
         return "EXIT_ORDERS_REJECTED"
@@ -933,7 +940,7 @@ class ExecutionEngine:
     def _drive_exit(self, g: GroupRuntime, ts: int) -> bool:
         if any(l.status in (SENT, UNKNOWN) for l in g.legs.values()) or g.halted_reason:
             return False
-        if sum(1 for l in g.exit_legs() if l.status == REJECTED and l.reject_reason != HELD_REASON) - g.exit_attempt_floor >= self.policy.max_exit_attempts:
+        if sum(1 for l in g.exit_legs() if counts_as_rejection(l)) - g.exit_attempt_floor >= self.policy.max_exit_attempts:
             self._emit("HALT_GROUP", g.plan.group_id, ts, {"reason": "EXIT_ORDERS_REJECTED"})
             return True
         sent = False
@@ -942,8 +949,8 @@ class ExecutionEngine:
             ex = excess.get(l.plan.leg_id, Decimal(0))
             pending = sum((x.plan_qty - x.filled for x in g.exit_legs() if x.parent == l.plan.leg_id and x.status == LIVE), Decimal(0))
             need = ex - pending
-            if any(x.parent == l.plan.leg_id and x.status == REJECTED and x.reject_reason == HELD_REASON and x.sent_ms == ts for x in g.exit_legs()):
-                continue                                                  # held behind its perp exit this step: the venue is re-read next step (a partial perp fill is then re-sent for the remainder)
+            if any(x.parent == l.plan.leg_id and x.status == REJECTED and str(x.reject_reason).startswith(UNCOUNTED_EXIT_REASONS) and x.sent_ms == ts for x in g.exit_legs()):
+                continue                                                  # held behind its perp exit (or not sendable this step because a read failed): the venue is re-read next step (a partial perp fill is then re-sent for the remainder)
             if need <= EPS or l.plan.symbol in self.halted_symbols or any(x.parent == l.plan.leg_id and x.status == LIVE for x in g.exit_legs()):
                 continue
             k = sum(1 for x in g.exit_legs() if x.parent == l.plan.leg_id)

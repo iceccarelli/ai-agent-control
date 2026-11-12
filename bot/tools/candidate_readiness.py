@@ -38,6 +38,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import carry_costs as CC  # noqa: E402
+import cash_basis as CB  # noqa: E402
 import opportunity_map as OM  # noqa: E402
 import research_harness as RH  # noqa: E402
 import statistical_power as SP  # noqa: E402
@@ -1722,9 +1723,78 @@ def book_analytics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def _vs_cash_descriptive(basis: Any, is_carry: bool, variants: Mapping[str, Mapping[int, Mapping[str, Any]]], common: Sequence[int], hold_days: int) -> Dict[str, Any]:
+    """IN-SAMPLE, descriptive only (too few rows for a test): per variant the mean net per row, the cash it displaces on the committed capital and the mean excess, with the hurdle a row's gross return must clear.
+    Nothing is recorded in the multiple-testing ledger and nothing here is a verdict."""
+    capital = CB.capital_per_gross_notional(is_carry)
+    per: Dict[str, Any] = {}
+    for name, rows in variants.items():
+        ex, unknown = CB.excess_rows([rows[t] for t in common], hold_days=hold_days, capital=capital, basis=basis)
+        if ex:
+            vals = list(ex.values())
+            per[name] = {"rows": len(vals), "rows_without_cash": len(unknown), "mean_net_bps_of_gross": statistics.fmean(v["net_bps_of_gross"] for v in vals),
+                         "mean_cash_bps_of_capital": statistics.fmean(v["cash_bps_of_capital"] for v in vals), "mean_cash_hurdle_bps_of_gross": statistics.fmean(v["cash_hurdle_bps_of_gross"] for v in vals),
+                         "mean_excess_bps_of_capital": statistics.fmean(v["excess_bps_of_capital"] for v in vals)}
+        else:
+            per[name] = {"rows": 0, "rows_without_cash": len(unknown), "note": "the cash source covers none of these rows: UNKNOWN, never priced at zero"}
+    return {"label": "IN_SAMPLE_DESCRIPTIVE_NOT_A_TEST", "basis": basis.describe(), "capital_per_gross_notional": capital, "variants": per}
+
+
+def _vs_cash_walk_forward(basis: Any, *, kind: str, is_carry: bool, selectable: Sequence[str], by_t: Callable[[str], Mapping[int, Mapping[str, Any]]], common_sorted: Sequence[int], hold_days: int, ledger: Any,
+                          params_of: Mapping[str, Mapping[str, Any]], alpha: float, min_rows: int) -> Dict[str, Any]:
+    """The family's walk-forward on the EXCESS over ``basis`` on the capital committed. Rows the cash source cannot price (a hole, a window before its series begins) are dropped from EVERY variant together and
+    counted; the cash-adjusted variants are recorded in the family's persistent ledger under their own names (``...|X<source>``: a new trial each, an identical re-run the same trial), so the Holm correction
+    below counts them. Reject-only: ``verdict`` is REJECTED or INSUFFICIENT_DATA, never a pass."""
+    capital = CB.capital_per_gross_notional(is_carry)
+    per_variant: Dict[str, Dict[int, Dict[str, float]]] = {}
+    unknown_ts: set = set()
+    for name in selectable:
+        ex, unknown = CB.excess_rows([by_t(name)[t] for t in common_sorted], hold_days=hold_days, capital=capital, basis=basis)
+        per_variant[name] = ex
+        unknown_ts |= set(unknown)
+    ts = [t for t in common_sorted if t not in unknown_ts]
+    blk: Dict[str, Any] = {"basis": basis.describe(), "capital_per_gross_notional": capital, "statistic": "excess_bps_of_capital = net_bps_of_gross_notional / capital - cash_bps_over_the_hold",
+                           "rows_aligned": len(common_sorted), "rows_without_cash": len(unknown_ts), "rows": len(ts)}
+    if len(ts) < min_rows:
+        blk.update({"status": "TOO_FEW_ROWS_WITH_CASH", "verdict": "INSUFFICIENT_DATA", "reason": f"{len(ts)} rows have cash coverage; need >= {min_rows}"})
+        return blk
+    series_x = {f"{n}|X{basis.label}": [per_variant[n][t]["excess_bps_of_capital"] for t in ts] for n in selectable}
+    for xn, rets in series_x.items():
+        base = xn.rsplit("|X", 1)[0]
+        if RH.series_digest(rets) not in ledger.returns_digests(xn):
+            ledger.record(xn, {**params_of[base], "statistic": "EXCESS_OVER_CASH_ON_CAPITAL", "cash_basis": basis.label, "capital_per_gross_notional": capital}, rets, horizon=1)
+    folds = RH.walk_forward_folds(len(ts), train_min=max(20, len(ts) // 2), test_len=max(5, len(ts) // 10), label_horizon=1, embargo=1)
+    oos: List[float] = []
+    picks: List[str] = []
+    idx: List[Tuple[str, int]] = []
+    for f in folds:
+        pick = RH.train_only_best({k: [v[i] for i in f.train] for k, v in series_x.items()})
+        picks.append(pick)
+        oos.extend(series_x[pick][i] for i in f.test)
+        idx.extend((pick, i) for i in f.test)
+    st = RH.significance(oos)
+    m = ledger.n_variants
+    adj = SP.adjust_pvalues([st["p_one_sided"]], "holm", alpha=alpha, n_tested=m)["adjusted"][0]
+    mean = st["mean"]
+    enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
+    verdict = "REJECTED" if enough and (mean is None or mean <= 0 or adj > alpha) else "INSUFFICIENT_DATA"
+    early = early_rejection(st)
+    if verdict == "INSUFFICIENT_DATA" and early:
+        verdict = "REJECTED"
+    chosen = [per_variant[p.rsplit("|X", 1)[0]][ts[i]] for p, i in idx]
+    blk.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "n_variants_counted": m, "correction": "holm", "oos_rows": len(oos), "oos_mean_excess_bps_of_capital_per_row": mean,
+                "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"], "p_adjusted": adj, "selected_per_fold": picks,
+                "reject_early": early if verdict == "REJECTED" and not enough else None,
+                "oos_mean_net_bps_of_gross_per_row": statistics.fmean(c["net_bps_of_gross"] for c in chosen) if chosen else None,
+                "oos_mean_cash_hurdle_bps_of_gross_per_row": statistics.fmean(c["cash_hurdle_bps_of_gross"] for c in chosen) if chosen else None,
+                "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY; REJECT-ONLY: a negative or insignificant excess over cash rejects, a positive one is never a promotion"})
+    return blk
+
+
 def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: Optional[str], universe_info: Optional[Mapping[str, Any]] = None,
                     formation_days_grid: Sequence[int] = (7, 14, 30), hold_days: int = 7, top_k_grid: Sequence[int] = (1, 3), min_rows: int = 60, alpha: float = 0.05,
-                    min_listing_age_days: int = 30, max_staleness_ms: Optional[int] = None, allow_unverified_key_basis_for_tests: bool = False) -> Dict[str, Any]:
+                    min_listing_age_days: int = 30, max_staleness_ms: Optional[int] = None, allow_unverified_key_basis_for_tests: bool = False,
+                    cash_bases: Sequence[Any] = ()) -> Dict[str, Any]:
     """Walk-forward of one strategy family on the fixed non-overlapping grid. Every (formation x top_k x cost scenario) variant is recorded in the family's PERSISTENT ledger
     (``ledger_path`` is required: a fresh process cannot reset the count) and is a member of the multiple-testing family. Variants are aligned on decision time: only slots where
     every variant produced a row are used, so the row count follows from the data. The verdict is capped at INSUFFICIENT_DATA; REJECTED when an adequately sized
@@ -1812,6 +1882,8 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
                                          "book_analytics": {n: book_analytics([by_t(n)[t] for t in common_sorted]) for n in sorted(results) if n not in unselectable} if n_rows else {},
                                          "book_analytics_modelled_scenarios": {n: book_analytics([by_t(n)[t] for t in common_sorted]) for n in unselectable} if n_rows else {},
                                          "modelled_scenarios_note": "MODELLED-cost scenarios (never measured): shown apart, never the headline and never selectable"}})
+        if cash_bases and n_rows:
+            out["descriptive_only"]["vs_cash_in_sample"] = {b.label: _vs_cash_descriptive(b, spec["is_carry"], {n: by_t(n) for n in results if n not in unselectable}, common_sorted, hold_days) for b in cash_bases}
         return out
     series_by = {n: [by_t(n)[t]["net_bps"] for t in common_sorted] for n in sorted(results)}
     for name, rets in series_by.items():
@@ -1835,6 +1907,7 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
         test_idx.extend((pick, i) for i in f.test)                                           # type: ignore[arg-type]
     st = RH.significance(oos)
     m = ledger.n_variants
+    m_nominal = m                                                      # what the NOMINAL p-value below is adjusted for (reported as n_variants_used_for_nominal_p)
     adj = SP.adjust_pvalues([st["p_one_sided"]], "holm", alpha=alpha, n_tested=m)["adjusted"][0]
     mean = st["mean"]
     enough = st["independent_observations"] >= SV.MIN_OBSERVATIONS["oos_test"]
@@ -1846,15 +1919,30 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
     if unpriced or unkeyed:
         verdict, early_applied = "INSUFFICIENT_DATA", False   # unknown terminal losses / unverified timing: neither a pass nor a rejection can be claimed
     oos_rows = [by_t(pick)[common_sorted[i]] for pick, i in test_idx]
+    if cash_bases:
+        # The statistic a decision needs is the EXCESS over cash on the capital committed (cash_basis). Each cash source is its own, separately COUNTED set of variants (a new trial per variant and source); a
+        # result against one never stands in for another. REJECT-ONLY: a family whose excess over cash is significantly non-positive is REJECTED; nothing here can promote one.
+        out["vs_cash"] = {}
+        for basis in cash_bases:
+            blk = _vs_cash_walk_forward(basis, kind=kind, is_carry=spec["is_carry"], selectable=sorted(selectable), by_t=by_t, common_sorted=common_sorted, hold_days=hold_days, ledger=ledger, params_of=params_of,
+                                        alpha=alpha, min_rows=min_rows)
+            out["vs_cash"][basis.label] = blk
+        m = ledger.n_variants                                          # the family grew by the cash-adjusted variants: reported (and used by their own Holm); THIS run's nominal p-value used n_variants_used_for_nominal_p.
+        #                                                                A LATER nominal run on the same persistent ledger starts from the larger count (the ledger remembers every trial): conservative, never a promotion.
+        rejecting = sorted(lbl for lbl, b in out["vs_cash"].items() if b.get("verdict") == "REJECTED")
+        if rejecting and verdict != "REJECTED" and not (unpriced or unkeyed):
+            verdict = "REJECTED"
+            out["rejected_vs_cash"] = rejecting
     out["reject_early"] = early if early_applied else None
     out["reject_early_suppressed_by_cap"] = bool(early and not early_applied and verdict != "REJECTED")
-    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_tried_in_call": len(results), "correction": "holm",
+    out.update({"status": "WALK_FORWARD_DONE", "verdict": verdict, "family_ledger": fam, "n_variants_counted": m, "n_variants_used_for_nominal_p": m_nominal, "n_variants_tried_in_call": len(results), "correction": "holm",
                 "oos_rows": len(oos), "oos_mean_total_bps_per_row": mean, "oos_independent_observations": st["independent_observations"], "p_one_sided": st["p_one_sided"],
                 "p_adjusted": adj, "selected_per_fold": chosen, "oos_book_analytics": book_analytics(oos_rows),
                 "label": "OUT_OF_SAMPLE_WITHIN_THE_CAPTURE_ONLY: one regime, one capture; not prospective",
                 "reason": (("carry: funding - spot+perp round trip (basis residual UNMEASURED)" if kind == FAMILY_CARRY else
                            "perp-only book: funding earned/paid + measured price legs - perp round trips; NOT carry")
-                          + ((" | REJECTED_EARLY: " + early["rule"]) if early_applied else ""))})
+                          + ((" | REJECTED_EARLY: " + early["rule"]) if early_applied else "")
+                          + ((" | REJECTED_VS_CASH: " + ",".join(out["rejected_vs_cash"])) if out.get("rejected_vs_cash") else ""))})
     return out
 
 
@@ -1902,7 +1990,7 @@ def default_ledger_path(family: str, data_root: str, ledger_dir: Optional[str] =
 
 def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], ledger_path: Optional[str], holdout_ledger: Any, spot_dir: Optional[str] = None,
                              mark_interval: Optional[str] = None, spec: Optional[Mapping[str, Any]] = None, unreserved_exploratory: bool = False, reader: str = "",
-                             **kw: Any) -> Dict[str, Any]:
+                             cash_bases: Sequence[Any] = (), **kw: Any) -> Dict[str, Any]:
     """Load a market_history root against its verified universe capture and run the ranked-funding walk-forward. The universe dir is REQUIRED (HarnessError UNIVERSE_DIR_REQUIRED) and
     so is a persistent ``ledger_path``: a fresh process must not reset the multiple-testing family count (HarnessError otherwise).
 
@@ -1922,7 +2010,9 @@ def evaluate_cross_sectional(history_root: str, *, universe_dir: Optional[str], 
         out["history_shortfall"] = {"required_days": out["required_span"].get("window_days_required"), "loaded_history_window_days": hw.get("days"),
                                     "note": "this run is a SHORT DIAGNOSTIC: it must never be quoted as evidence for or against the strategy"}
     stem = os.path.splitext(ledger_path)[0]
-    out["families"] = {k: evaluate_family(series, k, ledger_path=f"{stem}.{k.lower()}.jsonl", universe_info=info) for k in FAMILIES}
+    cash_bases = tuple(cash_bases or ())
+    out["families"] = {k: evaluate_family(series, k, ledger_path=f"{stem}.{k.lower()}.jsonl", universe_info=info, cash_bases=cash_bases) for k in FAMILIES}
+    out["cash_bases"] = [b.describe() for b in cash_bases] if cash_bases else []
     hstatus = (info.get("holdout") or {}).get("status")
     out["holdout_status"] = hstatus
     for f in out["families"].values():

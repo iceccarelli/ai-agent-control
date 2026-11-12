@@ -148,6 +148,9 @@ def capital_book(report: Mapping[str, Any]) -> Event:
         p[rename.get(k, k)] = num(report.get(k))
     p.update({"lifecycles_settled": report.get("lifecycles_settled"), "wins": report.get("wins"), "losses": report.get("losses"), "profit_factor": report.get("profit_factor"),
               "loss_streak": report.get("loss_streak"), "halted": bool(report.get("halted"))})
+    # A new EPOCH (the owner's audited ``capital --rebaseline``) restarts every figure above; the result over ALL epochs is stated beside them so a record can never read as a fresh account.
+    p["epoch"] = report.get("epoch")
+    p["all_epochs_verified_result_usd"] = num(report.get("lifetime_cumulative_realised_usd"))
     return ("DAILY_PNL", "CAPITAL_BOOK", p)
 
 
@@ -270,10 +273,13 @@ def funding_events(doc: Optional[Mapping[str, Any]]) -> List[Event]:
     if not isinstance(doc, Mapping):
         return []
     out: List[Event] = []
+    suppressed = doc.get("suppressed")                                          # the session withdrew this document (the held window is unknown): NO print may carry a verdict or a figure
     for r in list(doc.get("recognitions") or [])[:4]:
         if not isinstance(r, Mapping):
             continue
         for p in list(r.get("prints") or [])[:20]:
+            if suppressed:
+                p = {**p, "status": "SUPPRESSED", "amount_usd": None, "expected_usd": None, "wallet": None, "reason": f"SUPPRESSED:{suppressed}"}
             w = p.get("wallet") if isinstance(p.get("wallet"), Mapping) else {}
             out.append(("FUNDING", "FUNDING_SETTLEMENT", {"source": "VENUE", "symbol": r.get("symbol"), "settlement_ms": p.get("ts_ms"), "rate": num(p.get("rate"), 8), "held_qty": num(p.get("signed_position_qty"), 6),
                                                           "status": p.get("status"), "amount_usd": num(p.get("amount_usd"), 6) if str(p.get("status")).startswith("BOOKED") else None,          # a quarantined / mismatched row's cash is NOT an amount: it must not be summable

@@ -54,6 +54,7 @@ class FakeBybitTestnet:
         self.create_calls: Dict[str, int] = {}
         self.faults: List[Dict[str, Any]] = []
         self.api_perms: Dict[str, Any] = {"readOnly": 0, "permissions": {"ContractTrade": ["Order", "Position"], "Spot": ["SpotTrade"]}, "ips": ["*"]}
+        self.user_id: Any = 100000001                      # the venue states WHICH account these credentials belong to (query-api userID); None = the field is absent
         self.position_idx_hedge = False
         self.spot_fee_in_base = False
         self.dup_executions = False
@@ -153,7 +154,8 @@ class FakeBybitTestnet:
         if path == "/v5/market/orderbook":
             return self._orderbook(q)
         if path == "/v5/user/query-api":
-            return self._ok({"id": "1", "apiKey": "<masked>", "readOnly": self.api_perms["readOnly"], "permissions": self.api_perms["permissions"], "ips": self.api_perms["ips"], "type": 1})
+            return self._ok({"id": "1", "apiKey": "<masked>", "readOnly": self.api_perms["readOnly"], "permissions": self.api_perms["permissions"], "ips": self.api_perms["ips"], "type": 1,
+                             **({} if self.user_id is None else {"userID": self.user_id})})
         if path == "/v5/account/wallet-balance":
             coins = [{"coin": c, "walletBalance": _s(v), "locked": "0", "equity": _s(v), "usdValue": _s(v * (D(self.book["BTCUSDT"]["mark"]) if c == "BTC" else D(self.book["ETHUSDT"]["mark"]) if c == "ETH" else 1))} for c, v in self.wallet.items()]
             eq = sum(D(c["usdValue"]) for c in coins)

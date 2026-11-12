@@ -21,6 +21,7 @@ for _p in (HERE, BOT, os.path.join(BOT, "tools")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import capital_testkit as CT  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
 from test_ms_testnet_autopilot import _cycle_eng, _profit_world, w  # noqa: E402,F401  (the fake venue world the autopilot tests already own)
@@ -34,7 +35,7 @@ def _unexplained(book):
 
 # ------------------------------------------------------------------ the book
 def test_an_unexplained_settlement_puts_the_review_in_the_book_in_the_same_save(tmp_path):
-    book = CC.CapitalBook(str(tmp_path))
+    book = CT.anchored(str(tmp_path))
     _unexplained(book)
     r = book.settle("10000")
     assert r["status"] == "UNEXPLAINED_CASH"
@@ -46,7 +47,7 @@ def test_an_unexplained_settlement_puts_the_review_in_the_book_in_the_same_save(
 
 
 def test_a_settled_session_leaves_no_review(tmp_path):
-    book = CC.CapitalBook(str(tmp_path))
+    book = CT.anchored(str(tmp_path))
     book.ensure_baseline("500")
     assert book.park("s1", "500", "0.50", True, True)
     assert book.settle("500.50")["status"] == "SETTLED"
@@ -54,6 +55,7 @@ def test_a_settled_session_leaves_no_review(tmp_path):
 
 
 def test_a_book_written_before_the_field_existed_loads_with_no_review(tmp_path):
+    """the BARE loader's compatibility with a pre-review book (an anchored view that was edited is VIEW_TAMPERED: see test_capital_anchor)"""
     book = CC.CapitalBook(str(tmp_path))
     book.ensure_baseline("500")
     d = json.load(open(book.path))
@@ -63,7 +65,7 @@ def test_a_book_written_before_the_field_existed_loads_with_no_review(tmp_path):
 
 
 def test_the_first_review_is_kept_when_a_second_unexplained_session_follows(tmp_path):
-    book = CC.CapitalBook(str(tmp_path))
+    book = CT.anchored(str(tmp_path))
     _unexplained(book)
     book.settle("10000")
     first = book.load()["review_required"]
@@ -73,10 +75,10 @@ def test_the_first_review_is_kept_when_a_second_unexplained_session_follows(tmp_
 
 
 def test_acknowledging_the_review_clears_only_the_review_and_changes_no_money(tmp_path):
-    book = CC.CapitalBook(str(tmp_path))
+    book = CT.anchored(str(tmp_path))
     _unexplained(book)
     book.settle("10000")
-    audit = ("review_required", "review_acknowledged")
+    audit = ("review_required", "review_acknowledged", "ledger_ref")                       # the lineage position advances with the owner's decision, as it must
     before = {k: v for k, v in book.load().items() if k not in audit}
     assert book.acknowledge_review() is True
     after = book.load()
@@ -91,7 +93,7 @@ def test_a_crash_between_the_settlement_save_and_the_alert_cannot_lose_the_stop(
     """The window: settle() has saved, the ALERT write never happened. The next session must still refuse, and must re-raise the ALERT itself."""
     _profit_world(w)
     eng = str(w.tmp / "eng")
-    book = CC.CapitalBook(eng)
+    book = CT.anchored(eng)
     _unexplained(book)
     assert book.settle("10000")["status"] == "UNEXPLAINED_CASH"            # ... and the process died here: no ALERT was written
     assert not AP.ES.EngineState(eng, w.clock.now).has("ALERT")
@@ -105,7 +107,7 @@ def test_a_crash_between_the_settlement_save_and_the_alert_cannot_lose_the_stop(
 def test_clearing_the_alert_alone_does_not_resume_trading(w):
     _profit_world(w)
     eng = str(w.tmp / "eng")
-    book = CC.CapitalBook(eng)
+    book = CT.anchored(eng)
     _unexplained(book)
     book.settle("10000")
     es = AP.ES.EngineState(eng, w.clock.now)
@@ -121,7 +123,7 @@ def test_clearing_the_alert_alone_does_not_resume_trading(w):
 def test_after_the_owners_acknowledgement_the_normal_gates_decide_again(w):
     _profit_world(w)
     eng = str(w.tmp / "eng")
-    book = CC.CapitalBook(eng)
+    book = CT.anchored(eng)
     _unexplained(book)
     book.settle("10000")
     AP.ES.EngineState(eng, w.clock.now).set("ALERT", {"code": "ACCOUNT_CASH_UNEXPLAINED"})
@@ -132,18 +134,18 @@ def test_after_the_owners_acknowledgement_the_normal_gates_decide_again(w):
 
 def test_the_capital_command_shows_the_review_and_acknowledges_it_only_when_asked(tmp_path, capsys):
     eng = str(tmp_path / "eng_cli")
-    book = CC.CapitalBook(eng)
+    book = CT.anchored(eng)
     _unexplained(book)
     book.settle("10000")
     assert AP.main(["capital", "--root", eng], env={}) == 0
     out = capsys.readouterr().out
     assert '"review_required"' in out and "ACCOUNT_CASH_UNEXPLAINED" in out
-    assert CC.CapitalBook(eng).load()["review_required"] is not None, "printing the book must not clear anything"
+    assert CT.anchored(eng).load()["review_required"] is not None, "printing the book must not clear anything"
     # the acknowledgement is the OWNER's act (an interactive terminal and the line it shows, test_owner_gate.py): here the terminal is injected and types the line the screen asked for
     def owner_types(prompt: str) -> str:
         return next(l for l in capsys.readouterr().out.splitlines() if l.startswith("CONFIRM "))
     assert AP.main(["capital", "--root", eng, "--ack-review"], env={}, isatty=lambda: True, input_fn=owner_types) == 0
     out = capsys.readouterr().out
-    assert "review acknowledged" in out and CC.CapitalBook(eng).load()["review_required"] is None
+    assert "review acknowledged" in out and CT.anchored(eng).load()["review_required"] is None
     assert AP.main(["capital", "--root", eng, "--ack-review"], env={}, isatty=lambda: True, input_fn=owner_types) == 0
     assert "no review to acknowledge" in capsys.readouterr().out

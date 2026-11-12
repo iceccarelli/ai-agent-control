@@ -104,8 +104,15 @@ def parse_filters(category: str, row: Mapping[str, Any]) -> Filters:
         raise ExecutorError(f"instrument row not understood: {type(exc).__name__}") from None
 
 
-def filter_violations(f: Filters, *, side: str, order_type: str, qty: str, price: Optional[str], ref_price: Optional[D]) -> List[str]:
-    """Every way an order breaks the instrument's rules (empty = it may be sent). Checked BEFORE sending."""
+#: 110072 = duplicate orderLinkId (linear / any category); 170141 = "Duplicate clientOrderId" (spot; seen on a real testnet rejection, bybit_connection.DUPLICATE_LINK_ID_RET_CODES). 170130 is deliberately NOT here:
+#: it is also "data sent for parameter ... is not valid", a DEFINITIVE refusal; routed through the lookup, a deterministic refusal would read as an unknown outcome and be resent.
+DUPLICATE_LINK_RET_CODES = (110072, 170141)
+
+
+def filter_violations(f: Filters, *, side: str, order_type: str, qty: str, price: Optional[str], ref_price: Optional[D], reduce_only: bool = False) -> List[str]:
+    """Every way an order breaks the instrument's rules (empty = it may be sent). Checked BEFORE sending. ``reduce_only``: an order that can only REDUCE a position is never refused here for a price the executor
+    could not read (NOTIONAL_UNVERIFIABLE): the venue enforces its own minimum, and an unreadable public ticker used to refuse a risk-reducing exit LOCALLY, five times, until the group HALTED with the perp
+    still open (round-10 specialist, A6). A known price below the minimum is still refused here."""
     out: List[str] = []
     if f.status != "Trading":
         out.append(f"INSTRUMENT_NOT_TRADING:{f.status}")
@@ -134,7 +141,8 @@ def filter_violations(f: Filters, *, side: str, order_type: str, qty: str, price
     use = px if px is not None else ref_price
     if f.min_notional > 0:
         if use is None:
-            out.append("NOTIONAL_UNVERIFIABLE")
+            if not reduce_only:
+                out.append("NOTIONAL_UNVERIFIABLE")
         elif q * use < f.min_notional:
             out.append("NOTIONAL_BELOW_MIN")
     if f.category == "spot" and order_type == "Market" and side == "Buy":
@@ -293,7 +301,7 @@ class TestnetExecutor:
                 ref = self._ref_price(leg)
             elif not exit_:
                 self._quote_row(leg.category, leg.symbol)                 # a public read for the MEASUREMENT only (entries only: an exit is never made slower)
-            bad = filter_violations(f, side=leg.side, order_type=leg.order_type, qty=leg.qty, price=leg.price, ref_price=ref)
+            bad = filter_violations(f, side=leg.side, order_type=leg.order_type, qty=leg.qty, price=leg.price, ref_price=ref, reduce_only=bool(leg.reduce_only))
         except ExecutorError as exc:
             return Ack(link, "REJECTED", None, f"FILTERS_UNAVAILABLE:{exc}"[:160])        # nothing was sent
         if bad:
@@ -312,7 +320,7 @@ class TestnetExecutor:
             return Ack(link, "REJECTED", None, ("NOT_SENT:" + str(exc))[:200])
         except bc.PermanentAPIError as exc:
             code = exc.ret_code
-            if code == 110072:                                         # duplicate orderLinkId: the order EXISTS
+            if code in DUPLICATE_LINK_RET_CODES:                       # duplicate orderLinkId: the order EXISTS (the lookup adopts it; with no order under the link the outcome is UNKNOWN, never a refusal)
                 return self._resolve(req)
             if code in bc.UNKNOWN_OUTCOME_RET_CODES:                   # 0 = no retCode stated (HTTP error body, garbage, proxy), 10000/170007 = timeouts
                 return self._resolve(req)
@@ -507,14 +515,27 @@ class TestnetExecutor:
         fee_blank = r.get("execFee") in (None, "")                       # a Trade row with no fee stated is an UNKNOWN fee, never a measured zero (the ledger and the quality record see it as unknown)
         qty, px, fee = _d(r["execQty"], "execQty"), _d(r["execPrice"], "execPrice"), _d(r.get("execFee") or "0", "execFee")
         side, sym = r["side"], r["symbol"]
-        if not link:                                                    # a trade under no client link id: SURFACED, never booked as our fill
+        def surface(rejected: Optional[str]) -> None:
             row = {"exec_id": eid, "type": typ, "symbol": sym, "fee": str(fee), "exec_time_ms": _ms(r.get("execTime")), "side": side, "qty": r.get("execQty"), "price": r.get("execPrice"),
                    "mark": r.get("markPrice"), "fee_ccy": r.get("feeCurrency"), "order_id": r.get("orderId"), "category": cat}
+            if rejected:
+                row["rejected"] = rejected
             self._read_unattributed.append(row)
             if not any(u["exec_id"] == eid for u in self.unattributed):
                 self.unattributed.append(row)
+
+        if not link:                                                    # a trade under no client link id: SURFACED, never booked as our fill
+            surface(None)
             return
-        fee_ccy = str(r.get("feeCurrency") or QUOTE).strip().upper()      # the casing is not part of the meaning: compared as the quote and the base coin are written
+        if qty <= 0 or px <= 0:
+            # A corrupt row (a quantity or price that is not positive) used to raise LedgerError out of the session loop with the hedge still open (round-10 specialist, C1). Set aside as evidence it leaves the
+            # venue's order list to say the order filled, so the net is incomplete (unknown) and the unwind goes on.
+            surface("NON_POSITIVE_QTY_OR_PRICE")
+            return
+        stated_ccy = str(r.get("feeCurrency") or "").strip().upper()      # the casing is not part of the meaning: compared as the quote and the base coin are written
+        # A row that states NO fee currency: on a USDT-settled linear contract the fee is paid in the settle coin by definition, so the quote is the answer; on a SPOT fill it is the quote OR the received base coin
+        # and nothing in the row says which. Reading it as the quote booked a base-coin fee of 1e-6 BTC (0.06 USD) as 1e-6 USDT, MEASURED, about 60,000 times too small (round-10 specialist, M1). It is UNKNOWN.
+        fee_ccy = stated_ccy or (QUOTE if cat != "spot" else "")
         fee_signed = fee
         # Only two currencies can be applied: the quote (dollars as stated) and, on a SPOT fill, the symbol's own base coin (the received quantity is net of it; dollars at the fill price). A fee in ANYTHING
         # else (MNT, a third coin, USDC on a USDT contract) can be neither subtracted from this coin's quantity nor valued at this coin's price: it used to be treated as the base coin (a 0.18 MNT fee
@@ -522,10 +543,17 @@ class TestnetExecutor:
         # dollars are not invented, and the ledger and the quality record see it as unknown like a blank fee.
         base = self._spot_base_coin(sym) if cat == "spot" else None
         unsupported = fee_ccy != QUOTE and not (base is not None and fee_ccy == base)
+        if fee < 0 and not unsupported:
+            # A REBATE (negative fee) is never assumed: the ledger flags FEE_REBATE_UNVERIFIED and treats the component as unknown, but this parser clamped it to a MEASURED zero (fee_usd) while the quality record used the
+            # signed figure: two answers to one question (M2). It is an UNKNOWN fee in both; the owner who verifies a real rebate tier can say so.
+            fee_blank, fee, fee_signed = True, D(0), D(0)
         if unsupported:
             fee_blank, fee, fee_signed = True, D(0), D(0)
         elif cat == "spot" and fee_ccy != QUOTE:                         # fee taken from the received base coin: net quantity, fee in USD at the fill price
             if side == "Buy":
+                if qty - fee <= 0:                                       # a fee that is the whole fill (or more) is not a fill the venue made: a corrupt row, set aside like any other
+                    surface("BASE_FEE_NOT_LESS_THAN_QTY")
+                    return
                 qty = qty - fee
                 self._fee_in_qty[link] = self._fee_in_qty.get(link, D(0)) + fee
             fee = fee * px

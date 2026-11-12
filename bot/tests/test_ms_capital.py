@@ -352,17 +352,22 @@ def test_halt_and_drawdown_acknowledgements_are_reachable_only_from_the_owner_cl
     """Red-team MED: the autopilot must never clear its own capital stop. Only the `capital --ack-*` CLI branch may call the acknowledgements; no other function in the tools tree does."""
     import ast
     # every method that clears a stop, re-bases the drawdown or changes what the book counts as cash/sizing: the autopilot's loop, run_once and the session tool never call them (red-team F2)
-    OWNER_ONLY = ("acknowledge_halt", "acknowledge_drawdown", "acknowledge_review", "declare_transfer", "set_reserve_fraction")
+    OWNER_ONLY = ("acknowledge_halt", "acknowledge_drawdown", "acknowledge_review", "declare_transfer", "set_reserve_fraction", "initialise", "rebuild_view", "rebaseline", "accept_older_lineage")
     tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
     offenders = []
     for fn in sorted(os.listdir(tools)):
         if not fn.endswith(".py"):
             continue
         tree = ast.parse(open(os.path.join(tools, fn), encoding="utf-8").read())
+        in_cli_main = set()
+        if fn == "ms_testnet_autopilot.py":                                       # the CLI's ``main`` AND the closures it defines for its gated steps (init_account, rebuild, rebaseline)
+            for top in tree.body:
+                if isinstance(top, ast.FunctionDef) and top.name == "main":
+                    in_cli_main = {id(n) for n in ast.walk(top)}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for sub in ast.walk(node):
-                    if isinstance(sub, ast.Attribute) and sub.attr in OWNER_ONLY and not (fn == "ms_testnet_autopilot.py" and node.name == "main"):
+                    if isinstance(sub, ast.Attribute) and sub.attr in OWNER_ONLY and id(node) not in in_cli_main:
                         offenders.append((fn, node.name, sub.attr))
     offenders = [o for o in offenders if o[0] != "ms_capital.py"]
     assert offenders == [], offenders

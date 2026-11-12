@@ -186,6 +186,15 @@ def hedged_pair_capital_usd(notional_usd: Any, leverage: Any, *, buffer_fraction
     return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "derived", "usd")
 
 
+def perp_only_capital_usd(notional_usd: Any, leverage: Any, *, buffer_fraction: Any = PLAN_BUFFER_FRACTION) -> Quantity:
+    """The cash a PERP-ONLY book (a funding spread or a directional short: no spot leg) COMMITS per ``notional_usd`` of gross perp notional at ``leverage``: the initial margin (notional / leverage) plus the same
+    buffer the pair uses. The sibling of ``hedged_pair_capital_usd`` (which adds the spot leg paid in full): one definition per construction, never a per-USD constant that silently encodes leverage 1."""
+    n, lev, buf = to_decimal(notional_usd), to_decimal(leverage), to_decimal(buffer_fraction)
+    if n <= 0 or lev < 1 or buf < 0:
+        raise EconomicModelError("a capital basis needs notional > 0, leverage >= 1 and a buffer >= 0")
+    return Quantity(n / lev * (Decimal(1) + buf), "derived", "usd")
+
+
 def at_least(q: Quantity, floor: Any) -> Optional[bool]:
     """Tri-state comparison: None when q is unknown (an unknown is neither above nor below)."""
     return None if not q.known else q.value >= to_decimal(floor)

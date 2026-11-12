@@ -274,6 +274,10 @@ def cmd_preflight(ctx: Ctx) -> int:
     save_record(ctx, rec)
     for c in checks:
         ctx.out(f"[{'ok' if c['ok'] else 'FAIL'}] {c['name']}: {c['detail']}")
+    if snapshot:                                                              # informational: it does not fail a typed session, but the unattended autopilot's capital book needs it
+        ref = snapshot.get("account_ref")
+        ctx.out("capital account identity: " + (f"{ref} (basis {snapshot.get('account_identity_basis')})" if ref else
+                "UNAVAILABLE - the venue's key read states no userID, so the autopilot's capital book will refuse every session (owner decision: CAPITAL_ACCOUNT_IDENTITY_FALLBACK=KEY_ID, see RUNBOOKS)"))
     ctx.out(f"preflight {status}")
     return EXIT_OK if status == "PASS" else EXIT_FAIL
 
@@ -291,7 +295,9 @@ def _preflight_reads(ctx: Ctx, manifest: Mapping[str, Any], checks: List[Dict[st
         _check(checks, "server_time_skew", False, f"unreadable: {type(exc).__name__}")
     ok, detail, summary = TT.check_api_key(client)
     _check(checks, "key_permissions", ok, detail if not ok else f"least privilege: {summary.get('granted')}")
-    snap: Dict[str, Any] = {"market": {}, "filters": {}, "spot_baseline": {}}
+    snap: Dict[str, Any] = {"market": {}, "filters": {}, "spot_baseline": {}, "account_ref": summary.get("account_ref"), "account_identity_basis": "USER_ID" if summary.get("account_ref") else "UNAVAILABLE"}
+    if snap["account_ref"] is None and str(ctx.env.get("CAPITAL_ACCOUNT_IDENTITY_FALLBACK", "")).strip().upper() == "KEY_ID" and summary.get("key_id_account_ref"):
+        snap["account_ref"], snap["account_identity_basis"] = summary["key_id_account_ref"], "KEY_ID"          # the OWNER chose this because the venue states no userID; rotating the key is then a new account
     try:
         info = ex._get("/v5/account/info", {}, signed=True)
         _check(checks, "account_mode", str(info.get("unifiedMarginStatus", "")) in ("3", "4", "5", "6") or info.get("marginMode") in ("REGULAR_MARGIN", "ISOLATED_MARGIN", "PORTFOLIO_MARGIN"),
@@ -937,6 +943,27 @@ class Run:
             self.ctx.out(f"funding recognition failed ({type(exc).__name__}); funding stays UNKNOWN")
             return None
 
+    def _suppress_funding_doc(self, reason: str) -> None:
+        """The funding recognition already written for this session is withdrawn: marked ``suppressed`` and every recognition unresolved with nothing booked, so the evidence event and the research feedback row (which read
+        this document) say UNKNOWN too. The ledger's own funding sum is not consulted again after this point."""
+        try:
+            path = self.ctx.path("funding")
+            doc = _read_json(path)
+            if not isinstance(doc, dict):
+                return
+            doc["suppressed"] = reason
+            for r in doc.get("recognitions") or []:
+                if isinstance(r, dict):
+                    r["all_prints_resolved"], r["booked_usd"] = False, None
+                    for pr in r.get("prints") or []:                           # every print was judged against the held window, which is what is now unknown: its verdict and figures are withdrawn too (the
+                        if isinstance(pr, dict):                                # FUNDING_SETTLEMENT evidence events are built from these rows and used to publish BOOKED 0.48 beside a record that said UNKNOWN)
+                            if pr.get("status") != "SUPPRESSED":                # a SECOND withdrawal must not overwrite what the first one kept (the venue's own figures)
+                                pr["was"] = {"status": pr.get("status"), "amount_usd": pr.get("amount_usd"), "expected_usd": pr.get("expected_usd")}
+                            pr["status"], pr["amount_usd"], pr["expected_usd"], pr["reason"] = "SUPPRESSED", None, None, f"SUPPRESSED:{reason}"
+            _write_json(path, doc)
+        except Exception as exc:                                       # noqa: BLE001 - the record's own net is already unknown; a document that cannot be rewritten is stated, never trusted
+            self.ctx.out(f"funding document could not be withdrawn ({type(exc).__name__}); treat its figures as UNKNOWN")
+
     def snapshot_record(self, rec: Dict[str, Any], final: bool = False) -> Dict[str, Any]:
         view = self.ex.venue_state()
         rec["orders"] = _orders_for_record(view["orders"], self.gid)
@@ -967,7 +994,11 @@ class Run:
                 # measurement. (2) The ledger itself flags a conflict in its inputs (a duplicate fill with different content, an orphan fill ...): its partial sums are not a net. (3) The measurement that
                 # would have told us (1) failed. Publishing any of them would turn "we could not tell" into a measured number (the capital book's `known` is None whenever either is None, so such a
                 # session can debit a loss but never credit a gain).
-                rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None, **({"funding_usd": None} if integrity else {})}      # a flagged conflict taints the ledger's funding sum too (two prints for one settlement)
+                # Funding goes with them in EVERY case (round-10 specialist, H1): the held window starts at the first VISIBLE perp fill, so when an execution the venue's list does not show (or a failed measurement) leaves
+                # that start wrong, a settlement the pair was really held through falls BEFORE it, "no settlement while held" is declared (a DERIVED zero) and a held +0.48 USD was published as 0.0 into the record, the
+                # evidence event and the research feedback row. An unknown window cannot be a zero.
+                rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None, "funding_usd": None}
+                self._suppress_funding_doc("FILLS_INCOMPLETE" if incomplete else ("LEDGER_INTEGRITY" if integrity else "MEASUREMENT_FAILED"))
         elif rec["orders"] or rec["executions"]:
             self.execution_quality(view, False, None)
         return view

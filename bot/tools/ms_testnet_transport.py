@@ -27,6 +27,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import bybit_connection as bc  # noqa: E402
+import ms_capital_anchor as AN  # noqa: E402
 import runtime_capability as RC  # noqa: E402
 import venues as _venues  # noqa: E402
 
@@ -253,5 +254,10 @@ def check_api_key(client: Any) -> Tuple[bool, str, Dict[str, Any]]:
         payload = client._request("GET", "/v5/user/query-api", signed=True, retries=1)
     except bc.BybitAPIError as exc:
         return False, f"KEY_CHECK_FAILED:retCode={exc.ret_code}:{type(exc).__name__}", {}
-    bad, summary = key_permission_findings((payload or {}).get("result"))
+    result = (payload or {}).get("result")
+    bad, summary = key_permission_findings(result)
+    # WHICH account these credentials belong to, as the VENUE states it (``userID``): only its hash leaves this function (the capital book is bound to it; the raw id and the key never are). None when the
+    # venue did not state one: the capital book then refuses, it never guesses.
+    summary["account_ref"] = AN.account_ref_of("testnet", result.get("userID")) if isinstance(result, Mapping) else None
+    summary["key_id_account_ref"] = AN.account_ref_of_key("testnet", result.get("id")) if isinstance(result, Mapping) else None      # the owner-chosen FALLBACK identity (see ms_capital_anchor); a hash, never the id
     return (not bad), ("ok" if not bad else ",".join(bad)), summary

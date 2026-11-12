@@ -141,7 +141,9 @@ def test_a_conflicted_funding_figure_is_not_published_but_a_mere_valuation_flag_
     d2 = _ready(world2)
     assert world2.run("execute", "--confirm-plan-digest", d2, typed=d2) == 0, world2.text()[-300:]
     assert world2.record()["net"]["funding_usd"] == 1.25, "a flag that is not an integrity conflict must not hide a measured funding figure"
-    # unlisted executions null the fees and the price leg (a lower bound is not a measurement) but say nothing about the funding the venue paid
+    # unlisted executions null the fees and the price leg (a lower bound is not a measurement) AND the funding (round-10 specialist H1): the held window starts at the first VISIBLE perp fill, so a fill the venue's
+    # list does not show can leave that start wrong, a settlement the pair really was held through falls before it, and "no settlement while held" is a DERIVED zero. An unknown window cannot be a zero.
+    # (This was pinned the other way round, 1.25, before: that expectation was the defect, not a control.)
     monkeypatch.setattr(S.AC.Ledger, "canonical_net", with_flags())
     world3 = World(tmp_path / "third", monkeypatch)
     for i in range(1, 9):
@@ -149,7 +151,7 @@ def test_a_conflicted_funding_figure_is_not_published_but_a_mere_valuation_flag_
     d3 = _ready(world3)
     assert world3.run("execute", "--confirm-plan-digest", d3, typed=d3) == 0, world3.text()[-300:]
     n3 = world3.record()["net"]
-    assert n3["fees_usd"] is None and n3["price_pnl_usd"] is None and n3["funding_usd"] == 1.25, "incomplete executions are not a funding conflict"
+    assert n3["fees_usd"] is None and n3["price_pnl_usd"] is None and n3["funding_usd"] is None, f"incomplete executions leave the held window unknown: a funding figure ({n3}) is a derived zero or a partial sum, not a measurement"
 
 
 def test_a_session_with_a_clean_ledger_keeps_its_measured_net(tmp_path, monkeypatch):

@@ -60,7 +60,7 @@ def read_json(path: str) -> Optional[Any]:
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):                       # a deeply nested file is as unreadable as a corrupt one (RecursionError is not a ValueError)
         return None
 
 
