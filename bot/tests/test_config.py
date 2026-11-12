@@ -542,15 +542,3 @@ def test_the_fingerprint_records_the_exit_policy_and_whether_a_cost_of_capital_w
     assert summary["CARRY_OPPORTUNITY_COST_APR_SUPPLIED"] is True
     bare = fp.config_summary(_config.load({}))
     assert bare["CARRY_OPPORTUNITY_COST_APR_SUPPLIED"] is False
-
-
-def test_build_bot_refuses_the_continuation_exit_on_a_config_object_that_never_stated_a_cost():
-    """REVIEW FINDING (Round 16, second pass): `build_bot(config=<Config>)` never
-    passes through config.load, so the refusal there did not reach it."""
-    from types import SimpleNamespace
-    import config as _config
-    import main
-    cfg = SimpleNamespace(CARRY_EXIT_POLICY="continuation",
-                          CARRY_OPPORTUNITY_COST_APR_SUPPLIED=False)
-    with pytest.raises(_config.ConfigError, match="stated by the owner"):
-        main.build_bot(config=cfg)

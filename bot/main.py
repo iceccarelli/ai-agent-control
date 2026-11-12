@@ -2461,16 +2461,6 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
     for any of them.
     """
     cfg = overrides.pop("config", None) or _config.get_config_object()
-    # The continuation exit prices holding against the owner's cost of capital:
-    # `config.load` refuses it unless one was STATED, and a Config object built
-    # by any other route (a caller passing `config=`) must meet the same rule
-    # here, before anything is constructed. An unstated cost is not zero.
-    if (str(getattr(cfg, "CARRY_EXIT_POLICY", "funding_streak")) == "continuation"
-            and not getattr(cfg, "CARRY_OPPORTUNITY_COST_APR_SUPPLIED", False)):
-        raise _config.ConfigError(
-            "CARRY_EXIT_POLICY=continuation needs CARRY_OPPORTUNITY_COST_APR "
-            "stated by the owner (an explicit 0 is a statement; an absent "
-            "value is not)")
     _config.setup_logging(cfg)
     if attach_strategy is None:
         attach_strategy = bool(getattr(cfg, "ENTRIES_ENABLED", True))
@@ -2605,6 +2595,17 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 ("UNKNOWN (an inventory leg was not valued)"
                  if _st["pair_net_usd"] is None else f"${_st['pair_net_usd']:.2f}"))
 
+        # The continuation exit prices holding against the owner's cost of
+        # capital: `config.load` refuses it unless one was STATED, and a Config
+        # object built by any other route (a caller passing `config=`) must meet
+        # the same rule here, before the engine exists. An unstated cost is not
+        # zero. (Read as `cfg.CARRY_*`, never through a getattr fallback.)
+        if (str(cfg.CARRY_EXIT_POLICY) == "continuation"
+                and not cfg.CARRY_OPPORTUNITY_COST_APR_SUPPLIED):
+            raise _config.ConfigError(
+                "CARRY_EXIT_POLICY=continuation needs CARRY_OPPORTUNITY_COST_APR "
+                "stated by the owner (an explicit 0 is a statement; an absent "
+                "value is not)")
         bot.carry = CarryEngine(
             broker=_ledger.LedgerBroker(
                 CarryBroker(
