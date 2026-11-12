@@ -838,6 +838,16 @@ def test_levels_are_cumulative_and_nothing_above_research_ready_without_an_evalu
     assert q["levels"]["PROMISING"]["reached"] is False and q["levels"]["PROSPECTIVE"]["reached"] is False
 
 
+def test_the_readiness_vocabulary_states_what_its_independence_count_cannot_see():
+    """PROMISING stands on an ESTIMATED count of independent observations and a Holm-adjusted p computed from it. The estimate assumes autoregressive-type dependence and is blind to a slow
+    hidden regime (the Round 14 audit measured false-pass rates 5 to 28 times the stated level on regime-driven nulls at n 100 to 250), so every readiness result says so, reached or not."""
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
+          "terminal_exit_unpriced": 0}
+    for r in (_lv(), _lv(evaluation=ev, executable=True)):
+        text = " ".join(r["notes"])
+        assert "PROMISING" in text and "AR-type" in text and "regime" in text and "dwell" in text and "reason to look" in text, text
+
+
 def test_a_rejected_evaluation_is_rejected_and_not_promising():
     ev = {"status": "WALK_FORWARD_DONE", "verdict": "REJECTED", "oos_mean_total_bps_per_row": -4.0, "p_adjusted": 0.9, "oos_independent_observations": 80, "terminal_exit_unpriced": 0}
     r = _lv(evaluation=ev)

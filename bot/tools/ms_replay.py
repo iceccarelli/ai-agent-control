@@ -936,7 +936,8 @@ def observations(res: ReplayResult) -> List[Observation]:
 
 def independent_observations(obs: Sequence[Observation], embargo_ms: int = 0) -> List[Observation]:
     """Earliest-finish greedy: keep an observation only if it starts AFTER the last kept one ended (+embargo). Overlapping trades (across ANY symbols: they share the market
-    and the same funding regime) are NOT independent and never counted as such."""
+    and the same funding regime) are NOT independent and never counted as such. Non-overlap in time is NECESSARY for independence, not SUFFICIENT: consecutive trades inside one funding regime are
+    serially dependent, so this count is an UPPER BOUND on the independent observations (see ``_ci``)."""
     kept: List[Observation] = []
     end = None
     for o in sorted(obs, key=lambda x: (x.exit_ts, x.entry_ts, x.group_id)):
@@ -979,6 +980,9 @@ def _clean(x: Any) -> Any:
 
 
 def _ci(values: Sequence[float], trials: int) -> Dict[str, Any]:
+    """A NORMAL interval on the kept observations with NO dependence adjustment and no t correction. Measured by the Round 14 audit under a ZERO true mean: at a lag-1 autocorrelation of 0.3 the
+    lower 95% bound is above zero 7.9% of the time (nominal 2.5%) and the Bonferroni-adjusted bound 2.1% (nominal 0.21%); at 0.6, 17% and 8.6%. ``promotion_eligible`` is hard False, so this is a
+    presentational limit, but never read ``reliable`` as 'statistically independent and calibrated'."""
     n = len(values)
     if n < 2:
         return {"n": n, "mean": values[0] if n else None, "lo95": None, "hi95": None, "lo_adj": None, "hi_adj": None, "method": "NONE_N_LT_2", "reliable": False}

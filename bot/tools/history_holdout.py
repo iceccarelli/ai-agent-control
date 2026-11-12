@@ -360,7 +360,8 @@ def _arithmetic(a: int, b: int, cut: int, *, requested: Optional[Tuple[int, int]
     out = {"standard_grid_days_required": need, "explore_days": explore, "reserved_days": reserved, "explore_supports_standard_grid": explore >= need, "reserved_rows_possible": rows,
            "oos_verdict_floor_rows": floor, "reserved_supports_a_verdict_above_insufficient": rows >= floor,
            "arithmetic": f"the standard 60 x 7-day grid needs {need} days; the explore window has {explore}, the reserved region {reserved} ({rows} non-overlapping 7-day rows; the verdict "
-                         f"ladder needs {floor} independent out-of-sample observations to say more than INSUFFICIENT_DATA)"}
+                         f"ladder needs {floor} independent out-of-sample observations to say more than INSUFFICIENT_DATA; weekly funding rows are serially dependent, so rows OVERSTATE independent "
+                         f"observations: at a weekly autocorrelation of 0.3 to 0.5 about 1.5 to 2 times as many rows are needed, and no row count can see a regime longer than the window)"}
     if rows < floor:
         out["warning"] = (f"the reserved region holds {rows} non-overlapping 7-day rows, fewer than the {floor} the verdict ladder needs: a final read of this size can REJECT a hypothesis "
                           f"but can never support more than INSUFFICIENT_DATA")
