@@ -190,6 +190,17 @@ def test_symbols_are_listed_across_pages(tmp_path):
     assert a.list_symbols("fundingRate") == ["1000PEPEUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
+def test_a_listed_directory_outside_the_requested_prefix_is_never_a_symbol(tmp_path):
+    """The symbol is what FOLLOWS the requested prefix. A directory the listing returns from elsewhere is ignored even when slicing off ``len(prefix)`` characters of it would leave a
+    symbol-shaped tail (found by a mutant that removed the prefix filter and survived every other test)."""
+    net = FakeNet()
+    base = "data/futures/um/monthly/fundingRate/"
+    foreign_lookalike = "X" * len(base) + "ETHUSDT/"                                        # sliced by length alone this reads as ETHUSDT
+    foreign_dataset = "data/futures/um/monthly/klines/" + "SOLUSDT/"
+    net.add(BA.listing_url(base), _listing([base + "BTCUSDT/", foreign_lookalike, foreign_dataset]))
+    assert archive(tmp_path, net).list_symbols("fundingRate") == ["BTCUSDT"]
+
+
 def test_months_come_from_zip_keys_only_and_never_from_checksum_or_foreign_keys(tmp_path):
     net = FakeNet()
     pre = "data/futures/um/monthly/klines/BTCUSDT/1d/"
