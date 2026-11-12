@@ -93,10 +93,12 @@ def test_t_sf_and_isf_invert_each_other_and_are_symmetric():
     assert 0.0 < sp.student_t_sf(60.0, 5) < 1e-6          # a far tail is small, not zero
 
 
-def test_t_approaches_the_normal_and_agrees_with_the_evidence_stats_expansion():
+def test_t_approaches_the_normal_and_agrees_with_the_evidence_stats_critical_value():
+    """``evidence_stats._t_crit`` was a Cornish-Fisher expansion, hence the loose 1e-3 and 1e-4 here; it is the exact quantile now (an independent implementation), so the two agree."""
     assert abs(sp.student_t_sf(1.96, 1e7) - 0.025) < 1e-4
-    assert abs(sp.student_t_isf(0.025, 30) - ES._t_crit(30, 0.05)) < 1e-3
-    assert abs(sp.student_t_isf(0.025, 200) - ES._t_crit(200, 0.05)) < 1e-4
+    assert abs(sp.student_t_isf(0.025, 30) - ES._t_crit(30, 0.05)) < 1e-9
+    assert abs(sp.student_t_isf(0.025, 200) - ES._t_crit(200, 0.05)) < 1e-9
+    assert abs(sp.student_t_isf(0.05, 2) - ES._t_crit(2, 0.10)) < 1e-9
 
 
 def test_noncentral_t_with_zero_noncentrality_is_the_central_t_and_grows_with_delta():
