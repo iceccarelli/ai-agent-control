@@ -16,6 +16,7 @@ cent.
 """
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import sys
@@ -151,25 +152,84 @@ class TestTheSweepIsTheSameSimulation:
         assert [c["net"] for c in one] == [c["net"] for c in many]
 
 
+def best_seconds_per_run(run, repeats, clock=time.perf_counter):
+    """The FASTEST of ``repeats`` timed calls of ``run`` (which returns how many simulations it did), in seconds per simulation.
+
+    A speed claim is about what the code can do. Main's own CI run on the PR #257 merge commit failed this check twice in a row on Python 3.11 (2.1x, then 5.8x: the native sweep at 7.9 and 5.6 ms per
+    simulation instead of well under 1 ms) on a tree that passed on the PR head and on 3.12. A sample that a collector pass or a stalled runner landed in says something about the process, not the code;
+    the garbage collector is off while timing (as ``timeit`` does) and the best of several samples is taken."""
+    best = None
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()                                    # as timeit does: a collection over the heap of a 17,000-test process (about 0.5 s) must not land inside a timed window
+    try:
+        for _ in range(repeats):
+            started = clock()
+            count = run()
+            per_run = (clock() - started) / count
+            best = per_run if best is None else min(best, per_run)
+    finally:
+        if was_enabled:
+            gc.enable()
+    return best
+
+
+class TestTheSpeedCheckIsAboutTheCodeNotTheMachine:
+    def test_one_stalled_sample_does_not_decide_the_result(self):
+        ticks = iter([0.0, 0.5, 1.0, 1.004, 2.0, 2.0042])         # sample 1 stalls (0.5 s), samples 2 and 3 take 4.0 ms and 4.2 ms
+        best = best_seconds_per_run(lambda: 2, 3, clock=lambda: next(ticks))
+        assert best == pytest.approx(0.002)                       # 4.0 ms / 2 simulations; the 0.5 s stall is ignored
+
+    def test_it_is_still_the_fastest_when_every_sample_is_slow(self):
+        ticks = iter([0.0, 0.3, 1.0, 1.2, 2.0, 2.5])
+        assert best_seconds_per_run(lambda: 1, 3, clock=lambda: next(ticks)) == pytest.approx(0.2)
+
+
+    def test_the_collector_is_off_while_timing_and_back_on_after_even_if_the_run_raises(self):
+        seen = []
+
+        def run():
+            seen.append(gc.isenabled())
+            return 1
+        assert gc.isenabled()
+        best_seconds_per_run(run, 2)
+        assert seen == [False, False] and gc.isenabled()
+
+        def boom():
+            raise RuntimeError("x")
+        with pytest.raises(RuntimeError):
+            best_seconds_per_run(boom, 1)
+        assert gc.isenabled()
+        gc.disable()
+        try:
+            best_seconds_per_run(run, 1)
+            assert not gc.isenabled()                 # a caller that had it off finds it off
+        finally:
+            gc.enable()
+
+
 class TestItIsActuallyFaster:
     def test_the_sweep_beats_python_by_at_least_twenty_times(self, native, rows):
         """Not a benchmark for its own sake: if the core is not much faster
-        there is no reason to carry C++ in this repository at all."""
+        there is no reason to carry C++ in this repository at all. The threshold is unchanged (20x); each side is timed as its fastest of several samples."""
         base = core.params(gated=True, overlay=True, impact_bps=1.093,
                            round_trip_bps=11.0)
         entry = [0.1 * i for i in range(1, 13)]
-        started = time.perf_counter()
-        cells = native.sweep(rows, base, entry_grid=entry, hold_grid=[7.0, 30.0],
-                             exit_grid=[1, 3, 6])
-        native_per_run = (time.perf_counter() - started) / len(cells)
 
-        started = time.perf_counter()
-        for value in entry[:3]:
-            cb.simulate_settlements_series(rows, notional=100_000.0,
-                                           borrow_apr=0.0, gated=True,
-                                           impact_bps=1.093, mode=cb.OVERLAY,
-                                           entry_bps=value)
-        python_per_run = (time.perf_counter() - started) / 3
+        def native_sweep():
+            return len(native.sweep(rows, base, entry_grid=entry, hold_grid=[7.0, 30.0],
+                                    exit_grid=[1, 3, 6]))
+
+        def python_runs():
+            for value in entry[:3]:
+                cb.simulate_settlements_series(rows, notional=100_000.0,
+                                               borrow_apr=0.0, gated=True,
+                                               impact_bps=1.093, mode=cb.OVERLAY,
+                                               entry_bps=value)
+            return 3
+
+        native_per_run = best_seconds_per_run(native_sweep, 5)
+        python_per_run = best_seconds_per_run(python_runs, 3)
         assert python_per_run / native_per_run > 20.0, (
             f"only {python_per_run / native_per_run:.1f}x faster")
 
