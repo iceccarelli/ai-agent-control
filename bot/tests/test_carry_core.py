@@ -16,6 +16,7 @@ cent.
 """
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import sys
@@ -154,14 +155,22 @@ class TestTheSweepIsTheSameSimulation:
 def best_seconds_per_run(run, repeats, clock=time.perf_counter):
     """The FASTEST of ``repeats`` timed calls of ``run`` (which returns how many simulations it did), in seconds per simulation.
 
-    A speed claim is about what the code can do. One sample that a shared CI runner happened to stall (main's own run once measured the native sweep at 7.9 ms per
-    simulation instead of well under 1 ms: 2.1x instead of > 20x) says something about the machine, not the code; the best of several samples does not."""
+    A speed claim is about what the code can do. Main's own CI run on the PR #257 merge commit failed this check twice in a row on Python 3.11 (2.1x, then 5.8x: the native sweep at 7.9 and 5.6 ms per
+    simulation instead of well under 1 ms) on a tree that passed on the PR head and on 3.12. A sample that a collector pass or a stalled runner landed in says something about the process, not the code;
+    the garbage collector is off while timing (as ``timeit`` does) and the best of several samples is taken."""
     best = None
-    for _ in range(repeats):
-        started = clock()
-        count = run()
-        per_run = (clock() - started) / count
-        best = per_run if best is None else min(best, per_run)
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()                                    # as timeit does: a collection over the heap of a 17,000-test process (about 0.5 s) must not land inside a timed window
+    try:
+        for _ in range(repeats):
+            started = clock()
+            count = run()
+            per_run = (clock() - started) / count
+            best = per_run if best is None else min(best, per_run)
+    finally:
+        if was_enabled:
+            gc.enable()
     return best
 
 
@@ -174,6 +183,29 @@ class TestTheSpeedCheckIsAboutTheCodeNotTheMachine:
     def test_it_is_still_the_fastest_when_every_sample_is_slow(self):
         ticks = iter([0.0, 0.3, 1.0, 1.2, 2.0, 2.5])
         assert best_seconds_per_run(lambda: 1, 3, clock=lambda: next(ticks)) == pytest.approx(0.2)
+
+
+    def test_the_collector_is_off_while_timing_and_back_on_after_even_if_the_run_raises(self):
+        seen = []
+
+        def run():
+            seen.append(gc.isenabled())
+            return 1
+        assert gc.isenabled()
+        best_seconds_per_run(run, 2)
+        assert seen == [False, False] and gc.isenabled()
+
+        def boom():
+            raise RuntimeError("x")
+        with pytest.raises(RuntimeError):
+            best_seconds_per_run(boom, 1)
+        assert gc.isenabled()
+        gc.disable()
+        try:
+            best_seconds_per_run(run, 1)
+            assert not gc.isenabled()                 # a caller that had it off finds it off
+        finally:
+            gc.enable()
 
 
 class TestItIsActuallyFaster:
