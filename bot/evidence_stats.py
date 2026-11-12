@@ -73,12 +73,93 @@ def _mean(v: Sequence[float]) -> float:
     return sum(v) / len(v)
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction of the incomplete beta function (modified Lentz). It converges in tens of terms for every argument the t quantile reaches; failing to converge is an
+    error, never a number."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 5000):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < 3e-16:
+            return h
+    raise ArithmeticError("the incomplete beta continued fraction did not converge")
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """Regularised incomplete beta function I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+#: At and above this many degrees of freedom the three-term Cornish-Fisher expansion stands in for the exact evaluation: its first neglected term is about 3e-11 at 1e4 degrees of
+#: freedom (alpha 0.003 to 0.10, shrinking as df^-3), while the direct evaluation loses digits to the cancellation in ``lgamma(a + b) - lgamma(a) - lgamma(b)`` (about 2.5e-11 at
+#: 1e4, 1.4e-10 at 1e5 and 1.5e-9 at 1e6), which would also make the value wobble in df.
+_T_EXPANSION_DF = 1e4
+
+
 def _t_crit(df: float, alpha: float = 0.05) -> float:
-    """Two-sided Student-t critical value by the Cornish-Fisher expansion (stdlib only); adequate for
-    df >= 2 and never below the normal value."""
-    z = NormalDist().inv_cdf(1.0 - alpha / 2.0)
-    df = max(df, 2.0)
-    return z + (z ** 3 + z) / (4 * df) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * df * df)
+    """The two-sided Student-t critical value: the t > 0 with P(|T| > t) = alpha for any real df > 0 (stdlib only), never below the normal value. Intended for confidence levels
+    of 50% and above (alpha <= 0.5): the repository uses 0.10, 0.05 and the family-wise 0.003125. Measured against scipy (alpha from 1e-6 to 0.5) it agrees to about 2e-12
+    (relative) up to 1e3 degrees of freedom, 4e-11 up to 1e4 and 2e-10 above it.
+
+    It was a Cornish-Fisher expansion clamped at df >= 2, and that is anti-conservative exactly where the intervals lean on it: 2.762 for the 90% interval at df = 2 (the
+    3-batch interval) where the table says 2.920 (the old value was 5.4% too small; 10.5% at 95%, 27% at alpha 0.01, 40.7% at the opportunity engine's family-wise alpha),
+    3.0% too small at df 2.5, 1.8% at 3, 0.8% at 4, and at df = 1 (the 2 batches a sample of 8 to 11 gets) the clamp returned the df = 2 value where the table says 6.314.
+    A critical value that is too small is an interval that is too narrow."""
+    try:
+        df_, alpha_ = float(df), float(alpha)
+    except (TypeError, ValueError):
+        raise ValueError(f"df and alpha must be numbers, got {df!r} and {alpha!r}") from None
+    if not df_ > 0.0:                                                   # also false for NaN
+        raise ValueError(f"the degrees of freedom must be positive, got {df!r}")
+    if not 0.0 < alpha_ < 1.0:
+        raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+    z = -NormalDist().inv_cdf(alpha_ / 2.0)                             # not inv_cdf(1 - alpha / 2): that rounds to 1 for a tiny alpha and loses the tail
+    if df_ >= _T_EXPANSION_DF:
+        return z + (z ** 3 + z) / (4.0 * df_) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96.0 * df_ * df_)
+
+    def tail(t: float) -> float:
+        return _betainc(df_ / 2.0, 0.5, df_ / (df_ + t * t))            # P(|T| > t)
+
+    lo, hi = z, 2.0 * z                                                 # a t tail is heavier than the normal one, so the root lies above z
+    for _ in range(400):
+        if tail(hi) <= alpha_:
+            break
+        lo, hi = hi, hi * 2.0
+    else:
+        raise ValueError(f"alpha {alpha!r} is too small for a critical value to be found at df {df!r}")
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if tail(mid) > alpha_:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo <= 1e-14 * hi:
+            break
+    return 0.5 * (lo + hi)
 
 
 BATCHES = 6

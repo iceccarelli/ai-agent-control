@@ -236,9 +236,15 @@ def test_the_directional_evaluators_refuse_short_history_and_a_missing_cost():
 
 
 def test_trend_is_a_candidate_where_persistent_drift_really_exists_and_reversion_never_is_there():
-    """Measured at the family-wise alpha over 100 days of 5-minute bars: the trend variants are a candidate in about 5 of 6 worlds
-    with a real, persistent drift (power is NOT 100 %: that is the price of the multiple-testing correction), and the
-    mean-reversion hypothesis is never a candidate on the same prices."""
+    """Measured at the family-wise alpha over 100 days of 5-minute bars: with a real, persistent drift the trend variants CAN be a candidate, and the mean-reversion hypothesis
+    never is on the same prices.
+
+    HOW OFTEN is no longer 'about 5 of 6 worlds'. That figure was measured with an interval that was too narrow: the 3-batch t interval took a Cornish-Fisher critical value
+    that, at this family-wise alpha (0.05 / 16), was 10.6 where the exact Student-t value for 2 degrees of freedom is 17.8 (40.7% too small, ``evidence_stats._t_crit``). With
+    the exact value the trend variants are a candidate in 2 of these 6 worlds (11 of 40 worlds, 27.5%; 24 of 40, 60%, with the old value), and a 3-fold stronger drift barely
+    moves it (4 of 12): the widest-of interval at a family-wise alpha is conservative where the dependence is strong, because three batch means carry two degrees of freedom.
+    That is the pre-registered rule's own conservatism, now stated honestly; it is not tuned away here. The upper bound below is what stops the narrow interval coming back
+    (it gave 5)."""
     ev = good_ev()
     t_hits = m_hits = m_unattractive = 0
     for sd in range(6):
@@ -249,7 +255,7 @@ def test_trend_is_a_candidate_where_persistent_drift_really_exists_and_reversion
         m_hits += m.status == OE.Status.RESEARCH_CANDIDATE
         m_unattractive += m.status == OE.Status.ECONOMICALLY_UNATTRACTIVE
         assert "beat zero AND buy-and-hold" in t.metrics["baseline"] and t.authorizes_trading is False
-    assert t_hits >= 3 and m_hits == 0 and m_unattractive >= 4, (t_hits, m_hits, m_unattractive)
+    assert 1 <= t_hits <= 3 and m_hits == 0 and m_unattractive >= 4, (t_hits, m_hits, m_unattractive)
 
 
 def test_NULL_neither_directional_hypothesis_becomes_a_candidate_on_a_random_walk():
