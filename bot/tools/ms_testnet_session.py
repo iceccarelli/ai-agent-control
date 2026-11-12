@@ -957,7 +957,8 @@ class Run:
                     r["all_prints_resolved"], r["booked_usd"] = False, None
                     for pr in r.get("prints") or []:                           # every print was judged against the held window, which is what is now unknown: its verdict and figures are withdrawn too (the
                         if isinstance(pr, dict):                                # FUNDING_SETTLEMENT evidence events are built from these rows and used to publish BOOKED 0.48 beside a record that said UNKNOWN)
-                            pr["was"] = {"status": pr.get("status"), "amount_usd": pr.get("amount_usd"), "expected_usd": pr.get("expected_usd")}
+                            if pr.get("status") != "SUPPRESSED":                # a SECOND withdrawal must not overwrite what the first one kept (the venue's own figures)
+                                pr["was"] = {"status": pr.get("status"), "amount_usd": pr.get("amount_usd"), "expected_usd": pr.get("expected_usd")}
                             pr["status"], pr["amount_usd"], pr["expected_usd"], pr["reason"] = "SUPPRESSED", None, None, f"SUPPRESSED:{reason}"
             _write_json(path, doc)
         except Exception as exc:                                       # noqa: BLE001 - the record's own net is already unknown; a document that cannot be rewritten is stated, never trusted

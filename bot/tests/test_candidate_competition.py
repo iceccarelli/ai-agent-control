@@ -317,7 +317,7 @@ def test_a_short_cash_series_does_not_crash_the_verdict_and_is_stated_unknown(mo
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 def _stub_xs(monkeypatch, nominal, blocks):
     fam = {"verdict": "INSUFFICIENT_DATA", "status": "WALK_FORWARD_DONE", "is_carry": False, "independent_holding_rows": 80, "oos_mean_total_bps_per_row": nominal, "vs_cash": blocks,
-           "survivorship": "SURVIVORS_ONLY", "n_variants_counted": 5, "reason": "x"}
+           "survivorship": "SURVIVORS_ONLY", "n_variants_counted": 5, "n_variants_used_for_nominal_p": 3, "reason": "x"}
     res = {"status": "EVALUATED", "evaluation": {"families": {"PERP_FUNDING_SPREAD": fam}, "survivorship": "SURVIVORS_ONLY", "input": {"holdout": {"status": "RESERVED"}}}}
     monkeypatch.setattr(CC_, "run_cross_sectional", lambda *a, **k: res)
 
@@ -342,3 +342,10 @@ def test_the_cross_sectional_row_says_nominal_and_not_a_comparison_with_cash_whe
     r = _xs_row(tmp_path)
     assert r["net_edge"]["value_bps"] == 30.0
     assert "NOMINAL_BPS_OF_GROSS_NOTIONAL" in r["net_edge"]["basis"] and "NOT a comparison with cash" in r["net_edge"]["basis"] and "EXCESS_OVER_CASH" not in r["net_edge"]["basis"], r["net_edge"]["basis"]
+
+
+def test_the_family_row_carries_both_variant_counts_so_a_p_value_is_never_read_against_the_wrong_one(tmp_path, monkeypatch):
+    blk = lambda x: {"verdict": "INSUFFICIENT_DATA", "status": "WALK_FORWARD_DONE", "oos_mean_excess_bps_of_capital_per_row": x, "capital_per_gross_notional": 1.02}      # noqa: E731
+    _stub_xs(monkeypatch, 30.0, {"HISTORICAL": blk(-2.0)})
+    f = _xs_row(tmp_path)["families"]["PERP_FUNDING_SPREAD"]
+    assert f["n_variants_counted"] == 5 and f["n_variants_used_for_nominal_p"] == 3

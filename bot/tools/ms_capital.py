@@ -615,20 +615,31 @@ class CapitalBook:
 
     def rebuild_view(self) -> str:
         """The owner's decision to replace a book that does not match its lineage (VIEW_TAMPERED, VIEW_UNBOUND) with the lineage's own head; the rejected file is kept. ANCHOR_BEHIND_BOOK is never rebuilt: the
-        book there is NEWER than the lineage, and replacing it would be the rollback this exists to prevent."""
+        book there is NEWER than the lineage, and replacing it would be the rollback this exists to prevent. That holds whatever the REASON of the refusal is: a view or a readable mark that is AHEAD of the lineage
+        refuses here even when the refusal at hand is VIEW_TAMPERED (a damaged mark used to turn this command into the rollback; second red team, NEW-1)."""
         if self.anchor is None:
             raise BookRefused("NOT_ANCHORED", "a bare book has no lineage")
         try:
             with self._locked():
+                an = self.anchor
                 try:
-                    self.anchor.open_view()
+                    an.open_view()
                     return "NOTHING_TO_REBUILD"
                 except AN.AnchorRefused as exc:
                     if exc.code not in ("VIEW_TAMPERED", "VIEW_UNBOUND"):
                         raise
-                entries = self.anchor.entries()
-                self.anchor._preserve("rejected")
-                self.anchor._heal(AN.rebuild(entries), entries[-1], "OWNER_REBUILD", None)
+                entries = an.entries()
+                if not entries:
+                    raise AN.AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", "no lineage exists: there is nothing to rebuild a view from")
+                nf = an.newer_facts()
+                ahead = [k for k in ("view", "hwm") if nf.get(k) and isinstance(nf[k].get("seq"), int) and nf[k]["seq"] > entries[-1]["seq"]]
+                if ahead and not (an._discarded(entries) >= {(nf[k]["seq"], nf[k]["head"]) for k in ahead}):
+                    raise AN.AnchorRefused("ANCHOR_BEHIND_BOOK", f"this root remembers lineage seq {max(nf[k]['seq'] for k in ahead)} ({'/'.join(ahead)}) and the lineage ends at seq {entries[-1]['seq']}: an older anchor was "
+                                                                 "restored. Nothing was rebuilt (see capital --accept-older-lineage)")
+                an._preserve("rejected")
+                if an._read_hwm()[0] == "unreadable":
+                    an._preserve_path(an.hwm_path, "unreadable")
+                an._heal(AN.rebuild(entries), entries[-1], "OWNER_REBUILD", None)
                 return "REBUILT"
         except AN.AnchorRefused as exc:
             raise BookRefused(exc.code, exc.detail) from None
@@ -650,11 +661,15 @@ class CapitalBook:
                 except AN.AnchorRefused as exc:
                     if exc.code != "ANCHOR_BEHIND_BOOK":
                         raise
-                an.check_witness(publish=False)                                              # a witness that knows a newer head refuses HERE, before anything is written
+                wstate = an.check_witness(publish=False)                                     # a witness that knows a newer head refuses HERE, before anything is written
+                if getattr(an.witness, "configured", False) and wstate == "UNAVAILABLE":
+                    # an OPTIONAL witness that cannot answer is not 'no witness': accepting an older history blind to it would leave the account refused for good (LOCAL_BEHIND_WITNESS on every open, and every owner act
+                    # needs an open book) the moment the witness answers again (second red team, NEW-3)
+                    raise AN.AnchorRefused("WITNESS_UNAVAILABLE", "a witness is configured and cannot be read: an older lineage is never accepted blind to it (retry when it answers, or unset CAPITAL_WITNESS deliberately)")
                 entries = an.entries()
                 discarded = an.newer_facts()
-                an._preserve("rejected-newer")
-                an._preserve_path(an.hwm_path, "rejected-newer")
+                if not (an._preserve("rejected-newer") and an._preserve_path(an.hwm_path, "rejected-newer")):
+                    raise AN.AnchorRefused("EVIDENCE_NOT_KEPT", "the newer view or mark could not be copied aside: nothing was changed (an act that discards history keeps what it discards)")
                 b = AN.rebuild(entries)
                 prev = b.get("review_required")
                 b["review_required"] = {"code": "ROLLBACK_ACCEPTED", "session_id": None, "delta_usd": None, "known_usd": None, "set_ms": int(time.time() * 1000), "older_head_seq": entries[-1]["seq"],

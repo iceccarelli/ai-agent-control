@@ -350,3 +350,18 @@ def test_the_decision_record_and_the_evidence_event_state_the_epoch_and_the_resu
     assert ev[2]["epoch"] == 1 and D(ev[2]["all_epochs_verified_result_usd"]) == D("-10"), "a new epoch must never read as a fresh account"
     ctx = AP._decision_context(str(w.tmp / "eng_epochs"), "0")
     assert ctx["portfolio"]["epoch"] == 1 and D(ctx["portfolio"]["all_epochs_verified_result_usd"]) == D("-10"), ctx["portfolio"]
+
+
+def test_a_rollback_accepted_review_is_shown_as_what_it_is_not_as_unexplained_cash(w):
+    """Second red team, L1: every review was reported to the owner as ACCOUNT_CASH_UNEXPLAINED."""
+    _profit_world(w)
+    eng = w.tmp / "eng_review"
+    book = CT.anchored(str(eng))
+    with book._locked():
+        b = book.load()
+        b["review_required"] = {"code": "ROLLBACK_ACCEPTED", "session_id": None, "delta_usd": None, "known_usd": None, "set_ms": 1}
+        book._save(b, "ACK_REVIEW", {"test": True})
+    res = session(w, eng)
+    assert res["result"] == "REFUSED" and res["why"] == ["ROLLBACK_ACCEPTED"], res
+    alert = ES.EngineState(str(eng), lambda: 0).read("ALERT") or {}
+    assert alert.get("code") == "ROLLBACK_ACCEPTED" and not posts(w)

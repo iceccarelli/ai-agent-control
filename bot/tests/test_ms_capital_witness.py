@@ -45,6 +45,7 @@ class FakePostgrest:
         self.json_blind = False                 # a GET whose filter is a JSON path (payload->>x) answers [] for rows that DO exist (the head query is the one thing never run against the real PostgREST)
         self.garbage = False                    # the answer is not HTTP at all (a malformed status line)
         self.lag = 0                            # the head query hides the newest N capital rows (a read replica that has not caught up with the write)
+        self.lag_reads = 0                      # ... for the next N head queries only (a replica that catches up)
 
     def put(self, row):
         cur = self.rows.get(row["event_id"])
@@ -70,8 +71,12 @@ class FakePostgrest:
                 rows = [r for r in rows if str(r["payload"].get(f)) == v.removeprefix("eq.")]
         if q.get("order") == "seq.desc":
             rows.sort(key=lambda r: -r["seq"])
-            if self.lag and any(k.startswith("payload->>") for k in q):
-                rows = rows[self.lag:]
+            if any(k.startswith("payload->>") for k in q):
+                if self.lag:
+                    rows = rows[self.lag:]
+                elif self.lag_reads:
+                    self.lag_reads -= 1
+                    rows = rows[1:]
         rows = rows[: int(q.get("limit", "1000"))]
         return [] if self.invisible else [{"seq": r["seq"], "payload": r["payload"], "event_id": r["event_id"]} for r in rows]
 
@@ -133,7 +138,7 @@ def pg():
 
 def witness(pg, **kw):
     client = XE.RestClient(pg.url, KEY, allow_insecure_loopback_for_tests=True, sleep=lambda s: None, retries=0)
-    return W.SupabaseWitness(client, OWNER, **kw)
+    return W.SupabaseWitness(client, OWNER, sleep=lambda s: None, **kw)
 
 
 def _sha(tag, n):
@@ -421,3 +426,29 @@ def test_a_read_that_lags_the_write_is_not_an_acknowledgement(pg):
     pg.lag = 0
     w.publish(ACCT, entry(1))
     assert w.head(ACCT)[0] == 1
+
+
+def test_a_replica_that_catches_up_within_the_bounded_re_reads_acknowledges_the_head_and_one_that_never_does_does_not(pg):
+    """Second red team, L7: with 20% stale head reads, 15 of 60 healthy commits reported the witness UNAVAILABLE and a REQUIRED witness refused 3 of 40 session opens."""
+    w = witness(pg)
+    w.publish(ACCT, entry(0, "GENESIS"))
+    pg.lag_reads = 2                                 # two stale reads, then the replica has caught up: three attempts are enough
+    w.publish(ACCT, entry(1))
+    assert w.head(ACCT)[0] == 1
+    pg.lag_reads = 3                                 # more stale reads than attempts: unacknowledged
+    with pytest.raises(AN.WitnessError) as e:
+        w.publish(ACCT, entry(2))
+    assert "READBACK_FAILED" in str(e.value)
+
+
+def test_a_read_that_shows_another_head_at_the_sequence_just_written_is_not_waited_for(pg):
+    w = witness(pg)
+    w.publish(ACCT, entry(0, "GENESIS"))
+    pauses = []
+    w._sleep = pauses.append
+    orig = w.head
+    w.head = lambda account: (0, "hdeadbeefdeadbee")   # the read disagrees with the write that was just acknowledged
+    with pytest.raises(AN.WitnessError):
+        w.publish(ACCT, entry(0, "GENESIS"))
+    w.head = orig
+    assert pauses == [], "the same sequence with another head is a disagreement, not lag: no re-reads"

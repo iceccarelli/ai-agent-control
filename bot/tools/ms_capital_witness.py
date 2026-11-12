@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BOT not in sys.path:
@@ -75,10 +76,14 @@ class SupabaseWitness:
     configured = True
     name = "SUPABASE_EVENTS"
 
-    def __init__(self, client: Any, owner_id: str, *, required: bool = False) -> None:
+    READBACK_ATTEMPTS = 3                       # a read replica may lag the write by a moment: the head is re-read (a short pause between reads) before the publish is called unacknowledged
+    READBACK_PAUSE_S = 0.3
+
+    def __init__(self, client: Any, owner_id: str, *, required: bool = False, sleep: Optional[Callable[[float], None]] = None) -> None:
         if not isinstance(owner_id, str) or not XE._UUID.match(owner_id):
             raise AN.AnchorRefused("WITNESS_MISCONFIGURED", "SUPABASE_OWNER_ID must be a lowercase uuid")
         self.client, self.owner_id, self.required = client, owner_id, bool(required)
+        self._sleep = sleep or time.sleep
         self._visible: Dict[str, bool] = {}
 
     @classmethod
@@ -161,7 +166,13 @@ class SupabaseWitness:
         # READ-BACK. A write that the server accepted proves nothing about what a READ will say: if the head query's filter (a PostgREST JSON-path filter, never run against the real service here) answers [] for
         # rows that do exist, every later "witness: OK" would be a publish nobody reads, and a rolled-back volume would open as if the witness agreed (reproduced against a loopback server whose head query
         # answers []: a REQUIRED witness let the rolled-back book open). A head is acknowledged only when it can be read back.
-        got = self.head(account)
         want_seq, want_ref = int(entry["seq"]), ref(entry["h"])
-        if got is None or got[0] < want_seq or (got[0] == want_seq and got[1] != want_ref):
-            raise AN.WitnessError("READBACK_FAILED: the witness accepted the head but a read does not return it (is the head query working on this project?)")
+        for attempt in range(self.READBACK_ATTEMPTS):
+            got = self.head(account)
+            if got is not None and (got[0] > want_seq or (got[0] == want_seq and got[1] == want_ref)):
+                return
+            if got is not None and got[0] == want_seq:                       # the SAME sequence with another head is not lag: the read disagrees with the write that was just acknowledged
+                break
+            if attempt + 1 < self.READBACK_ATTEMPTS:                          # nothing, or an older head: a replica that has not caught up yet
+                self._sleep(self.READBACK_PAUSE_S)
+        raise AN.WitnessError("READBACK_FAILED: the witness accepted the head but a read does not return it (is the head query working on this project?)")

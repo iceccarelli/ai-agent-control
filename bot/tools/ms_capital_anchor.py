@@ -306,14 +306,19 @@ class Lineage:
 
     def _set_aside(self, text: bytes, at: int) -> None:
         """The torn tail is evidence: keep its bytes, then cut the file back to the last complete line. Printed, never silent."""
-        try:
-            with open(self.path + ".torn", "ab") as fh:
-                fh.write(text + b"\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-        except OSError as exc:
-            print(f"CAPITAL_LINEAGE_TORN_TEXT_NOT_KEPT: {type(exc).__name__}", file=sys.stderr)
+        # the cut happens under the data file's OWN lock and only if the file still has exactly the bytes that were judged: with the lock FILE deleted by a clean-up script, a writer could have appended a COMPLETE
+        # entry since this read, and truncating to the old length would delete it (second red team, L11)
         with open(self.path, "r+b") as fh:
+            flock_with_timeout(fh.fileno(), LOCK_TIMEOUT_S, "the capital lineage file")
+            if os.fstat(fh.fileno()).st_size != at + len(text):
+                raise AnchorRefused("LINEAGE_CHANGED_UNDER_COMMIT", "the lineage changed while its torn tail was being judged: nothing was cut")
+            try:
+                with open(self.path + ".torn", "ab") as kept:
+                    kept.write(text + b"\n")
+                    kept.flush()
+                    os.fsync(kept.fileno())
+            except OSError as exc:
+                print(f"CAPITAL_LINEAGE_TORN_TEXT_NOT_KEPT: {type(exc).__name__}", file=sys.stderr)
             fh.truncate(at)
             fh.flush()
             os.fsync(fh.fileno())
@@ -463,27 +468,45 @@ class Anchor:
         e = self.entries()
         return e[-1] if e else None
 
+    @staticmethod
+    def _discarded(entries: Sequence[Mapping[str, Any]]) -> set:
+        """(sequence, 16-hex head) of every history an ``ACK_OLDER`` entry of this lineage recorded as DISCARDED (the owner's ``capital --accept-older-lineage``). A root whose view or mark still names one of
+        them is not tampered with and not forked: it has simply not heard of the owner's decision yet (another root of the account, or a crash inside the act), and is healed forward from the lineage."""
+        out: set = set()
+        for e in entries:
+            if e.get("kind") != "ACK_OLDER":
+                continue
+            d = (e.get("facts") or {}).get("discarded")
+            for k in ("view", "hwm"):
+                x = d.get(k) if isinstance(d, Mapping) else None
+                if isinstance(x, Mapping) and isinstance(x.get("seq"), int) and not isinstance(x.get("seq"), bool) and isinstance(x.get("head"), str):
+                    out.add((x["seq"], x["head"][:16]))
+        return out
+
     # ---- the open: the case table that decides whether the book may be used
     def open_view(self) -> Dict[str, Any]:
-        """The verified book (a dict with ``ledger_ref``), rebuilt from the lineage when the view is missing or older. MUST be called inside ``locked()``. Raises ``AnchorRefused``; nothing is rewritten on a refusal."""
+        """The verified book (a dict with ``ledger_ref``), rebuilt from the lineage when the view is missing or older. MUST be called inside ``locked()``. Raises ``AnchorRefused``; nothing is rewritten on a refusal.
+
+        What the ROOT remembers (its view's ``ledger_ref`` and its high-water mark) is evidence of how far the account has come, and each piece is judged on its own: a damaged mark must never MASK a view that is ahead of
+        the lineage (it did, and ``capital --rebuild-view`` then performed the rollback; second red team, NEW-1)."""
         entries = self.entries()
         status, view = self._read_view()
-        if status == "bound":
-            bound_to = (view.get("ledger_ref") or {}).get("account")            # type: ignore[union-attr]
+        ref = view["ledger_ref"] if status == "bound" and isinstance(view, dict) else None
+        if ref is not None:
+            bound_to = ref.get("account")
             if bound_to != self.account or view.get("account") not in (None, self.account):   # type: ignore[union-attr]
                 raise AnchorRefused("ACCOUNT_MISMATCH", f"the book is bound to account {bound_to}, not {self.account}: a state directory belongs to the account it was created for")
         hw_status, hw = self._read_hwm()
-        if hw_status == "unreadable":
-            raise AnchorRefused("VIEW_TAMPERED", f"the root's high-water mark ({HWM_NAME}) cannot be read; nothing was changed (the owner decides: capital --rebuild-view)")
         if hw is not None and hw["account"] != self.account:
             raise AnchorRefused("ACCOUNT_MISMATCH", f"this root's high-water mark belongs to account {hw['account']}, not {self.account}: a state directory belongs to the account it was created for")
         if not entries:
-            if status == "bound":
-                ref = view.get("ledger_ref") or {}               # type: ignore[union-attr]
+            if ref is not None:
                 raise AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", f"the book names lineage {ref.get('account')} seq {ref.get('seq')} head {str(ref.get('head'))[:12]}, and no lineage exists at {self.lineage.path}")
             if hw is not None:
                 raise AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", f"this root last saw lineage {hw['account']} seq {hw['seq']} head {hw['head'][:12]}, and no lineage exists at {self.lineage.path}: the anchor directory was lost or "
                                                                  "restored empty; restore it (a new history would be the reset this exists to prevent)")
+            if hw_status == "unreadable":
+                raise AnchorRefused("ANCHOR_MISSING_BOOK_BOUND", f"this root has a high-water mark ({HWM_NAME}) that cannot be read, and no lineage exists at {self.lineage.path}: restore the anchor directory")
             self._propose(adopt=status in ("legacy", "unreadable"))
             if status in ("legacy", "unreadable"):
                 raise AnchorRefused("BOOK_UNANCHORED", "a capital book exists with no lineage: only the owner can adopt it (capital --anchor-init)")
@@ -492,12 +515,29 @@ class Anchor:
         replay = rebuild(entries)
         if book_digest(replay) != head["book_digest"]:
             raise AnchorRefused("ANCHOR_CORRUPT", "the lineage does not reproduce the book digest it attests at its head")
+        discarded = self._discarded(entries)
+        stale: List[str] = []                                              # what the root remembers that the owner has RECORDED as discarded: healed forward, never refused
+        vs = None
+        if ref is not None:
+            vs = ref.get("seq")
+            if isinstance(vs, bool) or not isinstance(vs, int) or vs < 0:
+                raise AnchorRefused("VIEW_TAMPERED", "the book's ledger_ref is malformed")
+            if vs > head["seq"]:
+                if (vs, str(ref.get("head"))[:16]) not in discarded:
+                    raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"the book is at seq {vs} and the lineage ends at seq {head['seq']}: an older anchor was restored, or entries were removed")
+                stale.append("view")
+        if hw_status == "unreadable":
+            raise AnchorRefused("VIEW_TAMPERED", f"the root's high-water mark ({HWM_NAME}) cannot be read; nothing was changed (the owner decides: capital --rebuild-view)")
         if hw is not None:
             if hw["seq"] > head["seq"]:
-                raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"this root last saw the lineage at seq {hw['seq']} and the lineage ends at seq {head['seq']}: an older anchor was restored. Deleting capital.json does not change "
-                                                          "that (capital --accept-older-lineage is the owner's recorded decision to continue from the older one)")
-            if entries[hw["seq"]]["h"] != hw["head"]:
-                raise AnchorRefused("LINEAGE_FORKED", f"this root last saw a different head at lineage seq {hw['seq']} than the lineage holds there: the lineage is another history than the one this root has been following")
+                if (hw["seq"], hw["head"][:16]) not in discarded:
+                    raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"this root last saw the lineage at seq {hw['seq']} and the lineage ends at seq {head['seq']}: an older anchor was restored. Deleting capital.json does not change "
+                                                              "that (capital --accept-older-lineage is the owner's recorded decision to continue from the older one)")
+                stale.append("mark")
+            elif entries[hw["seq"]]["h"] != hw["head"]:
+                if (hw["seq"], hw["head"][:16]) not in discarded:
+                    raise AnchorRefused("LINEAGE_FORKED", f"this root last saw a different head at lineage seq {hw['seq']} than the lineage holds there: the lineage is another history than the one this root has been following")
+                stale.append("mark")
         if status == "absent":
             return self._heal(replay, head, "NO_VIEW", None)
         if status == "unreadable":
@@ -505,17 +545,21 @@ class Anchor:
             return self._heal(replay, head, "VIEW_UNREADABLE", None)
         if status == "legacy":
             raise AnchorRefused("VIEW_UNBOUND", "capital.json is a pre-anchor file but this account has a lineage; the owner must decide (capital --rebuild-view)")
-        ref = view["ledger_ref"]                                  # type: ignore[index]
-        vs = ref.get("seq")
-        if isinstance(vs, bool) or not isinstance(vs, int) or vs < 0:
-            raise AnchorRefused("VIEW_TAMPERED", "the book's ledger_ref is malformed")
-        if vs > head["seq"]:
-            raise AnchorRefused("ANCHOR_BEHIND_BOOK", f"the book is at seq {vs} and the lineage ends at seq {head['seq']}: an older anchor was restored, or entries were removed")
-        at = entries[vs]
-        if ref.get("head") != at["h"] or ref.get("digest") != at["book_digest"] or book_digest(view) != at["book_digest"]:     # type: ignore[arg-type]
-            raise AnchorRefused("VIEW_TAMPERED", f"the book does not match what the lineage attested at seq {vs}")
-        if vs == head["seq"]:
-            return dict(view)                                       # type: ignore[arg-type]
+        assert ref is not None and vs is not None
+        if vs <= head["seq"]:
+            at = entries[vs]
+            if ref.get("head") != at["h"] or ref.get("digest") != at["book_digest"] or book_digest(view) != at["book_digest"]:     # type: ignore[arg-type]
+                if (vs, str(ref.get("head"))[:16]) not in discarded:
+                    raise AnchorRefused("VIEW_TAMPERED", f"the book does not match what the lineage attested at seq {vs}")
+                stale.append("view")
+            elif vs == head["seq"] and not stale:
+                return dict(view)                                       # type: ignore[arg-type]
+        if stale:
+            if "view" in stale:
+                self._preserve("rejected-newer")
+            if "mark" in stale:
+                self._preserve_path(self.hwm_path, "rejected-newer")
+            return self._heal(replay, head, "DISCARDED_HISTORY", vs)
         # an older view of THIS lineage: a crash between the append and the view write (one entry behind) or a restored backup. The lineage is the truth; forward only, loudly.
         if vs < head["seq"] - 1:
             self._preserve("stale")
@@ -531,21 +575,25 @@ class Anchor:
         self.audit("VIEW_REBUILT", {"why": why, "from_seq": from_seq, "to_seq": head["seq"], "head": head["h"][:16]})
         return dict(view)
 
-    def _preserve(self, tag: str) -> None:
+    def _preserve(self, tag: str) -> bool:
         """Keep an unreadable or stale view as evidence before it is replaced."""
-        self._preserve_path(self.view_path, tag)
+        return self._preserve_path(self.view_path, tag)
 
-    def _preserve_path(self, path: str, tag: str) -> None:
+    def _preserve_path(self, path: str, tag: str) -> bool:
+        """Keep ``path`` as evidence (``<path>.<tag>.<ms>``). True when it is kept or there is nothing to keep; False when the copy could not be made (printed). Healing paths go on without it; an OWNER act that discards
+        history (``accept_older_lineage``) aborts."""
         if self.verify_only or not os.path.lexists(path):
-            return
+            return True
         dst = f"{path}.{tag}.{int(self.clock())}"
         try:
             with open(path, "rb") as src, open(dst, "xb") as out:
                 out.write(src.read())
                 out.flush()
                 os.fsync(out.fileno())
+            return True
         except OSError as exc:
             print(f"CAPITAL_VIEW_EVIDENCE_NOT_KEPT: {type(exc).__name__}", file=sys.stderr)
+            return False
 
     def newer_facts(self) -> Dict[str, Any]:
         """What this ROOT remembers that is not in the lineage (read-only): the view's sequence and figures and the high-water mark. Shown to the owner before ``capital --accept-older-lineage`` and kept in the entry that
@@ -684,7 +732,10 @@ class Anchor:
         if hw is not None:
             if hw["account"] != self.account:
                 raise AnchorRefused("ACCOUNT_MISMATCH", f"this root belongs to account {hw['account']}, not {self.account}: use a root of its own for another account")
-            if not (adopt is not None and isinstance(adopt_ref, Mapping) and adopt_ref.get("seq") == hw["seq"] and adopt_ref.get("head") == hw["head"]):
+            aseq = adopt_ref.get("seq") if isinstance(adopt_ref, Mapping) else None
+            adoptable = (adopt is not None and isinstance(aseq, int) and not isinstance(aseq, bool)
+                         and (aseq > hw["seq"] or (aseq == hw["seq"] and adopt_ref.get("head") == hw["head"])))          # type: ignore[union-attr]  # not OLDER than what the root last saw (a view one ahead is a crash window)
+            if not adoptable:
                 raise AnchorRefused("GENESIS_REFUSED_ROOT_REMEMBERS_LINEAGE", f"this root last saw this account's lineage at seq {hw['seq']} (head {hw['head'][:12]}) and no lineage exists now: restore the anchor directory; a new "
                                                                               "history would reset every stop")
         w = self.witness

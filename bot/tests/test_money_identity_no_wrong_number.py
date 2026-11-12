@@ -189,5 +189,8 @@ def test_a_suppressed_funding_document_publishes_no_booked_amount_in_any_event(t
     d2["suppressed"] = "FILLS_INCOMPLETE"                                              # the events builder is defensive on its own: a document marked suppressed whose prints still say BOOKED
     sett2 = [e for e in EL.funding_events(d2) if e[1] == "FUNDING_SETTLEMENT"]
     assert sett2 and all(e[2]["amount_usd"] is None and e[2]["status"] == "SUPPRESSED" for e in sett2), sett2
+    S.Run._suppress_funding_doc(_Stub(), "MEASUREMENT_FAILED")                          # a SECOND withdrawal must not overwrite what the first one kept
+    d4 = json.loads(path.read_text())
+    assert d4["recognitions"][0]["prints"][0]["was"]["amount_usd"] == "0.48" and d4["suppressed"] == "MEASUREMENT_FAILED"
     d3 = json.loads(json.dumps(doc))                                                    # and an unsuppressed document is unchanged
     assert [e[2]["amount_usd"] for e in EL.funding_events(d3) if e[1] == "FUNDING_SETTLEMENT"] == ["0.480000"]

@@ -1512,3 +1512,266 @@ def test_a_deeply_nested_capital_json_does_not_crash_the_offline_account_resolut
 def test_the_status_command_reports_an_unrecognised_witness_required_value_instead_of_raising():
     assert AP._witness_required_for_status({"CAPITAL_WITNESS_REQUIRED": "enabled"}) == "INVALID"
     assert AP._witness_required_for_status({"CAPITAL_WITNESS_REQUIRED": "on"}) is True and AP._witness_required_for_status({}) is False
+
+
+def test_the_owners_rebuild_view_repairs_a_damaged_mark_and_never_a_mark_that_is_ahead(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    open(hwm, "w").write("not json")                                                  # damage, not an attack: the root's own record of the head is unreadable
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    assert owner.rebuild_view() == "REBUILT"
+    d = json.load(open(hwm))
+    assert d["seq"] == len(_lineage_lines(world)) - 1 and d["account"] == ACCT
+    assert opened(world).load()["start_cash_usd"] == "232"
+    # a mark that is AHEAD of the lineage is the rollback signal: --rebuild-view must not erase it (ANCHOR_BEHIND_BOOK is never rebuilt)
+    d["seq"] += 5
+    json.dump(d, open(hwm, "w"))
+    assert owner.anchor.__class__ is AN.Anchor
+    with pytest.raises(CC.BookRefused) as e:
+        owner.rebuild_view()
+    assert e.value.code == "ANCHOR_BEHIND_BOOK" and json.load(open(hwm))["seq"] == d["seq"], "nothing was rewritten"
+
+
+# =====================================================================================================================================================================================================
+# ROUND 10, SECOND RED TEAM (the fixes themselves). NEW-1 was a HIGH and a release blocker: a damaged mark masked a newer view, and `capital --rebuild-view` then performed the rollback.
+# =====================================================================================================================================================================================================
+def _lost_ground(world):
+    """lifetime stop reached after a snapshot of the anchor directory, which is then restored: the root remembers MORE than the lineage"""
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    assert stopped(book)
+    _put_back(world.anchor, snap)
+    return book
+
+
+def test_a_damaged_mark_cannot_mask_a_newer_view_and_rebuild_view_does_not_perform_the_rollback(world):
+    _lost_ground(world)
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    open(hwm, "w").write("not json")                                                  # a damaged mark: the view still says how far the account had come
+    view_before = open(os.path.join(world.root, "capital.json"), "rb").read()
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_BEHIND_BOOK", "it was VIEW_TAMPERED, which the documented fix (--rebuild-view) turned into the rollback"
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    with pytest.raises(CC.BookRefused) as e2:
+        owner.rebuild_view()
+    assert e2.value.code == "ANCHOR_BEHIND_BOOK"
+    assert open(os.path.join(world.root, "capital.json"), "rb").read() == view_before and open(hwm).read() == "not json", "nothing was rebuilt, moved or copied"
+    assert not [n for n in os.listdir(world.root) if ".rejected" in n or ".unreadable" in n]
+
+
+def test_a_damaged_mark_with_the_lineage_gone_is_a_missing_anchor_not_a_tampered_view_and_nothing_stray_is_written(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    os.unlink(book.path)
+    open(os.path.join(world.root, "capital_hwm.json"), "w").write("not json")
+    shutil.rmtree(world.anchor)
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code == "ANCHOR_MISSING_BOOK_BOUND"
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    with pytest.raises(CC.BookRefused) as e2:
+        owner.rebuild_view()
+    assert e2.value.code == "ANCHOR_MISSING_BOOK_BOUND", "it was ANCHOR_CORRUPT 'empty lineage', after writing a stray copy"
+    assert not [n for n in os.listdir(world.root) if ".rejected" in n]
+
+
+def test_rebuild_view_refuses_over_a_newer_remembered_state_whatever_the_refusal_at_hand_is(world, monkeypatch):
+    """defence in depth: the guard lives in rebuild_view itself, not only in the order open_view judges the evidence"""
+    _lost_ground(world)
+    monkeypatch.setattr(AN.Anchor, "open_view", lambda self: (_ for _ in ()).throw(AN.AnchorRefused("VIEW_TAMPERED", "forced")))
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+    view_before = open(os.path.join(world.root, "capital.json"), "rb").read()
+    with pytest.raises(CC.BookRefused) as e:
+        owner.rebuild_view()
+    assert e.value.code == "ANCHOR_BEHIND_BOOK" and open(os.path.join(world.root, "capital.json"), "rb").read() == view_before
+
+
+def test_rebuild_view_keeps_a_damaged_mark_as_evidence_when_it_repairs_it(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    open(hwm, "w").write("not json")
+    CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).rebuild_view()
+    assert any(n.startswith("capital_hwm.json.unreadable.") for n in os.listdir(world.root))
+
+
+# --------------------------------------------------------------------------------- NEW-3: a CONFIGURED witness that cannot be read is not 'no witness'
+def test_accepting_the_older_lineage_is_refused_while_a_configured_witness_cannot_be_read_even_if_it_is_optional(world):
+    w = FakeWitness(required=False)
+    book = genesis(world, witness=w)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    _put_back(world.anchor, snap)
+    ob = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor, witness=w))
+    before = (sorted(os.listdir(world.root)), open(os.path.join(world.root, "capital.json")).read(), len(_lineage_lines(world)))
+    w.down = True
+    with pytest.raises(CC.BookRefused) as e:
+        ob.accept_older_lineage({})
+    assert e.value.code == "WITNESS_UNAVAILABLE"
+    assert (sorted(os.listdir(world.root)), open(os.path.join(world.root, "capital.json")).read(), len(_lineage_lines(world))) == before, "nothing was changed: accepting blind would have left the account refused for good"
+
+
+def test_a_configured_witness_that_holds_nothing_does_not_block_the_acceptance(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    _put_back(world.anchor, snap)
+    empty = FakeWitness()
+    ob = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor, witness=empty))
+    assert ob.accept_older_lineage({})["status"] == "ACCEPTED"
+
+
+# --------------------------------------------------------------------------------- L2: an act that discards history keeps what it discards
+def test_accepting_aborts_when_the_evidence_cannot_be_kept(world, monkeypatch):
+    owner_book = _behind_world(world)
+    n = len(_lineage_lines(world))
+    view_before = open(os.path.join(world.root, "capital.json"), "rb").read()
+    monkeypatch.setattr(AN.Anchor, "_preserve_path", lambda self, path, tag: False)
+    monkeypatch.setattr(AN.Anchor, "_preserve", lambda self, tag: False)
+    with pytest.raises(CC.BookRefused) as e:
+        owner_book.accept_older_lineage({})
+    assert e.value.code == "EVIDENCE_NOT_KEPT" and len(_lineage_lines(world)) == n and open(os.path.join(world.root, "capital.json"), "rb").read() == view_before
+
+
+# --------------------------------------------------------------------------------- NEW-4: a root that still names a history the owner RECORDED as discarded is healed forward, never stuck
+def test_a_crash_inside_the_acceptance_after_the_append_heals_forward_instead_of_forking(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    assert book.park("s1", "232", None, False, False)                                  # the discarded history is exactly ONE entry ahead: the ACK entry takes the same sequence
+    _put_back(world.anchor, snap)
+    owner = CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor))
+
+    def die(point):
+        if point == "after_append":
+            raise Crash(point)
+    AN.crash_hook = die
+    try:
+        with pytest.raises(Crash):
+            owner.accept_older_lineage({})
+    finally:
+        AN.crash_hook = AN._noop
+    again = opened(world)                                                              # the view and mark still name the discarded head at the ACK entry's own sequence
+    cb = again.load()
+    assert cb["review_required"]["code"] == "ROLLBACK_ACCEPTED" and cb["pending"] is None, "the older lineage's state continues; the discarded park is gone"
+    assert any(n.startswith("capital.json.rejected-newer.") for n in os.listdir(world.root)), "and what was discarded is still kept"
+
+
+def test_a_second_root_of_the_account_is_healed_forward_after_the_owner_accepted_on_the_first(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    snap = _snapshot_dir(world.anchor, world.tmp / "anchor_backup")
+    drive_to_lifetime_stop(book)
+    other_root = opened(world, world.root2)                                            # root B follows the lineage to its (newer) head
+    assert stopped(other_root)
+    _put_back(world.anchor, snap)
+    CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).accept_older_lineage({})
+    healed = opened(world, world.root2)                                                # it names the discarded history: recorded in the lineage, so healed forward
+    assert healed.load()["review_required"]["code"] == "ROLLBACK_ACCEPTED" and not stopped(healed)
+
+
+def test_a_root_naming_a_history_nobody_recorded_as_discarded_still_refuses(world):
+    """the exemption is only for what an ACK_OLDER entry of THIS lineage names (sequence and head), never a general 'ahead is fine'"""
+    owner_book = _behind_world(world)
+    r = owner_book.accept_older_lineage({})
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    d = json.load(open(hwm))
+    d["seq"] = r["discarded"]["hwm"]["seq"]                                            # the very sequence that was discarded ...
+    d["head"] = "ab" * 32                                                              # ... but another head: nobody recorded THAT
+    json.dump(d, open(hwm, "w"))
+    with pytest.raises(CC.BookRefused) as e:
+        opened(world)
+    assert e.value.code in ("ANCHOR_BEHIND_BOOK", "LINEAGE_FORKED")
+    d["seq"] += 7                                                                      # and a sequence nobody recorded
+    json.dump(d, open(hwm, "w"))
+    with pytest.raises(CC.BookRefused) as e2:
+        opened(world)
+    assert e2.value.code == "ANCHOR_BEHIND_BOOK"
+
+
+# --------------------------------------------------------------------------------- L5: a view that is AHEAD of the mark may be adopted (a crash window), an older one may not
+def test_a_view_one_ahead_of_the_mark_can_be_adopted_when_the_lineage_is_lost(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    stale_mark = open(hwm).read()
+    drive_to_lifetime_stop(book)                                                       # the view is several entries ahead of the mark we put back
+    open(hwm, "w").write(stale_mark)
+    shutil.rmtree(world.anchor)
+    CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).initialise({"test": True})
+    assert stopped(opened(world)), "the newest book the root has is adopted whole: every stop kept"
+
+
+def test_a_view_that_is_not_the_one_the_root_last_saw_cannot_be_adopted_at_the_same_sequence(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    hwm = os.path.join(world.root, "capital_hwm.json")
+    d = json.load(open(hwm))
+    d["head"] = "ef" * 32                                                              # the mark names another head at the view's own sequence
+    json.dump(d, open(hwm, "w"))
+    shutil.rmtree(world.anchor)
+    with pytest.raises(CC.BookRefused) as e:
+        CC.CapitalBook(world.root, AN.Anchor(world.root, ACCT, "testnet", world.anchor)).initialise({"test": True})
+    assert e.value.code == "GENESIS_REFUSED_ROOT_REMEMBERS_LINEAGE"
+
+
+# --------------------------------------------------------------------------------- L11: the torn-tail cut never deletes an entry a writer appended since the read
+def test_the_torn_tail_cut_refuses_when_the_file_changed_since_it_was_judged(world):
+    book = genesis(world)
+    book.ensure_baseline("232")
+    path = os.path.join(world.anchor, f"lineage-{ACCT}.jsonl")
+    lin = AN.Lineage(path, ACCT, "testnet")
+    data = open(path, "rb").read()
+    with open(path, "ab") as fh:
+        fh.write(b'{"torn')
+    torn = b'{"torn'
+    at = len(data)
+    with open(path, "ab") as fh:
+        fh.write(b' and a writer appended more')                                       # the file is not what was judged any more
+    before = open(path, "rb").read()
+    with pytest.raises(AN.AnchorRefused) as e:
+        lin._set_aside(torn, at)
+    assert e.value.code == "LINEAGE_CHANGED_UNDER_COMMIT" and open(path, "rb").read() == before and not os.path.exists(path + ".torn")
+
+
+# --------------------------------------------------------------------------------- NEW-5: what the owner types reads what is DISCARDED, what is CONTINUED, and what the witness said
+def _typed_line(world, capsys, argv, *, witness=None, answer=""):
+    import re
+    holder = {}
+
+    def typed(_p):
+        m = re.search(r"^(CONFIRM .+)$", capsys.readouterr().out, flags=re.M)
+        holder["line"] = m.group(1).strip() if m else ""
+        return answer or holder["line"]
+    orig = AN.witness_from_env
+    if witness is not None:
+        AN.witness_from_env = lambda env: witness
+    try:
+        rc = AP.main(["capital", "--root", world.root, *argv], env={"CAPITAL_ANCHOR_DIR": world.anchor}, isatty=lambda: True, input_fn=typed, uid=0)
+    finally:
+        AN.witness_from_env = orig
+    return rc, holder["line"]
+
+
+def test_the_accept_line_states_what_is_discarded_what_is_continued_and_the_witness(world, capsys):
+    _behind_world(world)
+    rc, line = _typed_line(world, capsys, ["--accept-older-lineage"], answer="not the line")
+    assert rc == 2
+    for key in ("older_head_seq=", "older_realised_usd=", "older_streak=", "older_halted=", "newer_view_seq=", "newer_view_realised_usd=", "newer_view_streak=", "newer_view_halted=", "hwm_seq=", "witness_state=NOT_CONFIGURED"):
+        assert key in line, (key, line)
+    w = FakeWitness()
+    w.rows[ACCT] = {40: "ab" * 32}                                                      # a witness that holds a NEWER head than the local lineage
+    rc2, line2 = _typed_line(world, capsys, ["--accept-older-lineage"], witness=w, answer="not the line")
+    assert "witness_state=LOCAL_BEHIND_WITNESS" in line2 and "witness_head_seq=40" in line2, line2
+
+
+def test_the_rebuild_view_line_names_the_newer_view_and_mark(world, capsys):
+    _behind_world(world)
+    rc, line = _typed_line(world, capsys, ["--rebuild-view"], answer="not the line")
+    assert rc == 2 and "newer_view_seq=" in line and "hwm_seq=" in line, line
