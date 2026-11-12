@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim AS base
+FROM python:3.15-slim AS base
 
 # Fail fast and log immediately; a buffered crash loop tells you nothing.
 ENV PYTHONUNBUFFERED=1 \

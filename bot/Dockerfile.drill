@@ -5,7 +5,7 @@
 # touched. Same dependency pins and module closure as Dockerfile; the tools are
 # named one by one, never `COPY tools/`. tests/test_drill_image.py recomputes
 # the import closure of the drill entry points and fails if a file is missing.
-FROM python:3.11-slim AS base
+FROM python:3.15-slim AS base
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 COPY requirements.txt constraints.txt ./
