@@ -18,6 +18,7 @@ on:
       - "bot/tools/*.py"
       - "bot/requirements.txt"
       - "bot/constraints.txt"
+      - ".github/dependabot.yml"
       - ".github/workflows/autopilot-image.yml"
   workflow_dispatch:
 

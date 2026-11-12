@@ -3,7 +3,7 @@
 # Python standard library (tools/research_service.py + research_jobs + dataset_inventory + agent_contracts), so there is nothing to pip-install. It reads data directories the collector
 # wrote and writes typed, quarantined proposals and a status file on its own volume. The modules are named one by one (never `COPY tools/`); tests/test_research_image.py recomputes the
 # import closure and fails if a module is missing, if a credential name or a venue module appears, or if the image could place an order.
-FROM python:3.15-slim AS base
+FROM python:3.11-slim AS base
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 COPY tools/agent_contracts.py tools/dataset_inventory.py tools/research_jobs.py tools/research_service.py ./tools/
