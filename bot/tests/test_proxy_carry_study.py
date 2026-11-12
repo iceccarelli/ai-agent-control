@@ -1357,3 +1357,30 @@ def test_the_builder_s_dropped_legs_and_missing_rows_are_counted_not_lost(store)
     only = [i for i in insts if i.symbol in ("AAAUSDT",)]
     rows, medvol, why, st2 = P.build_variant_rows(only, slots, params)                      # a one-symbol universe: top-3 weeks cannot even form, top-1 weeks lose the leg when its marks are stale
     assert st2["slots_with_universe"] > 0 and sum(st2["slots_without_row"].values()) > 0
+
+
+# ------------------------------------------------------------------------------------------------ the committed result
+RESULT = os.path.join(os.path.dirname(__file__), "..", "research", "proxy_studies", "results", "binance_archive_carry_v1.explore.json")
+
+
+def test_the_committed_explore_report_is_the_registered_runs_and_its_verdict_follows_from_its_own_numbers():
+    rep = json.load(open(RESULT, encoding="utf-8"))
+    proto, digest = P.load_protocol()
+    assert rep["protocol_digest"] == digest == P.EXPECTED_PROTOCOL_DIGEST and rep["pre_registered"] is True and rep["label"] == "PROXY_RESEARCH_ONLY"
+    assert rep["window"]["aligned_rows"] == rep["window"]["grid_slots_expected"] and rep["window"]["cut_utc"] == "2024-10-01"
+    assert rep["rejects_recorded_by_the_downloader"] and rep["quality"]["pairs_with_a_spot_listing"] == rep["instruments"]
+    assert rep["bounds"]["ADVERSE"]["n_variants_counted"] == rep["bounds"]["FAVOURABLE"]["n_variants_counted"] == 12
+    assert rep["bounds"]["ADVERSE"]["cash_covered_only"] is True and rep["bounds"]["FAVOURABLE"]["cash_covered_only"] is False
+    assert rep["bounds"]["ADVERSE"]["quarters"][0] == "2022Q1" and rep["bounds"]["ADVERSE"]["quarters"][-1] == "2024Q3"
+    assert rep["selection_facts"]["terminal_exit_unpriced_count"] == 0
+    again = P.decide(rep["bounds"]["ADVERSE"], rep["bounds"]["FAVOURABLE"], proto["parameters"])
+    assert rep["decision"]["verdict"] == again["verdict"] and rep["decision"]["survivor_checks"] == again["survivor_checks"]
+    assert rep["decision"]["verdict"] in ("NO_WINNER", "SURVIVOR_PENDING_FINAL_READ", "INCONCLUSIVE")
+    assert "not Bybit" in rep["claim_limits"] and "hypothesis" in rep["claim_limits"] and rep["forbidden"] == proto["forbidden_claims"]
+    assert set(rep["code_sha256"]) == {"proxy_carry_study.py", "binance_archive.py"} and rep["produced_by"]["commit"].startswith("8c2405e")
+
+
+def test_the_committed_report_carries_no_path_secret_or_owner_detail():
+    text = open(RESULT, encoding="utf-8").read()
+    for bad in ("/tmp", "/home", "scratchpad", "claude", "@", "token", "secret", "api_key", "iceccarelli", "ai-agent"):
+        assert bad not in text.lower(), bad

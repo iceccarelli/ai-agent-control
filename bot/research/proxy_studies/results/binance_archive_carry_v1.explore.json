@@ -1,0 +1,457 @@
+{
+  "bounds": {
+    "ADVERSE": {
+      "bound": "ADVERSE",
+      "by_year": {
+        "2022": -13.174140381988272,
+        "2023": -12.59940908855836,
+        "2024": -12.217407986347075
+      },
+      "cash": {
+        "before_apr": 0.011339241092087388,
+        "before_series": "MEAN_OF_FIRST_90_DAYS",
+        "description": "OKX USDT lending, hourly, column rate_annual (a lender quote on another venue; NOT the owner's opportunity cost)",
+        "file": "data/real_borrow/OKX_LENDING_RATE_USDT_1H.csv.gz",
+        "first_ms": 1639472400000,
+        "hourly_points": 41809,
+        "label": "HISTORICAL",
+        "last_ms": 1790013600000,
+        "series_first_ms": 1639472400000,
+        "sha256": "12a5b543c029a1ac4c6a1e471fa104e5406553aab397975f169242e402794e6f"
+      },
+      "cash_covered_only": true,
+      "descriptives": {
+        "by_year": {
+          "2022": {
+            "break_even_gross_funding_bps_per_week": 32.27065791771762,
+            "capital_per_gross_notional": 2.04,
+            "legs_with_a_funding_hole_in_the_hold": 0,
+            "legs_with_unmeasured_basis": 0,
+            "mean_basis_bps": 11.81381338031651,
+            "mean_cash_bps_of_capital": 2.82421292890059,
+            "mean_cost_bps": 38.323076923076925,
+            "mean_excess_bps_of_capital": -13.174140381988272,
+            "mean_gross_funding_bps": 5.395411538461539,
+            "mean_net_bps_of_gross": -21.113852004298874,
+            "net_return_on_capital_bps_per_week_with_free_capital": -10.349927453087682,
+            "share_of_weeks_with_positive_excess": 0.038461538461538464,
+            "turnover_share_of_legs_traded_per_week": 0.8653846153846154,
+            "weeks": 52
+          },
+          "2023": {
+            "break_even_gross_funding_bps_per_week": 54.59565030988982,
+            "capital_per_gross_notional": 2.04,
+            "legs_with_a_funding_hole_in_the_hold": 0,
+            "legs_with_unmeasured_basis": 0,
+            "mean_basis_bps": 1.0522858172060916,
+            "mean_cash_bps_of_capital": 8.351175326253655,
+            "mean_cost_bps": 38.61153846153846,
+            "mean_excess_bps_of_capital": -12.59940908855836,
+            "mean_gross_funding_bps": 28.89285576923077,
+            "mean_net_bps_of_gross": -8.666396875101599,
+            "net_return_on_capital_bps_per_week_with_free_capital": -4.2482337623047055,
+            "share_of_weeks_with_positive_excess": 0.11538461538461539,
+            "turnover_share_of_legs_traded_per_week": 0.6538461538461539,
+            "weeks": 52
+          },
+          "2024": {
+            "break_even_gross_funding_bps_per_week": 69.57930702899014,
+            "capital_per_gross_notional": 2.04,
+            "legs_with_a_funding_hole_in_the_hold": 0,
+            "legs_with_unmeasured_basis": 0,
+            "mean_basis_bps": 1.3805094921242067,
+            "mean_cash_bps_of_capital": 16.437990554725815,
+            "mean_cost_bps": 37.42631578947368,
+            "mean_excess_bps_of_capital": -12.217407986347075,
+            "mean_gross_funding_bps": 44.655794736842104,
+            "mean_net_bps_of_gross": 8.60998843949263,
+            "net_return_on_capital_bps_per_week_with_free_capital": 4.22058256837874,
+            "share_of_weeks_with_positive_excess": 0.07894736842105263,
+            "turnover_share_of_legs_traded_per_week": 0.7236842105263158,
+            "weeks": 38
+          }
+        },
+        "overall": {
+          "break_even_gross_funding_bps_per_week": 50.43001193617755,
+          "capital_per_gross_notional": 2.04,
+          "legs_with_a_funding_hole_in_the_hold": 0,
+          "legs_with_unmeasured_basis": 0,
+          "mean_basis_bps": 5.080961401210529,
+          "mean_cash_bps_of_capital": 8.491294579912688,
+          "mean_cost_bps": 38.1887323943662,
+          "mean_excess_bps_of_capital": -12.707648422180378,
+          "mean_gross_funding_bps": 24.506409154929578,
+          "mean_net_bps_of_gross": -8.601361838226088,
+          "net_return_on_capital_bps_per_week_with_free_capital": -4.216353842267691,
+          "share_of_weeks_with_positive_excess": 0.07746478873239436,
+          "turnover_share_of_legs_traded_per_week": 0.75,
+          "weeks": 142
+        },
+        "persistence": {
+          "correlation": 0.5472669892313985,
+          "mean_forward_over_mean_trailing": 0.7049983120690404,
+          "pairs": 142
+        }
+      },
+      "dropped_best_weeks": 3,
+      "folds": 11,
+      "ledger_anchor": {
+        "head": "dcc350199d996eb54443e33f5a4a059604e5b8c53f5a52f257bcc061e74368fa",
+        "n": 12
+      },
+      "max_symbol_share": null,
+      "mean_cash_bps_of_capital": 8.491294579912688,
+      "mean_net_bps_of_gross": -8.601361838226088,
+      "mean_unmeasured_basis_legs": 0.0,
+      "mean_without_best_weeks": -13.81651882832118,
+      "minimum_detectable_mean_excess_bps_80pct_power": 5.069592708358867,
+      "n_variants_counted": 12,
+      "oos_rows": 142,
+      "oos_rows_all": 142,
+      "p_adjusted": 1.0,
+      "picks": [
+        "SPOT_PERP_CARRY|F7|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F7|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F7|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE"
+      ],
+      "quarters": [
+        "2022Q1",
+        "2022Q2",
+        "2022Q3",
+        "2022Q4",
+        "2023Q1",
+        "2023Q2",
+        "2023Q3",
+        "2023Q4",
+        "2024Q1",
+        "2024Q2",
+        "2024Q3"
+      ],
+      "stats": {
+        "ci": {
+          "B": 2000,
+          "alpha": 0.1,
+          "batch3_hi": -9.927459608554043,
+          "batch3_lo": -15.487837235806714,
+          "batch6_hi": -9.750972917758329,
+          "batch6_lo": -15.664323926602428,
+          "block": 5,
+          "bootstrap_hi": -10.638759305531165,
+          "bootstrap_lo": -14.315108573172676,
+          "ess": 59.17983980024155,
+          "ess_t_hi": -10.272609085649075,
+          "ess_t_lo": -15.142687758711682,
+          "estimate": -12.707648422180378,
+          "hi": -9.750972917758329,
+          "lo": -15.664323926602428,
+          "method": "widest of the moving-block bootstrap, the ESS-adjusted t interval and the 6- and 3-batch-means t intervals",
+          "n": 142,
+          "seed": 20261105,
+          "status": "OK"
+        },
+        "ess": 59.17983980024155,
+        "independent_observations": 59,
+        "mean": -12.707648422180378,
+        "n": 142,
+        "p_one_sided": 0.9999999999981412,
+        "sd": 11.2071679519165,
+        "t": -8.722805788042168
+      },
+      "symbol_share_top": [],
+      "unmeasured_basis_charge_bps": -1362.292767058219,
+      "variants": [
+        "SPOT_PERP_CARRY|F14|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F14|H7|K3|BADVERSE",
+        "SPOT_PERP_CARRY|F30|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F30|H7|K3|BADVERSE",
+        "SPOT_PERP_CARRY|F7|H7|K1|BADVERSE",
+        "SPOT_PERP_CARRY|F7|H7|K3|BADVERSE"
+      ]
+    },
+    "FAVOURABLE": {
+      "bound": "FAVOURABLE",
+      "by_year": {
+        "2022": -9.018498016533496,
+        "2023": -0.4460194298434488,
+        "2024": 2.8447657382893197
+      },
+      "cash": {
+        "before_apr": 0.0,
+        "before_series": "ZERO",
+        "description": "OKX USDT lending, hourly, column rate_annual (a lender quote on another venue; NOT the owner's opportunity cost)",
+        "file": "data/real_borrow/OKX_LENDING_RATE_USDT_1H.csv.gz",
+        "first_ms": 1639472400000,
+        "hourly_points": 41809,
+        "label": "HISTORICAL",
+        "last_ms": 1790013600000,
+        "series_first_ms": 1639472400000,
+        "sha256": "12a5b543c029a1ac4c6a1e471fa104e5406553aab397975f169242e402794e6f"
+      },
+      "cash_covered_only": false,
+      "descriptives": {
+        "by_year": {
+          "2022": {
+            "break_even_gross_funding_bps_per_week": 16.760480033775462,
+            "capital_per_gross_notional": 1.224,
+            "legs_with_a_funding_hole_in_the_hold": 0,
+            "legs_with_unmeasured_basis": 0,
+            "mean_basis_bps": 10.84058736042963,
+            "mean_cash_bps_of_capital": 2.82421292890059,
+            "mean_cost_bps": 24.14423076923077,
+            "mean_excess_bps_of_capital": -9.018498016533496,
+            "mean_gross_funding_bps": 5.7218384615384625,
+            "mean_net_bps_of_gross": -7.581804947262677,
+            "net_return_on_capital_bps_per_week_with_free_capital": -6.194285087632906,
+            "share_of_weeks_with_positive_excess": 0.19230769230769232,
+            "turnover_share_of_legs_traded_per_week": 0.7788461538461539,
+            "weeks": 52
+          },
+          "2023": {
+            "break_even_gross_funding_bps_per_week": 29.43878355135915,
+            "capital_per_gross_notional": 1.224,
+            "legs_with_a_funding_hole_in_the_hold": 0,
+            "legs_with_unmeasured_basis": 0,
+            "mean_basis_bps": 1.0522858172060916,
+            "mean_cash_bps_of_capital": 8.351175326253655,
+            "mean_cost_bps": 20.26923076923077,
+            "mean_excess_bps_of_capital": -0.4460194298434488,
+            "mean_gross_funding_bps": 28.89285576923077,
+            "mean_net_bps_of_gross": 9.675910817206091,
+            "net_return_on_capital_bps_per_week_with_free_capital": 7.905155896410206,
+            "share_of_weeks_with_positive_excess": 0.40384615384615385,
+            "turnover_share_of_legs_traded_per_week": 0.6538461538461539,
+            "weeks": 52
+          },
+          "2024": {
+            "break_even_gross_funding_bps_per_week": 41.173801473175985,
+            "capital_per_gross_notional": 1.224,
+            "legs_with_a_funding_hole_in_the_hold": 0,
+            "legs_with_unmeasured_basis": 0,
+            "mean_basis_bps": 1.3805094921242067,
+            "mean_cash_bps_of_capital": 16.437990554725815,
+            "mean_cost_bps": 22.43421052631579,
+            "mean_excess_bps_of_capital": 2.8447657382893197,
+            "mean_gross_funding_bps": 44.655794736842104,
+            "mean_net_bps_of_gross": 23.60209370265052,
+            "net_return_on_capital_bps_per_week_with_free_capital": 19.282756293015133,
+            "share_of_weeks_with_positive_excess": 0.3157894736842105,
+            "turnover_share_of_legs_traded_per_week": 0.7236842105263158,
+            "weeks": 38
+          }
+        },
+        "overall": {
+          "break_even_gross_funding_bps_per_week": 27.936381425406246,
+          "capital_per_gross_notional": 1.224,
+          "legs_with_a_funding_hole_in_the_hold": 0,
+          "legs_with_unmeasured_basis": 0,
+          "mean_basis_bps": 4.7245687742097005,
+          "mean_cash_bps_of_capital": 8.491294579912688,
+          "mean_cost_bps": 22.267605633802816,
+          "mean_excess_bps_of_capital": -2.7046042898352605,
+          "mean_gross_funding_bps": 24.62594577464789,
+          "mean_net_bps_of_gross": 7.082908915054771,
+          "net_return_on_capital_bps_per_week_with_free_capital": 5.786690290077427,
+          "share_of_weeks_with_positive_excess": 0.3028169014084507,
+          "turnover_share_of_legs_traded_per_week": 0.7183098591549296,
+          "weeks": 142
+        },
+        "persistence": {
+          "correlation": 0.5558878418853891,
+          "mean_forward_over_mean_trailing": 0.7180127699495447,
+          "pairs": 142
+        }
+      },
+      "dropped_best_weeks": 3,
+      "folds": 11,
+      "ledger_anchor": {
+        "head": "dcc350199d996eb54443e33f5a4a059604e5b8c53f5a52f257bcc061e74368fa",
+        "n": 12
+      },
+      "max_symbol_share": 0.7746384575440812,
+      "mean_cash_bps_of_capital": 8.491294579912688,
+      "mean_net_bps_of_gross": 7.082908915054771,
+      "mean_unmeasured_basis_legs": 0.0,
+      "mean_without_best_weeks": -5.196729349350712,
+      "minimum_detectable_mean_excess_bps_80pct_power": 21.140283342632344,
+      "n_variants_counted": 12,
+      "oos_rows": 142,
+      "oos_rows_all": 142,
+      "p_adjusted": 1.0,
+      "picks": [
+        "SPOT_PERP_CARRY|F7|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F7|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F30|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE"
+      ],
+      "quarters": [
+        "2022Q1",
+        "2022Q2",
+        "2022Q3",
+        "2022Q4",
+        "2023Q1",
+        "2023Q2",
+        "2023Q3",
+        "2023Q4",
+        "2024Q1",
+        "2024Q2",
+        "2024Q3"
+      ],
+      "stats": {
+        "ci": {
+          "B": 2000,
+          "alpha": 0.1,
+          "batch3_hi": 10.537288479832387,
+          "batch3_lo": -15.94649705950291,
+          "batch6_hi": 9.617452330570085,
+          "batch6_lo": -15.026660910240608,
+          "block": 16,
+          "bootstrap_hi": 5.216626432201227,
+          "bootstrap_lo": -7.880303794850043,
+          "ess": 18.20685627010733,
+          "ess_t_hi": 7.855009734609729,
+          "ess_t_lo": -13.26421831428025,
+          "estimate": -2.7046042898352605,
+          "hi": 10.537288479832387,
+          "lo": -15.94649705950291,
+          "method": "widest of the moving-block bootstrap, the ESS-adjusted t interval and the 6- and 3-batch-means t intervals",
+          "n": 142,
+          "seed": 20261105,
+          "status": "OK"
+        },
+        "ess": 18.20685627010733,
+        "independent_observations": 18,
+        "mean": -2.7046042898352605,
+        "n": 142,
+        "p_one_sided": 0.6691380602942301,
+        "sd": 25.9217432110305,
+        "t": -0.4452019013052699
+      },
+      "symbol_share_top": [
+        [
+          "1000PEPEUSDT",
+          0.7746384575440812
+        ],
+        [
+          "TRBUSDT",
+          0.3099564189468956
+        ],
+        [
+          "AIUSDT",
+          0.2770392603664169
+        ],
+        [
+          "ARKUSDT",
+          0.20136735305318385
+        ],
+        [
+          "ORDIUSDT",
+          0.11943545007724254
+        ]
+      ],
+      "unmeasured_basis_charge_bps": 0.0,
+      "variants": [
+        "SPOT_PERP_CARRY|F14|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F14|H7|K3|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F30|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F30|H7|K3|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F7|H7|K1|BFAVOURABLE",
+        "SPOT_PERP_CARRY|F7|H7|K3|BFAVOURABLE"
+      ]
+    }
+  },
+  "claim_limits": "PROXY_RESEARCH_ONLY: Binance data and Bybit-style costs; not Bybit, not owner dollars, not capacity; a survivor is a hypothesis",
+  "code_sha256": {
+    "binance_archive.py": "8d7376f26194f18a79798809fd0d26a8071c5786cde338ca72e3f42f5171c0bd",
+    "proxy_carry_study.py": "6c2f4fb46672d02db85b773ab7a332f96e29a4455728b434b601518f0690f261"
+  },
+  "data_digest": "445ef3f3c64c777e8ea090c985488525d33b1d8756b3e5c50d65d41c0aa25736",
+  "decision": {
+    "no_winner_test_favourable_ci_hi_le_0": false,
+    "note": "the design is neither excluded under the favourable assumptions nor demonstrated under the adverse ones",
+    "positive_years": [],
+    "survivor_checks": {
+      "a_adverse_mean_positive_holm_and_ci_lo_positive": false,
+      "b_positive_in_enough_years": false,
+      "c_positive_without_the_best_weeks": false,
+      "d_no_symbol_above_the_share_cap": false
+    },
+    "verdict": "INCONCLUSIVE"
+  },
+  "exclusions": {
+    "below_top_n_dropped": 8223,
+    "delivered": 490,
+    "duplicate_base_dropped": 0,
+    "listing_age": 31568,
+    "not_alive": 689,
+    "spot_delisted": 1248,
+    "volume_below_floor_or_too_few_days": 11272
+  },
+  "forbidden": [
+    "any Bybit funding, price, fee tier or capacity figure derived from this data",
+    "any owner-dollar or annualised-return figure presented as achievable",
+    "'winner', 'edge', 'profitable' or 'survivorship-free'",
+    "using a result of this study to select, rank or tune anything on the owner's holdout registry or on Bybit data",
+    "'the direction is closed', 'carry cannot work' or any statement about a design, a period or a venue this study did not test"
+  ],
+  "instruments": 271,
+  "label": "PROXY_RESEARCH_ONLY",
+  "pre_registered": true,
+  "produced_by": {
+    "command": "tools/proxy_carry_study.py run --root <store> --ledger-dir <throwaway> --out <report>",
+    "commit": "8c2405e417a70e8adb626e27825f3caf5fd5ecd9",
+    "date_utc": "2026-11-12",
+    "note": "the report exactly as the runner wrote it, plus this block; the store (about 33,000 verified archive files, 140 MB) and the throwaway ledger are not committed; the data digest names every file the run read"
+  },
+  "protocol_digest": "54b9f5acbbe8e3e48ae35ac8039b13ccf4249a3931d51c239ac08cd9f8db9559",
+  "protocol_id": "binance_archive_carry_v1",
+  "quality": {
+    "aligned_rows_before_the_cash_series_(cash_extended)": 98,
+    "funding_duplicate_after_snap_dropped": 0,
+    "funding_holes": 1,
+    "funding_off_grid_dropped": 0,
+    "interval_disagreement_months": 0,
+    "pairs_with_a_spot_listing": 271
+  },
+  "rejects_recorded_by_the_downloader": {
+    "ROWS_INVALID": 1
+  },
+  "schema": "proxy_carry_study/v1",
+  "selection_facts": {
+    "legs_the_builder_dropped_by_variant": {
+      "F14K1": 0,
+      "F14K3": 0,
+      "F30K1": 0,
+      "F30K3": 0,
+      "F7K1": 0,
+      "F7K3": 0
+    },
+    "slots_with_a_universe": 243,
+    "slots_without_a_row_by_variant": {},
+    "terminal_exit_unpriced_count": 0,
+    "terminal_exit_unpriced_first_20": []
+  },
+  "window": {
+    "aligned_rows": 243,
+    "cut_utc": "2024-10-01",
+    "first_row_ms": 1580428800000,
+    "grid_slots_expected": 243,
+    "grid_slots_required": 231,
+    "last_row_ms": 1726790400000,
+    "last_slot_expected_ms": 1726790400000
+  }
+}
