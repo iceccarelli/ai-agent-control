@@ -17,6 +17,7 @@ run and is never a licence to change host or path. A caller must state the last 
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import http.client
 import io
@@ -210,11 +211,22 @@ def _int(x: str, what: str, line: int) -> int:
         raise ArchiveError("ROWS_INVALID", f"line {line}: {what} {x!r} is not an integer") from None
 
 
-def parse_rows(dataset: str, text: str) -> List[Tuple[Any, ...]]:
+def month_bounds_ms(month: str) -> Tuple[int, int]:
+    """[start, end) of a UTC calendar month in ms."""
+    if not _MONTH.match(month):
+        raise ArchiveError("BAD_ARGUMENT", f"month {month!r} is not YYYY-MM")
+    y, m = int(month[:4]), int(month[5:])
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    epoch_days = lambda yy, mm: (datetime.date(yy, mm, 1) - datetime.date(1970, 1, 1)).days
+    return epoch_days(y, m) * 86_400_000, epoch_days(ny, nm) * 86_400_000
+
+
+def parse_rows(dataset: str, text: str, month: Optional[str] = None) -> List[Tuple[Any, ...]]:
     """Funding: (calc_time_ms, interval_hours, rate). Klines: (open_time_ms, open, high, low, close, volume, close_time_ms, quote_volume, count). The header is optional (some archive months have none) and, when
-    present, must be the documented one. Every row is checked; one bad row makes the whole month a reject."""
+    present, must be the documented one. Every row is checked (and, when ``month`` is given, must lie inside that UTC month); one bad row makes the whole month a reject."""
     funding = dataset == "fundingRate"
     _dataset(dataset)
+    m_lo, m_hi = month_bounds_ms(month) if month is not None else (0, 1 << 62)
     lines = text.splitlines()
     while lines and not lines[-1].strip():
         lines.pop()
@@ -253,6 +265,8 @@ def parse_rows(dataset: str, text: str) -> List[Tuple[Any, ...]]:
             if t < 0 or min(o, h, lo, c) <= 0 or h < lo or vol < 0 or qv < 0 or n < 0 or ct <= t:
                 raise ArchiveError("ROWS_INVALID", f"line {line_no}: a price, volume, count or time is out of range")
             row = (t, o, h, lo, c, vol, ct, qv, n)
+        if not m_lo <= t < m_hi:
+            raise ArchiveError("ROWS_INVALID", f"line {line_no}: the time is outside the month the file is named for")
         if t <= last_t:
             raise ArchiveError("ROWS_INVALID", f"line {line_no}: time does not strictly increase")
         last_t = t
@@ -332,7 +346,8 @@ def read_rows(zip_path: str, dataset: str) -> List[Tuple[Any, ...]]:
         raise ArchiveError("STORE_CHECKSUM_MISMATCH", f"{os.path.basename(zip_path)} does not match its stored checksum: it is not read")
     with open(zip_path, "rb") as fh:
         body = fh.read()
-    return parse_rows(dataset, extract_csv(body, _member_name(zip_path)))
+    m = re.search(r"-(\d{4}-\d{2})\.zip$", os.path.basename(zip_path))
+    return parse_rows(dataset, extract_csv(body, _member_name(zip_path)), m.group(1) if m else None)
 
 
 # ---------------------------------------------------------------- the store
@@ -364,9 +379,11 @@ def _private_dirs(root: str, target: str) -> None:
     cur = root
     for part in ([] if rel == "." else rel.split(os.sep)):
         cur = os.path.join(cur, part)
-        if not os.path.isdir(cur):
-            os.mkdir(cur, 0o700)
-            os.chmod(cur, 0o700)
+        try:
+            os.mkdir(cur, 0o700)                                        # a umask can only remove bits from 0700
+        except FileExistsError:                                         # another worker made it first (the CLI downloads in parallel)
+            if os.path.islink(cur) or not os.path.isdir(cur):
+                raise ArchiveError("ROOT_NOT_ALLOWED", f"{os.path.basename(cur)} exists inside the store and is not a plain directory") from None
 
 
 class Archive:
@@ -532,7 +549,7 @@ class Archive:
         if sha != want:
             return self._reject("CHECKSUM_MISMATCH", "the downloaded bytes do not equal the published sha256", dataset, symbol, interval, month, url)
         try:
-            parse_rows(dataset, extract_csv(body, _member_name(path)))
+            parse_rows(dataset, extract_csv(body, _member_name(path)), month)
         except ArchiveError as exc:
             return self._reject(exc.code, str(exc), dataset, symbol, interval, month, url)
         _private_dirs(self.root, os.path.dirname(path))

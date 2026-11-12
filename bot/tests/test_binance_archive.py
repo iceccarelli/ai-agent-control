@@ -459,10 +459,15 @@ def test_a_stored_month_without_its_checksum_file_is_not_read(tmp_path):
 
 
 # ------------------------------------------------------------------------------------------------ a window that stops where the protocol stops
+def _month_klines(month):
+    start, _end = BA.month_bounds_ms(month)
+    return kline_csv([(start, "42000.0", "43000.0", "41000.0", "42500.0", "100.5", "4250000.0"), (start + DAY, "42500.0", "43500.0", "41500.0", "43000.0", "90.1", "3900000.0")])
+
+
 def test_months_after_the_until_month_are_never_requested(tmp_path):
     net = FakeNet()
     for m in ("2024-08", "2024-09", "2024-10", "2024-11"):
-        net.add_month("klines", "BTCUSDT", "1d", m, GOOD_KLINES)
+        net.add_month("klines", "BTCUSDT", "1d", m, _month_klines(m))
     a = archive(tmp_path, net)
     out = a.download_range("klines", "BTCUSDT", "1d", ["2024-08", "2024-09", "2024-10", "2024-11"], until_month="2024-09")
     assert [o["month"] for o in out] == ["2024-08", "2024-09"] and all(o["status"] == "OK" for o in out)
@@ -543,3 +548,59 @@ def test_the_module_names_itself_research_only_and_not_a_venue():
     assert "RESEARCH ONLY" in src and "never a venue" in src
     import venues
     assert "binance" not in " ".join(str(h) for h in getattr(venues, "rest_hosts")()).lower()
+
+def test_a_row_outside_the_month_its_file_is_named_for_is_a_reject_and_is_never_read(tmp_path):
+    net = FakeNet()
+    net.add_month("klines", "BTCUSDT", "1d", "2024-02", GOOD_KLINES)               # January rows in a file named for February
+    a = archive(tmp_path, net)
+    r = a.download_month("klines", "BTCUSDT", "1d", "2024-02")
+    assert r["status"] == "REJECT" and r["code"] == "ROWS_INVALID"
+    assert not os.path.exists(a.file_path("klines", "BTCUSDT", "1d", "2024-02"))
+    # a stored file whose rows do not belong to its month is refused on read too (a file moved or renamed by hand)
+    net2 = FakeNet()
+    net2.add_month("klines", "BTCUSDT", "1d", "2024-01", GOOD_KLINES)
+    b = archive(tmp_path / "b", net2)
+    b.download_month("klines", "BTCUSDT", "1d", "2024-01")
+    p = b.file_path("klines", "BTCUSDT", "1d", "2024-01")
+    q = b.file_path("klines", "BTCUSDT", "1d", "2024-03")
+    os.makedirs(os.path.dirname(q), exist_ok=True)
+    import shutil
+    shutil.copy(p, q)
+    shutil.copy(p + ".CHECKSUM", q + ".CHECKSUM")
+    with pytest.raises(BA.ArchiveError):
+        BA.read_rows(q, "klines")                                                   # the checksum names January: refused before any row is read
+
+
+def test_month_bounds_are_utc_calendar_months():
+    assert BA.month_bounds_ms("2024-01") == (1704067200000, 1706745600000)
+    assert BA.month_bounds_ms("2023-12") == (1701388800000, 1704067200000)
+    assert BA.month_bounds_ms("2024-02")[1] - BA.month_bounds_ms("2024-02")[0] == 29 * DAY
+    with pytest.raises(BA.ArchiveError):
+        BA.month_bounds_ms("2024-13")
+
+
+def test_parallel_workers_creating_the_same_new_directories_do_not_collide(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    net = FakeNet()
+    months = [f"2023-{m:02d}" for m in range(1, 13)] + [f"2024-{m:02d}" for m in range(1, 5)]
+    for m in months:
+        net.add_month("klines", "BTCUSDT", "1d", m, _month_klines(m))
+    a = archive(tmp_path, net)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        out = list(pool.map(lambda m: a.download_month("klines", "BTCUSDT", "1d", m), months))
+    assert [o["status"] for o in out] == ["OK"] * 16
+    leaf = os.path.dirname(a.file_path("klines", "BTCUSDT", "1d", "2023-01"))
+    assert stat.S_IMODE(os.stat(leaf).st_mode) == 0o700 and stat.S_IMODE(os.stat(os.path.join(a.root, "data")).st_mode) == 0o700
+    assert len(open(os.path.join(a.root, "MANIFEST.jsonl"), encoding="utf-8").read().splitlines()) == 16
+
+
+def test_a_symlink_where_a_directory_belongs_is_refused(tmp_path):
+    net = FakeNet()
+    net.add_month("klines", "BTCUSDT", "1d", "2024-01", GOOD_KLINES)
+    a = archive(tmp_path, net)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(str(elsewhere), os.path.join(a.root, "data"))
+    with pytest.raises(BA.ArchiveError) as e:
+        a.download_month("klines", "BTCUSDT", "1d", "2024-01")
+    assert e.value.code == "ROOT_NOT_ALLOWED"

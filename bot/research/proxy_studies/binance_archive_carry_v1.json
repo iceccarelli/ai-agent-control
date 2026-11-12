@@ -178,6 +178,7 @@
       "survivor_min_positive_years": 2,
       "drop_best_weeks": 3,
       "max_symbol_share": 0.25
-    }
+    },
+    "min_aligned_rows": 60
   }
 }
