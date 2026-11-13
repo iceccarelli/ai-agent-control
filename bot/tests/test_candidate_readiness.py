@@ -812,6 +812,10 @@ def _lv(**kw):
     return CR.readiness_levels(**base)
 
 
+#: Round 18: PROMISING also needs a KNOWN, positive, significant excess over cash on the committed capital (a ``vs_cash`` block per applied cash basis)
+GOOD_CASH = {"OKX_LENDING": {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_excess_bps_of_capital_per_row": 6.0, "p_adjusted": 0.02, "oos_independent_observations": 80}}
+
+
 def test_the_readiness_vocabulary_is_ordered_and_named():
     assert CR.READINESS_LEVELS == LEVELS
 
@@ -832,7 +836,7 @@ def test_levels_are_cumulative_and_nothing_above_research_ready_without_an_evalu
         assert r["levels"][lvl]["reached"] is False and r["levels"][lvl]["reasons"]
     # a good evaluation reaches PROMISING only; prospective/execution/owner levels need evidence this tool cannot create
     ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
-          "terminal_exit_unpriced": 0}
+          "terminal_exit_unpriced": 0, "vs_cash": GOOD_CASH}
     p = _lv(evaluation=ev, executable=True)
     assert p["highest"] == "PROMISING" and p["levels"]["EXECUTION_READY"]["reached"] is False and p["levels"]["OWNER_PROFIT_EVIDENCED"]["reached"] is False
     assert p["highest_supportable_verdict"] == "INSUFFICIENT_DATA"                                # the ceiling never moves
@@ -845,10 +849,38 @@ def test_the_readiness_vocabulary_states_what_its_independence_count_cannot_see(
     """PROMISING stands on an ESTIMATED count of independent observations and a Holm-adjusted p computed from it. The estimate assumes autoregressive-type dependence and is blind to a slow
     hidden regime (the Round 14 audit measured false-pass rates 5 to 28 times the stated level on regime-driven nulls at n 100 to 250), so every readiness result says so, reached or not."""
     ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
-          "terminal_exit_unpriced": 0}
+          "terminal_exit_unpriced": 0, "vs_cash": GOOD_CASH}
     for r in (_lv(), _lv(evaluation=ev, executable=True)):
         text = " ".join(r["notes"])
         assert "PROMISING" in text and "AR-type" in text and "regime" in text and "dwell" in text and "reason to look" in text, text
+
+
+def _good_eval(**over):
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
+          "terminal_exit_unpriced": 0, "vs_cash": GOOD_CASH}
+    ev.update(over)
+    return ev
+
+
+def test_promising_needs_a_known_positive_significant_excess_over_cash(monkeypatch):
+    """Round 18 (quant specialist), reproduced on the unfixed code: a WALK_FORWARD_DONE evaluation with a positive nominal mean and NO ``vs_cash`` block reached PROMISING (every reason list empty):
+    an absent or unknown comparison with cash was 'no objection', although the nominal bps of notional charge no cost of capital."""
+    assert _lv(evaluation=_good_eval())["levels"]["PROMISING"]["reached"] is True                                             # the control: known, positive, significant
+    for ev in (_good_eval(vs_cash=None), _good_eval(vs_cash={}), {k: v for k, v in _good_eval().items() if k != "vs_cash"}):
+        lv = _lv(evaluation=ev)["levels"]["PROMISING"]
+        assert lv["reached"] is False and any("CASH_COMPARISON_UNKNOWN" in r for r in lv["reasons"]), lv["reasons"]
+    base = GOOD_CASH["OKX_LENDING"]
+    bad_blocks = {"rejected": {**base, "verdict": "REJECTED"}, "non_positive_mean": {**base, "oos_mean_excess_bps_of_capital_per_row": -0.5}, "not_significant": {**base, "p_adjusted": 0.2},
+                  "too_few_observations": {**base, "oos_independent_observations": CR.MIN_PROMISING_OOS_OBS - 1}, "not_done": {**base, "status": "TOO_FEW_ROWS_WITH_CASH"},
+                  "no_mean": {k: v for k, v in base.items() if k != "oos_mean_excess_bps_of_capital_per_row"}, "malformed": "x"}
+    for name, blk in bad_blocks.items():
+        lv = _lv(evaluation=_good_eval(vs_cash={"OKX_LENDING": blk}))["levels"]["PROMISING"]
+        assert lv["reached"] is False and any("CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED" in r for r in lv["reasons"]), (name, lv["reasons"])
+    # one basis that passes is enough (the owner's stated alternative beside a lender's-floor series that covers only part of the window)
+    both = {"HISTORICAL": {**base, "status": "TOO_FEW_ROWS_WITH_CASH"}, "OWNER_STATED": base}
+    assert _lv(evaluation=_good_eval(vs_cash=both))["levels"]["PROMISING"]["reached"] is True
+    # the nominal bars are unchanged: a good cash comparison does not rescue a bad nominal evaluation
+    assert _lv(evaluation=_good_eval(oos_mean_total_bps_per_row=-1.0))["levels"]["PROMISING"]["reached"] is False
 
 
 def test_a_rejected_evaluation_is_rejected_and_not_promising():
@@ -1116,6 +1148,14 @@ def test_an_evaluation_carries_the_state_and_identity_of_the_data_it_read_and_an
     assert row["readiness"]["levels"]["DATA_READY"]["reached"] is False and row["readiness"]["highest"] == "NONE"
     assert any("DATA_INCOMPLETE" in x for x in row["readiness"]["levels"]["DATA_READY"]["reasons"])
     assert row["readiness"]["levels"]["PROMISING"]["reached"] is False                    # a partial cross-section cannot reach the allocation gate however good its walk-forward looks
+    # the object the COMPETITION hands the ladder is the family evaluation, not the top-level one: it must carry the state too, and the ladder must read it from there
+    fam = out["families"]["PERP_FUNDING_SPREAD"]
+    assert fam["dataset_state"]["state"] == CR.DATA_INCOMPLETE and fam["loaded_identity"]["digest"] == out["input"]["loaded_identity"]["digest"]
+    walk2 = {**fam, "status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
+             "holdout_status": "RESERVED", "vs_cash": GOOD_CASH}
+    row2 = rowof(CR.build_report(data_root=root, universe_dir=uni, evaluations={"cross_sectional_funding": walk2}), "cross_sectional_funding")
+    assert row2["readiness"]["levels"]["DATA_READY"]["reached"] is False and any("DATA_INCOMPLETE" in x for x in row2["readiness"]["levels"]["DATA_READY"]["reasons"])
+    assert out["input"]["dataset_state"]["state"] == fam["dataset_state"]["state"] == out["dataset_state"]["state"]          # top-level ranked-funding evaluation, family evaluation and loader agree
 
 
 def test_a_survivors_only_evaluation_does_not_imply_a_survivorship_free_claim(tmp_path, offline):

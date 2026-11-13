@@ -59,6 +59,47 @@ def test_committed_corpus_runs_the_btc_row_labelled_in_sample_and_every_candidat
     assert any("REJECTED policy" in r for r in b["rejection_reasons"])
 
 
+def test_every_row_without_a_wired_evaluator_says_so_and_nothing_else_changes(committed):
+    """Round 18 (red team): ``run_competition`` hands the ladder a completed walk-forward for ONE family (cross_sectional_funding). The other rows can never reach PROMISING whatever the data, so
+    their NO WINNER is structural, not a measured failure. The typed reason is reasons-only: the verdicts and levels the committed-corpus tests pin above are untouched."""
+    rep, _ = committed
+    assert CC_.WIRED_EVALUATORS == ("cross_sectional_funding",)
+    for r in rep["results"]:
+        wired = r["name"] in CC_.WIRED_EVALUATORS
+        assert r["evaluator"] == {"wired": wired, "code": None if wired else f"NO_EVALUATOR_WIRED:{r['name']}"}
+        assert wired or any(x.startswith(f"NO_EVALUATOR_WIRED:{r['name']}") for x in r["rejection_reasons"]), r["name"]
+        assert wired is (not any(x.startswith("NO_EVALUATOR_WIRED") for x in r["rejection_reasons"]))
+    b = rep["no_winner_breakdown"]
+    assert b["evaluator_wired"] == ["cross_sectional_funding"] and "cash_and_carry" in b["structural_no_evaluator_wired"] and len(b["structural_no_evaluator_wired"]) == len(rep["results"]) - 1
+    assert rep["winner"] is None and rep["winner_statement"].startswith("NO WINNER")
+
+
+def test_missing_candidate_specs_are_a_typed_refusal_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """Round 18 (red team): the autopilot image ships these modules but not research/candidates; the CLI died with an uncaught FileNotFoundError at load_candidates."""
+    import candidate_readiness as CR_
+    monkeypatch.setattr(CR_, "CAND_DIR", str(tmp_path / "not_shipped"))
+    with pytest.raises(RH.HarnessError, match="CANDIDATE_SPECS_NOT_SHIPPED"):
+        CR_.load_candidates()
+    assert CC_.main(["--ledger-dir", str(tmp_path / "led"), "--no-historical-cash"]) == 2
+    assert "CANDIDATE_SPECS_NOT_SHIPPED" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as ex:
+        CR_.main([])
+    assert ex.value.code == 2
+
+
+def test_the_wired_evaluator_set_is_the_set_run_competition_actually_builds():
+    import ast
+    import inspect
+    src = ast.parse(inspect.getsource(CC_.run_competition))
+    keys = []
+    for node in ast.walk(src):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "evals" for t in node.targets) and isinstance(node.value, ast.IfExp):
+            for d in ast.walk(node.value.body):
+                if isinstance(d, ast.Dict):
+                    keys += [k.value for k in d.keys if isinstance(k, ast.Constant)]
+    assert keys == ["cross_sectional_funding"] == list(CC_.WIRED_EVALUATORS), keys          # wiring a second evaluator must update WIRED_EVALUATORS (and is the owner's decision for the BTC families)
+
+
 def test_a_btc_rejection_says_how_strong_it_is_by_the_repos_own_early_rejection_standard(committed):
     """REJECTED here is the competition's documented in-sample verdict (it loses after costs or to cash by point estimate). The repo has a STRONGER standard for rejecting (candidate_readiness.early_rejection:
     >= 12 independent observations, lower-tail p <= 0.01, the widest 90% interval wholly below zero). Every policy now carries whether it meets it, with the numbers, so a point-estimate loss is never read as a

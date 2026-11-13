@@ -739,7 +739,8 @@ def test_the_default_registry_is_per_user_and_independent_of_the_data_root(monke
 
 # ------------------------------------------------------------------ the exploratory stamp is not cosmetic: it caps readiness
 def _promising_evaluation(**over):
-    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 200}
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 200,
+          "vs_cash": {"OKX_LENDING": {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_excess_bps_of_capital_per_row": 6.0, "p_adjusted": 0.02, "oos_independent_observations": 200}}}
     ev.update(over)
     return ev
 

@@ -95,7 +95,12 @@ def scenarios(c: Mapping[str, Any]) -> Dict[str, float]:
 # ---------------------------------------------------------------- candidates
 def load_candidates() -> List[Tuple[str, Dict[str, Any]]]:
     out = []
-    for fn in sorted(os.listdir(CAND_DIR)):
+    try:
+        names = sorted(os.listdir(CAND_DIR))
+    except OSError as exc:       # Round 18 (red team): the autopilot image ships these modules but not research/candidates: a traceback is not a refusal
+        raise RH.HarnessError(f"CANDIDATE_SPECS_NOT_SHIPPED: the candidate specifications directory {CAND_DIR!r} is not readable here ({type(exc).__name__}); "
+                              "nothing was evaluated (the research chain needs the specs, a verified history root and a universe capture)") from exc
+    for fn in names:
         if fn.endswith(".json"):
             with open(os.path.join(CAND_DIR, fn), encoding="utf-8") as f:
                 out.append((fn[:-5], json.load(f)))
@@ -421,6 +426,39 @@ READINESS_LEVELS = ("DATA_READY", "RESEARCH_READY", "PROMISING", "PROSPECTIVE", 
 MIN_PROMISING_OOS_OBS = SV.MIN_OBSERVATIONS["oos_test"]
 
 
+def _cash_comparison_problems(ev: Mapping[str, Any], alpha: float) -> List[str]:
+    """Round 18 (quant specialist): PROMISING used to need only a positive nominal out-of-sample mean (bps of GROSS notional, a zero cost of capital), so an absent or unknown comparison with cash was
+    'no objection': a candidate that never beat the owner's alternative on the capital it ties up could be ranked top tier and pass the allocation gate. The decision statistic is the EXCESS over cash on
+    the committed capital, so PROMISING now also needs at least one KNOWN cash comparison (``vs_cash``: a walk-forward on that excess) that is not REJECTED and passes the SAME bars as the nominal one:
+    a positive out-of-sample mean, a Holm-adjusted p within alpha over the whole family, and enough independent observations. Absent or unknown = CASH_COMPARISON_UNKNOWN: nothing promotes on an
+    unknown cost of capital. This only tightens; a block that is REJECTED already demoted the verdict in evaluate_family."""
+    blocks = ev.get("vs_cash")
+    if not isinstance(blocks, Mapping) or not blocks:
+        return ["CASH_COMPARISON_UNKNOWN: no excess-over-cash walk-forward is attached (no cash basis was applied, or none covers the window): the nominal bps of notional charge no cost of capital"]
+    known, why = [], []
+    for label, b in sorted(blocks.items()):
+        if not isinstance(b, Mapping) or b.get("status") != "WALK_FORWARD_DONE":
+            why.append(f"{label}: {b.get('status') if isinstance(b, Mapping) else 'malformed'}")
+            continue
+        mean, padj, nobs = b.get("oos_mean_excess_bps_of_capital_per_row"), b.get("p_adjusted"), b.get("oos_independent_observations") or 0
+        bad = []
+        if b.get("verdict") == "REJECTED":
+            bad.append("REJECTED")
+        if not isinstance(mean, (int, float)) or mean <= 0:
+            bad.append(f"excess mean {mean} is not positive")
+        if not isinstance(padj, (int, float)) or padj > alpha:
+            bad.append(f"Holm-adjusted p {padj} > {alpha}")
+        if nobs < MIN_PROMISING_OOS_OBS:
+            bad.append(f"{nobs} independent observations < {MIN_PROMISING_OOS_OBS}")
+        if bad:
+            why.append(f"{label}: " + "; ".join(bad))
+        else:
+            known.append(label)
+    if known:
+        return []
+    return ["CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED: no cash basis shows a positive, significant excess over cash on the committed capital (" + " | ".join(why)[:400] + ")"]
+
+
 def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_ok: bool, survivorship: Optional[str], mechanism_ok: bool,
                      evaluation: Optional[Mapping[str, Any]] = None, prospective: Optional[Mapping[str, Any]] = None, executable: bool = False,
                      owner_evidence: Any = None, alpha: float = 0.05) -> Dict[str, Any]:
@@ -473,6 +511,7 @@ def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_
             pr.append("unpriced terminal exits")
         if "holdout_status" in ev and ev.get("holdout_status") not in ("RESERVED", "SPENT"):
             pr.append(f"the evaluation was exploratory (holdout {ev.get('holdout_status')}): NOT_A_HOLDOUT_STUDY cannot reach PROMISING")
+        pr += _cash_comparison_problems(ev, alpha)
         promising = not pr
     put("PROMISING", promising, pr)
     pp = prospective if isinstance(prospective, Mapping) else {}
@@ -828,7 +867,10 @@ def candidate_row(name: str, spec: Mapping[str, Any], scan: Mapping[str, Any], e
     dr = row["required_data"]["evaluation_data_verified"] and (not needs_u or u_dir["status"] == "SUPPLIED_VERIFIED") and not (needs_u and not u_dir["supplied"])
     # Round 18: an evaluation that ran on a history in which some lifecycle-eligible symbol is missing or not COMPLETE over the window (its own ``input.dataset_state``) cannot stand on
     # DATA_READY, whatever the dataset-level manifests say
-    ev_state = ((evaluation or {}).get("input") or {}).get("dataset_state") if isinstance(evaluation, Mapping) and isinstance((evaluation or {}).get("input"), Mapping) else None
+    ev_state = None
+    if isinstance(evaluation, Mapping):
+        ev_state = evaluation.get("dataset_state") if isinstance(evaluation.get("dataset_state"), Mapping) else \
+            (evaluation["input"].get("dataset_state") if isinstance(evaluation.get("input"), Mapping) else None)
     ev_state_reasons: List[str] = []
     if isinstance(ev_state, Mapping) and ev_state.get("state") not in COMPLETE_DATA_STATES:
         dr = False
@@ -1171,6 +1213,8 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                            "closed_in_universe_not_in_series": cin, "key_basis_unverified": bool(unkeyed),
                            "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED,
                            "history_coverage": (universe_info or {}).get("history_coverage") if isinstance(universe_info, Mapping) else None,
+                           "dataset_state": (universe_info or {}).get("dataset_state") if isinstance(universe_info, Mapping) else None,
+                           "loaded_identity": (universe_info or {}).get("loaded_identity") if isinstance(universe_info, Mapping) else None,
                            "survivorship_claim_note": ("DELISTINGS_OBSERVED: Closed contracts the venue still serves were observed; an absent symbol is still not proof it was never delisted"
                                                        if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
                            "universe_info_verified": verdict is not None,
@@ -1942,7 +1986,9 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
                            "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED, "warnings": warnings, "ceiling": "INSUFFICIENT_DATA", "cost_scenarios": costs,
                            "cost_basis": "carry_costs authoritative names: fee VENUE_STATED (base tier), spread ASSUMED 0.4, maker MODELLED", "symbols": len(series),
                            "hedgeability_basis": HEDGE_BASIS, "multiple_testing_scope": "PERSISTENT_LEDGER_FILE", "ledger_path": ledger_path and os.path.abspath(ledger_path),
-                           "time_mode": "REPLAY_OBSERVATION_TIME", "selection": "formation-window information only; never realised future funding"}
+                           "time_mode": "REPLAY_OBSERVATION_TIME", "selection": "formation-window information only; never realised future funding",
+                           "dataset_state": (universe_info or {}).get("dataset_state") if isinstance(universe_info, Mapping) else None,
+                           "loaded_identity": (universe_info or {}).get("loaded_identity") if isinstance(universe_info, Mapping) else None}
     if any(s.interval_min is None for s in series):
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "FUNDING_NORMALISATION_UNKNOWN", "reason": "a symbol carries no fundingInterval"})
         return out
@@ -2305,7 +2351,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ident = dr["dataset_identity"]["digest"]
         print(f"DATASET_STATE: {st}  (dataset_identity {ident[:16] + '...' if ident else 'NONE: a component is unverified or has no digest'})", file=sys.stderr)
         return 0 if st in SUFFICIENT_DATA_STATES else (3 if st == DATA_VALID_BUT_INSUFFICIENT else 2)      # a download that exited 0 is not a complete dataset: only DATA_SUFFICIENT_* exits 0
-    rep = build_report(data_root=a.data_root or a.history_root or None, universe_dir=a.universe_dir or None)
+    try:
+        rep = build_report(data_root=a.data_root or a.history_root or None, universe_dir=a.universe_dir or None)
+    except RH.HarnessError as exc:
+        ap.exit(2, f"refused: {exc}\n")
     if a.data_root and not a.universe_dir and any(not r["universe_dir"]["supplied"] and r["universe_dir"]["required"] for r in rep["candidates"]):
         print("UNIVERSE_DIR_REQUIRED: no --universe-dir passed; the cross-sectional rows are NOT evaluated and cannot reach RESEARCH_READY", file=sys.stderr)
     if a.history_root:
