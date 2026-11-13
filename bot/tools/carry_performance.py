@@ -308,6 +308,12 @@ def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
         sum(q * p for q, p in closes) if closes and not unread else None)
     cur["overlay"] = hedged and cur["spot_cost_usd"] <= 0
     cur["has_perp"] = hedged
+    # The spot leg's state when the perp went flat. An ACQUIRE cycle is a hedged
+    # PAIR only if its spot leg is flat and was the size of the hedge
+    # (`_acquire_spot_leg_problem`): a perp closed while the spot sale was
+    # refused, partial or never made leaves the BTC held, with its price move
+    # unbooked.
+    cur["spot_residual_qty"] = cur.get("spot_qty")
     for key in ("perp_closed", "notional_unknown", "first_open_ms",
                 "last_close_ms", "perp_qty", "spot_qty", "spot_sold", "last_ms"):
         cur.pop(key, None)
@@ -491,7 +497,66 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
         if e.kind == "perp_close" and abs(cur["perp_qty"]) <= L.DUST[L.PERP]:
             cur["perp_closed"] = True
             cur["last_close_ms"] = e.ms
-    return [_finish(by_id[c]) for c in order]
+    out = [_finish(by_id[c]) for c in order]
+    for c in out:
+        c["economic_net_usd"], c["economic_net_basis"] = _economic_net_of(c)
+    return out
+
+
+def _economic_net_of(c: Mapping[str, Any]) -> Tuple[Optional[float], str]:
+    """THE economic net of ONE closed cycle (and how it was reached), or None.
+
+    The booked `net_usd` is CASH. It is the economic result only when both
+    price legs are booked: an aborted cycle (its whole round trip is the loss),
+    an ACQUIRE cycle whose spot leg is flat and the size of the hedge, or an
+    OVERLAY whose never-sold BTC is booked with VERIFIED marks. An overlay whose
+    inventory leg is only DERIVED from perp prices has its basis counted as zero
+    (not an economic result), and any cycle whose pair cannot be computed has
+    none: every return, win rate, drawdown and verdict is taken on this figure,
+    so a figure that is not measured can never be the base of a return."""
+    if not c.get("closed"):
+        return None, "OPEN"
+    if c.get("outcome") != "CLOSED":
+        return c.get("net_usd"), "ABORTED_CASH_IS_THE_LOSS"
+    pair = hedged_pair(c)
+    if not pair["available"]:
+        return None, "PAIR_NOT_COMPUTABLE"
+    if pair.get("derived"):
+        return None, "DERIVED_NOT_BOOKED"
+    return pair["net_usd"], pair["inventory_leg"]
+
+
+#: How far an acquire cycle's spot leg may differ from its hedge and still be the
+#: hedge: the engine's own DELTA_BAND (carry_engine.DELTA_BAND, pinned equal by a
+#: test), because the hedge is the perp short snapped to the lot, which can sit up
+#: to about a lot under the BTC actually held.
+ACQUIRE_HEDGE_TOLERANCE = 0.02
+
+
+def _acquire_spot_leg_problem(c: Mapping[str, Any]) -> Optional[str]:
+    """Why an ACQUIRE cycle is not (provably) a flat hedged pair, or None.
+
+    Its booked net holds both price legs only if the spot leg was sold back
+    (nothing left) and was the size of the perp short. Unknown stays unknown:
+    a quantity the journal cannot state is a problem, never a pass."""
+    residual = c.get("spot_residual_qty")
+    bought = c.get("spot_buy_net_qty")
+    hedged = c.get("hedged_qty")
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+               and math.isfinite(x) for x in (residual, bought, hedged)):
+        return ("the spot or perp quantity of this cycle is not readable from "
+                "the journal, so a flat hedged pair cannot be shown")
+    if abs(residual) > max(L.DUST[L.BTC], 1e-9):
+        return (f"{residual:+.8f} BTC of the spot leg was never sold back: its "
+                "price move is not booked, so the booked net is not the "
+                "pair's")
+    if hedged <= 0 or bought <= 0:
+        return "no hedged quantity or no spot purchase to compare"
+    if abs(bought - hedged) > ACQUIRE_HEDGE_TOLERANCE * max(bought, hedged):
+        return (f"the spot leg ({bought:.8f} BTC bought) was not the size of "
+                f"the perp short ({hedged:.8f} BTC): an under-sized hedge is "
+                "not a delta-neutral pair")
+    return None
 
 
 def _cycle_ms(cycle_id: str) -> Optional[int]:
@@ -531,9 +596,12 @@ def attach_capital(cycles: Sequence[Dict[str, Any]],
         c["capital_committed_usd"] = (
             None if c["margin_committed_usd"] is None or c["spot_leg_usd"] is None
             else c["margin_committed_usd"] + c["spot_leg_usd"])
+        # on the ECONOMIC net (None unless the pair is measured): the cash net
+        # of an unhedged short follows BTC and is not a return on anything
         c["return_on_committed_capital_pct"] = (
-            100.0 * c["net_usd"] / c["capital_committed_usd"]
+            100.0 * c["economic_net_usd"] / c["capital_committed_usd"]
             if c["closed"] and c["outcome"] == "CLOSED"
+            and c.get("economic_net_usd") is not None
             and c["capital_committed_usd"] else None)
 
 
@@ -562,7 +630,8 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                  net_usd_provisional=0.0, provisional_cycles=0)
         for key in ("return_on_peak_notional_pct", "win_rate",
                     "max_drawdown_usd", "annualised_on_notional_in_market_pct",
-                    "mean_hold_days", "best_cycle_share_of_winning_net_pct"):
+                    "mean_hold_days", "best_cycle_share_of_winning_net_pct",
+                    "economic_net_usd", "returns_withheld_why"):
             s[key] = None
         return s
     confirmed = [c for c in closed if c["basis"] == "confirmed"]
@@ -583,16 +652,34 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     peak = (max(notionals) if notionals and all(n is not None for n in notionals)
             else None)
     s["peak_notional_usd"] = peak
-    total_net = sum(c["net_usd"] for c in closed)
-    s["return_on_peak_notional_pct"] = (100.0 * total_net / peak
-                                        if peak else None)
+    # EVERY RETURN-TYPE FIGURE BELOW IS TAKEN ON THE ECONOMIC NET, never on the
+    # cash `net_usd`. For an overlay the booked cash is the net of an UNHEDGED
+    # short (its sign follows BTC); for an acquire cycle that closed its perp
+    # with the spot leg unsold or the wrong size it omits the BTC's move. Each
+    # cycle's `economic_net_usd` is None unless its pair is measured
+    # (`_economic_net_of`); if ANY closed cycle has none, every return, win rate,
+    # drawdown and concentration is withheld (None) and the reason is stated,
+    # never replaced by the cash figure.
+    econ = [c.get("economic_net_usd") for c in closed]
+    measured = all(x is not None for x in econ)
+    econ_total = sum(econ) if measured else None
+    s["economic_net_usd"] = econ_total
+    s["returns_withheld_why"] = None if measured else (
+        "NO_RETURN_OR_STATISTIC: " + "; ".join(sorted({
+            f"{c['cycle_id']}: {c.get('economic_net_basis')}"
+            for c in closed if c.get("economic_net_usd") is None}))
+        + " (the booked cash net of such a cycle is not an economic result)")
+    s["return_on_peak_notional_pct"] = (
+        100.0 * econ_total / peak if measured and peak else None)
     days = sum(c["hold_days"] or 0.0 for c in closed)
     s["days_in_market"] = days
     import performance_analytics as PA
     ann, ann_why = PA.annualise_simple(
-        100.0 * total_net / peak if peak else None, days, len(closed))
+        100.0 * econ_total / peak if measured and peak else None, days,
+        len(closed))
     s["annualised_on_notional_in_market_pct"] = ann
-    s["annualised_refusal_reason"] = ann_why or None
+    s["annualised_refusal_reason"] = ann_why or (
+        None if measured else s["returns_withheld_why"])
     s["annualisation_rule"] = (
         f">= {PA.MIN_ANNUALISE_CYCLES} closed cycles and >= "
         f"{PA.MIN_ANNUALISE_DAYS:g} days in market, else None")
@@ -605,16 +692,18 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     s["totals_are_bounds"] = bool(s["cycles_with_unstated_fees"]
                                   or s["cycles_with_unverified_funding"])
     cum = peak_cum = drawdown = 0.0
-    for c in sorted(closed, key=lambda c: c["start_ms"]):
-        cum += c["net_usd"]
-        peak_cum = max(peak_cum, cum)
-        drawdown = max(drawdown, peak_cum - cum)
-    s["max_drawdown_usd"] = drawdown
+    if measured:
+        for c in sorted(closed, key=lambda c: c["start_ms"]):
+            cum += c["economic_net_usd"]
+            peak_cum = max(peak_cum, cum)
+            drawdown = max(drawdown, peak_cum - cum)
+    s["max_drawdown_usd"] = drawdown if measured else None
     s["open_cycle_booked_costs_usd"] = sum(
         c["fees_usd"] + c["borrow_usd"] for c in cycles if not c["closed"])
-    s["win_rate"] = sum(1 for c in closed if c["net_usd"] > 0) / len(closed)
-    wins = sorted((c["net_usd"] for c in closed if c["net_usd"] > 0),
-                  reverse=True)
+    s["win_rate"] = (sum(1 for x in econ if x > 0) / len(closed)
+                     if measured else None)
+    wins = (sorted((x for x in econ if x > 0), reverse=True)
+            if measured else [])
     s["best_cycle_share_of_winning_net_pct"] = (
         100.0 * wins[0] / sum(wins) if wins else None)
     s["mean_hold_days"] = days / len(closed)
@@ -628,7 +717,8 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     caps = [c.get("capital_committed_usd") for c in hedged]
     if caps and all(c is not None for c in caps):
         s["peak_capital_committed_usd"] = max(caps)
-        s["period_return_on_peak_capital_pct"] = 100.0 * total_net / max(caps)
+        s["period_return_on_peak_capital_pct"] = (
+            100.0 * econ_total / max(caps) if measured else None)
     return s
 
 
@@ -1107,6 +1197,9 @@ def hedged_pair(c: Mapping[str, Any]) -> Dict[str, Any]:
                 "basis_why": "the hedge never landed; the whole round trip "
                              "is the cycle's loss"}
     if not c.get("overlay"):
+        problem = _acquire_spot_leg_problem(c)
+        if problem:
+            return {"available": False, "why": "SPOT_LEG_NOT_FLAT: " + problem}
         return {"available": True, "net_usd": net,
                 "inventory_leg": "SPOT_LEG_BOOKED", "inventory_leg_usd": None,
                 "derived": False, "basis_pnl_usd": c["realised_usd"],
@@ -1702,47 +1795,54 @@ def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
     pair_metric = M["hedged_pair_net_usd"]
     n_overlay = sum(1 for c in closed
                     if c["outcome"] == "CLOSED" and c.get("overlay"))
+    n_hedged = sum(1 for c in closed if c["outcome"] == "CLOSED")
     n_derived = (pair_metric.get("derived_cycles", 0)
                  if pair_metric["value"] is not None else 0)
+    # An ACQUIRE cycle whose perp went flat while the spot leg was unsold or the
+    # wrong size has NO pair (`_acquire_spot_leg_problem`): its booked cash net
+    # omits the BTC's move (phantom +$5,000 per 5% fall per BTC in the red
+    # team's reproduction, with the strongest verdict code).
+    n_unflat = sum(1 for c in closed if c["outcome"] == "CLOSED"
+                   and not c.get("overlay")
+                   and c.get("economic_net_usd") is None)
 
-    def _cycle_economic_net(c: Mapping[str, Any]) -> Optional[float]:
-        if c["outcome"] == "CLOSED" and c.get("overlay"):
-            p = hedged_pair(c)
-            return p["net_usd"] if p["available"] else None
-        return c["net_usd"]
-
-    if n_overlay:
+    # THE ECONOMIC NET (one definition: `_economic_net_of` per cycle). Cash is
+    # the pair only where both price legs are booked; an overlay's booked cash is
+    # the net of an UNHEDGED short whose sign follows BTC. A cycle whose pair is
+    # not MEASURED (derived basis, unavailable, spot leg not flat) has no
+    # economic net, and then EVERY return, benchmark comparison, risk statistic
+    # and the verdict is UNAVAILABLE rather than taken on the cash figure.
+    per_cycle_econ = [c.get("economic_net_usd") for c in ordered]
+    measured = all(x is not None for x in per_cycle_econ)
+    nets = per_cycle_econ if measured else None
+    if n_hedged:
         econ_net = pair_metric["value"]
         econ_class = pair_metric["evidence_class"]
         econ_status = pair_metric["status"]
         econ_why = pair_metric.get("why")
-        per_cycle_econ = [_cycle_economic_net(c) for c in ordered]
-        nets = (per_cycle_econ
-                if all(x is not None for x in per_cycle_econ) else None)
     else:
         econ_net, econ_class, econ_status, econ_why = (
             sum(cash_nets), cls_closed, "CASH_IS_PAIR", None)
-        nets = cash_nets
-    # THE RETURN BASE. A pair whose inventory leg is only DERIVED from perp fill
-    # prices is funding - fees BY CONSTRUCTION (the price legs cancel), so its
-    # basis (perp vs spot) is unmeasured: the unmeasured term is silently zero
-    # and a return on it overstates (about -$265 to -$330 per cycle at a +35 bps
-    # entry basis in the reviewer's reproduction). It is shown, labelled, as
-    # `hedged_pair_net_usd`, and it is NOT a return, benchmark or statistics
-    # base: those need a MEASURED pair (booked, verified inventory marks) or an
-    # acquire cycle whose both price legs are booked.
-    ret_net = econ_net if not (n_overlay and n_derived) else None
-    if n_overlay and n_derived:
-        nets = None
-    no_pair = ((
-        "OVERLAY_PAIR_DERIVED_NOT_BOOKED: the inventory leg is derived from the "
-        "perp fill prices, so basis (perp vs spot) is NOT measured and a return "
-        "on it would count it as zero; the booked cash net of an unhedged short "
-        "is not a return either")
-        if (n_overlay and n_derived and econ_net is not None) else
-        ("OVERLAY_PAIR_NOT_COMPUTABLE: " + str(
+    # THE RETURN BASE: the sum of the per-cycle economic nets, or None. A pair
+    # whose inventory leg is only DERIVED from perp fill prices is funding - fees
+    # BY CONSTRUCTION (basis unmeasured, counted as zero): shown, labelled, as
+    # `hedged_pair_net_usd`, never a return, benchmark or statistics base.
+    ret_net = sum(per_cycle_econ) if measured else None
+    if n_unflat:
+        no_pair = ("ACQUIRE_SPOT_LEG_NOT_FLAT: " + str(
+            econ_why or "an acquire cycle's spot leg is not flat or not the "
+            "size of its hedge") + "; its booked cash net omits the BTC's move "
+            "and is not a return")
+    elif n_overlay and n_derived and econ_net is not None:
+        no_pair = (
+            "OVERLAY_PAIR_DERIVED_NOT_BOOKED: the inventory leg is derived from "
+            "the perp fill prices, so basis (perp vs spot) is NOT measured and a "
+            "return on it would count it as zero; the booked cash net of an "
+            "unhedged short is not a return either")
+    else:
+        no_pair = ("OVERLAY_PAIR_NOT_COMPUTABLE: " + str(
             econ_why or "no hedged-pair net for an overlay cycle")
-         + "; the booked cash net of an unhedged short is not a return"))
+            + "; the booked cash net of an unhedged short is not a return")
 
     funding_net = sum(c["funding_usd"] for c in closed)
     funding_in = sum(c["funding_received_usd"] for c in closed)
@@ -1984,7 +2084,8 @@ def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
         vs_benchmark=((ret_net - sum(b))
                       if b and ret_net is not None else None),
         sample_ok=len(closed) >= PA.MIN_ANNUALISE_CYCLES,
-        overlay_cycles=n_overlay, economic_net=econ_net)
+        overlay_cycles=n_overlay, unflat_cycles=n_unflat,
+        economic_net=econ_net)
     headline = {
         # CASH, as booked. For an overlay this is the net of an unhedged
         # short and follows BTC; it is kept for the ledger and is NOT the
@@ -2014,6 +2115,7 @@ def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
 
 def net_verdict(*, hedged_pair_net: Optional[float] = None,
                 inventory_unbooked_cycles: int = 0, overlay_cycles: int = 0,
+                unflat_cycles: int = 0,
                 economic_net: Optional[float] = None,
                 **kw: Any) -> Dict[str, Any]:
     """The verdict, judged on the ECONOMIC net.
@@ -2033,8 +2135,21 @@ def net_verdict(*, hedged_pair_net: Optional[float] = None,
     """
     cash_net = kw["net"]
     money = lambda x: f"{'-' if x < 0 else ''}${abs(x):,.2f}"  # noqa: E731
-    if not (overlay_cycles and kw["closed"]):
+    if not ((overlay_cycles or unflat_cycles) and kw["closed"]):
         v = _net_verdict(**kw)
+    elif unflat_cycles:
+        base = _net_verdict(**kw)
+        v = {"code": "ACQUIRE_SPOT_LEG_NOT_FLAT",
+             **{k: base[k] for k in ("funding_net_usd", "explicit_costs_usd",
+                                     "price_leg_usd", "net_usd",
+                                     "funding_exceeds_explicit_costs",
+                                     "net_complete")},
+             "statement": (
+                 f"The booked cash net is {money(cash_net)}, but {unflat_cycles} "
+                 "acquire cycle(s) closed the perp while the spot leg was "
+                 "unsold or not the size of the hedge, so the BTC's price move "
+                 "is not booked and the cash net is not the pair's: no net "
+                 "result is claimed.")}
     elif economic_net is None:
         base = _net_verdict(**kw)
         v = {"code": "OVERLAY_PAIR_NOT_COMPUTABLE",
@@ -2078,7 +2193,8 @@ def net_verdict(*, hedged_pair_net: Optional[float] = None,
             "booked inventory mark; the cash net alone is the net of an "
             "unhedged short.)")
     v["hedged_pair_net_usd"] = hedged_pair_net
-    v["economic_net_usd"] = (None if not kw["closed"] or inventory_unbooked_cycles
+    v["economic_net_usd"] = (None if not kw["closed"]
+                             or inventory_unbooked_cycles or unflat_cycles
                              else economic_net)
     v["inventory_unbooked_cycles"] = inventory_unbooked_cycles
     if kw["closed"] and inventory_unbooked_cycles and hedged_pair_net is not None:
@@ -2360,6 +2476,9 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
 
 def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[str]:
     f = lambda v, p="{:,.2f}": "n/a" if v is None else p.format(v)  # noqa: E731
+    # an unmeasured figure prints as a bare "n/a", never "$n/a" or "n/a%"
+    usd = lambda v: "n/a" if v is None else f"${v:,.2f}"  # noqa: E731
+    pct = lambda v, p="{:,.2f}": "n/a" if v is None else p.format(v) + "%"  # noqa: E731
     lines = [f"cycles: {s['closed_cycles']} closed ({s['aborted_cycles']} "
              f"aborted before the hedge), {s['open_cycles']} open "
              f"({s['provisional_cycles']} closed but provisional)"]
@@ -2367,27 +2486,33 @@ def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[st
         lines.append("no closed cycle: no performance figure exists yet")
     else:
         lines += [
-            f"confirmed net: ${f(s['net_usd_confirmed'])}   provisional net "
-            f"(not confirmed): ${f(s['net_usd_provisional'])}",
-            f"funding ${f(s['funding_usd'])}  price leg ${f(s['price_leg_usd'])}  "
-            f"= gross before costs ${f(s['gross_before_costs_usd'])}",
-            f"fees ${f(s['fees_usd'])}  financing ${f(s['borrow_usd'])}  "
-            f"(fees are {f(s['fees_pct_of_funding'], '{:.1f}')}% of funding)",
-            f"peak notional ${f(s['peak_notional_usd'])}  return on it "
-            f"{f(s['return_on_peak_notional_pct'])}%  annualised over "
+            f"confirmed net (booked CASH; for an overlay the net of an unhedged "
+            f"short): {usd(s['net_usd_confirmed'])}   provisional net (not "
+            f"confirmed): {usd(s['net_usd_provisional'])}   economic net (the "
+            f"hedged pair): {usd(s.get('economic_net_usd'))}",
+            f"funding {usd(s['funding_usd'])}  price leg "
+            f"{usd(s['price_leg_usd'])}  = gross before costs "
+            f"{usd(s['gross_before_costs_usd'])}",
+            f"fees {usd(s['fees_usd'])}  financing {usd(s['borrow_usd'])}  "
+            f"(fees are {pct(s['fees_pct_of_funding'], '{:.1f}')} of funding)",
+            f"peak notional {usd(s['peak_notional_usd'])}  return on it "
+            f"{pct(s['return_on_peak_notional_pct'])}  annualised over "
             f"{f(s['days_in_market'], '{:.1f}')} days in market: "
-            f"{f(s['annualised_on_notional_in_market_pct'])}%",
-            f"max drawdown (closed cycles) ${f(s['max_drawdown_usd'])}  win "
-            f"rate {f(100 * s['win_rate'], '{:.0f}')}%  best winner = "
-            f"{f(s['best_cycle_share_of_winning_net_pct'], '{:.1f}')}% of "
+            f"{pct(s['annualised_on_notional_in_market_pct'])}",
+            f"max drawdown (closed cycles) {usd(s['max_drawdown_usd'])}  win "
+            f"rate {pct(None if s['win_rate'] is None else 100 * s['win_rate'], '{:.0f}')}  best winner = "
+            f"{pct(s['best_cycle_share_of_winning_net_pct'], '{:.1f}')} of "
             f"winning net  mean hold {f(s['mean_hold_days'], '{:.1f}')} days"]
+    if s.get("returns_withheld_why"):
+        lines.append("returns, win rate and drawdown: n/a - " + str(
+            s["returns_withheld_why"]))
     if s.get("period_return_on_peak_capital_pct") is not None:
         lines.append(
             f"committed capital (venue margin + spot leg), peak "
-            f"${f(s['peak_capital_committed_usd'])}; period net / that peak "
-            f"{f(s['period_return_on_peak_capital_pct'])}% over "
+            f"{usd(s['peak_capital_committed_usd'])}; period economic net / "
+            f"that peak {pct(s['period_return_on_peak_capital_pct'])} over "
             f"{f(s['period_days'], '{:.1f}')} calendar days (peak margin "
-            f"${f(s['margin_committed_usd'])}); {s['capital_basis']}")
+            f"{usd(s['margin_committed_usd'])}); {s['capital_basis']}")
     else:
         lines.append("committed capital: not available (no observed venue margin "
                      "for every closed cycle); no return on capital is shown")

@@ -30,11 +30,27 @@ T0 = 1_700_000_000_000
 
 
 def cycle(j, day_open, day_close, *, funding, close_price=100_000.0, tag,
-          fee_status="confirmed", basis="venue", qty=1.0):
+          fee_status="confirmed", basis="venue", qty=1.0, inventory_mark=True):
+    """A perp-only (overlay) cycle. By default the client's BTC is booked and
+    marked FLAT (a verified zero-move revaluation), so the perp's move is a real
+    BASIS loss/gain of the MEASURED hedged pair and the pair net equals the
+    booked net: that is what keeps these fixtures' hand-computed returns valid.
+    `inventory_mark=False` is the overlay whose inventory leg is only DERIVED
+    from the perp prices: its pair is not measured, so it has no economic net and
+    no return (see `test_a_derived_overlay_*` below)."""
     L.perp_open(j, ms=T0 + day_open * DAY, ref=f"{tag}-o", qty=qty,
                 price=100_000.0, fee_usd=55.0, fee_status=fee_status)
     mid = (day_open + day_close) // 2
     L.funding(j, ms=T0 + mid * DAY, ref=f"{tag}-f", usd=funding, basis=basis, raw=(_vraw(f"{tag}-f", T0 + mid * DAY, funding) if basis == "venue" else None))
+    if inventory_mark:
+        L.revalue_inventory(
+            j, ms=T0 + day_close * DAY - 1, ref=f"{tag}-rv", qty=qty,
+            from_price=100_000.0, to_price=100_000.0,
+            raw={"valuation": L.MARK_VALUATION, "qty": qty,
+                 "entry_spot": 100_000.0, "exit_spot": 100_000.0,
+                 "exit_mark_source": "tick_spot_mark",
+                 "exit_mark_observed_ms": T0 + day_close * DAY - 1,
+                 "fill_ms": T0 + day_close * DAY})
     L.perp_close(j, ms=T0 + day_close * DAY, ref=f"{tag}-c", qty=qty,
                  price=close_price, entry_price=100_000.0, fee_usd=55.0,
                  fee_status=fee_status)
