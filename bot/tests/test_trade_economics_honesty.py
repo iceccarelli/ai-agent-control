@@ -194,3 +194,23 @@ def test_the_sensitivity_grid_builds_consistent_paths_and_every_row_keeps_its_hu
             r = TE.compute(pos(float(d)), complete_costs(), path, funding_source="SCENARIO")
             assert r["consistency"]["funding_path_matches_hold"] is True
     assert all(row["incomplete"] is False for row in rows)
+
+
+def test_a_stated_borrow_rate_with_no_stated_principal_is_unknown_not_a_free_loan():
+    """Round 19 (capital specialist F4, reproduced): ``borrowed_usd`` defaulted to 0.0, so ``borrow_apr=0.05`` with the principal forgotten priced the borrow at 0.000 and listed no unknown: a false
+    'complete'. A rate with no principal is no price. A stated 0% is zero whatever the principal, and a STATED principal of 0 is 'no loan'."""
+    forgotten = TE.compute(pos(), complete_costs(borrow_apr=0.05), [0.65] * 90)
+    assert "borrow" in forgotten["unknowns"] and "OPTIMISTIC BOUND" in forgotten["net_reading"] and forgotten["components_usd"]["borrow_usd"] == 0.0
+    stated = TE.compute(pos(), complete_costs(borrow_apr=0.05, borrowed_usd=10_000.0), [0.65] * 90)
+    assert "borrow" not in stated["unknowns"] and stated["components_usd"]["borrow_usd"] == pytest.approx(-(0.05 * 10_000.0 * 30.0 / 365.0))
+    assert stated["net_pnl_usd"] < forgotten["net_pnl_usd"], "the loan costs money; the forgotten principal flattered the net"
+    no_loan = TE.compute(pos(), complete_costs(borrow_apr=0.05, borrowed_usd=0.0), [0.65] * 90)
+    assert "borrow" not in no_loan["unknowns"] and no_loan["components_usd"]["borrow_usd"] == 0.0
+    zero_rate = TE.compute(pos(), complete_costs(borrow_apr=0.0), [0.65] * 90)
+    assert "borrow" not in zero_rate["unknowns"], "a stated 0% rate costs nothing on any principal"
+    no_rate = TE.compute(pos(), complete_costs(borrow_apr=None, borrowed_usd=10_000.0), [0.65] * 90)
+    assert "borrow" in no_rate["unknowns"], "a principal with no rate is as unknown as it ever was"
+    with pytest.raises(ValueError):
+        TE.compute(pos(), complete_costs(borrow_apr=0.05, borrowed_usd=-1.0), [0.65] * 90)
+    with pytest.raises(ValueError):
+        TE.compute(pos(), complete_costs(borrow_apr=0.05, borrowed_usd=float("nan")), [0.65] * 90)

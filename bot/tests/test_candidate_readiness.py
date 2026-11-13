@@ -1792,3 +1792,23 @@ def test_the_competition_row_says_when_a_family_was_rejected_early_and_on_how_ma
     assert out["families"]["F"]["rejected_early"] is True and out["families"]["F"]["oos_independent_observations"] == 28
     out2 = CCmp._xs_summary({"status": "EVALUATED", "evaluation": {"families": {"F": {**fam, "reject_early": None}}}})
     assert out2["families"]["F"]["rejected_early"] is False
+
+
+def test_the_acquire_class_is_priced_at_the_executed_capital_and_the_overlay_grid_states_every_multiple():
+    """Round 19 (capital F6, quant F1): the acquire class was priced at the research overlay's FAVOURABLE 1.16x while the executor commits 2.04x, and no report said how the overlay's excess over
+    cash moves with the capital multiple (+1.4%/yr at 1.0x, +0.2% at 1.16x, -3.1% at 2.04x on the whole replay: the sign flips). A pass on the favourable basis is not evidence about the executed one."""
+    econ = CR.btc_carry_economics()
+    cap = econ["on_capital_after_cash"]
+    assert cap["status"] == "COMPUTED"
+    by_class = cap["capital_per_notional_by_class"]
+    assert by_class[CR.CAP_ACQUIRE] == pytest.approx(2.04) == pytest.approx(float(CR.EM.hedged_pair_capital_usd(1, 1).value)) and by_class[CR.CAP_OVERLAY] == pytest.approx(CR.OM.CAPITAL_PER_NOTIONAL)
+    a51 = cap["classes"][CR.CAP_ACQUIRE]["holds"]["51"]["mean_excess_over_cash_bps_of_capital"]
+    assert a51 == pytest.approx(-23.07, abs=0.05) and a51 < -22.99, "dearer capital, same hold: more negative than the -22.99 the favourable factor gave"
+    grid = cap["overlay_capital_grid"]
+    keys = ("inventory_only", "research_assumption", "no_collateral_credit")
+    assert [grid[k]["capital_per_notional"] for k in keys] == [1.0, pytest.approx(1.16), pytest.approx(2.04)]
+    ex = [grid[k]["mean_excess_over_cash_bps_of_capital"] for k in keys]
+    assert all(x is not None for x in ex) and ex[0] > ex[1] > ex[2], "a dearer capital basis never improves the excess over cash of a positive-net hold"
+    assert grid["research_assumption"]["mean_excess_over_cash_bps_of_capital"] == pytest.approx(cap["classes"][CR.CAP_OVERLAY]["holds"]["51"]["mean_excess_over_cash_bps_of_capital"])
+    _verdict, reasons, _p = CR._carry_verdict(econ)
+    assert any("executed no-credit basis 2.04x" in r for r in reasons), "the verdict names the executed basis next to the favourable one"

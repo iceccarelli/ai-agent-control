@@ -40,6 +40,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
 
 import carry_costs as CC  # noqa: E402
 import cash_basis as CB  # noqa: E402
+import economic_model as EM  # noqa: E402
 import opportunity_map as OM  # noqa: E402
 import research_harness as RH  # noqa: E402
 import statistical_power as SP  # noqa: E402
@@ -683,7 +684,10 @@ def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_co
     is the most favourable denominator there is: a hedged position that does not beat USD cash is not a money-maker however positive its notional net. The cash series is the repo's own OKX USDT
     lending history (a lender's floor, not the owner's opportunity cost) and a hold the series cannot cover is UNKNOWN and dropped, never free."""
     curve = OM.load_cash_curve(BOT)
-    base = {"capital_per_notional": OM.CAPITAL_PER_NOTIONAL,
+    # Round 19: ONE definition per structure. The overlay keeps the research assumption (the FAVOURABLE basis: used to REJECT, since a carry that fails on it fails on every dearer one), and the
+    # ACQUIRE class is priced at what the executor commits (the registry's 2.04x at leverage 1), no longer at the favourable overlay factor.
+    factors = {CAP_OVERLAY: float(OM.CAPITAL_PER_NOTIONAL), CAP_ACQUIRE: float(EM.structure_capital_usd(EM.ACQUIRED_SPOT_PERP, 1, 1).value)}
+    base = {"capital_per_notional": OM.CAPITAL_PER_NOTIONAL, "capital_per_notional_by_class": factors,
             "capital_basis": "spot leg (paid, or owned and so forgone) + an ASSUMED ~15% perp initial margin + 1% buffer per USD of notional (the research overlay basis; the live Testnet plan at leverage 1 "
                              "commits 2.04x, so this is the FAVOURABLE basis for carry)",
             "cash_series": {"source": OM.OKX_LENDING, "label": OM.CASH_BENCHMARK_LABEL, "first_utc": OM._iso(curve.first_ms()), "last_utc": OM._iso(curve.last_ms())}, "label": LABEL_CORPUS}
@@ -695,18 +699,29 @@ def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_co
     for cls, cost in classes.items():
         holds: Dict[str, Any] = {}
         for h in HOLDS_PRINTS:
-            ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - cost, "cost_bps": cost} for e in base_entries[h]], curve)
+            ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - cost, "cost_bps": cost} for e in base_entries[h]], curve, capital_factor=factors[cls])
             holds[str(h)] = OM.excess_summary(ent, unk, hold=h)
             if cls == CAP_OVERLAY and ent and holds[str(h)].get("cash_coverage_ok"):          # how strong is the loss, by the repo's own rejection standard (the policies the competition ranks)
                 holds[str(h)]["rejection_bars"] = {"nominal": rejection_bar([e["net_bps"] for e in ent], basis="mean_net_bps_of_notional_zero_capital_cost"),
                                                    "excess": rejection_bar([e["excess_over_cash_bps_of_capital"] for e in ent], basis="mean_excess_over_cash_bps_of_capital")}
         out[cls] = {"round_trip_bps": cost, "holds": holds}
+    # the same overlay hold priced at each stated capital multiple, so a favourable-basis figure is never read as evidence about the executed structure (the sign flips with the multiple: committed
+    # data, +1.4%/yr at 1.0x, +0.2% at 1.16x, -3.1% at 2.04x on the whole replay)
+    grid_hold = OM.HOLD_LONG_PRINTS if OM.HOLD_LONG_PRINTS in HOLDS_PRINTS else max(HOLDS_PRINTS)
+    upper = float(EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 1, 1).value)
+    grid: Dict[str, Any] = {}
+    for label, f, what in (("inventory_only", 1.0, "the held coin only: its margin is covered by it as collateral at ratio 1 (a best case the venue must state)"),
+                           ("research_assumption", float(OM.CAPITAL_PER_NOTIONAL), "the research overlay: held coin + an ASSUMED ~15% margin + 1% buffer (the favourable basis; used to reject)"),
+                           ("no_collateral_credit", upper, "held coin + the perp margin paid in separate cash + the plan buffer: the upper bound until the owner states the venue's collateral ratio")):
+        ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - overlay_cost_bps, "cost_bps": overlay_cost_bps} for e in base_entries[grid_hold]], curve, capital_factor=f)
+        sm = OM.excess_summary(ent, unk, hold=grid_hold)
+        grid[label] = {"capital_per_notional": f, "hold_prints": grid_hold, "n": sm.get("n"), "mean_excess_over_cash_bps_of_capital": sm.get("mean_excess_over_cash_bps_of_capital"), "meaning": what}
     gt, gunk = OM.on_capital(list(gated["trades"]), curve)
     gs = OM.excess_summary(gt, gunk, hold=OM.HOLD_PRINTS)
     if gt and gs.get("cash_coverage_ok"):
         gs["rejection_bars"] = {"nominal": rejection_bar([e["net_bps"] for e in gt], basis="mean_net_bps_of_notional_zero_capital_cost"),
                                 "excess": rejection_bar([e["excess_over_cash_bps_of_capital"] for e in gt], basis="mean_excess_over_cash_bps_of_capital")}
-    return {**base, "status": "COMPUTED", "classes": out, "gated_sequential_overlay": gs,
+    return {**base, "status": "COMPUTED", "classes": out, "gated_sequential_overlay": gs, "overlay_capital_grid": grid,
             "reading": "mean_excess_over_cash_bps_of_capital below zero = the position earns LESS than the cash alternative on the capital it ties up, after every modelled cost; "
                        "the nominal bps-of-notional figures elsewhere in this report do not charge that capital"}
 
@@ -739,7 +754,10 @@ def _carry_verdict(econ: Mapping[str, Any]) -> Tuple[str, List[str], Dict[str, A
         reasons.append(f"ON CAPITAL, AFTER CASH (capital {cap['capital_per_notional']}x notional; cash = {cap['cash_series']['label']}): the {OM.HOLD_LONG_PRINTS}-print hold's nominal net "
                        f"{o['mean_nominal_net_bps_of_notional']:.1f} bps of notional is {o['mean_net_bps_on_capital']:.1f} bps on capital and {o['mean_excess_over_cash_bps_of_capital']:.1f} bps EXCESS over cash "
                        f"(overlay; block-CI90 {None if ci is None else [round(x, 1) for x in ci]}, {o['annualised_excess_pct_of_capital']:.2f}%/yr extrapolated"
-                       + (f"; acquire {a['mean_excess_over_cash_bps_of_capital']:.1f} bps" if a.get("mean_excess_over_cash_bps_of_capital") is not None else "") + f") [{LABEL_CORPUS}]")
+                       + (f"; acquire at {cap['capital_per_notional_by_class'][CAP_ACQUIRE]:.2f}x {a['mean_excess_over_cash_bps_of_capital']:.1f} bps" if a.get("mean_excess_over_cash_bps_of_capital") is not None else "") + f")"
+                       + (f"; overlay at the executed no-credit basis {cap['overlay_capital_grid']['no_collateral_credit']['capital_per_notional']:.2f}x "
+                          f"{cap['overlay_capital_grid']['no_collateral_credit']['mean_excess_over_cash_bps_of_capital']:.1f} bps"
+                          if ((cap.get('overlay_capital_grid') or {}).get('no_collateral_credit') or {}).get('mean_excess_over_cash_bps_of_capital') is not None else "") + f" [{LABEL_CORPUS}]")
     else:
         reasons.append("CASH_UNKNOWN: the cost of capital could not be applied (no cash series, or it covers too little of the history); every net figure above is bps of NOTIONAL with ZERO capital cost, "
                        "not a return on capital")

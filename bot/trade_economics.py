@@ -71,7 +71,7 @@ class Costs:
     custody_apr: Optional[float] = None
     operational_usd: Optional[float] = None
     borrow_apr: Optional[float] = None
-    borrowed_usd: float = 0.0
+    borrowed_usd: Optional[float] = None    # Round 19: None = UNSTATED (it was 0.0: a stated rate with a forgotten principal priced the loan at nothing); 0.0 is the statement 'no loan'
     fee_provenance: str = "UNVERIFIED"      # ACCOUNT_VERIFIED only when read from the account
     maker_taker: str = "taker"
 
@@ -132,7 +132,15 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
     comp["transfer_usd"] = -opt("transfer", costs.transfer_usd, lambda v: v)
     comp["custody_usd"] = -opt("custody", costs.custody_apr, lambda v: v * position.btc_inventory_usd * hold / 365.0)
     comp["operational_usd"] = -opt("operational", costs.operational_usd, lambda v: v)
-    comp["borrow_usd"] = -opt("borrow", costs.borrow_apr, lambda v: v * costs.borrowed_usd * hold / 365.0)
+    def _borrow_cost(rate: float) -> float:
+        if costs.borrowed_usd is None:
+            if rate > 0:                                      # a rate with no principal is no price: unknown, never a free loan (a stated 0% is zero on any principal)
+                unknowns.append("borrow")
+            return 0.0
+        if not (_fin(costs.borrowed_usd) and costs.borrowed_usd >= 0):
+            raise ValueError("borrowed_usd must be a non-negative finite number")
+        return rate * costs.borrowed_usd * hold / 365.0
+    comp["borrow_usd"] = -opt("borrow", costs.borrow_apr, _borrow_cost)
     net = sum(comp.values())
     n_settle = len(funding_bps)
 
