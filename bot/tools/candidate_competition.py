@@ -338,6 +338,14 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
             verdict = "UNTESTED"
         if verdict not in ("REJECTED", "INSUFFICIENT_DATA", "UNTESTED"):
             verdict = "UNTESTED"
+        # A family whose persistent ledger has COUNTED trials has been tried: 'no test has been run' is false, its data was read once, and offering it as a next
+        # hypothesis would invite a further variant on that data (a wider multiple-testing family). Round 17: reg-1 and reg-2 were counted yet the row said UNTESTED.
+        n_counted = mt.get("n_variants_counted") or 0
+        if verdict == "UNTESTED" and name not in RESEARCH_ONLY and n_counted > 0:
+            verdict = "INSUFFICIENT_DATA"
+            reasons = [x for x in reasons if not x.startswith("no test has been run")]
+            reasons.insert(0, f"TRIALS_ALREADY_COUNTED: {n_counted} variant(s) of family {mt['family']!r} are in the persistent multiple-testing ledger, so this mechanism "
+                              "has been tried and its data read; the result is not recorded here, and another variant on that data widens the family")
         lv = r["readiness"]
         row = {"candidate": r["candidate"], "name": name, "origin": "DRAFT_PROPOSED" if draft else ("RESEARCH_ONLY" if name in RESEARCH_ONLY else "SPEC"),
                "verdict": verdict, "highest_supportable_verdict": verdict, "readiness_level": lv["highest"], "readiness_levels": {k: v["reached"] for k, v in lv["levels"].items()},
@@ -370,7 +378,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                            "next_hypotheses": [], "caveats": base["caveats"]}
     if all_failed:
         out["next_hypotheses"] = [{"candidate": x["candidate"], "name": x["name"], "status": "UNTESTED (registered draft, specification only)", "rationale": x.get("rationale", ""),
-                                   "data_missing": x["data_readiness"]["missing"]} for x in rows if x["origin"] == "DRAFT_PROPOSED"]
+                                   "data_missing": x["data_readiness"]["missing"]} for x in rows
+                                  if x["origin"] == "DRAFT_PROPOSED" and x["verdict"] == "UNTESTED" and not (x["multiple_testing"]["n_variants_counted"] or 0)]
     if universe_dir is None and (data_root or history_root):
         out["findings"].append("UNIVERSE_DIR_REQUIRED: no --universe-dir; the cross-sectional rows were not evaluated")
     return out
