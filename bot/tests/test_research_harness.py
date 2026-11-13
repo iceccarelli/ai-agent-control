@@ -859,3 +859,22 @@ def test_the_committed_files_load_with_every_print_accounted_for(sym):
     assert len(got) <= n
     if sym == "SOLUSDT":
         assert len(got) < n, "SOL's 2h/4h cadence must collapse into fewer 8h slots, by summing, not by dropping"
+
+
+def test_persisted_variants_counts_the_file_and_ignores_the_process_high_water_mark(tmp_path):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    fam = "persisted-count-family"
+    path = str(tmp_path / "led.jsonl")
+    led = RH.VariantLedger(fam, path=path)
+    assert led.persisted_variants == 0
+    led.record("a", {"k": 1}, [0.1, -0.2, 0.3, 0.05], horizon=1)
+    led.record("b", {"k": 2}, [0.2, 0.1, -0.1, 0.0], horizon=1)
+    assert led.persisted_variants == 2 and led.n_variants == 2
+    again = RH.VariantLedger(fam, path=path)                                         # a fresh object over the same file
+    assert again.persisted_variants == 2
+    other = RH.VariantLedger(fam, path=str(tmp_path / "other.jsonl"))                # another file of the same family: nothing persisted there, though the high-water mark is 2
+    assert other.persisted_variants == 0 and other.n_variants >= 2
+    assert RH.VariantLedger(fam).persisted_variants == 0                             # in memory
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()

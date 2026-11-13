@@ -970,6 +970,12 @@ class VariantLedger:
     def carried_prior_variants(self) -> int:
         return self._carried
 
+    @property
+    def persisted_variants(self) -> int:
+        """Variants this ledger's own FILE holds (0 for an in-memory ledger). Unlike `n_variants` it ignores the process-wide high-water mark, which a long process (a test
+        suite, a notebook) raises for a family whatever file is asked about: "this family has already been tried" is a statement about the FILE."""
+        return self._persisted
+
     def variant_names(self) -> Tuple[str, ...]:
         """Names of the variants that were actually TESTED (rejected ones are counted but cannot be selected)."""
         self._tl.verify()

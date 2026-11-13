@@ -286,8 +286,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
         net_basis = "UNKNOWN: no committed or supplied data measures this edge"
         extra: Dict[str, Any] = {}
         mt_led, mt_path = _ledger(RH.normalise_family(r["multiple_testing"]["family"]), ldir)
-        persisted_trials = mt_led.n_variants                 # what the family's PERSISTENT ledger file counts (the cross-sectional row below re-states n_variants_counted from this run's evaluation)
-        mt = {"family": r["multiple_testing"]["family"], "n_variants_counted": persisted_trials, "scope": "PERSISTENT_LEDGER_FILE", "ledger_path": mt_path}
+        persisted_trials = mt_led.persisted_variants         # what the family's LEDGER FILE holds: not `n_variants`, which a long process raises to a family-wide high-water mark, and not the cross-sectional total re-stated below
+        mt = {"family": r["multiple_testing"]["family"], "n_variants_counted": mt_led.n_variants, "persisted_variants": persisted_trials, "scope": "PERSISTENT_LEDGER_FILE", "ledger_path": mt_path}
         if name == "cash_and_carry" and econ is not None and "unconditional_forced_hold" in econ:
             pols = btc_policies(econ)
             lost = [p for p in pols if p["verdict"] == "REJECTED"]
@@ -382,7 +382,7 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
     if all_failed:
         out["next_hypotheses"] = [{"candidate": x["candidate"], "name": x["name"], "status": "UNTESTED (registered draft, specification only)", "rationale": x.get("rationale", ""),
                                    "data_missing": x["data_readiness"]["missing"]} for x in rows
-                                  if x["origin"] == "DRAFT_PROPOSED" and x["verdict"] == "UNTESTED" and not (x["multiple_testing"]["n_variants_counted"] or 0)]
+                                  if x["origin"] == "DRAFT_PROPOSED" and x["verdict"] == "UNTESTED" and not (x["multiple_testing"].get("persisted_variants") or 0)]
     if universe_dir is None and (data_root or history_root):
         out["findings"].append("UNIVERSE_DIR_REQUIRED: no --universe-dir; the cross-sectional rows were not evaluated")
     return out
