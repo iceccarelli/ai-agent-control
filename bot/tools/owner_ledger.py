@@ -1012,6 +1012,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
                         "funding_coverage": (eco["funding_usd"] / funding_all) if funding_all else None,
                         "fee_coverage": (eco["fees_usd"] / fees_all) if fees_all else None,
                         "reading": "exact for the COMPLETE round trips only (a spot reference on every fill); the account-level bridge above covers everything",
+                        "partial": eco.get("partial") is True, "excluded_round_trips": perp_rep.get("excluded_round_trips"),
                         "limitations": limits}
         else:
             strategy = {"status": "UNKNOWN", "reason": eco.get("reading", "no complete round trip with a basis"), "limitations": limits}
@@ -1038,7 +1039,11 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
             capital["account_return_on_capital_period"] = ((bridge["change_in_equity_usd"] - ext_usd) / avg_capital) if (bridge and not unpriced_btc) else None
             if unpriced_btc:
                 capital["account_return_withheld"] = "a BTC deposit/withdrawal has no USD value"
-            if strategy.get("status") == "COMPUTED":
+            if strategy.get("status") == "COMPUTED" and strategy.get("partial"):
+                # Round 18 (review): the perp review excluded round trips whose records are incomplete, and selection by completeness is not independent of P&L: a rate on the complete trips only
+                # is the number the review itself withholds. The dollars stay.
+                capital["strategy_return_withheld"] = "the perp review is partial (round trips with incomplete records are excluded from the net): no strategy rate is stated"
+            elif strategy.get("status") == "COMPUTED":
                 capital["strategy_return_on_capital_period"] = strategy["net_usd"] / avg_capital
                 ann, why = annualise(strategy["net_usd"] / avg_capital, window_days)
                 capital["strategy_return_on_capital_annualised_simple_pct"] = ann
@@ -1154,7 +1159,7 @@ def _hedged_notional_return(fills, funding, perp_rep, window_days, t0, t1, openi
         area += abs(min(q, 0.0)) * last_p * (t1 - last_t)
     avg = area / (t1 - t0) if t1 > t0 else None
     out = {"average_short_notional_usd": avg, "priced_at": "the most recent fill price (approximation)"}
-    if avg and avg > 0 and strategy.get("status") == "COMPUTED" and window_days:
+    if avg and avg > 0 and strategy.get("status") == "COMPUTED" and not strategy.get("partial") and window_days:
         out["strategy_return_period"] = strategy["net_usd"] / avg
         ann, why = annualise(strategy["net_usd"] / avg, window_days)
         out["strategy_return_annualised_simple_pct"] = ann

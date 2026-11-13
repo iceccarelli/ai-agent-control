@@ -37,6 +37,10 @@ import research_harness as RH  # noqa: E402
 SCHEMA = "candidate_competition/v1"
 COMPETING = ("cross_sectional_funding", "spot_perp_basis", "cash_and_carry", "market_neutral_relative_value", "passive_execution", "liquidity_imbalance", "spread_microstructure")
 RESEARCH_ONLY = ("cross_venue_funding",)
+#: Round 18 (red team): the families whose completed walk-forward the competition puts in front of the readiness ladder (``evals`` in ``run_competition``). Every other row can only be REJECTED in-sample
+#: or UNTESTED: PROMISING is unreachable for it whatever the data, so its NO WINNER is STRUCTURAL (``NO_EVALUATOR_WIRED:<family>``), not a measurement. Wiring a BTC carry out-of-sample evaluator
+#: spends the owner's out-of-sample lock and is the owner's decision; this tuple is pinned by a test against the evaluations the function really builds.
+WIRED_EVALUATORS = ("cross_sectional_funding",)
 BTC_ROWS = ("cash_and_carry",)
 CORPUS_LABEL = CR.LABEL_CORPUS
 VERDICT_TIER = {"PROMISING": 0, "EVALUATED_POSITIVE": 1, "INSUFFICIENT_DATA": 2, "UNTESTED": 3, "REJECTED": 4}
@@ -362,6 +366,19 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                "executable_on_qualified_venue": {"value": r["executable_on_qualified_venues"]["value"], "executable": r["executable_on_qualified_venues"]["executable"],
                                                  "venues": "Bybit only (venues.qualified_names)"},
                "rejection_reasons": reasons[:12], "label": CORPUS_LABEL if name == "cash_and_carry" else None, **extra}
+        wired = name in WIRED_EVALUATORS
+        row["evaluator"] = {"wired": wired, "code": None if wired else f"NO_EVALUATOR_WIRED:{name}"}
+        if name == "cross_sectional_funding":
+            # The data state of the history this evaluation read, with the candidate's verdict folded in (Round 18 review: the two DATA_SUFFICIENT_* verdict states were never produced). REJECTED on sufficient
+            # data -> DATA_SUFFICIENT_CANDIDATE_REJECTED; PROMISING on the ladder -> ..._ELIGIBLE_FOR_FURTHER_REVIEW; an evaluator that says "not enough" keeps DATA_VALID_BUT_INSUFFICIENT; any data finding wins.
+            fam_ev = (evals or {}).get("cross_sectional_funding") if evals else None
+            ds0 = fam_ev.get("dataset_state") if isinstance(fam_ev, Mapping) else None
+            if isinstance(ds0, Mapping) and isinstance(ds0.get("findings"), Mapping):
+                cv = "PROMISING" if lv["levels"]["PROMISING"]["reached"] else (verdict if verdict in ("REJECTED", "INSUFFICIENT_DATA", "UNTESTED") else "INSUFFICIENT_DATA")
+                row["dataset_state"] = CR.dataset_state(ds0["findings"], candidate_verdict=cv)
+        if not wired:                                                # reasons only: no verdict, level, rank or net edge above depends on this
+            row["rejection_reasons"] = reasons[:11] + [f"NO_EVALUATOR_WIRED:{name}: no walk-forward evaluator is connected to this family in run_competition, so PROMISING is unreachable "
+                                                         "for it whatever the data: NO WINNER for this row is structural, not measured"]
         if draft:
             row["rationale"] = DRAFT_RATIONALE.get(name, "")
         rows.append(row)
@@ -378,7 +395,10 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                            "winner": None if all_failed else promising[0]["name"], "all_failed": all_failed,
                            "winner_statement": ("NO WINNER: no candidate reached PROMISING; the ranking orders evidence, it does not pick a strategy. Nothing here is a trade recommendation."
                                                 if all_failed else f"{promising[0]['name']} reached PROMISING (in-sample to its capture): still INSUFFICIENT_DATA until prospective evidence and the owner's attestation"),
-                           "next_hypotheses": [], "caveats": base["caveats"]}
+                           "next_hypotheses": [], "caveats": base["caveats"],
+                           "no_winner_breakdown": {"evaluator_wired": sorted(x["name"] for x in rows if x["evaluator"]["wired"]),
+                                                   "structural_no_evaluator_wired": sorted(x["name"] for x in rows if not x["evaluator"]["wired"]),
+                                                   "reading": "a row without a wired evaluator cannot reach PROMISING whatever the data: its NO WINNER is structural, not an evaluated failure"}}
     if all_failed:
         out["next_hypotheses"] = [{"candidate": x["candidate"], "name": x["name"], "status": "UNTESTED (registered draft, specification only)", "rationale": x.get("rationale", ""),
                                    "data_missing": x["data_readiness"]["missing"]} for x in rows
@@ -440,8 +460,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"NOTE: your cost-of-capital statement is not usable ({info.get('state')}: {'; '.join(info.get('problems') or [])}): no OWNER_STATED comparison was made, and the historical series was NOT substituted for it")
         else:
             bases.append(ob)
-    rep = run_competition(data_root=a.data_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval, ledger_dir=a.ledger_dir, history_root=a.history_root,
-                          unreserved_exploratory=a.unreserved_exploratory, cash_bases=bases)
+    try:
+        rep = run_competition(data_root=a.data_root, universe_dir=a.universe_dir, spot_dir=a.spot_dir, mark_interval=a.mark_interval, ledger_dir=a.ledger_dir, history_root=a.history_root,
+                              unreserved_exploratory=a.unreserved_exploratory, cash_bases=bases)
+    except RH.HarnessError as exc:                                   # a typed refusal (e.g. CANDIDATE_SPECS_NOT_SHIPPED), never a traceback
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
     print(render_table(rep))
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:

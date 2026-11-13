@@ -255,6 +255,16 @@ class TestARefreshMustExtendNotReplace:
         assert open(path, "rb").read() == before, (
             "a shorter walk must never touch the file already on disk")
 
+    def test_a_refused_refresh_exits_non_zero(self, tmp_path, monkeypatch, capsys):
+        """Round 18 (market-data specialist): the refusal is carried in the report's ``error`` (not raised), and ``main`` returned 0 for it: a wrapper reading the exit code saw a successful
+        refresh of a cash benchmark that was in fact refused."""
+        refused = {"historical_bytes_are_prefix": False, "error": "REFRESH WOULD REWRITE HISTORY - refusing to write."}
+        monkeypatch.setattr(fbr, "run", lambda *a, **k: refused)
+        assert fbr.main(["--repo", str(tmp_path), "--ccy", "USDT"]) == 1
+        assert "REFUSED USDT: REFRESH WOULD REWRITE HISTORY" in capsys.readouterr().err
+        monkeypatch.setattr(fbr, "run", lambda *a, **k: {"historical_bytes_are_prefix": True, "written": False})
+        assert fbr.main(["--repo", str(tmp_path), "--ccy", "USDT"]) == 0
+
     def test_no_existing_file_is_trivially_a_prefix(self, tmp_path):
         report = fbr.run(str(tmp_path), ccy="USDT",
                          pager=pager_over(2_500, NOW))

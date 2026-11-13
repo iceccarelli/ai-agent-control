@@ -52,6 +52,11 @@ def test_a_long_low_funding_recording_reaches_an_economic_verdict_with_the_scree
     assert "LOWER BOUND" in text and "best case" in text and "MODELLED net" in text and "UNPRICED" in text
     assert "environment mainnet, symbol BTCUSDT" in text and "venue bybit" in text
     assert res["components_usd"]["market_impact_usd"] == 0.0 and "market_impact" in res["unknowns"]     # unknown, not a known zero
+    # Round 18: the render says what the arithmetic does. The unpriced costs ARE counted as zero in that net, so it is an upper bound; "excluded, not zero" was the opposite of the truth, and the screens
+    # line prints the hurdle's own verdict, never the legacy bare "meets"
+    assert res["net_is_optimistic_bound"] is True and "OPTIMISTIC BOUND" in text and "counted as ZERO" in text and "excluded, not zero" not in text
+    screens = next(ln for ln in text.splitlines() if "screens (" in ln)
+    assert all(h["verdict"] in screens for h in res["hurdles"]) and " -> meets" not in screens and " -> misses" not in screens
 
 
 def test_a_tampered_file_fails_integrity_and_drops_the_conclusion_to_insufficient(tmp_path):

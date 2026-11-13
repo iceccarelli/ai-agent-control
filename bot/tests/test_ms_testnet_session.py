@@ -856,6 +856,60 @@ def test_the_unwind_does_not_close_out_a_leg_sent_moments_ago(w, monkeypatch):
     assert w.record()["flat_verified"] is True
 
 
+def test_an_incomplete_final_read_publishes_no_fee_funding_or_price_number(w):
+    """Round 18 (execution): when the FINAL venue read is incomplete the ledger holds only the executions THAT read returned (a symbol's order and execution reads share one try-block), so its sums
+    are a lower bound. The record used to publish them as numbers (fees 0.0 with both entry legs filled and fees paid; the durable COSTS_BOOKED said funding 0 was READ). Unknown is not zero."""
+    d = _ready(w)
+    w.fake.inject("/v5/order/realtime", "malformed", 10 ** 6, lambda q: len(w.fake.execs) >= 2)           # the order read fails once both entry legs are filled on the venue
+    w.execute(d)
+    rec = w.record()
+    assert rec["flat_verified"] is not True
+    assert len(w.fake.execs) >= 2 and sum(1 for e in w.fake.execs if e["execFee"] != "0") >= 2             # ground truth: the venue really charged fees
+    assert rec["net"]["fees_usd"] is None and rec["net"]["funding_usd"] is None and rec["net"]["price_pnl_usd"] is None, rec["net"]
+
+
+def test_an_incomplete_read_never_erases_rows_an_earlier_complete_read_recorded(w):
+    """The same fault one execution later: the rows the complete reads recorded stay (they are venue facts that cannot un-happen), while no number is published from the incomplete final read."""
+    d = _ready(w)
+    w.fake.inject("/v5/order/realtime", "malformed", 10 ** 6, lambda q: len(w.fake.execs) >= 3)
+    w.execute(d)
+    rec = w.record()
+    assert len(w.fake.execs) >= 3 and rec["flat_verified"] is not True
+    assert rec["executions"] and rec["basis"] == "EXCHANGE_REPORTED", rec["basis"]
+    assert rec["net"]["fees_usd"] is None and rec["net"]["funding_usd"] is None and rec["net"]["price_pnl_usd"] is None, rec["net"]
+
+
+def test_a_complete_final_read_still_publishes_the_measured_fees(w):
+    d = _ready(w)
+    assert w.execute(d) == 0
+    rec = w.record()
+    assert rec["flat_verified"] is True and rec["net"]["fees_usd"] is not None and rec["net"]["fees_usd"] > 0, rec["net"]
+
+
+def test_the_final_ledger_vs_venue_result_is_persisted_and_a_clean_session_says_so(w):
+    """Round 18 (execution): ``Run.venue_recon`` was assigned at every reconcile and never read or written, so whether a finished session's executions, ledger fills, positions and fees agreed
+    with the venue could not be audited afterwards."""
+    d = _ready(w)
+    assert w.execute(d) == 0
+    doc = json.load(open(os.path.join(w.state_dir, "reconciliation.json")))
+    assert doc["schema"] == "ms_session_reconciliation/1" and doc["view_complete"] is True
+    assert doc["venue_reconciled"] is True and doc["finding_codes"] == [] and doc["checked"]["executions"] >= 4 and doc["halt_new_exposure"] is False
+    assert "details" not in json.dumps(doc) and "evidence only" in doc["note"]
+
+
+def test_a_hidden_execution_is_a_named_finding_in_the_persisted_reconciliation(w):
+    orig = w.fake._fill
+
+    def hide(o, qty, px, *, taker, dup=False):
+        orig(o, qty, px, taker=taker, dup=dup)
+        if o["orderLinkId"].endswith("-p"):
+            w.fake.hidden_execs.add(w.fake.execs[-1]["execId"])        # the perp ENTRY fill: the order row says Filled, /v5/execution/list does not list it
+    w.fake._fill = hide
+    w.execute(_ready(w))
+    doc = json.load(open(os.path.join(w.state_dir, "reconciliation.json")))
+    assert doc["venue_reconciled"] is False and doc["finding_codes"], doc
+
+
 def test_a_blank_execfee_leaves_the_session_net_unknown_not_a_measured_zero(w, monkeypatch):
     """The unknown fee must reach the P&L, not only the quality record: the net's fees are null, so the capital book is never debited a zero fee."""
     orig = TE.TestnetExecutor._take_exec

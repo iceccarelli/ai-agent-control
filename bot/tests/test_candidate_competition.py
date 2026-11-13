@@ -59,6 +59,47 @@ def test_committed_corpus_runs_the_btc_row_labelled_in_sample_and_every_candidat
     assert any("REJECTED policy" in r for r in b["rejection_reasons"])
 
 
+def test_every_row_without_a_wired_evaluator_says_so_and_nothing_else_changes(committed):
+    """Round 18 (red team): ``run_competition`` hands the ladder a completed walk-forward for ONE family (cross_sectional_funding). The other rows can never reach PROMISING whatever the data, so
+    their NO WINNER is structural, not a measured failure. The typed reason is reasons-only: the verdicts and levels the committed-corpus tests pin above are untouched."""
+    rep, _ = committed
+    assert CC_.WIRED_EVALUATORS == ("cross_sectional_funding",)
+    for r in rep["results"]:
+        wired = r["name"] in CC_.WIRED_EVALUATORS
+        assert r["evaluator"] == {"wired": wired, "code": None if wired else f"NO_EVALUATOR_WIRED:{r['name']}"}
+        assert wired or any(x.startswith(f"NO_EVALUATOR_WIRED:{r['name']}") for x in r["rejection_reasons"]), r["name"]
+        assert wired is (not any(x.startswith("NO_EVALUATOR_WIRED") for x in r["rejection_reasons"]))
+    b = rep["no_winner_breakdown"]
+    assert b["evaluator_wired"] == ["cross_sectional_funding"] and "cash_and_carry" in b["structural_no_evaluator_wired"] and len(b["structural_no_evaluator_wired"]) == len(rep["results"]) - 1
+    assert rep["winner"] is None and rep["winner_statement"].startswith("NO WINNER")
+
+
+def test_missing_candidate_specs_are_a_typed_refusal_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """Round 18 (red team): the autopilot image ships these modules but not research/candidates; the CLI died with an uncaught FileNotFoundError at load_candidates."""
+    import candidate_readiness as CR_
+    monkeypatch.setattr(CR_, "CAND_DIR", str(tmp_path / "not_shipped"))
+    with pytest.raises(RH.HarnessError, match="CANDIDATE_SPECS_NOT_SHIPPED"):
+        CR_.load_candidates()
+    assert CC_.main(["--ledger-dir", str(tmp_path / "led"), "--no-historical-cash"]) == 2
+    assert "CANDIDATE_SPECS_NOT_SHIPPED" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as ex:
+        CR_.main([])
+    assert ex.value.code == 2
+
+
+def test_the_wired_evaluator_set_is_the_set_run_competition_actually_builds():
+    import ast
+    import inspect
+    src = ast.parse(inspect.getsource(CC_.run_competition))
+    keys = []
+    for node in ast.walk(src):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "evals" for t in node.targets) and isinstance(node.value, ast.IfExp):
+            for d in ast.walk(node.value.body):
+                if isinstance(d, ast.Dict):
+                    keys += [k.value for k in d.keys if isinstance(k, ast.Constant)]
+    assert keys == ["cross_sectional_funding"] == list(CC_.WIRED_EVALUATORS), keys          # wiring a second evaluator must update WIRED_EVALUATORS (and is the owner's decision for the BTC families)
+
+
 def test_a_btc_rejection_says_how_strong_it_is_by_the_repos_own_early_rejection_standard(committed):
     """REJECTED here is the competition's documented in-sample verdict (it loses after costs or to cash by point estimate). The repo has a STRONGER standard for rejecting (candidate_readiness.early_rejection:
     >= 12 independent observations, lower-tail p <= 0.01, the widest 90% interval wholly below zero). Every policy now carries whether it meets it, with the numbers, so a point-estimate loss is never read as a
@@ -189,6 +230,25 @@ def test_with_verified_data_and_a_universe_the_three_families_are_evaluated_and_
         assert os.path.exists(os.path.join(ld, f"cross_sectional_funding.{k.lower()}.jsonl"))
     assert not os.path.exists(os.path.join(root, "candidate_ledgers"))                                # evidence directories stay byte-for-byte what the verifier hashed
     assert rep["winner"] is None
+
+
+def test_the_cross_sectional_row_carries_the_data_state_with_the_evaluators_verdict_folded_in(tmp_path, offline, monkeypatch):
+    """Round 18 review: the two DATA_SUFFICIENT_* verdict states were never produced by any code. The competition row is where an evaluation's verdict meets the state of the data it read."""
+    _reset()
+    root, uni, spot = _hist(tmp_path)                                                      # the default fixture: three symbols are PARTIAL over the window
+    x = row(CC_.run_competition(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), unreserved_exploratory=True), "cross_sectional_funding")
+    assert x["dataset_state"]["state"] == "DATA_INCOMPLETE" and x["readiness_levels"]["DATA_READY"] is False
+    _reset()
+    other = tmp_path / "ok"
+    other.mkdir()
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)                                          # complete data that the registered 60 rows would call insufficient is sufficient for 10 rows ...
+    root2, uni2, spot2 = _hist(other, complete_window=True)
+    y = row(CC_.run_competition(data_root=root2, universe_dir=uni2, spot_dir=spot2, mark_interval=MARK_IV, ledger_dir=str(other / "led"), unreserved_exploratory=True), "cross_sectional_funding")
+    assert y["dataset_state"]["state"] == "DATA_VALID_BUT_INSUFFICIENT" and any("evaluator's own verdict is INSUFFICIENT_DATA" in r for r in y["dataset_state"]["reasons"])      # ... until the evaluator says not enough
+    for r in (x, y):
+        assert r["verdict"] == "INSUFFICIENT_DATA"                                         # the state never changes a verdict, level or rank
+    rest = [r for r in CC_.run_competition(ledger_dir=str(tmp_path / "led2"))["results"] if r["name"] != "cross_sectional_funding"]
+    assert all("dataset_state" not in r for r in rest)
 
 
 def test_the_ledger_is_persistent_by_default_a_fresh_process_keeps_the_count_and_an_identical_rerun_does_not_inflate_it(tmp_path, monkeypatch):

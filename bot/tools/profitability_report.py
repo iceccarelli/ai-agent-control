@@ -432,9 +432,12 @@ def render(rep: Dict[str, Any]) -> str:
     if e:
         res = e["result"]
         out.append(f"6 ECONOMICS   {e['inputs']['basis']}, hold {e['inputs']['hold_days']:g} d, funding = {_f(e['inputs']['funding_used_bps_per_settlement'], 3)} bps/settlement ({e['inputs']['funding_used_is']})")
-        out.append(f"    MODELLED net {_f(res['net_pnl_usd'])} USD; {_f(res['returns']['annualised_pct_on_economic_capital'])}%/yr on economic capital, "
-                   f"{_f(res['returns']['annualised_pct_on_notional'])}%/yr on notional; UNPRICED (excluded, not zero): {', '.join(res['unknowns']) or 'none'}")
-        out.append("    screens (" + TE.PROVISIONAL + "), on modelled costs only: " + ", ".join(f"{h['hurdle_apr_pct']:g}% -> {'meets' if h['meets'] else 'misses'}" for h in res["hurdles"]))
+        # Round 18 (capital specialist): ``trade_economics.compute`` counts every unpriced cost as EXACTLY ZERO and says so in ``net_reading``; this line used to say "excluded, not zero" and the screens line
+        # printed the LEGACY ``meets`` (return >= hurdle) instead of the hurdle's own verdict. An unknown cost is not zero: a net with unpriced costs is an upper bound and is printed as one.
+        reading = "an OPTIMISTIC BOUND: the true net is this or LOWER" if res.get("net_is_optimistic_bound") else "net of every declared cost"
+        out.append(f"    MODELLED net {_f(res['net_pnl_usd'])} USD ({reading}); {_f(res['returns']['annualised_pct_on_economic_capital'])}%/yr on economic capital, "
+                   f"{_f(res['returns']['annualised_pct_on_notional'])}%/yr on notional; UNPRICED (counted as ZERO in this net): {', '.join(res['unknowns']) or 'none'}")
+        out.append("    screens (" + TE.PROVISIONAL + "), on modelled costs only: " + ", ".join(f"{h['hurdle_apr_pct']:g}% -> {h['verdict']}" for h in res["hurdles"]))
     else:
         out.append("6 ECONOMICS   WITHHELD: " + "; ".join(rep["economics_withheld_because"]))
     pw = rep["required_observations"]

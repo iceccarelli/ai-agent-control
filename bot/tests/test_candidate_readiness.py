@@ -231,9 +231,12 @@ def offline(monkeypatch):
 
 
 def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=("BTCUSDT", "ETHUSDT", "FASTUSDT", "OLDUSDT"), funding_override=None, universe_kw=None,
-          old_delivery=None, skip_history=()):
+          old_delivery=None, skip_history=(), complete_window=False):
     """A real dataset root: universe capture (BTC/ETH 8h, FAST 240m, OLD Closed with a deliveryTime), funding + mark-kline-240 written by the real writer with a scripted
-    fetch / clock / sleep, and (optionally) a spot-instruments snapshot. Returns (root, universe_dir, spot_dir)."""
+    fetch / clock / sleep, and (optionally) a spot-instruments snapshot. Returns (root, universe_dir, spot_dir).
+
+    ``complete_window`` asks the MARK dataset for the same window the funding dataset requested (default False keeps every older fixture byte-for-byte: its mark request ends 989 ms before the
+    funding request, so the funnel calls three of the four symbols PARTIAL over the window, which the Round 18 dataset-state now reports as DATA_INCOMPLETE)."""
     delivery = TMH.BASE - 60 * TMH.H8
     root = tmp_path / "hist"
     os.mkdir(root, 0o700)
@@ -251,7 +254,7 @@ def _hist(tmp_path, *, spot=True, tamper_funding=None, mark_scripts=None, syms=(
     mdata = {("mark-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in syms if s != "OLDUSDT" and s not in skip_history}
     if "OLDUSDT" in syms and "OLDUSDT" not in skip_history:
         mdata[("mark-kline", "OLDUSDT")] = TMH.grid(TMH.FIRST, (delivery - TMH.FIRST) // H4 + 1, H4)
-    mspecs = MH.build_specs("mark-kline", MARK_IV, sorted(hrecs), TMH.START, TMH.BASE + 10, recs)
+    mspecs = MH.build_specs("mark-kline", MARK_IV, sorted(hrecs), TMH.START, TMH.END if complete_window else TMH.BASE + 10, recs)
     mv = TMH.HV(mdata)
     for k, v in (mark_scripts or {}).items():
         mv.script[k] = v
@@ -809,6 +812,10 @@ def _lv(**kw):
     return CR.readiness_levels(**base)
 
 
+#: Round 18: PROMISING also needs a KNOWN, positive, significant excess over cash on the committed capital (a ``vs_cash`` block per applied cash basis)
+GOOD_CASH = {"OKX_LENDING": {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_excess_bps_of_capital_per_row": 6.0, "p_adjusted": 0.02, "oos_independent_observations": 80}}
+
+
 def test_the_readiness_vocabulary_is_ordered_and_named():
     assert CR.READINESS_LEVELS == LEVELS
 
@@ -829,7 +836,7 @@ def test_levels_are_cumulative_and_nothing_above_research_ready_without_an_evalu
         assert r["levels"][lvl]["reached"] is False and r["levels"][lvl]["reasons"]
     # a good evaluation reaches PROMISING only; prospective/execution/owner levels need evidence this tool cannot create
     ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
-          "terminal_exit_unpriced": 0}
+          "terminal_exit_unpriced": 0, "vs_cash": GOOD_CASH}
     p = _lv(evaluation=ev, executable=True)
     assert p["highest"] == "PROMISING" and p["levels"]["EXECUTION_READY"]["reached"] is False and p["levels"]["OWNER_PROFIT_EVIDENCED"]["reached"] is False
     assert p["highest_supportable_verdict"] == "INSUFFICIENT_DATA"                                # the ceiling never moves
@@ -842,10 +849,57 @@ def test_the_readiness_vocabulary_states_what_its_independence_count_cannot_see(
     """PROMISING stands on an ESTIMATED count of independent observations and a Holm-adjusted p computed from it. The estimate assumes autoregressive-type dependence and is blind to a slow
     hidden regime (the Round 14 audit measured false-pass rates 5 to 28 times the stated level on regime-driven nulls at n 100 to 250), so every readiness result says so, reached or not."""
     ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
-          "terminal_exit_unpriced": 0}
+          "terminal_exit_unpriced": 0, "vs_cash": GOOD_CASH}
     for r in (_lv(), _lv(evaluation=ev, executable=True)):
         text = " ".join(r["notes"])
         assert "PROMISING" in text and "AR-type" in text and "regime" in text and "dwell" in text and "reason to look" in text, text
+
+
+def _good_eval(**over):
+    ev = {"status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
+          "terminal_exit_unpriced": 0, "vs_cash": GOOD_CASH}
+    ev.update(over)
+    return ev
+
+
+def test_promising_needs_a_known_positive_significant_excess_over_cash(monkeypatch):
+    """Round 18 (quant specialist), reproduced on the unfixed code: a WALK_FORWARD_DONE evaluation with a positive nominal mean and NO ``vs_cash`` block reached PROMISING (every reason list empty):
+    an absent or unknown comparison with cash was 'no objection', although the nominal bps of notional charge no cost of capital."""
+    assert _lv(evaluation=_good_eval())["levels"]["PROMISING"]["reached"] is True                                             # the control: known, positive, significant
+    for ev in (_good_eval(vs_cash=None), _good_eval(vs_cash={}), {k: v for k, v in _good_eval().items() if k != "vs_cash"}):
+        lv = _lv(evaluation=ev)["levels"]["PROMISING"]
+        assert lv["reached"] is False and any("CASH_COMPARISON_UNKNOWN" in r for r in lv["reasons"]), lv["reasons"]
+    base = GOOD_CASH["OKX_LENDING"]
+    bad_blocks = {"rejected": {**base, "verdict": "REJECTED"}, "non_positive_mean": {**base, "oos_mean_excess_bps_of_capital_per_row": -0.5}, "not_significant": {**base, "p_adjusted": 0.2},
+                  "too_few_observations": {**base, "oos_independent_observations": CR.MIN_PROMISING_OOS_OBS - 1}, "not_done": {**base, "status": "TOO_FEW_ROWS_WITH_CASH"},
+                  "no_mean": {k: v for k, v in base.items() if k != "oos_mean_excess_bps_of_capital_per_row"}, "malformed": "x"}
+    for name, blk in bad_blocks.items():
+        lv = _lv(evaluation=_good_eval(vs_cash={"OKX_LENDING": blk}))["levels"]["PROMISING"]
+        assert lv["reached"] is False and any("CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED" in r for r in lv["reasons"]), (name, lv["reasons"])
+    # one basis that passes is enough (the owner's stated alternative beside a lender's-floor series that covers only part of the window)
+    both = {"HISTORICAL": {**base, "status": "TOO_FEW_ROWS_WITH_CASH"}, "OWNER_STATED": base}
+    assert _lv(evaluation=_good_eval(vs_cash=both))["levels"]["PROMISING"]["reached"] is True
+    # the nominal bars are unchanged: a good cash comparison does not rescue a bad nominal evaluation
+    assert _lv(evaluation=_good_eval(oos_mean_total_bps_per_row=-1.0))["levels"]["PROMISING"]["reached"] is False
+    # every basis that RAN must pass: the lowest bar (a lender's-floor series) cannot rescue a candidate the owner's own stated alternative does not
+    mixed = {"HISTORICAL": base, "OWNER_STATED": {**base, "p_adjusted": 0.2}}
+    lv = _lv(evaluation=_good_eval(vs_cash=mixed))["levels"]["PROMISING"]
+    assert lv["reached"] is False and any("OWNER_STATED" in r and "Holm-adjusted p" in r for r in lv["reasons"]), lv["reasons"]
+
+
+def test_a_nan_an_infinity_a_bool_or_a_string_is_never_evidence_for_promising():
+    """Round 18 review: NaN <= 0 and NaN > alpha are both False, so a NaN mean with a NaN p passed every bar; a string observation count raised TypeError."""
+    nan, inf = float("nan"), float("inf")
+    cases = {"nominal_mean_nan": {"oos_mean_total_bps_per_row": nan}, "nominal_mean_inf": {"oos_mean_total_bps_per_row": inf}, "nominal_mean_bool": {"oos_mean_total_bps_per_row": True},
+             "nominal_p_nan": {"p_adjusted": nan}, "nominal_p_negative": {"p_adjusted": -0.5}, "nominal_p_bool": {"p_adjusted": False}, "nominal_nobs_str": {"oos_independent_observations": "80"},
+             "nominal_nobs_nan": {"oos_independent_observations": nan}}
+    for name, over in cases.items():
+        assert _lv(evaluation=_good_eval(**over))["levels"]["PROMISING"]["reached"] is False, name
+    base = GOOD_CASH["OKX_LENDING"]
+    for name, over in {"excess_nan": {"oos_mean_excess_bps_of_capital_per_row": nan}, "excess_inf": {"oos_mean_excess_bps_of_capital_per_row": inf}, "excess_bool": {"oos_mean_excess_bps_of_capital_per_row": True},
+                       "p_nan": {"p_adjusted": nan}, "p_negative": {"p_adjusted": -0.1}, "nobs_str": {"oos_independent_observations": "80"}}.items():
+        lv = _lv(evaluation=_good_eval(vs_cash={"OKX_LENDING": {**base, **over}}))["levels"]["PROMISING"]
+        assert lv["reached"] is False and any("CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED" in r for r in lv["reasons"]), name
 
 
 def test_a_rejected_evaluation_is_rejected_and_not_promising():
@@ -954,6 +1008,242 @@ def test_dataset_report_of_a_tampered_root_reports_the_failure_and_includes_no_s
     r = CR.dataset_report(data_root=root, universe_dir=uni, mark_interval=MARK_IV)
     assert r["status"] == "REFUSED" and r["symbols_included"] == [] and r["readiness"]["highest"] == "NONE"
     assert any(not m["verified"] for m in r["source_manifests"])
+
+
+# ================================================================== Round 18: the dataset-state and the immutable dataset identity
+def _add_index_kline(tmp_path, root, uni, only=None):
+    """A real COMPLETE index-kline dataset (same writer, same window as the funding request) for every symbol of the fixture's universe, or only for ``only``."""
+    recs, info = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
+    delivery = TMH.BASE - 60 * TMH.H8
+    recs = {k: v for k, v in recs.items() if only is None or k in only}
+    idata = {("index-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in recs if s != "OLDUSDT"}
+    if "OLDUSDT" in recs:
+        idata[("index-kline", "OLDUSDT")] = TMH.grid(TMH.FIRST, (delivery - TMH.FIRST) // H4 + 1, H4)
+    ispecs = MH.build_specs("index-kline", MARK_IV, sorted(recs), TMH.START, TMH.END, recs)
+    TMH.run(root, ispecs, TMH.HV(idata), "index-kline", MARK_IV, universe=info)
+
+
+def _dr(root, uni, spot=None):
+    return CR.dataset_report(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+
+
+def test_dataset_state_precedence_verdict_mapping_and_unknown_inputs_raise():
+    f = CR.dataset_state
+    assert f({})["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and f({})["sufficient"] is True and f({})["complete_over_requested_window"] is True
+    every = {"unavailable": ["a"], "invalid": ["b"], "incomplete": ["c"], "insufficient": ["d"]}
+    assert [f({k: v for k, v in every.items() if k in keep})["state"] for keep in (("unavailable", "invalid", "incomplete", "insufficient"), ("invalid", "incomplete", "insufficient"),
+                                                                                    ("incomplete", "insufficient"), ("insufficient",))] \
+        == [CR.DATA_UNAVAILABLE, CR.DATA_INVALID, CR.DATA_INCOMPLETE, CR.DATA_VALID_BUT_INSUFFICIENT]
+    assert f({"incomplete": ["x"]})["complete_over_requested_window"] is False and f({"insufficient": ["x"]})["complete_over_requested_window"] is True
+    assert f({"insufficient": ["x"]})["sufficient"] is False
+    # the evaluator's own word only matters once the data are sufficient
+    assert f({}, candidate_verdict="REJECTED")["state"] == CR.DATA_SUFFICIENT_CANDIDATE_REJECTED
+    assert f({}, candidate_verdict="PROMISING")["state"] == CR.DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW
+    assert f({}, candidate_verdict="QUALIFIED")["state"] == CR.DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW
+    for v in ("INSUFFICIENT_DATA", "UNTESTED"):
+        assert f({}, candidate_verdict=v)["state"] == CR.DATA_VALID_BUT_INSUFFICIENT, v         # an evaluator that says "not enough" keeps the dataset insufficient
+    assert f({"incomplete": ["x"]}, candidate_verdict="PROMISING")["state"] == CR.DATA_INCOMPLETE          # a verdict never repairs a data finding
+    assert f({"invalid": ["x"]}, candidate_verdict="REJECTED")["state"] == CR.DATA_INVALID
+    for bad in ({"unknwon": ["x"]}, "invalid", None):
+        with pytest.raises(ValueError):
+            f(bad)
+    with pytest.raises(ValueError):
+        f({}, candidate_verdict="PROMISE")
+    assert CR.COMPLETE_DATA_STATES == CR.DATASET_STATES[3:] and CR.SUFFICIENT_DATA_STATES == CR.DATASET_STATES[4:] and len(set(CR.DATASET_STATES)) == len(CR.DATASET_STATES) == 7
+
+
+def test_the_sufficiency_geometry_is_the_evaluators_own_registered_geometry():
+    import inspect
+    p = inspect.signature(CR.evaluate_ranked_funding).parameters
+    assert (CR.STATE_HOLD_DAYS, CR.STATE_MIN_ROWS, CR.STATE_FORMATION_DAYS) == (p["hold_days"].default, p["min_rows"].default, max(p["formation_days_grid"].default))
+    assert CR.grid_requirements(formation_days=CR.STATE_FORMATION_DAYS, hold_days=CR.STATE_HOLD_DAYS, min_rows=CR.STATE_MIN_ROWS)["window_days_required"] == 457
+
+
+def test_a_history_holding_one_of_four_eligible_symbols_is_not_data_ready(tmp_path, offline):
+    """Round 18 F1, reproduced on the unfixed code: ``dataset_report`` called a history with ONE of four lifecycle-eligible symbols DATA_READY (dataset-level statuses only)."""
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("ETHUSDT", "FASTUSDT", "OLDUSDT"), complete_window=True)
+    r = _dr(root, uni)
+    assert r["status"] == "OK" and r["symbols_included"] == ["BTCUSDT"]
+    assert r["dataset_state"]["state"] == CR.DATA_INCOMPLETE and r["dataset_state"]["complete_over_requested_window"] is False
+    assert any("3 of 4 lifecycle-eligible symbols" in x and "ETHUSDT" in x for x in r["dataset_state"]["reasons"]), r["dataset_state"]["reasons"]
+    assert r["readiness"]["levels"]["DATA_READY"]["reached"] is False and r["readiness"]["highest"] == "NONE" and r["highest_supportable_verdict"] == "UNTESTED"
+    assert r["capabilities"]["perp_only_ranked_funding"] is False
+    _series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert info["dataset_state"]["state"] == CR.DATA_INCOMPLETE                      # the evaluation input says the same thing about what it loaded
+
+
+def test_symbols_not_complete_over_the_required_window_make_the_dataset_incomplete_even_when_every_manifest_says_complete(tmp_path, offline):
+    """The default fixture's mark request ends 989 ms before the funding request: three of four symbols are PARTIAL over the window. It used to read DATA_READY / RESEARCH_READY."""
+    root, uni, _ = _hist(tmp_path, spot=False)
+    r = _dr(root, uni)
+    assert all(m["dataset_status"] == "COMPLETE" and m["verified"] for m in r["source_manifests"])           # every manifest, on its own, claims COMPLETE
+    assert r["dataset_state"]["state"] == CR.DATA_INCOMPLETE and any("BTCUSDT" in x for x in r["dataset_state"]["reasons"])
+    assert r["readiness"]["levels"]["DATA_READY"]["reached"] is False
+
+
+def test_unavailable_invalid_and_incomplete_are_three_different_states(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    assert CR.dataset_report(data_root=root, universe_dir=None)["dataset_state"]["state"] == CR.DATA_UNAVAILABLE                  # no universe capture supplied
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert _dr(str(empty), uni)["dataset_state"]["state"] == CR.DATA_UNAVAILABLE                                                  # no dataset under the root
+    assert CR.dataset_report(data_root=None, universe_dir=uni)["dataset_state"]["state"] == CR.DATA_UNAVAILABLE
+    with open(os.path.join(root, "funding", "BTCUSDT", "rows.jsonl"), "ab") as fh:
+        fh.write(b"\n")                                                                                                           # one byte after the manifest was sealed
+    bad = _dr(root, uni)
+    assert bad["dataset_state"]["state"] == CR.DATA_INVALID and bad["status"] == "REFUSED" and bad["readiness"]["highest"] == "NONE"
+    assert "does not re-verify" in "; ".join(bad["dataset_state"]["reasons"])
+    assert bad["dataset_identity"]["identifies_every_component"] is False and bad["dataset_identity"]["digest"] is None      # a dataset that does not re-hash has no identity
+
+
+def test_a_complete_but_short_or_survivors_only_history_is_valid_but_insufficient(tmp_path, offline, monkeypatch):
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    r = _dr(root, uni)
+    assert r["dataset_state"]["state"] == CR.DATA_VALID_BUT_INSUFFICIENT and r["readiness"]["levels"]["DATA_READY"]["reached"] is True     # complete bytes, too few days
+    assert any("< 457 days" in x for x in r["dataset_state"]["reasons"]) and r["capabilities"]["perp_only_ranked_funding"] is False
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)                       # the same data against a lower registered bar: the transition is the state function's, not a special case
+    assert _dr(root, uni)["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED
+    tmp2 = tmp_path / "survivors"
+    tmp2.mkdir()
+    root2, uni2, _ = _hist(tmp2, spot=False, skip_history=("OLDUSDT",), complete_window=True)                 # the Closed contract's history was never collected
+    r2 = _dr(root2, uni2)
+    assert r2["dataset_state"]["state"] == CR.DATA_INCOMPLETE and any("OLDUSDT" in x for x in r2["dataset_state"]["reasons"])
+
+
+def test_the_hedged_carry_capability_needs_a_spot_snapshot_and_a_complete_index_kline(tmp_path, offline, monkeypatch):
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    r = _dr(root, uni, spot)
+    assert r["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and r["capabilities"]["perp_only_ranked_funding"] is True
+    assert r["capabilities"]["spot_hedged_carry"]["supported"] is False and any("index-kline" in x and "UNMEASURED" in x for x in r["capabilities"]["spot_hedged_carry"]["why_not"])
+    _add_index_kline(tmp_path, root, uni)
+    r2 = _dr(root, uni, spot)
+    assert r2["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and r2["capabilities"]["spot_hedged_carry"] == {"supported": True, "why_not": []}
+    assert r2["dataset_identity"]["digest"] != r["dataset_identity"]["digest"]                             # one more verified dataset under the root is a different dataset
+    assert _dr(root, uni)["capabilities"]["spot_hedged_carry"]["supported"] is False                         # without the snapshot every symbol is HEDGE_UNKNOWN
+
+
+def test_an_empty_universe_is_never_sufficient(tmp_path, offline, monkeypatch):
+    """Round 18 review (HIGH), reproduced: 'every eligible symbol is loaded and complete' is vacuously true of an empty set, so a verified capture with NO eligible symbol printed the go signal that
+    RUNBOOKS 6b tells the owner to reserve the one-time holdout on."""
+    f = CR._coverage_findings(eligible=[], covered=[], not_complete=[], ended_unaccounted=0, window_days=900.0, survivorship=CR.DELISTINGS_OBSERVED)
+    assert any("NO_ELIGIBLE_SYMBOLS" in x for x in f["incomplete"]) and f["insufficient"] == []
+    assert CR.dataset_state(f)["state"] == CR.DATA_INCOMPLETE
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    assert CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[1]["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED          # control: the same data IS sufficient
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV, include_statuses=("Settling",))                               # no instrument has that status
+    assert series == [] and info["history_coverage"]["status"] == "NO_ELIGIBLE_SYMBOLS"
+    assert info["dataset_state"]["state"] == CR.DATA_INCOMPLETE and any("NO_ELIGIBLE_SYMBOLS" in x for x in info["dataset_state"]["reasons"])
+
+
+def test_a_conflicted_dataset_is_invalid_in_the_loader_and_the_report_and_has_no_identity(tmp_path, offline, monkeypatch):
+    """Round 18 review: a CONFLICTED dataset re-hashes fine, so it kept a non-null identity ('archive it') while DATA_INVALID, and the loader called the same data INCOMPLETE."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    t = TMH.FIRST + 5 * TMH.H8
+    bad = TMH.envelope("mark-kline", "ETHUSDT", [TMH.row_for("mark-kline", "ETHUSDT", TMH.BASE), TMH.row_for("mark-kline", "ETHUSDT", t),
+                                                  TMH.row_for("mark-kline", "ETHUSDT", t, row=[str(t), "100", "101", "99", "100.7"])], TMH.SERVER0)
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True, mark_scripts={("mark-kline", "ETHUSDT"): [bad]})
+    _s, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert info["dataset_state"]["state"] == CR.DATA_INVALID and any("CONFLICTED" in x for x in info["dataset_state"]["reasons"])
+    r = _dr(root, uni)
+    assert r["status"] == "OK" and r["dataset_state"]["state"] == CR.DATA_INVALID
+    assert r["dataset_identity"]["digest"] is None and r["dataset_identity"]["identifies_every_component"] is False and "no identity" in r["dataset_identity"]["reason"]
+    assert r["capabilities"]["perp_only_ranked_funding"] is False and r["readiness"]["levels"]["DATA_READY"]["reached"] is False
+
+
+def test_the_hedged_carry_capability_needs_index_coverage_for_every_loaded_symbol_and_a_hedgeable_one(tmp_path, offline, monkeypatch):
+    """Round 18 review: the capability needed only a dataset-level COMPLETE index-kline plus a snapshot, so an index series for ONE of four symbols read 'supported'."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    _add_index_kline(tmp_path, root, uni, only=("BTCUSDT",))
+    r = _dr(root, uni, spot)
+    c = r["capabilities"]["spot_hedged_carry"]
+    assert r["dataset_state"]["sufficient"] is True and c["supported"] is False
+    assert any("index-kline is not COMPLETE for 3 of 4 loaded symbols" in x and "ETHUSDT" in x for x in c["why_not"]), c
+    # a snapshot in which nothing is hedgeable cannot support a carry claim either, whatever the index covers
+    tmp2 = tmp_path / "full"
+    tmp2.mkdir()
+    root2, uni2, spot2 = _hist(tmp2, complete_window=True)
+    _add_index_kline(tmp2, root2, uni2)
+    assert _dr(root2, uni2, spot2)["capabilities"]["spot_hedged_carry"]["supported"] is True                       # control: full index coverage and a trading spot pair
+    orig = MH.hedge_availability
+    monkeypatch.setattr(MH, "hedge_availability", lambda recs, sd: {**orig(recs, sd), "counts": {**orig(recs, sd)["counts"], "SPOT_TRADING": 0}})
+    c2 = _dr(root2, uni2, spot2)["capabilities"]["spot_hedged_carry"]
+    assert c2["supported"] is False and any("nothing is hedgeable" in x for x in c2["why_not"])
+
+
+def test_the_loaded_identity_includes_the_spot_snapshot_the_carry_family_selects_its_universe_with(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    _s1, with_spot = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    _s2, without = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert {c["kind"] for c in with_spot["loaded_identity"]["components"]} == {"market_history", "universe_capture", "spot_snapshot"}
+    assert with_spot["loaded_identity"]["digest"] != without["loaded_identity"]["digest"]                  # SPOT_PERP_CARRY drops every symbol the snapshot does not list: a different input
+
+
+def test_an_evaluation_stamps_the_state_only_from_the_loaders_own_sealed_info(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    sealed = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert sealed["dataset_state"]["state"] == info["dataset_state"]["state"] and sealed["loaded_identity"]["digest"] == info["loaded_identity"]["digest"]
+    forged = CR.evaluate_ranked_funding(series, universe_info=dict(info))                                    # a copy has no seal: the state is not carried (a hand-made dict cannot forge it)
+    assert forged["dataset_state"] is None and forged["loaded_identity"] is None
+
+
+def test_the_dataset_identity_is_a_pure_function_of_the_verified_content(tmp_path, offline):
+    import shutil
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    a = _dr(root, uni)
+    shutil.copytree(root, str(tmp_path / "copy_root"))
+    shutil.copytree(uni, str(tmp_path / "copy_uni"))
+    b = _dr(str(tmp_path / "copy_root"), str(tmp_path / "copy_uni"))
+    assert a["dataset_identity"]["digest"] and a["dataset_identity"]["digest"] == b["dataset_identity"]["digest"]          # same bytes elsewhere: same identity (no path, clock or machine in it)
+    assert a["dataset_identity"]["identifies_every_component"] is True and json.dumps(a["dataset_identity"]).count(str(tmp_path)) == 0
+    other = tmp_path / "other"
+    other.mkdir()
+    root2, uni2, _ = _hist(other, spot=False, complete_window=True, funding_override={"BTCUSDT": TMH.grid(TMH.FIRST, TMH.N - 5, TMH.H8)})       # five prints fewer: a different dataset
+    assert _dr(root2, uni2)["dataset_identity"]["digest"] != a["dataset_identity"]["digest"]
+    _s1, i1 = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    _s2, i2 = CR.load_history_root(str(tmp_path / "copy_root"), universe_dir=str(tmp_path / "copy_uni"), mark_interval=MARK_IV)
+    assert i1["loaded_identity"]["digest"] == i2["loaded_identity"]["digest"] and i1["loaded_identity"]["identifies_every_component"] is True
+    kinds = {c["kind"] for c in i1["loaded_identity"]["components"]}
+    assert kinds == {"market_history", "universe_capture"} and "SURVIVORS" not in json.dumps(i1["loaded_identity"])
+
+
+def test_the_dataset_report_cli_exits_zero_only_for_a_sufficient_dataset(tmp_path, offline, capsys, monkeypatch):
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    argv = ["--dataset-report", "--data-root", root, "--universe-dir", uni, "--mark-interval", MARK_IV]
+    assert CR.main(argv) == 3                                                                    # complete bytes, 199 days: valid but insufficient
+    out, err = capsys.readouterr()
+    assert json.loads(out)["dataset_state"]["state"] == CR.DATA_VALID_BUT_INSUFFICIENT and "DATASET_STATE: DATA_VALID_BUT_INSUFFICIENT" in err
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    assert CR.main(argv) == 0
+    capsys.readouterr()
+    other = tmp_path / "partial"
+    other.mkdir()
+    root2, uni2, _ = _hist(other, spot=False)
+    assert CR.main(["--dataset-report", "--data-root", root2, "--universe-dir", uni2, "--mark-interval", MARK_IV]) == 2        # INCOMPLETE: a successful download is not a complete dataset
+    assert "DATASET_STATE: DATA_INCOMPLETE" in capsys.readouterr().err
+
+
+def test_an_evaluation_carries_the_state_and_identity_of_the_data_it_read_and_an_incomplete_one_cannot_be_data_ready(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("ETHUSDT", "FASTUSDT", "OLDUSDT"), complete_window=True)
+    out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), mark_interval=MARK_IV, holdout_ledger=HH.UNGUARDED)
+    assert out["input"]["dataset_state"]["state"] == CR.DATA_INCOMPLETE and out["input"]["loaded_identity"]["digest"]
+    walk = {**out, "status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80, "holdout_status": "RESERVED"}
+    rep = CR.build_report(data_root=root, universe_dir=uni, evaluations={"cross_sectional_funding": walk})
+    row = rowof(rep, "cross_sectional_funding")
+    assert row["readiness"]["levels"]["DATA_READY"]["reached"] is False and row["readiness"]["highest"] == "NONE"
+    assert any("DATA_INCOMPLETE" in x for x in row["readiness"]["levels"]["DATA_READY"]["reasons"])
+    assert row["readiness"]["levels"]["PROMISING"]["reached"] is False                    # a partial cross-section cannot reach the allocation gate however good its walk-forward looks
+    # the object the COMPETITION hands the ladder is the family evaluation, not the top-level one: it must carry the state too, and the ladder must read it from there
+    fam = out["families"]["PERP_FUNDING_SPREAD"]
+    assert fam["dataset_state"]["state"] == CR.DATA_INCOMPLETE and fam["loaded_identity"]["digest"] == out["input"]["loaded_identity"]["digest"]
+    walk2 = {**fam, "status": "WALK_FORWARD_DONE", "verdict": "INSUFFICIENT_DATA", "oos_mean_total_bps_per_row": 12.0, "p_adjusted": 0.01, "oos_independent_observations": 80,
+             "holdout_status": "RESERVED", "vs_cash": GOOD_CASH}
+    row2 = rowof(CR.build_report(data_root=root, universe_dir=uni, evaluations={"cross_sectional_funding": walk2}), "cross_sectional_funding")
+    assert row2["readiness"]["levels"]["DATA_READY"]["reached"] is False and any("DATA_INCOMPLETE" in x for x in row2["readiness"]["levels"]["DATA_READY"]["reasons"])
+    assert out["input"]["dataset_state"]["state"] == fam["dataset_state"]["state"] == out["dataset_state"]["state"]          # top-level ranked-funding evaluation, family evaluation and loader agree
 
 
 def test_a_survivors_only_evaluation_does_not_imply_a_survivorship_free_claim(tmp_path, offline):
