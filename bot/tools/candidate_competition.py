@@ -286,7 +286,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
         net_basis = "UNKNOWN: no committed or supplied data measures this edge"
         extra: Dict[str, Any] = {}
         mt_led, mt_path = _ledger(RH.normalise_family(r["multiple_testing"]["family"]), ldir)
-        mt = {"family": r["multiple_testing"]["family"], "n_variants_counted": mt_led.n_variants, "scope": "PERSISTENT_LEDGER_FILE", "ledger_path": mt_path}
+        persisted_trials = mt_led.persisted_variants         # what the family's LEDGER FILE holds: not `n_variants`, which a long process raises to a family-wide high-water mark, and not the cross-sectional total re-stated below
+        mt = {"family": r["multiple_testing"]["family"], "n_variants_counted": mt_led.n_variants, "persisted_variants": persisted_trials, "scope": "PERSISTENT_LEDGER_FILE", "ledger_path": mt_path}
         if name == "cash_and_carry" and econ is not None and "unconditional_forced_hold" in econ:
             pols = btc_policies(econ)
             lost = [p for p in pols if p["verdict"] == "REJECTED"]
@@ -338,6 +339,16 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
             verdict = "UNTESTED"
         if verdict not in ("REJECTED", "INSUFFICIENT_DATA", "UNTESTED"):
             verdict = "UNTESTED"
+        # A family whose persistent ledger has COUNTED trials has been tried: 'no test has been run' is false, its data was read once, and offering it as a next
+        # hypothesis would invite a further variant on that data (a wider multiple-testing family). Round 17: reg-1 and reg-2 were counted yet the row said UNTESTED.
+        # Only the PERSISTENT ledger counts here (`persisted_trials`): a refused or unevaluated run states a count of its own (the cross-sectional row's re-stated total) and has
+        # recorded nothing, which `tests/test_history_holdout.py` pins (a refused run leaves no ledger file and stays UNTESTED).
+        n_counted = persisted_trials or 0
+        if verdict == "UNTESTED" and name not in RESEARCH_ONLY and n_counted > 0:
+            verdict = "INSUFFICIENT_DATA"
+            reasons = [x for x in reasons if not x.startswith("no test has been run")]
+            reasons.insert(0, f"TRIALS_ALREADY_COUNTED: {n_counted} variant(s) of family {mt['family']!r} are in the persistent multiple-testing ledger, so this mechanism "
+                              "has been tried and its data read; the result is not recorded here, and another variant on that data widens the family")
         lv = r["readiness"]
         row = {"candidate": r["candidate"], "name": name, "origin": "DRAFT_PROPOSED" if draft else ("RESEARCH_ONLY" if name in RESEARCH_ONLY else "SPEC"),
                "verdict": verdict, "highest_supportable_verdict": verdict, "readiness_level": lv["highest"], "readiness_levels": {k: v["reached"] for k, v in lv["levels"].items()},
@@ -370,7 +381,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                            "next_hypotheses": [], "caveats": base["caveats"]}
     if all_failed:
         out["next_hypotheses"] = [{"candidate": x["candidate"], "name": x["name"], "status": "UNTESTED (registered draft, specification only)", "rationale": x.get("rationale", ""),
-                                   "data_missing": x["data_readiness"]["missing"]} for x in rows if x["origin"] == "DRAFT_PROPOSED"]
+                                   "data_missing": x["data_readiness"]["missing"]} for x in rows
+                                  if x["origin"] == "DRAFT_PROPOSED" and x["verdict"] == "UNTESTED" and not (x["multiple_testing"].get("persisted_variants") or 0)]
     if universe_dir is None and (data_root or history_root):
         out["findings"].append("UNIVERSE_DIR_REQUIRED: no --universe-dir; the cross-sectional rows were not evaluated")
     return out

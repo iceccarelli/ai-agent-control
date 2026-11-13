@@ -349,3 +349,50 @@ def test_the_family_row_carries_both_variant_counts_so_a_p_value_is_never_read_a
     _stub_xs(monkeypatch, 30.0, {"HISTORICAL": blk(-2.0)})
     f = _xs_row(tmp_path)["families"]["PERP_FUNDING_SPREAD"]
     assert f["n_variants_counted"] == 5 and f["n_variants_used_for_nominal_p"] == 3
+
+
+# ------------------------------------------------------------------ a family whose trials are already counted has been TRIED (Round 17)
+def test_a_family_whose_trials_are_already_counted_is_not_untested_and_is_not_a_next_hypothesis(tmp_path):
+    """The persistent ledger counted reg-1 and reg-2 for the regime family, yet the table said 'no test has been run' (UNTESTED) and listed it among the next
+    hypotheses: a third trial on data that was already read widens the multiple-testing family."""
+    _reset()
+    fam = "funding_regime_conditioned_entry"
+    led = RH.VariantLedger(fam, path=os.path.join(str(tmp_path), RH.normalise_family(fam) + ".jsonl"))
+    led.record("reg-1", {"k": 1}, [0.1, -0.2, 0.3, 0.05], horizon=1)
+    led.record("reg-2", {"k": 2}, [0.2, 0.1, -0.1, 0.0], horizon=1)
+    _reset()                                                                                             # a fresh process reloads the count from the file
+    rep = CC_.run_competition(ledger_dir=str(tmp_path))
+    r = row(rep, fam)
+    assert r["multiple_testing"]["n_variants_counted"] == 2
+    assert r["verdict"] == "INSUFFICIENT_DATA" and r["highest_supportable_verdict"] == "INSUFFICIENT_DATA"
+    assert any("TRIALS_ALREADY_COUNTED" in x and "2 variant" in x for x in r["rejection_reasons"])
+    assert not any("no test has been run" in x for x in r["rejection_reasons"])
+    assert fam not in {h["name"] for h in rep["next_hypotheses"]}
+    # an untouched sibling is still genuinely untested, and still a next hypothesis
+    assert row(rep, "cross_interval_funding_dispersion")["verdict"] == "UNTESTED"
+    assert "cross_interval_funding_dispersion" in {h["name"] for h in rep["next_hypotheses"]}
+    assert rep["winner"] is None and rep["all_failed"] is True
+
+
+def test_a_family_with_no_trials_is_unchanged(tmp_path):
+    _reset()
+    rep = CC_.run_competition(ledger_dir=str(tmp_path))
+    r = row(rep, "funding_regime_conditioned_entry")
+    assert r["multiple_testing"]["n_variants_counted"] == 0 and r["verdict"] == "UNTESTED"
+    assert any("no test has been run" in x for x in r["rejection_reasons"])
+
+
+def test_the_process_wide_high_water_mark_does_not_make_a_family_tried(tmp_path):
+    """PR #263's CI: `n_variants` is never below the family's PROCESS-WIDE high-water mark, so after an earlier test in the same process recorded variants for a family, a fresh ledger
+    directory still 'counted' them and a refused row flipped to INSUFFICIENT_DATA. 'Already tried' is a statement about the ledger FILE."""
+    _reset()
+    fam = "funding_regime_conditioned_entry"
+    mem = RH.VariantLedger(fam)                                          # in memory: raises the family's high-water mark, writes no file
+    mem.record("reg-1", {"k": 1}, [0.1, -0.2, 0.3, 0.05], horizon=1)
+    mem.record("reg-2", {"k": 2}, [0.2, 0.1, -0.1, 0.0], horizon=1)
+    assert RH.VariantLedger(fam).n_variants >= 2 and RH.VariantLedger(fam).persisted_variants == 0
+    rep = CC_.run_competition(ledger_dir=str(tmp_path))                  # NO _reset(): the high-water mark is still raised
+    r = row(rep, fam)
+    assert r["verdict"] == "UNTESTED" and any("no test has been run" in x for x in r["rejection_reasons"])
+    assert fam in {h["name"] for h in rep["next_hypotheses"]}
+    _reset()

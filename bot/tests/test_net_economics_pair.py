@@ -405,6 +405,262 @@ def test_an_acquire_cycle_already_holds_both_legs():
         == "SPOT_LEG_BOOKED"
 
 
+# -- an acquire cycle is a PAIR only if its spot leg is flat and hedge-sized ----
+# Round 17 red team: an acquire cycle whose perp closed while the spot sale was
+# refused, partial or never made has its booked cash net WITHOUT the BTC's move,
+# so a 5% fall read as +$5,000 per BTC under the strongest verdict code.
+
+def acquire_shaped(j, d0, d1, *, tag, close=P0, buy=1.0, perp=1.0, sell=1.0,
+                   funding=300.0):
+    """An ACQUIRE cycle with its own spot purchase, perp short and spot sale (BTC
+    quantities); `sell=0` is the perp closed while the spot leg is still held."""
+    L.spot_buy(j, ms=T0 + d0 * DAY, ref=f"{tag}-sb", qty=buy, price=P0,
+               fee_btc=0.0, fee_usdt=55.0, fee_status="confirmed")
+    L.perp_open(j, ms=T0 + d0 * DAY + 1, ref=f"{tag}-o", qty=perp, price=P0,
+                fee_usd=55.0, fee_status="confirmed")
+    L.funding(j, ms=T0 + ((d0 + d1) // 2) * DAY, ref=f"{tag}-f", usd=funding,
+              basis="venue", raw=_vraw(f"{tag}-f", T0 + ((d0 + d1) // 2) * DAY, funding))
+    L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=perp, price=close,
+                 entry_price=P0, fee_usd=55.0, fee_status="confirmed")
+    if sell:
+        L.spot_sell(j, ms=T0 + d1 * DAY + 1, ref=f"{tag}-ss", qty=sell,
+                    price=close, cost_basis=P0 * sell, fee_usd=55.0,
+                    fee_status="confirmed")
+
+
+UNFLAT_SHAPES = [
+    pytest.param(dict(sell=0.0), id="spot_never_sold_back"),
+    pytest.param(dict(sell=0.9), id="spot_partly_sold_back"),
+    pytest.param(dict(buy=0.5, perp=1.0, sell=0.5), id="spot_leg_smaller_than_hedge"),
+    pytest.param(dict(buy=1.0, perp=0.5, sell=1.0), id="spot_leg_larger_than_hedge"),
+]
+
+
+@pytest.mark.parametrize("shape", UNFLAT_SHAPES)
+def test_an_acquire_cycle_whose_spot_leg_is_not_flat_has_no_pair_and_no_return(shape):
+    j = L.Journal()
+    acquire_shaped(j, 0, 10, tag="a", close=95_000.0, **shape)
+    ne, cycles = economics(j, obs=[_im_obs()])
+    c = cycles[0]
+    assert c["overlay"] is False and c["outcome"] == "CLOSED"
+    pair = perf.hedged_pair(c)
+    assert pair["available"] is False
+    assert "SPOT_LEG_NOT_FLAT" in pair["why"]
+    assert c["economic_net_usd"] is None
+    assert c["economic_net_basis"] == "PAIR_NOT_COMPUTABLE"
+    # the CASH is still reported as cash (it is what the account booked) ...
+    assert ne["headline"]["net_usd"] == pytest.approx(c["net_usd"])
+    # ... but it is not a result, a return, a benchmark base or a verdict
+    assert ne["headline"]["economic_net_usd"] is None
+    v = ne["verdict"]
+    assert v["code"] == "ACQUIRE_SPOT_LEG_NOT_FLAT"
+    assert not v["code"].startswith("NET_POSITIVE")
+    assert v["economic_net_usd"] is None
+    assert "no net result is claimed" in v["statement"]
+    for k in ("return_on_committed_capital_pct",
+              "annualised_return_on_committed_capital_pct",
+              "net_return_per_capital_day_pct", "expectancy_after_costs_usd",
+              "max_drawdown_usd", "net_excluding_largest_winner_usd"):
+        assert ne["metrics"][k]["value"] is None, k
+        assert "ACQUIRE_SPOT_LEG_NOT_FLAT" in str(ne["metrics"][k]["why"]), k
+    sm = perf.summarise(cycles)
+    for k in ("return_on_peak_notional_pct", "win_rate", "max_drawdown_usd",
+              "best_cycle_share_of_winning_net_pct",
+              "annualised_on_notional_in_market_pct"):
+        assert sm[k] is None, k
+    assert sm["economic_net_usd"] is None
+    assert "PAIR_NOT_COMPUTABLE" in sm["returns_withheld_why"]
+    assert sm["net_usd_confirmed"] == pytest.approx(c["net_usd"])   # cash kept as cash
+
+
+def test_the_cash_of_an_unsold_spot_leg_follows_btc_but_the_economic_net_is_unstated():
+    """The reproduction: moving the exit +/-5% moves the booked cash 1:1 (the
+    phantom), while the economic net stays unstated, never a number that moves
+    with BTC."""
+    cash = {}
+    for close in (95_000.0, 100_000.0, 105_000.0):
+        j = L.Journal()
+        acquire_shaped(j, 0, 10, tag="a", close=close, sell=0.0)
+        c = perf.cycles_from_journal(j)[0]
+        cash[close] = c["net_usd"]
+        assert c["economic_net_usd"] is None
+        assert perf.net_verdict is not None
+    assert cash[95_000.0] - cash[105_000.0] == pytest.approx(10_000.0)
+    assert cash[95_000.0] == pytest.approx(300 - 3 * 55 + 5_000.0)   # the phantom +5,000
+
+
+@pytest.mark.parametrize("close", [95_000.0, 100_000.0, 105_000.0])
+def test_a_flat_acquire_pair_and_a_measured_overlay_do_not_follow_the_btc_price(close):
+    ja, jo = L.Journal(), L.Journal()
+    acquire(ja, 0, 10, tag="a", close=close)
+    overlay(jo, 0, 10, tag="o", close=close, revalue=True)
+    ca = perf.cycles_from_journal(ja)[0]
+    co = perf.cycles_from_journal(jo)[0]
+    assert ca["economic_net_usd"] == pytest.approx(300 - 4 * 55)      # funding - fees
+    assert ca["economic_net_basis"] == "SPOT_LEG_BOOKED"
+    assert co["economic_net_usd"] == pytest.approx(300 - 2 * 55)
+    assert co["economic_net_basis"] == "BOOKED_MARK"
+
+
+def test_a_hedge_within_the_engines_delta_band_is_still_a_pair():
+    """The perp short is snapped to the lot, so it can sit a little under the BTC
+    held: inside the engine's DELTA_BAND (|spot - perp| / both legs, as
+    `CarryPosition.delta_fraction`) that is a pair, outside it is not. The boundary
+    is the engine's own, not half of it."""
+    for perp, is_pair in ((0.99, True), (0.961, True), (0.96, False), (0.95, False),
+                          (1.04, True), (1.041, False)):
+        j = L.Journal()
+        acquire_shaped(j, 0, 10, tag="a", close=95_000.0, buy=1.0, perp=perp, sell=1.0)
+        got = perf.cycles_from_journal(j)[0]["economic_net_usd"]
+        assert (got is not None) is is_pair, (perp, got)
+
+
+@pytest.mark.parametrize("spot,perp", [(1.0, 0.99), (1.0, 0.961), (1.0, 0.96), (1.0, 0.9), (0.9, 1.0), (1.0, 1.04), (1.0, 1.041),
+                                      (0.5, 1.0), (0.0015, 0.001), (0.0016, 0.001), (0.002, 0.001)])
+def test_the_pair_boundary_is_exactly_the_engines_own_delta_fraction(spot, perp):
+    """The same quantities through `CarryPosition.delta_fraction` (the number that trips the engine's rebalance): the engine calls them a hedge iff its
+    fraction is within the band, and so does the report. A pair the engine would accept is never withheld; one it would rebalance is never a pair."""
+    import carry_engine as CE
+    price = 100_000.0
+    pos = CE.CarryPosition(
+        spot=CE.Leg(symbol="BTCUSDT", side="Buy", product="spot", requested_qty=spot, filled_qty=spot, avg_price=price),
+        perp=CE.Leg(symbol="BTCUSDT", side="Sell", product="linear", requested_qty=perp, filled_qty=perp, avg_price=price))
+    engine_says_hedge = pos.delta_fraction(price) <= CE.DELTA_BAND
+    j = L.Journal()
+    acquire_shaped(j, 0, 10, tag="a", close=95_000.0, buy=spot, perp=perp, sell=spot)
+    report_says_pair = perf.cycles_from_journal(j)[0]["economic_net_usd"] is not None
+    assert report_says_pair is engine_says_hedge, (spot, perp, pos.delta_fraction(price))
+
+
+# -- lot dust is not an unsold leg (red team round 2, H2) ----------------------
+# The engine floors the spot sale to the venue's lot, so a CLEAN acquire close leaves sub-lot dust (cents of BTC). It must not withhold every return in the book.
+
+def acquire_with_btc_fee(j, *, buy, fee_btc, perp, sell, tag="d", close=P0 * 0.95):
+    L.spot_buy(j, ms=T0, ref=f"{tag}-sb", qty=buy, price=P0, fee_btc=fee_btc, fee_usdt=0.0, fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 1, ref=f"{tag}-o", qty=perp, price=P0, fee_usd=5.0, fee_status="confirmed")
+    L.funding(j, ms=T0 + 5 * DAY, ref=f"{tag}-f", usd=30.0, basis="venue", raw=_vraw(f"{tag}-f", T0 + 5 * DAY, 30.0))
+    L.perp_close(j, ms=T0 + 10 * DAY, ref=f"{tag}-c", qty=perp, price=close, entry_price=P0, fee_usd=5.0, fee_status="confirmed")
+    L.spot_sell(j, ms=T0 + 10 * DAY + 1, ref=f"{tag}-ss", qty=sell, price=close, cost_basis=P0 * sell, fee_usd=5.0, fee_status="confirmed")
+
+
+@pytest.mark.parametrize("buy,fee_btc,perp,sell,dust", [
+    (0.123456, 0.000123456, 0.123332, 0.123332, 5.44e-7),        # a 1e-6 lot floor after a 0.1% BTC fee
+    (0.001, 0.0000012, 0.000998, 0.000998, 8e-7),                 # the engine's own docstring case: 0.0009988 sold as 0.000998
+])
+def test_sub_lot_dust_after_a_clean_close_is_a_pair_and_is_stated(buy, fee_btc, perp, sell, dust):
+    j = L.Journal()
+    acquire_with_btc_fee(j, buy=buy, fee_btc=fee_btc, perp=perp, sell=sell)
+    c = perf.cycles_from_journal(j)[0]
+    assert c["economic_net_usd"] is not None and c["economic_net_basis"] == "SPOT_LEG_BOOKED", perf.hedged_pair(c)
+    assert perf.hedged_pair(c)["spot_residual_btc"] == pytest.approx(dust, rel=1e-3)         # stated, not hidden
+    assert perf.summarise([c])["returns_withheld_why"] is None
+
+
+def test_the_dust_threshold_is_a_value_at_the_cycles_own_entry_price():
+    for residual_btc, is_pair in ((1.0e-5, True), (1.1e-5, False)):                           # $1.00 and $1.10 at $100k
+        j = L.Journal()
+        net = 0.5
+        acquire_with_btc_fee(j, buy=net + residual_btc, fee_btc=0.0, perp=net, sell=net, tag="b")
+        assert (perf.cycles_from_journal(j)[0]["economic_net_usd"] is not None) is is_pair, residual_btc
+    # the same remainder is a different VALUE at a different price: 1e-5 BTC is $0.10 at $10k (dust) and $10 at $1M (not)
+    for price, is_pair in ((10_000.0, True), (1_000_000.0, False)):
+        c = {"spot_residual_qty": 1e-5, "perp_entry_price": price, "spot_buy_net_qty": 0.5, "hedged_qty": 0.5, "spot_buy_gross_usd": 0.5 * price}
+        assert (perf._acquire_spot_leg_problem(c) is None) is is_pair, price
+
+
+def test_a_mis_scaled_perp_price_cannot_turn_an_unsold_coin_into_dust():
+    """Red team round 3: the first readable price used to win, so a perp memo price of 1.0 against a 100,000 spot purchase made 1 BTC unsold 'dust'."""
+    j = L.Journal()
+    L.spot_buy(j, ms=T0, ref="sb", qty=1.0, price=P0, fee_btc=0.0, fee_usdt=0.0, fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 1, ref="o", qty=1.0, price=1.0, fee_usd=0.0, fee_status="confirmed")
+    L.perp_close(j, ms=T0 + 10 * DAY, ref="c", qty=1.0, price=0.95, entry_price=1.0, fee_usd=0.0, fee_status="confirmed")
+    c = perf.cycles_from_journal(j)[0]
+    assert c["economic_net_usd"] is None and "SPOT_LEG_NOT_FLAT" in perf.hedged_pair(c)["why"]
+    for perp_price in (1e-6, 1e6):
+        d = {"spot_residual_qty": 1.0, "perp_entry_price": perp_price, "spot_buy_net_qty": 1.0, "hedged_qty": 1.0, "spot_buy_gross_usd": P0}
+        assert perf._acquire_spot_leg_problem(d) is not None, perp_price
+        assert perf._spot_dust_qty(d) < 1e-6                     # the strict ledger dust, never an inflated allowance
+    # prices that agree within 5% value the dust at the higher of them
+    d = {"spot_residual_qty": 0.0, "perp_entry_price": P0 * 1.02, "spot_buy_net_qty": 1.0, "hedged_qty": 1.0, "spot_buy_gross_usd": P0}
+    assert perf._spot_dust_qty(d) == pytest.approx(1.0 / (P0 * 1.02))
+
+
+def test_a_whole_unsold_leg_is_still_refused_whatever_the_dust_rule():
+    j = L.Journal()
+    acquire_shaped(j, 0, 10, tag="u", close=95_000.0, sell=0.0)
+    assert perf.cycles_from_journal(j)[0]["economic_net_usd"] is None
+
+
+def test_the_acquire_hedge_tolerance_is_the_engines_delta_band():
+    import carry_engine
+    assert perf.ACQUIRE_HEDGE_TOLERANCE == carry_engine.DELTA_BAND
+
+
+def test_an_acquire_cycle_with_an_unreadable_quantity_has_no_pair():
+    j = L.Journal()
+    L.spot_buy(j, ms=T0, ref="sb", qty=1.0, price=P0, fee_btc=0.0,
+               fee_usdt=55.0, fee_status="confirmed")
+    j.post(L.Entry(ms=T0 + 1, kind="perp_open", ref="o",
+                   lines=[L.Line(L.PERP, 0.0, qty=-1.0), L.Line(L.FEES, 55.0),
+                          L.Line(L.USDT, -55.0, qty=-55.0)],
+                   memo="not a readable memo", fee_status="confirmed"))
+    j.post(L.Entry(ms=T0 + 5 * DAY, kind="perp_close", ref="c",
+                   lines=[L.Line(L.PERP, 0.0, qty=1.0), L.Line(L.FEES, 55.0),
+                          L.Line(L.USDT, -55.0, qty=-55.0)],
+                   memo="not a readable memo", fee_status="confirmed"))
+    L.spot_sell(j, ms=T0 + 5 * DAY + 1, ref="ss", qty=1.0, price=P0,
+                cost_basis=P0, fee_usd=55.0, fee_status="confirmed")
+    c = perf.cycles_from_journal(j)[0]
+    assert c["economic_net_usd"] is None
+
+
+# -- the default text report and the per-cycle rows follow the economic net ----
+
+def test_a_derived_overlay_text_report_prints_no_return_and_no_win_rate():
+    j = L.Journal()
+    for i in range(3):
+        overlay(j, 20 * i, 20 * i + 10, tag=f"d{i}", funding=400.0)   # no mark
+    cycles = perf.cycles_from_journal(j)
+    perf.attach_capital(cycles, [
+        {"cycle_opened_ms": perf._cycle_ms(c["cycle_id"]),
+         "position_im_usd": 10_000.0} for c in cycles])
+    for c in cycles:
+        assert c["economic_net_usd"] is None
+        assert c["economic_net_basis"] == "DERIVED_NOT_BOOKED"
+        assert c["return_on_committed_capital_pct"] is None   # never the cash return
+    s = perf.summarise(cycles)
+    assert s["net_usd_confirmed"] == pytest.approx(3 * (400 - 110))   # cash kept
+    for k in ("return_on_peak_notional_pct", "period_return_on_peak_capital_pct",
+              "annualised_on_notional_in_market_pct", "win_rate",
+              "max_drawdown_usd", "best_cycle_share_of_winning_net_pct"):
+        assert s[k] is None, k
+    assert "DERIVED_NOT_BOOKED" in s["returns_withheld_why"]
+    text = "\n".join(perf.report_lines(cycles, s))
+    assert "economic net (the hedged pair): n/a" in text
+    assert "return on it n/a" in text
+    assert "win rate n/a" in text and "max drawdown (closed cycles) n/a" in text
+    assert "returns, win rate and drawdown: n/a - " in text
+    assert "$n/a" not in text and "n/a%" not in text
+    assert "no return on capital is shown" in text \
+        or "committed capital: not available" in text
+
+
+def test_a_measured_book_still_prints_its_returns():
+    j = L.Journal()
+    for i in range(3):
+        overlay(j, 20 * i, 20 * i + 10, tag=f"m{i}", funding=400.0,
+                revalue=True)
+    cycles = perf.cycles_from_journal(j)
+    s = perf.summarise(cycles)
+    assert s["returns_withheld_why"] is None
+    assert s["economic_net_usd"] == pytest.approx(3 * (400 - 110))
+    assert s["win_rate"] == 1.0
+    assert s["return_on_peak_notional_pct"] == pytest.approx(
+        100 * 3 * 290 / 100_000.0)
+    text = "\n".join(perf.report_lines(cycles, s))
+    assert "n/a" not in text.split("\n")[1]       # the net line has every figure
+
+
 def test_a_cycle_without_readable_perp_prices_gets_no_pair_not_zero():
     j = L.Journal()
     j.post(L.Entry(ms=T0, kind="perp_open", ref="o",

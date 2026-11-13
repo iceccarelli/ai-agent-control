@@ -970,6 +970,12 @@ class VariantLedger:
     def carried_prior_variants(self) -> int:
         return self._carried
 
+    @property
+    def persisted_variants(self) -> int:
+        """Variants this ledger's own FILE holds (0 for an in-memory ledger). Unlike `n_variants` it ignores the process-wide high-water mark, which a long process (a test
+        suite, a notebook) raises for a family whatever file is asked about: "this family has already been tried" is a statement about the FILE."""
+        return self._persisted
+
     def variant_names(self) -> Tuple[str, ...]:
         """Names of the variants that were actually TESTED (rejected ones are counted but cannot be selected)."""
         self._tl.verify()
@@ -1330,12 +1336,34 @@ LOOKBACKS = (3, 9, 21, 63, 189)
 HOLDS = (1, 3, 9)
 
 
+#: A settlement's timestamp carries a few tens of ms of jitter AFTER its instant (…001/…047 in the committed files): anything this close behind an 8h
+#: boundary is ON that boundary.
+FUNDING_SLOT_JITTER_MS = 1_000
+
+
+def funding_slot(funding_time_ms: int) -> int:
+    """The 8h slot a funding print belongs to: the boundary it is on (within the jitter) or the NEXT one after it. A print pays for the interval that
+    ENDS at its timestamp, so a 2h-cadence print at 02:00 belongs to the slot ending at 08:00. (The earlier ``round(t / 8h)`` sent the 18:00-20:00 prints
+    to the PREVIOUS slot, by banker's rounding at 20:00.)"""
+    return -((-(int(funding_time_ms) - FUNDING_SLOT_JITTER_MS)) // MS_8H)
+
+
 def load_funding(path: str) -> Dict[int, float]:
-    """{8h-grid index: funding rate in bps}. Row timestamps carry ms jitter (…001/…005), so they snap to the 8h grid."""
+    """{8h-slot index: funding in bps over that 8h}. Funding is ADDITIVE per settlement, so every print in a slot is SUMMED: Binance ran SOL on 2h/4h
+    cadences in Nov-2022 and the earlier loader keyed ``round(t / 8h)`` and OVERWROTE, dropping 75 of 6,655 prints (the Nov-2022 sum was -1,437.5 bps
+    after loading against -3,549.1 bps in the file) and shifting others into the wrong slot. A repeated timestamp is a data error, not a second payment:
+    it is refused. Assumes the cadence divides 8h (8h, 4h, 2h, 1h); a print that straddled a boundary would be attributed whole to one slot, and a print more than
+    ``FUNDING_SLOT_JITTER_MS`` (1,000 ms) behind a boundary belongs to the NEXT slot (the committed files' largest jitter is 47 ms)."""
     out: Dict[int, float] = {}
+    seen: set = set()
     with gzip.open(path, "rt", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            out[int(round(int(r["funding_time_ms"]) / MS_8H))] = float(r["funding_rate"]) * 1e4
+            t = int(r["funding_time_ms"])
+            if t in seen:
+                raise HarnessError(f"{path}: a funding print at {t} appears twice: a repeated timestamp is a data error, not a second payment")
+            seen.add(t)
+            slot = funding_slot(t)
+            out[slot] = out.get(slot, 0.0) + float(r["funding_rate"]) * 1e4
     return out
 
 
@@ -1398,7 +1426,7 @@ def cross_sectional_funding_demo(data_dir: str, *, family: Optional[str] = None,
     best = sel["best_variant"]
     hist = historical_evidence(stats=significance(per_variant[best][max(LOOKBACKS):]), ledger=vl, spec=spec, universe=universe, leak=leak, data_sha256=sha, alpha=alpha,
                                extra={"funding_leg_only": True, "gross_mean_note": "price legs unhedged and unmeasured; not a P&L claim", "receive_time_bound": False,
-                                                                                         "funding_interval_handling": "8h grid only (Binance BTC/ETH/SOL survivors); NOT interval-normalised and NOT representative of Bybit's mixed 480m/240m/60m universe"},
+                                                                                         "funding_interval_handling": "prints SUMMED into the 8h slot that contains them (Binance BTC/ETH/SOL survivors; SOL ran 2h/4h in Nov-2022); NOT representative of Bybit's mixed 480m/240m/60m universe"},
                                returns=per_variant[best][max(LOOKBACKS):])
     # walk-forward: re-select the best variant on each train window, trade it on the next test window
     h_max, emb = max(HOLDS), max(HOLDS)

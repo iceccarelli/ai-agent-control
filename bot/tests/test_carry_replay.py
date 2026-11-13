@@ -431,3 +431,229 @@ class TestTheOwnerCapitalView:
                            execution_mode="overlay", opportunity_cost_apr=0.03,
                            cost_of_capital_stated=True)
         assert stated["owner_capital"]["cost_of_capital"]["state"] == "STATED"
+
+
+# ---------------------------------------------------------------------------
+# Round 17: the overlay's hedge loses CASH when BTC rises, and the journal holds
+# no USDT to pay it from. A4/A1 reproduced on the 4.1-year corpus that the
+# journal's USDT account was negative about 81% of the time as booked (average
+# deficit $88,644, lasting maximum $178,750 on 2025-06-10), so the interest on it is
+# 55-88% of the $33,050 net at 5-8%. The
+# replay MEASURES the deficit always and charges interest ONLY on a rate the
+# operator states (never a default), without moving the journal or net_usd.
+# ---------------------------------------------------------------------------
+
+DAY_MS = 86_400_000
+
+
+def _journal_with_deficit(*moves, notional=100_000.0):
+    """A journal whose USDT account takes `moves` = [(ms, usd), ...]: each a
+    balanced posting against REALISED (a perp_close's cash leg)."""
+    import ledger as L
+    j = L.Journal()
+    for n, (ms, usd) in enumerate(moves):
+        j.post(L.Entry(ms=ms, kind="adjustment", ref=f"m{n}",
+                       lines=[L.Line(L.USDT, usd, qty=usd),
+                              L.Line(L.REALISED, -usd)]))
+    return j
+
+
+YEAR_MS = int(365.25 * DAY_MS)
+
+
+class TestTheUsdtFinancingProfile:
+    def test_the_deficit_is_the_time_integral_of_the_negative_balance(self):
+        t0 = START
+        # -100k for the first half-year, then back to 0 for the second
+        j = _journal_with_deficit((t0, -100_000.0), (t0 + YEAR_MS // 2, +100_000.0))
+        f = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                      notional=100_000.0)
+        assert f["available"] is True
+        assert f["deficit_usd_years"] == pytest.approx(50_000.0)
+        assert f["avg_deficit_usd"] == pytest.approx(50_000.0)
+        assert f["max_deficit_usd"] == pytest.approx(100_000.0)
+        assert f["share_of_time_in_deficit"] == pytest.approx(0.5)
+        assert f["state"] == "UNSTATED" and f["interest_usd"] is None
+
+    def test_interest_is_charged_only_on_a_stated_rate_and_only_on_the_deficit(self):
+        t0 = START
+        j = _journal_with_deficit((t0, -100_000.0), (t0 + YEAR_MS // 2, +100_000.0))
+        f = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                      notional=100_000.0, usdt_borrow_apr=0.05)
+        assert f["state"] == "STATED"
+        assert f["interest_usd"] == pytest.approx(0.05 * 50_000.0)
+        zero = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                         notional=100_000.0, usdt_borrow_apr=0.0)
+        assert zero["state"] == "STATED" and zero["interest_usd"] == 0.0
+
+    def test_the_rules_margin_cash_is_posted_first(self):
+        """The capital rule (hedged_pair_capital_usd) commits perp margin cash of
+        notional/leverage x 1.02 = $102,000 here; only the deficit BEYOND it is
+        borrowed on that view."""
+        t0 = START
+        j = _journal_with_deficit((t0, -150_000.0), (t0 + YEAR_MS // 2, +150_000.0))
+        f = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                      notional=100_000.0, usdt_borrow_apr=0.05)
+        assert f["margin_cash_assumed_usd"] == pytest.approx(102_000.0)
+        assert f["deficit_beyond_margin_cash"]["usd_years"] == pytest.approx(
+            (150_000.0 - 102_000.0) * 0.5)
+        assert f["interest_after_margin_cash_usd"] == pytest.approx(
+            0.05 * (150_000.0 - 102_000.0) * 0.5)
+        assert f["interest_usd"] == pytest.approx(0.05 * 150_000.0 * 0.5)
+        # a deficit inside the margin cash needs no loan on that view
+        j2 = _journal_with_deficit((t0, -90_000.0), (t0 + YEAR_MS // 2, +90_000.0))
+        f2 = rp.usdt_financing_profile(j2, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                       notional=100_000.0, usdt_borrow_apr=0.05)
+        assert f2["interest_after_margin_cash_usd"] == 0.0
+        assert f2["interest_usd"] == pytest.approx(0.05 * 90_000.0 * 0.5)
+
+    def test_a_book_that_never_goes_negative_has_a_measured_zero_deficit(self):
+        t0 = START
+        j = _journal_with_deficit((t0, +5_000.0))
+        f = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                      notional=100_000.0, usdt_borrow_apr=0.05)
+        assert f["max_deficit_usd"] == 0.0 and f["avg_deficit_usd"] == 0.0
+        assert f["share_of_time_in_deficit"] == 0.0 and f["max_deficit_at"] is None
+        assert f["interest_usd"] == 0.0       # MEASURED zero, not an unknown
+
+    def test_a_balance_that_dips_and_recovers_at_one_timestamp_is_not_a_deficit_that_lasted(self):
+        """Red team round 2: the postings of one millisecond are applied together (their order is arbitrary), so the transient between a close's realised loss and the
+        same-ms funding credit is not the maximum; a dip that lasts even 1 ms is."""
+        t0 = START
+        j = _journal_with_deficit((t0 + 1_000, -80_000.0), (t0 + 1_000, +80_000.0))
+        f = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                      notional=100_000.0)
+        assert f["max_deficit_usd"] == 0.0 and f["deficit_usd_years"] == 0.0 and f["max_deficit_at"] is None
+        j2 = _journal_with_deficit((t0 + 1_000, -80_000.0), (t0 + 1_001, +80_000.0))
+        f2 = rp.usdt_financing_profile(j2, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                       notional=100_000.0)
+        assert f2["max_deficit_usd"] == pytest.approx(80_000.0) and f2["deficit_usd_years"] > 0.0
+
+    def test_the_share_counts_only_material_deficits_and_the_integral_counts_all(self):
+        t0 = START
+        # a $500 deficit for the whole year (below 1% of $100k) is priced, but is not "negative for 100% of the window"
+        j = _journal_with_deficit((t0, -500.0))
+        f = rp.usdt_financing_profile(j, start_ms=t0, end_ms=t0 + YEAR_MS,
+                                      notional=100_000.0, usdt_borrow_apr=0.05)
+        assert f["share_of_time_in_deficit"] == 0.0 and f["share_of_time_in_any_deficit"] == pytest.approx(1.0)
+        assert f["deficit_usd_years"] == pytest.approx(500.0) and f["interest_usd"] == pytest.approx(25.0)
+        assert f["deficit_floor_usd"] == pytest.approx(1_000.0)
+
+    def test_a_posting_that_is_not_a_finite_number_gives_no_profile_not_a_silent_zero(self):
+        import ledger as L
+        j = L.Journal()
+        e = L.Entry(ms=START, kind="adjustment", ref="x", lines=[L.Line(L.USDT, -1.0, qty=-1.0), L.Line(L.REALISED, 1.0)])
+        j.post(e)
+        e.lines[0].usd = float("nan")                                    # a corrupted row that slipped past posting
+        f = rp.usdt_financing_profile(j, start_ms=START, end_ms=START + YEAR_MS, notional=100_000.0)
+        assert f["available"] is False and "finite" in f["why"]
+
+    @pytest.mark.parametrize("bad", [-0.01, float("nan"), float("inf"), True, "5%"])
+    def test_a_rate_that_is_not_a_finite_non_negative_number_is_refused(self, bad):
+        j = _journal_with_deficit((START, -1.0))
+        with pytest.raises(ValueError):
+            rp.usdt_financing_profile(j, start_ms=START, end_ms=START + YEAR_MS,
+                                      notional=100_000.0, usdt_borrow_apr=bad)
+
+    def test_an_empty_window_claims_nothing(self):
+        j = _journal_with_deficit((START, -1.0))
+        f = rp.usdt_financing_profile(j, start_ms=START, end_ms=START,
+                                      notional=100_000.0)
+        assert f["available"] is False and f["why"]
+
+
+def _rally_rows(n=140):
+    """BTC rallies 0.6% a print with a small positive funding rate: the engine
+    enters, the book later exits on negative funding at a higher price, and the
+    short's realised loss leaves the journal's USDT account in deficit."""
+    out, price = [], 30_000.0
+    for i in range(n):
+        price *= 1.006
+        rate = 0.0001 if i < 100 else -0.0003      # four negative prints force the exit
+        out.append(cb.Settlement(ms=START + i * H8, perp=price,
+                                 spot=price * (1 - 0.0004), rate=rate,
+                                 perp_high=price * 1.003, perp_low=price * 0.997))
+    return out
+
+
+class TestTheReplayStatesItsFinancing:
+    def test_a_rally_leaves_a_measured_deficit_and_the_net_says_it_is_an_upper_bound(self):
+        r = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                      execution_mode="overlay")
+        f = r["usdt_financing"]
+        assert r["trades"] >= 1
+        assert f["available"] and f["state"] == "UNSTATED" and f["interest_usd"] is None
+        assert f["max_deficit_usd"] > 0 and f["avg_deficit_usd"] > 0
+        assert 0 < f["share_of_time_in_deficit"] <= 1
+        assert r["owner_capital"]["break_even_status"] == "UPPER_BOUND_USDT_FINANCING_UNSTATED"
+        joined = " ".join(r["not_modelled"]).lower()
+        assert "negative usdt" in joined and "higher than the net after" in joined
+        assert r["net_after_usdt_financing_usd"] is None
+
+    def test_the_final_deficit_is_the_journals_net_realised(self):
+        """The journal opens at 0 USDT, so after the last close its USDT balance IS
+        its net realised cash: the profile cannot disagree with the statement."""
+        r = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                      execution_mode="overlay")
+        net_cash = r["ledger"]["net_usd"]
+        assert net_cash < 0, "the fixture must leave the short's loss in the account"
+        assert r["usdt_financing"]["max_deficit_usd"] >= -net_cash - 1e-6
+
+    def test_a_stated_rate_charges_the_measured_deficit_and_moves_nothing_else(self):
+        base = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                         execution_mode="overlay")
+        stated = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                           execution_mode="overlay", usdt_borrow_apr=0.05)
+        f = stated["usdt_financing"]
+        assert f["state"] == "STATED"
+        assert f["interest_usd"] == pytest.approx(0.05 * f["deficit_usd_years"])
+        assert stated["net_after_usdt_financing_usd"] == pytest.approx(
+            stated["net_usd"] - f["interest_usd"])
+        # the journal and the headline net are what they were: financing is a
+        # stated overlay on the report, never a posting
+        for k in ("net_usd", "funding_usd", "basis_usd", "fees_usd", "trades",
+                  "ledger_net_usd", "ledger_entries", "ledger_agrees"):
+            assert stated[k] == base[k], k
+        assert stated["owner_capital"]["break_even_status"] == "AFTER_STATED_USDT_FINANCING_WHOLE_DEFICIT"
+        assert "negative usdt" not in " ".join(stated["not_modelled"]).lower() \
+            or "stated" in " ".join(stated["not_modelled"]).lower()
+        # linear in the rate: it is the measured balance times the rate
+        eight = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                          execution_mode="overlay", usdt_borrow_apr=0.08)
+        assert eight["usdt_financing"]["interest_usd"] == pytest.approx(
+            1.6 * f["interest_usd"])
+
+    def test_the_return_on_committed_capital_is_after_the_interest_on_the_whole_deficit(self):
+        """Red team round 2: the margin cash is still posted as the NEXT short's margin, so the break-even is taken after the interest on the WHOLE deficit (the same base as
+        `net_after_usdt_financing_usd`); netting the margin cash first is shown beside it as an optimistic bound, never as the break-even."""
+        stated = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                           execution_mode="overlay", usdt_borrow_apr=0.08)
+        v, f = stated["owner_capital"], stated["usdt_financing"]
+        if v.get("available"):
+            committed, years = v["avg_committed_capital_usd"], stated["years"]
+            expect = 100.0 * (stated["net_usd"] - f["interest_usd"]) / committed / years
+            assert v["net_return_after_usdt_financing_pct_per_year"] == pytest.approx(expect)
+            assert v["break_even_cost_of_capital_pct"] == pytest.approx(expect)
+            opt = v["net_return_after_usdt_financing_margin_cash_netted_optimistic_pct_per_year"]
+            assert opt >= v["net_return_after_usdt_financing_pct_per_year"]
+            assert v["net_return_after_usdt_financing_pct_per_year"] <= v["net_return_before_usdt_financing_pct_per_year"]
+
+    def test_no_default_rate_is_ever_applied(self):
+        r = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                      execution_mode="overlay")
+        assert r["usdt_financing"]["usdt_borrow_apr"] is None
+        assert r["net_after_usdt_financing_usd"] is None
+
+
+class TestAcquireHasNoUsdtFinancingProfile:
+    def test_in_acquire_the_spot_purchase_is_committed_capital_not_a_deficit(self):
+        for apr in (None, 0.05):
+            r = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                          execution_mode="acquire", usdt_borrow_apr=apr)
+            f = r["usdt_financing"]
+            assert f["available"] is False and "ACQUIRE" in f["why"]
+            assert f["interest_usd"] is None and r["net_after_usdt_financing_usd"] is None
+            assert not any("negative usdt" in x.lower() for x in r["not_modelled"])
+            assert "break_even_status" not in r["owner_capital"]
+            text = "\n".join(rp.usdt_financing_lines(f, net_usd=r["net_usd"]))
+            assert "not measured" in text

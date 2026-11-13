@@ -92,3 +92,46 @@ def test_feed_never_emergency_prunes_when_retention_is_zero_or_no_predicate(worl
     assert feed.emergency_retention() == [] and st.emergency_prunes_denied == 0       # retention 0 = keep everything: not even asked
     feed.cfg = F.FeedConfig(symbol="BTCUSDT", environment="mainnet", retention_days=2)
     assert feed.emergency_retention() == [] and st.emergency_prunes_denied == 1       # no predicate: denied and counted
+
+
+def test_a_full_volume_runs_the_age_retention_at_once_instead_of_waiting_for_the_hourly_pass(world):
+    """Round 17: age retention ran only every retention_every_s (3,600) from process start and the full-volume path never called it, so a volume that fills
+    up lost up to ~59 minutes of data after each UTC midnight before the day that had just expired was freed. The same age rule (never a segment inside the
+    retention window) now runs first whenever the volume is below its reserve; it needs no backup key because it deletes only what retention already expires."""
+    import md_feed as F
+    from test_md_seal import DAY3
+
+    class Eng:
+        lock = __import__("threading").RLock()
+        def __init__(self, st): self.store = st
+    st = store(world)
+    st.min_free_bytes = 1 << 62                                                       # always "low"
+    before = st.segments()
+    assert len(before) == 3
+    feed = F.Feed.__new__(F.Feed)
+    feed.engine, feed.retention_errors, feed.emergency_may_prune = Eng(st), 0, None
+    feed.wall_ms = lambda: DAY3                                                       # still day 3 (2023-11-16 22:13 UTC): days 1 and 2 are 2 and 1 days back
+    feed.cfg = F.FeedConfig(symbol="BTCUSDT", environment="mainnet", retention_days=1)
+    removed = feed.emergency_retention()
+    assert removed == [before[0]], "the day older than the 1-day retention window is freed immediately"
+    assert st.segments() == before[1:]
+    assert st.emergency_prunes_denied == 0, "age retention is not an emergency prune: no backup key is asked for or denied"
+    assert feed.retention_errors == 0
+    # nothing else is touched in the same pass: the day inside the window stays, and the next call (still no key) only counts a denial
+    assert feed.emergency_retention() == [] and st.segments() == before[1:]
+
+
+def test_a_volume_with_room_runs_no_retention_early(world):
+    import md_feed as F
+    from test_md_seal import DAY3
+
+    class Eng:
+        lock = __import__("threading").RLock()
+        def __init__(self, st): self.store = st
+    st = store(world)                                                                 # no reserve configured: not low
+    before = st.segments()
+    feed = F.Feed.__new__(F.Feed)
+    feed.engine, feed.retention_errors, feed.emergency_may_prune = Eng(st), 0, None
+    feed.wall_ms = lambda: DAY3
+    feed.cfg = F.FeedConfig(symbol="BTCUSDT", environment="mainnet", retention_days=1)
+    assert feed.emergency_retention() == [] and st.segments() == before

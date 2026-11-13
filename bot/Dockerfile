@@ -57,10 +57,17 @@ COPY signals/ ./signals/
 # scripts/deploy.sh told the operator to run all four inside the container.
 # The instruction failed at the one moment it mattered.
 # tests/test_image_ships_the_tools.py compares the two lists now.
+#
+# venue_evidence.py and provenance.py are not operator tools: private_ws_consumer.py
+# (shipped above) puts tools/ on sys.path and imports venue_evidence LAZILY, in the
+# WS writer thread, and venue_evidence imports provenance. With PRIVATE_WS_ENABLED=1
+# an image without them failed every event with ImportError (evidence_capture_failed
+# + needs_reconciliation) while the import closure of /app/*.py stayed green.
+# tests/test_dockerfile.py now follows imports into tools/.
 COPY tools/connector_check.py tools/session_tail.py \
      tools/drill.py tools/fund_demo.py tools/carry_performance.py \
      tools/owner_policy_check.py tools/execution_samples_report.py tools/md_run.py \
-     tools/state_backup.py ./tools/
+     tools/state_backup.py tools/venue_evidence.py tools/provenance.py ./tools/
 
 # Run unprivileged. State lives on a mounted volume owned by this user.
 RUN useradd --create-home --shell /usr/sbin/nologin bot \

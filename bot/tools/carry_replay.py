@@ -764,9 +764,166 @@ def denominator_report(trades: Sequence[Dict[str, Any]], rows: Sequence[Any], *,
     return out
 
 
+#: A deficit smaller than this fraction of the notional (fees and a lumped funding credit move the balance by tens of dollars before the first real loss) does not count
+#: towards `share_of_time_in_deficit`; the integrals that price the interest count every dollar.
+MATERIAL_DEFICIT_FRACTION = 0.01
+
+
+def usdt_financing_profile(journal: Any, *, start_ms: int, end_ms: int,
+                           notional: float, leverage: float = 1.0,
+                           usdt_borrow_apr: Optional[float] = None
+                           ) -> Dict[str, Any]:
+    """How long and how deep the journal's USDT account is NEGATIVE, and what
+    interest that costs ONLY at a rate the operator states.
+
+    An OVERLAY hedges BTC the client already owns: when BTC rises the short
+    loses CASH at every close while the coin's gain is an unsold mark, so the
+    cash account goes negative and stays there until a fall pays it back. The
+    journal opens with 0 USDT, so its USDT balance after any posting IS the
+    cash the book would have had to find. On the 4.1-year Bybit corpus that
+    balance was negative for most of the window (average deficit $88,644 over the
+    window; the signed mean balance is -$86,887; lasting maximum $178,750 on
+    2025-06-10), and interest on it at 5-8%/yr is $18,198-$29,117, i.e. 55-88% of
+    the $33,050 net (Round 17 A4/A1, re-derived by the red team). A net that omits
+    it is an UPPER BOUND.
+
+    The balance is the journal's own USDT account, stepped at each TIMESTAMP (all
+    postings at one millisecond are applied before it is read: their order is
+    arbitrary, so a transient between a close's realised loss and the same-ms
+    funding credit is not a deficit that lasted) from `start_ms` to `end_ms`. Two
+    charges are reported once a rate is stated: `interest_usd` on the whole
+    deficit (the owner holds no USDT) and `interest_after_margin_cash_usd` on the
+    deficit BEYOND the margin cash the repository's capital rule commits
+    (`perp_only_capital_usd`). The second is the OPTIMISTIC variant: that cash is
+    still posted as the next short's margin, so it cannot also pay the realised
+    loss; `owner_capital_view` takes the break-even on the first. No default rate
+    exists: an unstated rate stays UNSTATED and the interest is None, never 0.0.
+    Funding is booked at the exit in this journal (it is paid per print live): the
+    lump is conservative for the interest (about 1.1% more dollar-years than per
+    print on the corpus) but it DOES move the share of time in deficit, which is
+    about 81% as booked and about 71-72% had each print's funding been credited when
+    it was paid (one 572-print trade collects $18,987 that the journal credits only
+    at its exit): the share is therefore reported as a figure that depends on when
+    funding is credited, not as a measurement of the live account. The
+    `MATERIAL_DEFICIT_FRACTION` floor only keeps fee-sized balances out of it. A
+    posting amount that is not a finite number gives no profile rather than a silent
+    zero."""
+    import economic_model as EM
+    import ledger as L
+    if usdt_borrow_apr is not None and (
+            isinstance(usdt_borrow_apr, bool)
+            or not isinstance(usdt_borrow_apr, (int, float))
+            or not math.isfinite(usdt_borrow_apr) or usdt_borrow_apr < 0):
+        raise ValueError("usdt_borrow_apr must be a finite number >= 0 "
+                         f"(a fraction per year) or None, got {usdt_borrow_apr!r}")
+    span_ms = int(end_ms) - int(start_ms)
+    out: Dict[str, Any] = {
+        "basis": "the journal's own USDT account (opens at 0), stepped at each "
+                 "timestamp; funding is booked at the exit here (paid per print "
+                 "live)",
+        "usdt_borrow_apr": None if usdt_borrow_apr is None
+        else float(usdt_borrow_apr),
+        "state": "UNSTATED" if usdt_borrow_apr is None else "STATED",
+        "interest_usd": None, "interest_after_margin_cash_usd": None}
+    if span_ms <= 0:
+        out.update(available=False, why="the replay window has no duration")
+        return out
+    year_ms = 365.25 * DAY_MS
+    margin_cash = float(EM.perp_only_capital_usd(
+        repr(float(notional)), repr(float(leverage))).value)
+    floor = MATERIAL_DEFICIT_FRACTION * float(notional)
+    dust = L.DUST[L.USDT]
+    balance, last = 0.0, int(start_ms)
+    low, low_ms = 0.0, int(start_ms)
+    dollar_years = beyond_dollar_years = 0.0
+    any_deficit_ms = material_ms = 0.0
+
+    def step(to_ms: int) -> None:
+        nonlocal dollar_years, beyond_dollar_years, any_deficit_ms, material_ms
+        dt = to_ms - last
+        if dt > 0 and balance < -dust:
+            deficit = -balance
+            dollar_years += deficit * dt / year_ms
+            beyond_dollar_years += max(deficit - margin_cash, 0.0) * dt / year_ms
+            any_deficit_ms += dt
+            if deficit > floor:
+                material_ms += dt
+
+    entries = sorted(journal.entries, key=lambda e: e.ms)
+
+    def at_of(e: Any) -> int:
+        return min(max(int(e.ms), int(start_ms)), int(end_ms))
+
+    i = 0
+    while i < len(entries):
+        at = at_of(entries[i])
+        step(at)
+        last = at
+        while i < len(entries) and at_of(entries[i]) == at:
+            for line in entries[i].lines:
+                if line.account == L.USDT:
+                    if not (isinstance(line.usd, (int, float))
+                            and math.isfinite(line.usd)):
+                        out.update(available=False, why="a USDT posting "
+                                   f"({entries[i].ref!r}) is not a finite number")
+                        return out
+                    balance += line.usd
+            i += 1
+        if balance < low:
+            low, low_ms = balance, at
+    step(int(end_ms))
+    years = span_ms / year_ms
+    out.update(
+        available=True, window_years=years,
+        avg_deficit_usd=dollar_years / years,
+        max_deficit_usd=-low if low < -dust else 0.0,
+        max_deficit_at=cb._iso_ms(low_ms) if low < -dust else None,
+        deficit_floor_usd=floor,
+        share_of_time_in_deficit=material_ms / span_ms,
+        share_of_time_in_any_deficit=any_deficit_ms / span_ms,
+        deficit_usd_years=dollar_years,
+        margin_cash_assumed_usd=margin_cash,
+        deficit_beyond_margin_cash={"avg_usd": beyond_dollar_years / years,
+                                    "usd_years": beyond_dollar_years},
+        reading="a negative USDT balance is cash the book does not hold: it "
+                "is borrowed (interest) or covered by selling the coin; the "
+                "replay's net omits that interest unless a rate is stated")
+    if usdt_borrow_apr is not None:
+        out["interest_usd"] = float(usdt_borrow_apr) * dollar_years
+        out["interest_after_margin_cash_usd"] = (
+            float(usdt_borrow_apr) * beyond_dollar_years)
+    return out
+
+
+def usdt_financing_lines(f: Dict[str, Any], *, net_usd: float) -> List[str]:
+    if not f.get("available"):
+        return ["  usdt financing: not measured (" + str(f.get("why")) + ")"]
+    lines = [
+        f"  USDT FINANCING (the journal opens with 0 USDT; the short's realised losses are cash it must find): negative by more than "
+        f"${f['deficit_floor_usd']:,.0f} for {100.0 * f['share_of_time_in_deficit']:.0f}% of the window ({100.0 * f['share_of_time_in_any_deficit']:.0f}% at any amount; "
+        f"lower if funding were credited per print: this journal credits it at each exit), "
+        f"average deficit ${f['avg_deficit_usd']:,.0f} over the window, lasting maximum ${f['max_deficit_usd']:,.0f}"
+        + (f" on {f['max_deficit_at']}" if f["max_deficit_at"] else ""),
+        f"    beyond the margin cash the capital rule commits (${f['margin_cash_assumed_usd']:,.0f}; optimistic: that cash is still posted as margin): average deficit "
+        f"${f['deficit_beyond_margin_cash']['avg_usd']:,.0f}"]
+    if f["state"] == "UNSTATED":
+        lines.append(
+            "    USDT BORROW RATE UNSTATED (no --usdt-borrow-apr): the interest on this deficit is NOT charged, so the NET above is an UPPER "
+            "BOUND on the net after financing; 0.0 is NOT assumed to be the venue's rate")
+    else:
+        rate = 100.0 * f["usdt_borrow_apr"]
+        lines.append(
+            f"    at the stated {rate:g}%/yr: interest ${f['interest_usd']:,.2f} on the whole deficit -> net after it "
+            f"${net_usd - f['interest_usd']:,.2f}; ${f['interest_after_margin_cash_usd']:,.2f} if the capital rule's margin cash "
+            f"could also pay the losses (optimistic) -> ${net_usd - f['interest_after_margin_cash_usd']:,.2f}")
+    return lines
+
+
 def owner_capital_view(d: Dict[str, Any], *, net_usd: float, years: float,
                        leverage: float = 1.0,
-                       stated_apr: Optional[float] = None) -> Dict[str, Any]:
+                       stated_apr: Optional[float] = None,
+                       financing: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
     """The same net on the capital the repository's OWN rule commits to a hedged
     pair, and the cost of capital that net can stand.
 
@@ -811,6 +968,29 @@ def owner_capital_view(d: Dict[str, Any], *, net_usd: float, years: float,
                avg_committed_capital_usd=committed,
                net_return_on_committed_capital_pct_per_year=pct,
                break_even_cost_of_capital_pct=pct)
+    if financing is not None and financing.get("available"):
+        # Unstated: the return is an UPPER BOUND on the break-even. Stated: it is
+        # taken after the interest on the WHOLE deficit. The view assumes the
+        # margin is separate cash (above), and that cash is still posted as the
+        # NEXT short's margin (the book is in market ~79% of the time), so a
+        # realised loss cannot also be paid out of it: netting the margin cash
+        # against the deficit would use the same $102,000 twice. That optimistic
+        # variant is shown beside it, labelled, never as the break-even.
+        out["usdt_financing_state"] = financing["state"]
+        if financing["state"] == "UNSTATED":
+            out["break_even_status"] = "UPPER_BOUND_USDT_FINANCING_UNSTATED"
+        else:
+            after = 100.0 * (net_usd - financing["interest_usd"]) \
+                / committed / years
+            optimistic = 100.0 * (net_usd - financing[
+                "interest_after_margin_cash_usd"]) / committed / years
+            out.update(
+                net_return_before_usdt_financing_pct_per_year=pct,
+                net_return_after_usdt_financing_pct_per_year=after,
+                net_return_after_usdt_financing_margin_cash_netted_optimistic_pct_per_year=optimistic,
+                break_even_cost_of_capital_pct=after,
+                break_even_status="AFTER_STATED_USDT_FINANCING_WHOLE_DEFICIT")
+            pct = after
     if stated_apr is not None:
         out["excess_over_stated_cost_pct_per_year"] = pct - 100.0 * stated_apr
     return out
@@ -826,6 +1006,14 @@ def owner_capital_lines(v: Dict[str, Any]) -> List[str]:
         f"{v['net_return_on_committed_capital_pct_per_year']:+.2f}%/yr",
         f"    = the BREAK-EVEN cost of capital: an alternative that earns more than "
         f"{v['break_even_cost_of_capital_pct']:.2f}%/yr on the same capital beats this book (margin assumed separate cash)"]
+    if v.get("break_even_status") == "UPPER_BOUND_USDT_FINANCING_UNSTATED":
+        lines.append("    UPPER BOUND: the interest on the USDT deficit is not charged (no --usdt-borrow-apr), so the break-even above is "
+                     "the best case, not the owner's")
+    elif v.get("break_even_status") == "AFTER_STATED_USDT_FINANCING_WHOLE_DEFICIT":
+        lines.append(f"    after the stated USDT financing on the whole deficit: {v['net_return_after_usdt_financing_pct_per_year']:+.2f}%/yr "
+                     f"(before it {v['net_return_before_usdt_financing_pct_per_year']:+.2f}%/yr; OPTIMISTIC bound if the margin cash could also pay the realised "
+                     f"losses, which it cannot while it is posted as margin: "
+                     f"{v['net_return_after_usdt_financing_margin_cash_netted_optimistic_pct_per_year']:+.2f}%/yr)")
     if coc["state"] == "UNSTATED":
         lines.append("    COST OF CAPITAL UNSTATED (no --opportunity-cost-apr): nothing above is an excess over any alternative, and 0.0 "
                      "is NOT assumed to be the owner's rate")
@@ -889,8 +1077,15 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            require_liquidation_evidence: bool = False,
            opportunity_cost_apr: float = 0.0,
            exit_policy: str = "funding_streak",
-           cost_of_capital_stated: bool = False) -> Dict[str, Any]:
+           cost_of_capital_stated: bool = False,
+           usdt_borrow_apr: Optional[float] = None) -> Dict[str, Any]:
     """Drive the real engine through `rows`. One bar, one `main.tick`.
+
+    ``usdt_borrow_apr`` (default None = UNSTATED, never a default rate) is the
+    rate at which a negative USDT balance is financed. The journal's USDT
+    deficit is MEASURED either way (`usdt_financing_profile`); interest is
+    reported only for a stated rate, as ``usdt_financing`` / ``net_after_usdt_
+    financing_usd``, and never enters the journal or ``net_usd``.
 
     ``cost_of_capital_stated`` says whether ``opportunity_cost_apr`` is the
     operator's STATEMENT (True) or just the 0.0 default (False): the gate sees
@@ -1175,6 +1370,23 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     span_days = max((rows[-1].ms - rows[0].ms) / float(DAY_MS), 1.0)
     years = span_days / 365.25
     net = funding_usd + basis_usd - fees_usd - borrow_usd
+    if execution_mode == cb.OVERLAY:
+        financing = usdt_financing_profile(
+            journal, start_ms=int(rows[0].ms), end_ms=int(rows[-1].ms),
+            notional=notional, usdt_borrow_apr=usdt_borrow_apr)
+    else:
+        # In ACQUIRE the journal's USDT account carries the spot leg's PURCHASE
+        # (cash the book commits, priced by the capital rule and `borrow_apr`), not
+        # a deficit from realised short losses: reporting it as financing would
+        # present committed capital as a loan and double-count `borrow_apr`.
+        financing = {
+            "available": False, "state": "UNSTATED" if usdt_borrow_apr is None
+            else "STATED", "usdt_borrow_apr": usdt_borrow_apr,
+            "interest_usd": None, "interest_after_margin_cash_usd": None,
+            "why": "the profile is defined for the OVERLAY (the short's realised "
+                   "losses are the only cash that moves); in ACQUIRE the journal's "
+                   "USDT account carries the spot purchase, which is committed "
+                   "capital, not a financing deficit"}
     held = sum(t["prints_held"] for t in trades) / cb.FUNDING_PERIODS_PER_DAY
     liquidation_report = _liquidation_report(
         liquidation, require_liquidation_evidence, raw_broker.liq_stats,
@@ -1204,10 +1416,15 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "net_usd": net,
         "net_annualised_pct": 100.0 * net / notional / years,
         "denominators": (_den := denominator_report(trades, rows, net_usd=net, funding_usd=funding_usd, years=years, notional=notional)),
+        "usdt_financing": financing,
+        "net_after_usdt_financing_usd": (
+            None if financing.get("interest_usd") is None
+            else net - financing["interest_usd"]),
         "owner_capital": owner_capital_view(
             _den, net_usd=net, years=years,
             stated_apr=(float(opportunity_cost_apr)
-                        if cost_of_capital_stated else None)),
+                        if cost_of_capital_stated else None),
+            financing=financing),
         "market_exposure_pct": 100.0 * held / span_days,
         "actions": actions, "reasons": reasons,
         # THE JOURNAL'S OWN ANSWER, built from balanced double-entry postings
@@ -1253,7 +1470,11 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             "declared touch spread is never charged (about 0.013 bp per round trip at the stock spread in overlay mode, two perp legs; about 0.026 in acquire mode, four legs)",
             "market impact beyond the declared haircut, adverse selection of resting orders, and the exit book being worse than the entry book",
             "cost completeness: this net omits the costs named here and its sign of error is not established; it is not a total",
-        ] + ([] if liquidation is not None else [
+        ] + ([] if financing.get("state") != "UNSTATED" or not financing.get("available") else [
+            "interest on a negative USDT balance: UNSTATED (no --usdt-borrow-apr). The short's realised losses leave the journal's USDT "
+            f"account negative {100.0 * financing['share_of_time_in_deficit']:.0f}% of the window (average ${financing['avg_deficit_usd']:,.0f}, "
+            f"maximum ${financing['max_deficit_usd']:,.0f}); the interest on it is NOT charged, so this net is HIGHER than the net after "
+            "financing by exactly that interest (a cost; it cannot be a credit)"]) + ([] if liquidation is not None else [
             "the production liquidation-distance gate: the corpus holds no "
             "liqPrice, leverage, collateral or accountMMRate"]),
     }
@@ -1343,6 +1564,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--repo", default=ROOT)
     ap.add_argument("--notional", type=float, default=100_000.0)
     ap.add_argument("--borrow-apr", type=float, default=0.0)
+    ap.add_argument("--usdt-borrow-apr", type=float, default=None,
+                    help="the rate (a fraction per year, e.g. 0.06) at which a "
+                         "NEGATIVE USDT balance is financed: an operator "
+                         "statement (the venue's unified-account rate history "
+                         "is not in the corpus). Unstated, the deficit is "
+                         "reported and no interest is charged or assumed")
     ap.add_argument("--opportunity-cost-apr", type=float, default=None,
                     help="the forgone return on the hedged capital, per year, "
                          "charged by the entry gate beside borrow (an "
@@ -1416,7 +1643,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                require_liquidation_evidence=args.require_liquidation_evidence,
                opportunity_cost_apr=stated_cost,
                exit_policy=args.exit_policy,
-               cost_of_capital_stated=args.opportunity_cost_apr is not None)
+               cost_of_capital_stated=args.opportunity_cost_apr is not None,
+               usdt_borrow_apr=args.usdt_borrow_apr)
 
     print("=" * 74)
     print("CARRY REPLAY — the ENGINE driven through history, not a model of it")
@@ -1472,6 +1700,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for line in capital_lines(r["net_annualised_pct"]):
         print(line)
     for line in denominator_lines(r["denominators"]):
+        print(line)
+    for line in usdt_financing_lines(r["usdt_financing"], net_usd=r["net_usd"]):
         print(line)
     for line in owner_capital_lines(r["owner_capital"]):
         print(line)

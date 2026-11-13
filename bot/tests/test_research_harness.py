@@ -795,3 +795,86 @@ def test_pit_limits_are_stated_in_gaps_and_in_the_evidence():
     assert ev.metrics["universe_pit_basis"] == "RAW_RESPONSES_VERIFIED" and ev.metrics["universe_pit_verified_against_exchange"] is False
     ev3 = RH.historical_evidence(spec=spec_for(L), stats=st, ledger=L, universe=survivors(), leak=CLEAN, data_sha256=SHA)
     assert ev3.metrics["universe_pit_basis"] == "ASSERTED" and ev3.metrics["universe_pit_source_assertion"] == "hand_picked_survivors"
+
+
+# ------------------------------------------------------------------ the funding loader neither drops nor shifts a print (Round 17)
+# Binance ran SOL on 2h/4h funding in Nov-2022. The loader keyed round(t / 8h) and OVERWROTE, so 75 of 6,655 prints were lost and others landed in the
+# wrong slot (Nov-2022 SOL funding: -3,549.1 bps in the file, -1,437.5 bps after loading), biasing the only runnable evidence for the
+# cross_sectional_funding family.
+
+def _funding_gz(tmp_path, rows):
+    import csv as _csv
+    import gzip as _gzip
+    p = tmp_path / "f.csv.gz"
+    with _gzip.open(p, "wt", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["funding_time", "funding_time_ms", "symbol", "funding_rate", "mark_price"])
+        for ms, rate in rows:
+            w.writerow([ms, ms, "X", rate, 1.0])
+    return str(p)
+
+
+H = 3_600_000
+
+
+def test_a_print_belongs_to_the_slot_it_is_on_or_the_next_one_never_an_earlier_one():
+    b = 100 * RH.MS_8H                                         # a boundary
+    for jitter in (0, 1, 5, 47, 999):
+        assert RH.funding_slot(b + jitter) == 100, jitter      # on the boundary, whatever the jitter behind it
+    assert RH.funding_slot(b + 1_001) == 101                   # past the tolerance: it pays for the NEXT interval
+    for hours in (2, 4, 6, 8):                                 # a 2h cadence inside (b, b+8h]: all in the slot ending at b+8h
+        assert RH.funding_slot(b + hours * H) == 101, hours
+    assert RH.funding_slot(b + 4 * H) == 101                   # banker's rounding used to send the 4h and 20:00-style halves to the EARLIER slot
+    assert RH.funding_slot(b + 20 * H) == 103 and RH.funding_slot(b + 16 * H + 5) == 102
+
+
+def test_every_print_in_a_slot_is_summed_and_none_is_overwritten(tmp_path):
+    b = 1000 * RH.MS_8H
+    rows = [(b, 0.0001), (b + 4 * H, 0.0002), (b + 6 * H + 3, 0.0003), (b + 8 * H + 5, 0.0004),   # 2h-ish cadence then back to 8h
+            (b + 16 * H + 11, 0.0005)]
+    got = RH.load_funding(_funding_gz(tmp_path, rows))
+    assert got == {1000: pytest.approx(1.0), 1001: pytest.approx(2.0 + 3.0 + 4.0), 1002: pytest.approx(5.0)}
+    assert sum(got.values()) == pytest.approx(sum(r for _, r in rows) * 1e4)             # nothing dropped, nothing double-counted
+
+
+def test_a_repeated_timestamp_is_refused_not_summed_or_overwritten(tmp_path):
+    p = _funding_gz(tmp_path, [(1_000 * RH.MS_8H, 0.0001), (1_000 * RH.MS_8H, 0.0001)])
+    with pytest.raises(RH.HarnessError, match="appears twice"):
+        RH.load_funding(p)
+
+
+@pytest.mark.parametrize("sym", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+def test_the_committed_files_load_with_every_print_accounted_for(sym):
+    import csv as _csv
+    import gzip as _gzip
+    path = os.path.join(DATA, "real_funding_full", "funding", RH.FUNDING_FILES[sym])
+    raw = 0.0
+    n = 0
+    with _gzip.open(path, "rt", encoding="utf-8") as f:
+        for r in _csv.DictReader(f):
+            raw += float(r["funding_rate"]) * 1e4
+            n += 1
+    got = RH.load_funding(path)
+    assert sum(got.values()) == pytest.approx(raw, rel=1e-9, abs=1e-6), sym              # the slot sums ARE the raw sum: no print lost
+    assert len(got) <= n
+    if sym == "SOLUSDT":
+        assert len(got) < n, "SOL's 2h/4h cadence must collapse into fewer 8h slots, by summing, not by dropping"
+
+
+def test_persisted_variants_counts_the_file_and_ignores_the_process_high_water_mark(tmp_path):
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+    fam = "persisted-count-family"
+    path = str(tmp_path / "led.jsonl")
+    led = RH.VariantLedger(fam, path=path)
+    assert led.persisted_variants == 0
+    led.record("a", {"k": 1}, [0.1, -0.2, 0.3, 0.05], horizon=1)
+    led.record("b", {"k": 2}, [0.2, 0.1, -0.1, 0.0], horizon=1)
+    assert led.persisted_variants == 2 and led.n_variants == 2
+    again = RH.VariantLedger(fam, path=path)                                         # a fresh object over the same file
+    assert again.persisted_variants == 2
+    other = RH.VariantLedger(fam, path=str(tmp_path / "other.jsonl"))                # another file of the same family: nothing persisted there, though the high-water mark is 2
+    assert other.persisted_variants == 0 and other.n_variants >= 2
+    assert RH.VariantLedger(fam).persisted_variants == 0                             # in memory
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()

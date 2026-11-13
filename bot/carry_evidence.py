@@ -108,6 +108,8 @@ def evidence_from_report(report: Mapping[str, Any], *, strategy_id: str,
                 _num(c.get("net_usd"))
             if (None in (start, end, net) or end < start or not _cycle_is_cash(c)):
                 continue                    # a cycle the report cannot vouch for
+            if "economic_net_usd" in c and c["economic_net_usd"] is None:
+                continue                    # booked cash whose pair is not computable (a spot leg left unsold): not a result
             # An overlay hedges BTC the client already owns and the book never
             # sells. Its cash is the short's result alone (the hedge is not in
             # it) and its pair economics rest on a MARKED, unsold inventory
