@@ -1078,7 +1078,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         "records": {"perp_executions": len(fills), "funding_settlements": len(funding), "spot_trades": len(spot), "external_flows": len(ext),
                     "statement_lines": len(lines), "snapshots": len(snaps)},
         "equity_bridge": bridge, "residuals": residuals, "statement": stmt, "returns": returns, "strategy_contribution": strategy,
-        "economic_capital": capital, "perp_review": ({"verdict": perp_rep["verdict"], "round_trips": perp_rep["round_trips"], "settlements": perp_rep["settlements"],
+        "economic_capital": capital, "perp_review": ({"verdict": perp_rep["verdict"], "round_trips": scrub_unreconciled_rates(perp_rep["round_trips"], verdict), "settlements": perp_rep["settlements"],
                                                       "sufficiency": perp_rep["sufficiency"]} if perp_rep else None),
         "perp_position": perp, "flags": flags, "limits": list(LIMITS),
         "custody": {"inputs_sha256": dict(inp.digests), "ignored_columns": {k: list(v) for k, v in inp.ignored.items()},
@@ -1120,6 +1120,23 @@ def withhold_unreconciled_returns(returns: Dict[str, Any], capital: Dict[str, An
             capital["return_on_hedged_notional"] = {k: (None if k in UNRECONCILED_HEDGED_RATE_KEYS else v) for k, v in hedged.items()}
         capital["returns_withheld"] = why
     return returns, capital
+
+
+#: A key whose number is a RATE (annualised, a period or an on-capital percentage). The perp review's per-round-trip rows carry `annualised_pct_on_notional` and
+#: `annualised_pct_on_stated_capital`; a dollar sensitivity named `..._usd_per_1pct` is not one.
+_RATE_KEY_PARTS = ("annualised", "period_pct", "pct_on_")
+
+
+def scrub_unreconciled_rates(node: Any, verdict: str) -> Any:
+    """The same rule for the perp review's round-trip rows (red team round 2: `perp_review.round_trips[0].annualised_pct_on_notional = -3.46` leaked on an INCOMPLETE
+    ledger): a numeric value under a rate-like key is None unless the verdict is RECONCILED_*. A copy; the dollar fields are untouched."""
+    if verdict.startswith("RECONCILED"):
+        return node
+    if isinstance(node, dict):
+        return {k: (None if any(t in str(k).lower() for t in _RATE_KEY_PARTS) and isinstance(v, (int, float)) and not isinstance(v, bool) else scrub_unreconciled_rates(v, verdict)) for k, v in node.items()}
+    if isinstance(node, list):
+        return [scrub_unreconciled_rates(v, verdict) for v in node]
+    return node
 
 
 def _hedged_notional_return(fills, funding, perp_rep, window_days, t0, t1, opening_qty, strategy) -> Dict[str, Any]:

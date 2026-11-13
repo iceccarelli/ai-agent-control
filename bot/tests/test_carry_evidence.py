@@ -257,3 +257,44 @@ def test_an_acquire_cycle_holds_both_legs_and_counts():
         c["overlay"] = False
         c["hedged_pair_inventory_leg"] = "SPOT_LEG_BOOKED"
     assert provider(rep)().verdict == se.ALLOCATE
+
+
+# -- an acquire cycle whose spot leg is unsold is booked cash, not a RESULT (red team round 2, H1) ---------------------------------------------
+def _unflat_acquire_cycle():
+    import ledger as Lg
+    import carry_performance as perf
+    DAYMS = 86_400_000
+    T0 = 1_700_000_000_000
+    j = Lg.Journal()
+    Lg.spot_buy(j, ms=T0, ref="sb", qty=1.0, price=100_000.0, fee_btc=0.0, fee_usdt=0.0, fee_status="confirmed")
+    Lg.perp_open(j, ms=T0 + 1, ref="o", qty=1.0, price=100_000.0, fee_usd=0.0, fee_status="confirmed")
+    from ledger_fixtures import vraw
+    Lg.funding(j, ms=T0 + 5 * DAYMS, ref="f", usd=-50.0, basis="venue", raw=vraw("f", T0 + 5 * DAYMS, -50.0))
+    Lg.perp_close(j, ms=T0 + 10 * DAYMS, ref="c", qty=1.0, price=95_000.0, entry_price=100_000.0, fee_usd=0.0, fee_status="confirmed")
+    return perf, perf.cycles_from_journal(j)                                                       # no spot_sell: the BTC is still held
+
+
+def test_an_unflat_acquire_cycle_is_not_reconciled_cash_and_is_not_a_trade():
+    perf, cycles = _unflat_acquire_cycle()
+    c = cycles[0]
+    assert c["overlay"] is False and c["closed"] and c["economic_net_usd"] is None
+    assert c["net_usd"] == pytest.approx(4_950.0)                       # the booked cash: the perp's +5,000 less 50 funding: the phantom
+    env = {"booked_figures_class": "UNAVAILABLE", "actual_reconciled_eligible": True}
+    perf._classify_cycle(c, env, {c["cycle_id"]: {"reconciled": True, "lifecycles": [], "reasons": []}}, [])
+    assert c["evidence_class"] != "ACTUAL_RECONCILED", c["provisional_reasons"]
+    assert any(r.startswith("PAIR_NOT_COMPUTABLE") and "SPOT_LEG_NOT_FLAT" in r for r in c["provisional_reasons"])
+    public = perf._public_cycle(c)
+    assert public["economic_net_usd"] is None and public["economic_net_basis"] == "PAIR_NOT_COMPUTABLE"
+
+
+def test_a_cycle_listed_as_cash_whose_pair_is_not_computable_is_never_a_trade():
+    """Defence in depth: even if a report listed it as cash, `economic_net_usd: None` keeps it out of the sample and counts it as unqualified."""
+    rep = report(25)
+    for c in rep["sections"]["ledger_detail"]["cycles"][:3]:
+        c["economic_net_usd"] = None
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW, discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert len(ev.trades) == 22 and ev.unqualified_results == 3
+    # a report that predates the field (no key at all) is unchanged
+    old = report(25)
+    ev2 = cev.evidence_from_report(old, strategy_id="s", observed_at_s=NOW, discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert len(ev2.trades) == 25 and ev2.unqualified_results == 0

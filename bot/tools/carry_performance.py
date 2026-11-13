@@ -535,13 +535,37 @@ def _economic_net_of(c: Mapping[str, Any]) -> Tuple[Optional[float], str]:
 #: never withheld here.
 ACQUIRE_HEDGE_TOLERANCE = 0.02
 
+#: What an unsold spot remainder may be worth and still leave a cycle a flat pair:
+#: the sell is floored to the venue's lot (`_spot_sellable`), so a clean close
+#: leaves sub-lot dust (a 1e-6 BTC lot is about $0.10 at $100k; the red team's
+#: two fixtures left 5.4e-7 and 8e-7 BTC, about $0.05) whose price move is worth
+#: cents against tens of dollars of fees. The dust is STATED in the pair
+#: (`spot_residual_btc`), never hidden, and a remainder above this value is a leg
+#: whose price move is not booked.
+SPOT_DUST_USD = 1.0
+
+
+def _spot_dust_qty(c: Mapping[str, Any]) -> float:
+    """The largest unsold/oversold BTC quantity treated as dust for this cycle:
+    SPOT_DUST_USD at the cycle's entry price, never below the ledger's own dust.
+    No readable price: the ledger's strict dust only."""
+    floor = max(L.DUST[L.BTC], 1e-9)
+    for price in (c.get("perp_entry_price"),
+                  (c.get("spot_buy_gross_usd") or 0.0)
+                  / c["spot_buy_net_qty"] if c.get("spot_buy_net_qty") else None):
+        if (isinstance(price, (int, float)) and not isinstance(price, bool)
+                and math.isfinite(price) and price > 0):
+            return max(floor, SPOT_DUST_USD / price)
+    return floor
+
 
 def _acquire_spot_leg_problem(c: Mapping[str, Any]) -> Optional[str]:
     """Why an ACQUIRE cycle is not (provably) a flat hedged pair, or None.
 
     Its booked net holds both price legs only if the spot leg was sold back
-    (nothing left) and was the size of the perp short. Unknown stays unknown:
-    a quantity the journal cannot state is a problem, never a pass."""
+    (nothing left beyond lot dust worth `SPOT_DUST_USD`) and was the size of the
+    perp short. Unknown stays unknown: a quantity the journal cannot state is a
+    problem, never a pass."""
     residual = c.get("spot_residual_qty")
     bought = c.get("spot_buy_net_qty")
     hedged = c.get("hedged_qty")
@@ -549,13 +573,13 @@ def _acquire_spot_leg_problem(c: Mapping[str, Any]) -> Optional[str]:
                and math.isfinite(x) for x in (residual, bought, hedged)):
         return ("the spot or perp quantity of this cycle is not readable from "
                 "the journal, so a flat hedged pair cannot be shown")
-    if abs(residual) > max(L.DUST[L.BTC], 1e-9):
+    if abs(residual) > _spot_dust_qty(c):
         return (f"{residual:+.8f} BTC of the spot leg was never sold back: its "
                 "price move is not booked, so the booked net is not the "
                 "pair's")
     if hedged <= 0 or bought <= 0:
         return "no hedged quantity or no spot purchase to compare"
-    if abs(bought - hedged) > ACQUIRE_HEDGE_TOLERANCE * (bought + hedged):
+    if abs(bought - hedged) > ACQUIRE_HEDGE_TOLERANCE * (bought + hedged) * (1 + 1e-9):
         return (f"the spot leg ({bought:.8f} BTC bought) was not the size of "
                 f"the perp short ({hedged:.8f} BTC) within the engine's delta "
                 "band: a directional position wearing a hedge is not a "
@@ -1009,6 +1033,17 @@ def _classify_cycle(c: Dict[str, Any], env: Mapping[str, Any],
         reasons.append("FUNDING_NOT_RECONCILED: " + (
             "; ".join(rec["reasons"]) if rec else
             "no perp lifecycle reconciliation found for this cycle"))
+    if (c["closed"] and c.get("outcome") == "CLOSED" and not c.get("overlay")
+            and c.get("economic_net_usd") is None):
+        # An ACQUIRE cycle whose pair cannot be computed (its spot leg unsold,
+        # partly sold or not hedge-sized, or a perp price unreadable) is not a
+        # completed round trip: its booked cash is real, but it is the cash of a
+        # position that is still partly open, not a RESULT. Without this the
+        # report's cash section and `carry_evidence` booked such a cycle as a
+        # reconciled trade (+$4,785 where the pair lost $160).
+        reasons.append("PAIR_NOT_COMPUTABLE: " + str(
+            hedged_pair(c).get("why") or "no hedged-pair net for this cycle")
+            + "; its booked cash is not a result")
     reasons += list(blockers)
     c["provisional_reasons"] = reasons
     c["evidence_class"] = (ACTUAL_RECONCILED
@@ -1053,6 +1088,8 @@ def _public_cycle(c: Mapping[str, Any]) -> Dict[str, Any]:
         "price_leg_usd": c["realised_usd"],
         "net_usd": c["net_usd"] if fees_ok and fund_ok and c["closed"] else None,
         "booked_net_usd": c["net_usd"],
+        "economic_net_usd": c.get("economic_net_usd"),
+        "economic_net_basis": c.get("economic_net_basis"),
         **_pair_fields(c, fees_ok and fund_ok),
         "notional_usd": c.get("notional_usd"),
         "capital_committed_usd": c.get("capital_committed_usd"),
@@ -1207,7 +1244,9 @@ def hedged_pair(c: Mapping[str, Any]) -> Dict[str, Any]:
         return {"available": True, "net_usd": net,
                 "inventory_leg": "SPOT_LEG_BOOKED", "inventory_leg_usd": None,
                 "derived": False, "basis_pnl_usd": c["realised_usd"],
-                "basis_why": None}
+                "basis_why": None,
+                # unsold lot dust (worth at most SPOT_DUST_USD): stated, not hidden
+                "spot_residual_btc": c.get("spot_residual_qty")}
     if c.get("revalue_entries"):
         if c.get("mark_status") != "VERIFIED":
             return {"available": False, "why": (

@@ -1469,25 +1469,31 @@ class CarryEngine:
         continuation = (self.exit_policy
                         == _costs().EXIT_POLICY_CONTINUATION)
         shortfall = None if pos is None else float(pos.exit_shortfall_bps)
+        # Under `continuation`, a pair whose shortfall is UNKNOWN (restored without
+        # it, or a held print could not be stepped) is judged by the ORIGINAL rule
+        # (`_funding_exit_reason`): the trace must name the rule that decides.
+        shortfall_known = pos is None or bool(pos.exit_shortfall_known)
+        by_shortfall = continuation and shortfall_known
         cached = self._last_round_trip
         round_trip = None if cached is None else float(cached[0])
         rules = [
             {"id": "FUNDING_INVERTED", "action": "UNWIND",
              "threshold": NEGATIVE_FUNDING_EXIT_PRINTS,
              "unit": "consecutive negative settled prints",
-             "current": streak, "decides": not continuation,
-             "active": (None if continuation else active(
+             "current": streak, "decides": not by_shortfall,
+             "active": (None if by_shortfall else active(
                  streak, lambda v: v >= NEGATIVE_FUNDING_EXIT_PRINTS))},
             {"id": EXIT_FUNDING_SHORTFALL, "action": "UNWIND",
              "threshold": round_trip,
              "unit": "bps of hedged notional: funding shortfall paid while "
                      "holding vs the priced round trip (last priced by the "
                      "entry path; the exit re-reads the venue's fee)",
-             "current": shortfall, "decides": continuation,
+             "current": shortfall, "decides": by_shortfall,
+             "shortfall_known": shortfall_known,
              "exit_policy": self.exit_policy,
              "active": (active(shortfall, lambda v: round_trip is not None
                                and v >= round_trip)
-                        if continuation else None)},
+                        if by_shortfall else None)},
             {"id": "MARGIN_HEADROOM", "action": "UNWIND",
              "threshold": self.min_margin_multiple, "unit": "x (margin multiple)",
              "current": margin, "read_ms": self._last_margin_ms,

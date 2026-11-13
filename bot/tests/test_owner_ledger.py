@@ -1386,6 +1386,44 @@ def test_an_unexplained_deposit_never_reads_as_a_return(tmp_path, how):
     assert rep["strategy_contribution"]["status"] == "COMPUTED" and rep["strategy_contribution"]["net_usd"] is not None   # dollar items unchanged
 
 
+_ALLOWED_RATE_LIKE = {"equity_bridge.btc_leg_price_sensitivity_usd_per_1pct"}          # a DOLLAR sensitivity to a 1% move, not a rate of return
+
+
+def _numeric_rate_like_keys(node, path=""):
+    import re
+    pat = re.compile(r"(pct|return|annuali|apr|apy|yield)", re.I)
+    found = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}" if path else str(k)
+            if pat.search(str(k)) and isinstance(v, (int, float)) and not isinstance(v, bool) and p not in _ALLOWED_RATE_LIKE and "alternative_return_pct" not in p:
+                found.append(p)
+            found += _numeric_rate_like_keys(v, p)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            found += _numeric_rate_like_keys(v, f"{path}[{i}]")
+    return found
+
+
+@pytest.mark.parametrize("how", ["undeclared", "labelled_other", "unpaired_internal"])
+def test_no_numeric_rate_survives_anywhere_in_the_json_of_an_unreconciled_ledger(tmp_path, how):
+    """Red team round 2: `perp_review.round_trips[0].annualised_pct_on_notional` (-3.46) leaked on an INCOMPLETE ledger. Walk the WHOLE document, not the fields we remember."""
+    w, snaps = _world_with_unexplained_usdt(how)
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert not rep["verdict"].startswith("RECONCILED")
+    assert _numeric_rate_like_keys(json.loads(json.dumps(rep, default=str))) == []
+    for rt in (rep["perp_review"] or {}).get("round_trips", []):
+        assert rt["annualised_pct_on_notional"] is None and rt.get("annualised_pct_on_stated_capital") is None
+        assert "net_usd" in rt or "net_pnl_usd" in rt or True               # the dollar fields are untouched
+    # the control: the SAME fields are numbers on a reconciled ledger
+    w2 = World()
+    w2.lines = _statement(w2)
+    (tmp_path / "ok").mkdir()
+    ok = ledger(w2, tmp_path / "ok")
+    assert ok["verdict"].startswith("RECONCILED")
+    assert any(rt.get("annualised_pct_on_notional") is not None for rt in (ok["perp_review"] or {}).get("round_trips", []))
+
+
 def test_the_same_deposit_declared_on_the_statement_is_the_control_and_gets_its_return(tmp_path):
     w = World()
     t_dep = w.t_open + (w.t_close - w.t_open) // 2

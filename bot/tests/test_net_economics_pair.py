@@ -532,6 +532,48 @@ def test_the_pair_boundary_is_exactly_the_engines_own_delta_fraction(spot, perp)
     assert report_says_pair is engine_says_hedge, (spot, perp, pos.delta_fraction(price))
 
 
+# -- lot dust is not an unsold leg (red team round 2, H2) ----------------------
+# The engine floors the spot sale to the venue's lot, so a CLEAN acquire close leaves sub-lot dust (cents of BTC). It must not withhold every return in the book.
+
+def acquire_with_btc_fee(j, *, buy, fee_btc, perp, sell, tag="d", close=P0 * 0.95):
+    L.spot_buy(j, ms=T0, ref=f"{tag}-sb", qty=buy, price=P0, fee_btc=fee_btc, fee_usdt=0.0, fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 1, ref=f"{tag}-o", qty=perp, price=P0, fee_usd=5.0, fee_status="confirmed")
+    L.funding(j, ms=T0 + 5 * DAY, ref=f"{tag}-f", usd=30.0, basis="venue", raw=_vraw(f"{tag}-f", T0 + 5 * DAY, 30.0))
+    L.perp_close(j, ms=T0 + 10 * DAY, ref=f"{tag}-c", qty=perp, price=close, entry_price=P0, fee_usd=5.0, fee_status="confirmed")
+    L.spot_sell(j, ms=T0 + 10 * DAY + 1, ref=f"{tag}-ss", qty=sell, price=close, cost_basis=P0 * sell, fee_usd=5.0, fee_status="confirmed")
+
+
+@pytest.mark.parametrize("buy,fee_btc,perp,sell,dust", [
+    (0.123456, 0.000123456, 0.123332, 0.123332, 5.44e-7),        # a 1e-6 lot floor after a 0.1% BTC fee
+    (0.001, 0.0000012, 0.000998, 0.000998, 8e-7),                 # the engine's own docstring case: 0.0009988 sold as 0.000998
+])
+def test_sub_lot_dust_after_a_clean_close_is_a_pair_and_is_stated(buy, fee_btc, perp, sell, dust):
+    j = L.Journal()
+    acquire_with_btc_fee(j, buy=buy, fee_btc=fee_btc, perp=perp, sell=sell)
+    c = perf.cycles_from_journal(j)[0]
+    assert c["economic_net_usd"] is not None and c["economic_net_basis"] == "SPOT_LEG_BOOKED", perf.hedged_pair(c)
+    assert perf.hedged_pair(c)["spot_residual_btc"] == pytest.approx(dust, rel=1e-3)         # stated, not hidden
+    assert perf.summarise([c])["returns_withheld_why"] is None
+
+
+def test_the_dust_threshold_is_a_value_at_the_cycles_own_entry_price():
+    for residual_btc, is_pair in ((1.0e-5, True), (1.1e-5, False)):                           # $1.00 and $1.10 at $100k
+        j = L.Journal()
+        net = 0.5
+        acquire_with_btc_fee(j, buy=net + residual_btc, fee_btc=0.0, perp=net, sell=net, tag="b")
+        assert (perf.cycles_from_journal(j)[0]["economic_net_usd"] is not None) is is_pair, residual_btc
+    # the same remainder is a different VALUE at a different price: 1e-5 BTC is $0.10 at $10k (dust) and $10 at $1M (not)
+    for price, is_pair in ((10_000.0, True), (1_000_000.0, False)):
+        c = {"spot_residual_qty": 1e-5, "perp_entry_price": price, "spot_buy_net_qty": 0.5, "hedged_qty": 0.5, "spot_buy_gross_usd": 0.5 * price}
+        assert (perf._acquire_spot_leg_problem(c) is None) is is_pair, price
+
+
+def test_a_whole_unsold_leg_is_still_refused_whatever_the_dust_rule():
+    j = L.Journal()
+    acquire_shaped(j, 0, 10, tag="u", close=95_000.0, sell=0.0)
+    assert perf.cycles_from_journal(j)[0]["economic_net_usd"] is None
+
+
 def test_the_acquire_hedge_tolerance_is_the_engines_delta_band():
     import carry_engine
     assert perf.ACQUIRE_HEDGE_TOLERANCE == carry_engine.DELTA_BAND

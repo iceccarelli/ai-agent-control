@@ -1346,7 +1346,8 @@ def load_funding(path: str) -> Dict[int, float]:
     """{8h-slot index: funding in bps over that 8h}. Funding is ADDITIVE per settlement, so every print in a slot is SUMMED: Binance ran SOL on 2h/4h
     cadences in Nov-2022 and the earlier loader keyed ``round(t / 8h)`` and OVERWROTE, dropping 75 of 6,655 prints (the Nov-2022 sum was -1,437.5 bps
     after loading against -3,549.1 bps in the file) and shifting others into the wrong slot. A repeated timestamp is a data error, not a second payment:
-    it is refused. Assumes the cadence divides 8h (8h, 4h, 2h, 1h); a print that straddled a boundary would be attributed whole to one slot."""
+    it is refused. Assumes the cadence divides 8h (8h, 4h, 2h, 1h); a print that straddled a boundary would be attributed whole to one slot, and a print more than
+    ``FUNDING_SLOT_JITTER_MS`` (1,000 ms) behind a boundary belongs to the NEXT slot (the committed files' largest jitter is 47 ms)."""
     out: Dict[int, float] = {}
     seen: set = set()
     with gzip.open(path, "rt", encoding="utf-8") as f:

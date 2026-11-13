@@ -658,8 +658,9 @@ class TestContinuationExit:
 # the shortfall leaves the accumulator one print short, and the position still
 # read as "known" (shortfall 0 -> "funding is paying for the hold" -> stay). An
 # unknown must stay unknown: the original rule then decides, as for a restored
-# pair. And a borrow rate the engine cannot price is refused at construction,
-# like the opportunity cost, not discovered one silent print at a time.
+# pair. (A constructor check on `borrow_apr` was tried and withdrawn: the gate
+# refuses every entry on an unusable rate, pinned in test_entry_gate_parity, and
+# config and build_bot refuse it upstream.)
 # ---------------------------------------------------------------------------
 
 class TestAnUnadvanceableShortfallIsUnknown:
@@ -697,6 +698,19 @@ class TestAnUnadvanceableShortfallIsUnknown:
         eng.borrow_apr = float("nan")
         eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
         assert eng.to_state()["position"]["exit_shortfall_known"] is False
+
+    def test_the_exit_trace_names_the_rule_that_decides_while_the_shortfall_is_unknown(self):
+        """Red team round 2: under continuation with an unknown shortfall the trace still said FUNDING_INVERTED decides=False while the legacy rule was the one deciding."""
+        eng = self._held()
+        rules = {r["id"]: r for r in eng._exit_outlook(100_000.0)["rules"]}
+        assert rules["FUNDING_SHORTFALL"]["decides"] is True and rules["FUNDING_INVERTED"]["decides"] is False   # known: unchanged
+        eng.borrow_apr = float("nan")
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        assert eng.position.exit_shortfall_known is False
+        rules = {r["id"]: r for r in eng._exit_outlook(100_000.0)["rules"]}
+        assert rules["FUNDING_INVERTED"]["decides"] is True and rules["FUNDING_INVERTED"]["active"] is not None
+        assert rules["FUNDING_SHORTFALL"]["decides"] is False and rules["FUNDING_SHORTFALL"]["active"] is None
+        assert rules["FUNDING_SHORTFALL"]["shortfall_known"] is False
 
     @pytest.mark.parametrize("bad", [-0.01, float("nan"), float("inf")])
     def test_an_unusable_borrow_rate_leaves_every_held_shortfall_unknown(self, bad):
