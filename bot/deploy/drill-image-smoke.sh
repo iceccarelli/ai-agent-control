@@ -64,7 +64,7 @@ echo "== no credential or live switch in the image; testnet only; the testnet ho
 ENVS="$(docker run --rm --network none --entrypoint env "$IMG")"
 echo "$ENVS" | grep -Eq '^(BYBIT_API_KEY|BYBIT_API_SECRET|BYBIT_TESTNET_API_KEY|BYBIT_TESTNET_API_SECRET|LIVE_TRADING_ACK)=' && fail "a credential or live switch is in the image environment"
 echo "$ENVS" | grep -q '^USE_TESTNET=1$' || fail "USE_TESTNET=1 missing"
-echo "NOTE: this image sets $(echo "$ENVS" | grep '^PAPER_TRADING=') with USE_TESTNET=1 (the legacy conformance drill's setting; docs/MONEY_MISSION.md section 0 records the conflict with CLAUDE.md for the owner; this script does not endorse it)"
+echo "NOTE: this image sets $(echo "$ENVS" | grep '^PAPER_TRADING=') with USE_TESTNET=1 (read-only default; the orchestrator forces PAPER_TRADING=0 only inside the order-capable child it starts)"
 HIST="$(docker history --no-trunc "$IMG")"
 echo "$HIST" | grep -Eiq 'LIVE_TRADING_ACK|BYBIT_API_(KEY|SECRET)=|BYBIT_TESTNET_API_(KEY|SECRET)=' && fail "a credential name with a value, or a live switch, appears in the image history"
 HOST="$(docker run --rm --network none -e PYTHONPATH=/app/tools -e BYBIT_VENUE=mainnet "$IMG" python3 -c 'import venues; print(venues.get("testnet").host)')"       # a hostile venue selection only: no arming variable is set here

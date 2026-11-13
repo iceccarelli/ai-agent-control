@@ -156,7 +156,10 @@ jobs:
 
       - name: Close anything left open (always; reduce-only, testnet, <= 0.0015 BTC)
         id: flat
-        if: always() && steps.window.outputs.inside == 'true'
+        # Round 19: only when THIS run's armed drill step ran and was not refused (exit 2 = the single-writer guard refused it and nothing was opened). Without this the step ran after a
+        # skipped or refused drill and bought back whatever perp short the shared Testnet account showed (<= 0.0015 BTC): another executor's hedge, leaving its spot leg naked.
+        # The tool itself now also takes the single-writer authority (exit 3 when it cannot), and this workflow has no Supabase wiring, so on a non-flat venue it fails closed.
+        if: always() && steps.window.outputs.inside == 'true' && steps.drill.outcome != 'skipped' && steps.drill.outputs.exit != '2'
         env:
           BYBIT_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}

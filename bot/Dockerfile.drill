@@ -44,9 +44,12 @@ COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /data && chown -R bot:bot /app /data
 
-# Testnet only, stated again here; the orchestrator also forces these for every
-# child and removes LIVE_TRADING_ACK. Credentials arrive as Fly secrets.
-ENV USE_TESTNET=1 PAPER_TRADING=0 BYBIT_VENUE=testnet BOOK_MODE=carry \
+# Testnet only, stated again here; the orchestrator also forces its own env for
+# every child (PAPER_TRADING=0 only inside the order-capable child it starts,
+# LIVE_TRADING_ACK removed). Credentials arrive as Fly secrets. Round 19: the
+# IMAGE default is PAPER_TRADING=1: a read-only image must not carry the order
+# arming flag for every command run in it (a `fly ssh` session, a mis-typed tool).
+ENV USE_TESTNET=1 PAPER_TRADING=1 BYBIT_VENUE=testnet BOOK_MODE=carry \
     CARRY_BORROW_APR=0.0 CARRY_EXECUTION_MODE=overlay
 
 # Starts as root only to chown the volume; the entrypoint drops to `bot`.

@@ -136,6 +136,8 @@ def load_grant(now_ms: int, manifest: Mapping[str, Any], path: Optional[str] = N
     else:
         if g["expires_ms"] <= now_ms:
             why.append("GRANT_EXPIRED")
+        if g["created_ms"] > now_ms + 300_000:        # Round 19: the lifetime check compares expires-created only, so a hand-built file dated 400 days ahead was valid for 430 days (the capability loader refuses this)
+            why.append("GRANT_FROM_THE_FUTURE")
         if g["expires_ms"] - g["created_ms"] > MAX_GRANT_DAYS * 86_400_000 or g["expires_ms"] <= g["created_ms"]:
             why.append("GRANT_LIFETIME")
     if g["manifest_plan_sha256"] != manifest.get("plan_sha256"):
@@ -1189,7 +1191,10 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
                                    "flat_verified": res.get("flat_verified"), "realised_costs": evidence_net(res.get("net")), "revoked_reason": res.get("revoked_reason")}, sid)
         except Exception:                                            # noqa: BLE001
             pass
-        seen["market"] = int(clock()) if res["result"] != "ERROR" else seen["market"]
+        # Round 19: stamped only when the cycle PROVES a market read (it carries the funding it read, or it ran a session). run_once returns before its first read on REFUSED (capability, grant,
+        # credentials) and on a daily-cap SKIP, and those used to stamp a dead feed fresh.
+        if res.get("funding_bps") is not None or res["result"] in ("DONE", "NOT_FLAT"):
+            seen["market"] = int(clock())
         r = res["result"]
         errors = errors + 1 if r == "ERROR" else 0
         refused = refused + 1 if r == "REFUSED" else 0

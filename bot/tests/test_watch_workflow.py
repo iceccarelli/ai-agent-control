@@ -102,3 +102,16 @@ def test_a_failed_read_is_classified_into_the_closed_vocabulary_and_never_forwar
     import runner_alerts as RA
     for word in ("auth_failed", "timeout", "machine_unreachable", "unknown"):
         assert word in RA.READ_FAILURES, word
+
+
+def test_every_workflow_that_reads_a_secret_declares_a_job_level_environment():
+    """Round 19 (adversarial review): a repository-level secret is delivered to a workflow run from ANY branch (a workflow_dispatch from a pushed branch whose copy of the file drops its `if:`); an
+    environment secret with a main-only deployment-branch policy is not. Every job that reads a secret other than GITHUB_TOKEN names an environment (the owner then creates it, moves the
+    secrets and deletes the repository-level copies; naming it changes nothing until then)."""
+    wf_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".github", "workflows")
+    bad = []
+    for name in sorted(os.listdir(wf_dir)):
+        code = "\n".join(l for l in open(os.path.join(wf_dir, name), encoding="utf-8").read().splitlines() if not l.lstrip().startswith("#"))
+        if re.search(r"secrets\.(?!GITHUB_TOKEN)[A-Z_]+", code) and not re.search(r"^    environment: \S+$", code, re.M):
+            bad.append(name)
+    assert not bad, bad

@@ -1977,3 +1977,69 @@ def test_a_capital_book_with_a_nonsense_figure_stops_the_session_before_any_orde
     # the view no longer matches what the lineage attested: refused before any order (a figure edited in place can never size anything), and the file is left exactly as it is
     assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:VIEW_TAMPERED"], res
     assert (root / "capital.json").read_text() == text and not w.requests_to("/v5/order/create")
+
+
+def _hb_loop(results, tmp_path):
+    t = {"v": 1_000_000}
+
+    def clock():
+        t["v"] += 1000
+        return t["v"]
+
+    class Tel:
+        last_sync_ms = None
+
+        def __init__(self):
+            self.hbs = []
+
+        def heartbeat(self, hb, drain=True):
+            self.hbs.append(dict(hb))
+
+        def event(self, *a, **k):
+            pass
+
+        def pending(self):
+            return 0
+    tel, it = Tel(), iter(results)
+    AP.loop({}, root=str(tmp_path), once=lambda *a, **k: next(it), clock=clock, sleep=lambda s: None, out=lambda s: None, max_iterations=len(results), telemetry=tel,
+            recover_fn=lambda env, **k: (True, [], {"venue_read_complete": True, "reconciled_ms": clock()}))
+    return tel.hbs
+
+
+def test_the_heartbeat_stamps_market_data_only_for_a_cycle_that_proved_a_market_read(tmp_path):
+    """Round 19 (adversarial review, Round 17 known-open): run_once returns before its first read on REFUSED (capability, grant, credentials) and on a daily-cap SKIP; the loop stamped
+    'market data fresh' for them, while a real read failure (ERROR) showed None."""
+    def fresh(i):                                                    # one engine root per scenario: a PAUSED/ALERT marker from one cycle must not leak into the next
+        d = tmp_path / f"root{i}"
+        d.mkdir()
+        return d
+    n = 0
+    for res in ({"result": "REFUSED", "why": ["OWNER_CAPABILITY_FILE:absent"]}, {"result": "SKIPPED", "why": ["DAILY_SESSIONS_REACHED"]}, {"result": "ERROR", "why": ["FUNDING_READ_FAILED:X"]}):
+        n += 1
+        assert _hb_loop([dict(res) for _ in range(3)], fresh(n))[-1]["last_market_data_ms"] is None, res["result"]
+    for res in ({"result": "SKIPPED", "why": ["FUNDING_BELOW_FLOOR"], "funding_bps": 0.4}, {"result": "DONE", "flat_verified": True}, {"result": "NOT_FLAT"}):
+        n += 1
+        beats = _hb_loop([dict(res) for _ in range(3)], fresh(n))
+        assert any(isinstance(b["last_market_data_ms"], int) for b in beats), res["result"]
+
+
+def test_a_grant_created_in_the_future_is_refused(tmp_path):
+    """Round 19 (adversarial review): the lifetime check compared expires - created only, so a hand-built grant dated 400 days ahead was valid for 430 days (the capability loader refuses this)."""
+    now, day = 1_800_000_000_000, 86_400_000
+    manifest = {"plan_sha256": "a" * 64, "symbol_allowlist": ["BTCUSDT"], "bounds": {"max_entries_per_utc_day": 3, "aggregate_max_notional_usd": 100}}
+
+    def write(created, expires):
+        g = {"schema": AP.GRANT_SCHEMA, "reference": "r", "created_ms": created, "expires_ms": expires, "manifest_plan_sha256": "a" * 64, "symbols": ["BTCUSDT"], "max_sessions_per_day": 1,
+             "max_notional_usd": 50, "max_hold_s": 3300, "min_funding_bps": 1.0, "allow_mechanics_sessions": False}
+        for k in AP.GRANT_KEYS - set(g) - {"grant_sha256"}:
+            g[k] = None
+        g["grant_sha256"] = AP._sha(g)
+        p = str(tmp_path / f"g{created}.json")
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.write(fd, json.dumps(g).encode())
+        os.close(fd)
+        return AP.load_grant(now, manifest, p)
+    out, why = write(now + 400 * day, now + 430 * day)
+    assert out is None and "GRANT_FROM_THE_FUTURE" in why
+    out2, why2 = write(now - day, now + 29 * day)
+    assert out2 is not None and not why2                                   # control: an ordinary grant is unchanged

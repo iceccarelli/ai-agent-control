@@ -94,6 +94,15 @@ class TestItLeavesTheVenueFlat:
         assert "if: always() && steps.window.outputs.inside == 'true'" in step
         assert "close_testnet_short.py --arm --no-prompt --max-qty 0.0015" in step
 
+    def test_it_closes_only_what_this_runs_own_drill_could_have_opened(self, text):
+        """Round 19 (adversarial review): the step used to run after a SKIPPED or REFUSED drill and bought back any short the shared Testnet account showed, i.e. another executor's hedge."""
+        step = re.search(r"- name: Close anything left open.*?(?=\n      - )", code(text), re.S).group(0)
+        cond = re.search(r"^\s+if: (.+)$", step, re.M).group(1)
+        assert "always()" in cond and "steps.drill.outcome != 'skipped'" in cond and "steps.drill.outputs.exit != '2'" in cond
+        drill = re.search(r"- name: Armed drill.*?(?=\n      - )", code(text), re.S).group(0)
+        assert "echo \"exit=$code\" >> \"$GITHUB_OUTPUT\"" in drill and "id: drill" in drill        # the output the condition reads is really written
+        assert "SUPABASE" not in text                                                              # no lease wiring is added to a GitHub-hosted job: a non-flat venue stays fail-closed
+
     def test_it_comes_after_the_drill_and_before_the_verdict(self, text):
         names = re.findall(r"- name: (.+)", code(text))
         i = {n: k for k, n in enumerate(names)}

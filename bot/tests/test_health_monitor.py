@@ -511,3 +511,19 @@ def test_workflow_carries_the_notification_state_between_runs_with_read_only_sco
     assert "actions/cache" not in code and "contents: write" not in code and "GITHUB_TOKEN" not in code.replace("github.token", "")
     assert code.index("Restore the previous run") < code.index("Judge the stored heartbeat") < code.index("Keep the notification state")
     assert '--state-file "$RUNNER_TEMP/notify-state.json"' in code
+
+
+def _jwt_with_role(role):
+    import base64, json as _json
+    b = lambda d: base64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
+    return b({"alg": "HS256", "typ": "JWT"}) + "." + b({"iss": "supabase", "role": role}) + ".sig_sig_sig_sig_sig"
+
+
+def test_the_monitor_key_may_not_be_a_privileged_one():
+    """Round 19 (adversarial review): the key is documented as a restricted READ-ONLY key and nothing checked it; a service-role key in a repository secret is reachable from any branch's workflow and
+    the executor lease, heartbeats and execution evidence live in the same project."""
+    for bad in (_jwt_with_role("service_role"), _jwt_with_role("SERVICE_ROLE"), _jwt_with_role("supabase_admin"), _jwt_with_role("postgres"), "sb_secret_" + "a" * 30):
+        with pytest.raises(hm.ReadError, match="privileged"):
+            hm.postgrest_reader("https://abc.supabase.co", bad, opener=object())
+    for ok in (_jwt_with_role("monitor_readonly"), _jwt_with_role("anon"), "sb_publishable_" + "a" * 30, "A" * 40):     # a restricted role, a publishable key and an opaque key are not refused here
+        assert callable(hm.postgrest_reader("https://abc.supabase.co", ok, opener=object()))

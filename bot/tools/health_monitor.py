@@ -301,12 +301,34 @@ def validate_supabase_url(url: str) -> str:
     return f"https://{host}"
 
 
+_PRIVILEGED_ROLES = frozenset({"service_role", "supabase_admin", "postgres"})
+
+
+def _privileged_key(key: str) -> bool:
+    """True for a key that is KNOWN to be privileged: a Supabase secret key (``sb_secret_...``) or a JWT whose ``role`` claim is service_role / supabase_admin / postgres. The monitor key must be a
+    restricted READ-ONLY one (the workflow comment says so; nothing checked it): the executor lease, the heartbeats and the execution evidence live in the same project, and a service-role key
+    in a repository secret is reachable from any branch's workflow. A key whose shape is not recognised is not refused here (a restricted key is a JWT with its own role)."""
+    if key.startswith("sb_secret_"):
+        return True
+    parts = key.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        import base64
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(payload, dict) and str(payload.get("role", "")).lower() in _PRIVILEGED_ROLES
+
+
 def postgrest_reader(base_url: str, key: str, *, timeout: float = 20.0, opener=None):
     """``read(table, query) -> list[dict]``: one read-only GET on schema ``carry``. The key is sent
     as a header only, never printed; failures raise ``ReadError`` with a fixed text."""
     base = validate_supabase_url(base_url)
     if not key or not re.fullmatch(r"[A-Za-z0-9._-]{16,4096}", key):
         raise ReadError("SUPABASE_MONITOR_KEY is missing or malformed")
+    if _privileged_key(key):
+        raise ReadError("SUPABASE_MONITOR_KEY is a privileged (service-role) key: the monitor reads with a restricted read-only key only")
     op = opener or urllib.request.build_opener(_NoRedirect)
 
     def read(table: str, query: str) -> List[dict]:
