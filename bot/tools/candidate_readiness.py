@@ -24,6 +24,7 @@ pair) only as directional price+funding P&L (never as carry), and refuses a verd
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -495,6 +496,94 @@ def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_
                       "reason to look, not evidence: declare the regime dwell of the mechanism before any holdout is read."]}
 
 
+# ---------------------------------------------------------------- the dataset-state vocabulary and the immutable dataset identity (Round 18)
+#: What a captured dataset IS, before any strategy reads it. One word per state, precedence UNAVAILABLE > INVALID > INCOMPLETE > INSUFFICIENT: a download that exited 0 is none of these.
+DATA_UNAVAILABLE = "DATA_UNAVAILABLE"                                    # nothing to judge: no history root, no universe capture, no dataset
+DATA_INCOMPLETE = "DATA_INCOMPLETE"                                      # verified bytes, but not every lifecycle-eligible symbol is COMPLETE over the whole required window
+DATA_INVALID = "DATA_INVALID"                                            # something present does not re-verify, is CONFLICTED / UNVERIFIED, or the loader refused it
+DATA_VALID_BUT_INSUFFICIENT = "DATA_VALID_BUT_INSUFFICIENT"              # complete and valid, but too short / survivors-only / the evaluator's own verdict is "not enough"
+DATA_SUFFICIENT_NOT_EVALUATED = "DATA_SUFFICIENT_NOT_EVALUATED"          # sufficient for the registered evaluation; no candidate has been run on it (never an edge)
+DATA_SUFFICIENT_CANDIDATE_REJECTED = "DATA_SUFFICIENT_CANDIDATE_REJECTED"
+DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW = "DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW"
+DATASET_STATES = (DATA_UNAVAILABLE, DATA_INCOMPLETE, DATA_INVALID, DATA_VALID_BUT_INSUFFICIENT, DATA_SUFFICIENT_NOT_EVALUATED, DATA_SUFFICIENT_CANDIDATE_REJECTED,
+                  DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW)
+#: the states in which every lifecycle-eligible symbol is verified and COMPLETE over the whole required window: the only ones a dataset-level DATA_READY may stand on
+COMPLETE_DATA_STATES = DATASET_STATES[3:]
+SUFFICIENT_DATA_STATES = DATASET_STATES[4:]
+#: the evaluation geometry the sufficiency window is measured against: pinned by a test to ``evaluate_ranked_funding``'s own defaults (the 457 days of backfill_plan.required_window)
+STATE_FORMATION_DAYS, STATE_HOLD_DAYS, STATE_MIN_ROWS = 30, 7, 60
+_FINDING_CLASSES = ("unavailable", "invalid", "incomplete", "insufficient")
+_VERDICT_TO_STATE = {"REJECTED": DATA_SUFFICIENT_CANDIDATE_REJECTED, "PROMISING": DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW, "QUALIFIED": DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW}
+_EVALUATOR_NOT_ENOUGH = ("INSUFFICIENT_DATA", "UNTESTED")
+
+
+def dataset_state(findings: Mapping[str, Sequence[str]], *, candidate_verdict: Optional[str] = None) -> Dict[str, Any]:
+    """The state of a dataset from its findings (a dict of reason lists keyed ``unavailable`` / ``invalid`` / ``incomplete`` / ``insufficient``; absent = none). The worst non-empty
+    class names the state and its reasons; ``candidate_verdict`` (the evaluator's own word: REJECTED / PROMISING / QUALIFIED / INSUFFICIENT_DATA / UNTESTED, or None = none was run)
+    only matters when the data themselves are sufficient: REJECTED -> DATA_SUFFICIENT_CANDIDATE_REJECTED, PROMISING or better -> DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW, and an
+    evaluator that itself says the sample is not enough keeps the dataset DATA_VALID_BUT_INSUFFICIENT. A dataset-state is a statement about bytes and coverage: it is never an edge,
+    an authority or a profit. An unknown finding class or verdict raises: a typo must not read as 'sufficient'."""
+    if not isinstance(findings, Mapping) or set(findings) - set(_FINDING_CLASSES):
+        raise ValueError(f"findings must be a mapping with keys from {_FINDING_CLASSES}")
+    if candidate_verdict is not None and candidate_verdict not in (*_VERDICT_TO_STATE, *_EVALUATOR_NOT_ENOUGH):
+        raise ValueError(f"unknown candidate verdict {candidate_verdict!r}")
+    f = {k: [str(x) for x in (findings.get(k) or ())] for k in _FINDING_CLASSES}
+    if f["unavailable"]:
+        state, why = DATA_UNAVAILABLE, f["unavailable"]
+    elif f["invalid"]:
+        state, why = DATA_INVALID, f["invalid"]
+    elif f["incomplete"]:
+        state, why = DATA_INCOMPLETE, f["incomplete"]
+    elif f["insufficient"]:
+        state, why = DATA_VALID_BUT_INSUFFICIENT, f["insufficient"]
+    elif candidate_verdict is None:
+        state, why = DATA_SUFFICIENT_NOT_EVALUATED, []
+    elif candidate_verdict in _VERDICT_TO_STATE:
+        state, why = _VERDICT_TO_STATE[candidate_verdict], []
+    else:
+        state, why = DATA_VALID_BUT_INSUFFICIENT, [f"the evaluator's own verdict is {candidate_verdict}: the sample cannot carry a claim"]
+    return {"schema": SCHEMA + "/dataset_state", "state": state, "reasons": why, "findings": f, "candidate_verdict": candidate_verdict,
+            "complete_over_required_window": state in COMPLETE_DATA_STATES, "sufficient": state in SUFFICIENT_DATA_STATES,
+            "note": "a statement about verified bytes and coverage only: no DATA_SUFFICIENT_* state is an edge, an authority to trade or a profit; DATA_READY stands on it"}
+
+
+def dataset_identity(components: Sequence[Mapping[str, Any]], *, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """A reproducible identity for a dataset: the sha256 of the canonical JSON of its components (each a ``kind`` / ``name`` / ``digest`` from a manifest the verifiers RE-HASHED) and of
+    the facts the evaluation depends on (window, mark interval, funnel digest). No path, clock or machine enters it, so a byte-identical copy has the same identity and one changed byte in
+    any verified page (which changes its manifest digest) has a different one; a result stamped with it names the exact data it read. A component that is not verified, or has no
+    digest, cannot be identified: ``identifies_every_component`` is then False and ``digest`` is None (a dataset that does not re-hash has no identity, so the identity of the pristine
+    copy is never printed for a tampered one)."""
+    comps = sorted(({"kind": str(c.get("kind")), "name": str(c.get("name")), "digest": c["digest"] if isinstance(c.get("digest"), str) and c["digest"] else None,
+                     "verified": c.get("verified") is True} for c in components), key=lambda c: (c["kind"], c["name"], c["digest"] or ""))
+    body = {"schema": SCHEMA + "/dataset_identity", "components": comps, "extra": {str(k): (extra or {})[k] for k in sorted(extra or {}, key=str)}}
+    identified = bool(comps) and all(c["digest"] and c["verified"] for c in comps)
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest() if identified else None
+    return {**body, "digest": digest, "identifies_every_component": identified}
+
+
+def _coverage_findings(*, eligible: Sequence[str], covered: Sequence[str], not_complete: Sequence[str], ended_unaccounted: int, window_days: Optional[float],
+                       survivorship: Optional[str]) -> Dict[str, List[str]]:
+    """The per-symbol and window findings every dataset-state shares (the loader and the report call this, so the two can never disagree). ``eligible`` = the funnel's lifecycle-eligible
+    symbols, ``covered`` = those with a loaded series, ``not_complete`` = loaded symbols not COMPLETE over the whole required window in every required dataset. A cross-section of the
+    symbols somebody happened to collect is not the universe: every eligible symbol must be loaded AND complete before the dataset is complete."""
+    out: Dict[str, List[str]] = {"incomplete": [], "insufficient": []}
+    missing = sorted(set(eligible) - set(covered))
+    if missing:
+        out["incomplete"].append(f"{len(missing)} of {len(eligible)} lifecycle-eligible symbols have no usable history in the datasets (first: {missing[:5]})")
+    short = sorted(set(not_complete))
+    if short:
+        out["incomplete"].append(f"{len(short)} loaded symbols are not COMPLETE over the whole required window (first: {short[:5]})")
+    if ended_unaccounted:
+        out["incomplete"].append(f"{ended_unaccounted} Closed/delivered perpetuals overlapping the window are neither in the series nor excluded for a reason that proves them out of scope")
+    need = grid_requirements(formation_days=STATE_FORMATION_DAYS, hold_days=STATE_HOLD_DAYS, min_rows=STATE_MIN_ROWS)["window_days_required"]
+    if window_days is None or window_days < need:
+        out["insufficient"].append(f"history window {None if window_days is None else round(window_days, 1)} days < {need} days: {STATE_MIN_ROWS} independent {STATE_HOLD_DAYS}-day holding rows need "
+                                   f"warmup + {STATE_FORMATION_DAYS}-day formation + {STATE_MIN_ROWS} x {STATE_HOLD_DAYS} (backfill_plan.required_window)")
+    if survivorship != DELISTINGS_OBSERVED:
+        out["insufficient"].append(f"survivorship is {survivorship}: delistings were not observed, so no survivorship-free claim can be made")
+    return out
+
+
 # ---------------------------------------------------------------- the BTC funding carry on the committed corpus
 def btc_carry_economics(repo: str = os.path.dirname(BOT)) -> Dict[str, Any]:
     """Net of cost on data/real_bybit_btc_4h (8h Bybit BTCUSDT settlements + 4h spot/perp bars). IN-SAMPLE, 8h only. Unconditional forced holds entered after EVERY
@@ -737,9 +826,16 @@ def candidate_row(name: str, spec: Mapping[str, Any], scan: Mapping[str, Any], e
     pit_ok = row["universe_complete_for_claim"]
     surv = None if not needs_u else uni.get("survivorship", SURVIVORS_ONLY)
     dr = row["required_data"]["evaluation_data_verified"] and (not needs_u or u_dir["status"] == "SUPPLIED_VERIFIED") and not (needs_u and not u_dir["supplied"])
+    # Round 18: an evaluation that ran on a history in which some lifecycle-eligible symbol is missing or not COMPLETE over the window (its own ``input.dataset_state``) cannot stand on
+    # DATA_READY, whatever the dataset-level manifests say
+    ev_state = ((evaluation or {}).get("input") or {}).get("dataset_state") if isinstance(evaluation, Mapping) and isinstance((evaluation or {}).get("input"), Mapping) else None
+    ev_state_reasons: List[str] = []
+    if isinstance(ev_state, Mapping) and ev_state.get("state") not in COMPLETE_DATA_STATES:
+        dr = False
+        ev_state_reasons = [f"the evaluation's own dataset is {ev_state.get('state')}: " + "; ".join(str(x) for x in (ev_state.get("reasons") or [])[:2])]
     pp = spec.get("prospective_protocol") if isinstance(spec.get("prospective_protocol"), dict) else {}
     row["readiness"] = readiness_levels(
-        data_ready=bool(dr), data_reasons=[f"{i['name'][:60]}: {i['status']}" for i in row["required_data"]["items"] if not i["execution_only"] and not (i["trusted"] and i["complete"])],
+        data_ready=bool(dr), data_reasons=[f"{i['name'][:60]}: {i['status']}" for i in row["required_data"]["items"] if not i["execution_only"] and not (i["trusted"] and i["complete"])] + ev_state_reasons,
         pit_ok=bool(pit_ok), survivorship=surv, mechanism_ok=bool(row["economic_mechanism"]["present"]), evaluation=evaluation,
         prospective={"started": pp.get("start_ms") is not None, "settlements_observed": 0, "min_settlements": pp.get("min_settlements")}, executable=bool(ex["executable"]))
     row["readiness_level"] = row["readiness"]["highest"]
@@ -1431,7 +1527,30 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                            "(an explicit --symbols list gives a small cross-section): the evaluation is over THOSE symbols, not the venue"}
     if history_cov["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS":
         warnings.append(f"HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS: the history datasets hold {len(series)} of {n_elig} eligible universe symbols; collect the rest (backfill_plan.plan) before trusting a cross-section")
+    # the dataset-state (Round 18): the SAME per-symbol funnel facts the warnings above are made of, as one word, and the identity of exactly what was loaded. A late listing dropped at the holdout
+    # boundary has nothing to explore and is not a coverage failure; every other lifecycle-eligible symbol must be loaded AND complete over the whole window.
+    _cut_set = set(cut_dropped)
+    _sf = _coverage_findings(eligible=[s for s in fn.eligible if s not in _cut_set], covered=[x.symbol for x in series],
+                             not_complete=[s for s in set(fn.loadable) - set(fn.complete) if s not in _cut_set], ended_unaccounted=len(closed_missing),
+                             window_days=(w1 - w0) / MS_DAY, survivorship=survivorship)
+    state_findings: Dict[str, List[str]] = {"unavailable": [], "invalid": [], **_sf}
+    for _nm, _man in (("funding", fman), (mark_name, mman)):
+        if _man.get("dataset_status") != "COMPLETE":
+            state_findings["incomplete"].append(f"dataset {_nm} dataset_status is {_man.get('dataset_status')!r}, not COMPLETE")
+    if uinfo.get("dataset_status") != "COMPLETE":
+        state_findings["incomplete"].append(f"the universe capture's re-derived dataset_status is {uinfo.get('dataset_status')!r}, not COMPLETE")
+    identity = dataset_identity(
+        [{"kind": "market_history", "name": "funding", "digest": fman.get("manifest_digest"), "verified": True},        # _verified_dataset / load_universe_dir raised unless they re-hashed
+         {"kind": "market_history", "name": mark_name, "digest": mman.get("manifest_digest"), "verified": True},
+         {"kind": "universe_capture", "name": "universe", "digest": uinfo.get("manifest_sha256"), "verified": True}],
+        extra={"funnel_digest": fn.report().get("funnel_digest"), "window_ms": [w0, w1], "mark_interval": mark_iv, "holdout_cut_ms": cut_ms,
+               "include_statuses": list(include_statuses), "quote_coins": list(quote_coins) if quote_coins else None})
+    if not identity["identifies_every_component"]:
+        state_findings["invalid"].append("a loaded manifest carries no digest: the dataset cannot be identified")
     info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
+                       "dataset_state": dataset_state(state_findings), "loaded_identity": identity,
+                       "loaded_identity_scope": "the funding + mark-kline datasets and the universe capture this load READ (the spot snapshot only labels legs; index-kline / open-interest are not loaded): "
+                                                "the report-level dataset_identity of dataset_report covers every manifest under the data root",
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
                             "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols"),
@@ -2058,6 +2177,7 @@ def dataset_report(*, data_root: Optional[str], universe_dir: Optional[str], spo
                            "missing_fields": [], "status_partition_coverage": {u["rel"]: {"delisting_observability": u["delisting_observability"], "status_coverage": u["status_coverage"],
                                                                                            "statuses_in_capture": u["statuses_in_capture"]} for u in inv["universes"]},
                            "survivorship": surv, "survivorship_free_claim": False, "pit_limitations": list(PIT_LIMITATIONS), "warnings": []}
+    info: Optional[Dict[str, Any]] = None
     have = {d["dataset"] for d in inv["datasets"]}
     for need, label in (("funding", "funding"), ("mark-kline", "mark-kline"), ("index-kline", "index-kline (basis/hedge price)"), ("open-interest", "open-interest (capacity)")):
         if need not in have:
@@ -2105,12 +2225,54 @@ def dataset_report(*, data_root: Optional[str], universe_dir: Optional[str], spo
             else:
                 rep["warnings"].append("no spot snapshot: hedgeability is HEDGE_UNKNOWN for every symbol; no SPOT_PERP_CARRY claim is possible")
     surv_known = rep["status"] == "OK"
-    crit_complete = surv_known and all(d["dataset_status"] == "COMPLETE" and d["verified"] for d in inv["datasets"] if d["dataset"] in ("funding", "mark-kline", "index-kline")) \
-        and any(d["dataset"] == "funding" for d in inv["datasets"]) and any(d["dataset"] == "mark-kline" for d in inv["datasets"]) \
-        and all(u["dataset_status"] == "COMPLETE" for u in uni_good)
+    # ---- the dataset-state (Round 18). DATA_READY used to stand on dataset-level statuses alone: a history holding ONE of 4 lifecycle-eligible symbols read DATA_READY. It now stands on the
+    # state: every eligible symbol loaded AND COMPLETE over the whole required window in every required dataset (the funnel's own result, the same one backfill_plan.plan decides
+    # research_ready on), plus verified bytes, plus a COMPLETE universe capture.
+    findings: Dict[str, List[str]] = {"unavailable": [], "invalid": [], "incomplete": [], "insufficient": []}
+    if not scan["universe_dir_supplied"]:
+        findings["unavailable"].append("UNIVERSE_DIR_REQUIRED: no (valid) universe capture was supplied")
+    if not scan["checked"] or not scan["market_history"]:
+        findings["unavailable"].append("no market_history dataset under the data root")
+    for m in manifests:
+        if not m["verified"]:
+            findings["invalid"].append(f"{m['kind']} does not re-verify: {'; '.join(str(p) for p in m['problems'])[:120]}")
+        elif m["dataset_status"] in ("CONFLICTED", "UNVERIFIED"):
+            findings["invalid"].append(f"{m['kind']} dataset_status is {m['dataset_status']}")
+    if inv["datasets"]:
+        for need in ("funding", "mark-kline"):
+            if need not in have:
+                findings["incomplete"].append(f"the required dataset {need} is absent under the data root")
+    for d in inv["datasets"]:
+        if d["dataset"] in ("funding", "mark-kline", "index-kline") and d["verified"] and d["dataset_status"] not in ("COMPLETE", "CONFLICTED", "UNVERIFIED"):
+            findings["incomplete"].append(f"{d['dataset']} dataset_status is {d['dataset_status']}, not COMPLETE")
+    for u in uni_good:
+        if u["dataset_status"] != "COMPLETE":
+            findings["incomplete"].append(f"the universe capture's dataset_status is {u['dataset_status']}, not COMPLETE")
+    if rep["status"] == "REFUSED" and not findings["invalid"] and not findings["unavailable"]:
+        reason = str(rep["reason"])
+        (findings["unavailable"] if ("not found" in reason or "no market_history" in reason or "mark_interval not given" in reason) else findings["invalid"]).append(reason[:200])      # unknown refusal = invalid: fail closed
+    if info is not None:
+        for k in ("invalid", "incomplete", "insufficient"):
+            findings[k] += list(info["dataset_state"]["findings"][k])
+    findings = {k: list(dict.fromkeys(v)) for k, v in findings.items()}
+    dstate = dataset_state(findings)
+    idx_ds = next((d for d in inv["datasets"] if d["dataset"] == "index-kline"), None)
+    basis_ok = bool(idx_ds and idx_ds["verified"] and idx_ds["dataset_status"] == "COMPLETE")
+    carry_why = ([] if spot_dir is not None else ["no spot-instruments snapshot: hedgeability is unknown for every symbol"]) \
+        + ([] if basis_ok else ["no verified COMPLETE index-kline dataset: the spot-vs-perp basis is UNMEASURED, so a hedged-carry claim is impossible"]) \
+        + ([] if dstate["sufficient"] else ["the dataset itself is not " + DATA_SUFFICIENT_NOT_EVALUATED])
+    rep["dataset_state"] = dstate
+    rep["dataset_identity"] = dataset_identity(
+        [{"kind": m["kind"], "name": m["kind"], "digest": m["digest"], "verified": m["verified"]} for m in manifests],
+        extra={"funnel_digest": ((info or {}).get("funnel") or {}).get("funnel_digest"), "history_window": (info or {}).get("history_window"), "mark_interval": (info or {}).get("mark_interval")})
+    if not rep["dataset_identity"]["identifies_every_component"] and dstate["complete_over_required_window"]:
+        findings["invalid"].append("a manifest carries no digest: the dataset cannot be identified")
+        dstate = rep["dataset_state"] = dataset_state(findings)
+    rep["capabilities"] = {"perp_only_ranked_funding": dstate["sufficient"],
+                           "spot_hedged_carry": {"supported": dstate["sufficient"] and spot_dir is not None and basis_ok, "why_not": carry_why}}
+    data_ready = dstate["state"] in COMPLETE_DATA_STATES
     rep["readiness"] = readiness_levels(
-        data_ready=bool(crit_complete), data_reasons=[f"{d['dataset']}: {d['dataset_status']} verified={d['verified']}" for d in inv["datasets"] if d["dataset_status"] != "COMPLETE" or not d["verified"]]
-        or ([] if crit_complete else [rep["reason"] or "funding/mark-kline/universe not all verified and COMPLETE"]),
+        data_ready=data_ready, data_reasons=[] if data_ready else (dstate["reasons"] or [rep["reason"] or "funding/mark-kline/universe not all verified and COMPLETE"]),
         pit_ok=surv_known and surv == DELISTINGS_OBSERVED, survivorship=surv, mechanism_ok=True)
     rep["survivorship_free_claim"] = rep["readiness"]["survivorship_free_claim"]
     rep["highest_supportable_verdict"] = rep["readiness"]["highest_supportable_verdict"] if surv_known else "UNTESTED"
@@ -2125,7 +2287,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--history-root", default="", help="a market_history root (funding/, mark-kline-<interval>/): also run the ranked-funding walk-forward on it")
     ap.add_argument("--universe-dir", default="", help="the verified universe_capture directory the history was built from: REQUIRED by the cross-sectional path (required with --history-root); recognised in data_scan when passed")
     ap.add_argument("--ledger", default="", help="persistent multiple-testing ledger file for --history-root (default: <parent of the history root>/candidate_ledgers/<family>.jsonl: the family count survives a restart)")
-    ap.add_argument("--dataset-report", action="store_true", help="print the reproducible dataset report for --data-root/--history-root + --universe-dir and exit")
+    ap.add_argument("--dataset-report", action="store_true",
+                    help="print the reproducible dataset report (dataset_state, dataset_identity, per-symbol coverage) for --data-root/--history-root + --universe-dir and exit; "
+                         "exit 0 only for DATA_SUFFICIENT_*, 3 for DATA_VALID_BUT_INSUFFICIENT, 2 for UNAVAILABLE / INCOMPLETE / INVALID")
     ap.add_argument("--spot-dir", default=None, help="a spot-instruments snapshot dir (hedgeability; absent = unknown)")
     ap.add_argument("--mark-interval", default=None, help="mark-kline interval (e.g. 240); needed when the root holds more than one")
     ap.add_argument("--unreserved-exploratory", action="store_true",
@@ -2137,7 +2301,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if a.dataset_report:
         dr = dataset_report(data_root=a.data_root or a.history_root or None, universe_dir=a.universe_dir or None, spot_dir=a.spot_dir, mark_interval=a.mark_interval)
         print(json.dumps(dr, indent=2, sort_keys=True, default=str))
-        return 0 if dr["status"] == "OK" else 2
+        st = dr["dataset_state"]["state"]
+        ident = dr["dataset_identity"]["digest"]
+        print(f"DATASET_STATE: {st}  (dataset_identity {ident[:16] + '...' if ident else 'NONE: a component is unverified or has no digest'})", file=sys.stderr)
+        return 0 if st in SUFFICIENT_DATA_STATES else (3 if st == DATA_VALID_BUT_INSUFFICIENT else 2)      # a download that exited 0 is not a complete dataset: only DATA_SUFFICIENT_* exits 0
     rep = build_report(data_root=a.data_root or a.history_root or None, universe_dir=a.universe_dir or None)
     if a.data_root and not a.universe_dir and any(not r["universe_dir"]["supplied"] and r["universe_dir"]["required"] for r in rep["candidates"]):
         print("UNIVERSE_DIR_REQUIRED: no --universe-dir passed; the cross-sectional rows are NOT evaluated and cannot reach RESEARCH_READY", file=sys.stderr)
