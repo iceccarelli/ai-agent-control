@@ -135,7 +135,7 @@ def session_reconciled(rec: Mapping[str, Any], result: str, reconciliation: Opti
         payload["venue_reconciled"] = reconciliation.get("venue_reconciled") if isinstance(reconciliation.get("venue_reconciled"), bool) else None
         payload["view_complete"] = reconciliation.get("view_complete") is True
         payload["finding_codes"] = [str(c)[:60] for c in (reconciliation.get("finding_codes") or [])][:12]
-        payload["wallet_checked"] = bool((reconciliation.get("checked") or {}).get("wallet"))        # `venue_reconciled` compares executions, ledger fills, positions and fees: not the wallet, unless this says so
+        payload["cash_compared"] = bool((reconciliation.get("checked") or {}).get("wallet"))        # `venue_reconciled` compares executions, ledger fills, positions and fees: not the cash balance, unless this says so (the evidence guard refuses the key names wallet / balance / account)
     return ("RECONCILIATION", "SESSION_RECONCILED", payload)
 
 

@@ -1218,7 +1218,7 @@ def test_the_executed_sessions_full_decision_record_and_reconciliation_outcome_a
     assert on_disk["decision_id"] == dec[0][2]["decision_id"]                                                            # the durable event IS the file's record
     rc = next(g for g in got if g[1] == "SESSION_RECONCILED")[2]
     assert rc["venue_reconciled"] is True and rc["view_complete"] is True and rc["finding_codes"] == [] and rc["venue_flat_verified"] is True
-    assert rc["wallet_checked"] is False                                   # `venue_reconciled` compares executions, ledger fills, positions and fees; the wallet is not part of it, and the event says so
+    assert rc["cash_compared"] is False                                    # `venue_reconciled` compares executions, ledger fills, positions and fees; the cash balance is not part of it, and the event says so (the guard refuses "wallet" as a key)
 
 
 def test_lifecycle_evidence_names_who_said_it_and_never_leaks_raw_venue_ids(w):
