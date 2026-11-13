@@ -172,6 +172,20 @@ def test_an_incomplete_review_withholds_every_rate_and_states_what_the_excluded_
     assert "ECONOMICS PARTIAL, RATES WITHHELD" in text and "EXCLUDED 1 round trip" in text and "bps per round trip" not in text and "annualised" not in text
 
 
+def test_an_open_lifecycle_is_not_summed_as_zero_in_the_excluded_block(tmp_path):
+    """Round 18 review: an open (or carried-in, long-exposure, no-short-entry) lifecycle carries NO component keys, so the excluded block summed nothing and printed 0.00 for fees that were paid."""
+    fa, ga, _ = make_trip(2000, 12, qty=0.5, tag="a")
+    fb, gb, _ = make_trip(2100, 12, qty=0.5, tag="b")
+    entry_only = [r for r in fb if r["side"] == "Sell"][:1]                                           # the perp short is opened and never closed in these records
+    rep = review_rows(fa + entry_only, ga, tmp_path, taker_bps=5.5, capital_usd=100000.0)
+    assert rep["verdict"] == "INCOMPLETE" and "OPEN_LIFECYCLE" in codes(rep, AR.SEVERITY_GAP)
+    x = rep["excluded_round_trips"]
+    assert x["count"] == 1 and x["by_status"] == {"EXCLUDED_OPEN": 1} and x["round_trips_without_components"] == 1 and x["statuses_without_components"] == ["EXCLUDED_OPEN"]
+    assert x["known_fees_usd"] is None and x["known_funding_usd"] is None and x["known_basis_usd"] is None                          # unknown, not 0
+    text = AR.render(rep)
+    assert "EXCLUDED 1 round trip(s)" in text and "n/a" in text and "their fees are NOT in these sums" in text and "fees -0.00" not in text
+
+
 def test_a_rejected_review_withholds_its_rates_too(tmp_path):
     fills, funding, _ = make_trip()
     funding = funding + [dict(funding[0], exec_id="stray", ts_ms=TS[K0 + 40])]                                     # one funding row no held position can explain: UNATTRIBUTED_FUNDING, a HARD flag
@@ -192,12 +206,17 @@ def test_a_consistent_review_keeps_every_rate_and_excludes_nothing(tmp_path):
     assert e.get("rates_withheld") is None and e.get("partial") is None and "bps per round trip" in AR.render(rep)
 
 
-def test_every_result_rate_account_review_withholds_is_also_withheld_by_the_owner_ledger_rule():
-    """account_review's list is the narrower one (it keeps the fee and funding cost LEVELS of a round trip); owner_ledger's rule is a superset, so nothing the review withholds can reappear there."""
+def test_every_per_round_trip_key_account_review_withholds_is_also_withheld_by_the_owner_ledger_rule(tmp_path):
+    """On the REAL key set of a round-trip row: account_review's list is the narrower one (it keeps the fee and funding LEVELS of a round trip); owner_ledger's rule is a superset for those rows, so
+    nothing the review withholds can reappear there. (The aggregate keys, e.g. ``notional_weighted_net_bps``, are not passed through owner_ledger at all.)"""
     import owner_ledger as OL
-    for k in ("net_bps_of_notional", "basis_bps_of_notional", "annualised_pct_on_notional", "annualised_pct_on_stated_capital"):
-        assert any(p in k for p in AR.RESULT_RATE_KEY_PARTS) and any(p in k for p in OL._RATE_KEY_PARTS), k
-    assert not any(p in "fee_bps_of_notional" for p in AR.RESULT_RATE_KEY_PARTS)
+    fills, funding, _ = make_trip()
+    keys = list(review_rows(fills, funding, tmp_path, taker_bps=5.5, capital_usd=100000.0)["round_trips"][0])
+    withheld = [k for k in keys if any(p in k.lower() for p in AR.RESULT_RATE_KEY_PARTS)]
+    assert {"net_bps_of_notional", "basis_bps_of_notional", "annualised_pct_on_notional", "annualised_pct_on_stated_capital"} <= set(withheld)
+    for k in withheld:
+        assert any(p in k.lower() for p in OL._RATE_KEY_PARTS), k
+    assert "fee_bps_of_notional" in keys and "fee_bps_of_notional" not in withheld
 
 
 def test_one_small_trip_is_consistent_but_too_small_never_verified(tmp_path):

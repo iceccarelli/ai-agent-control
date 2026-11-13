@@ -881,6 +881,25 @@ def test_promising_needs_a_known_positive_significant_excess_over_cash(monkeypat
     assert _lv(evaluation=_good_eval(vs_cash=both))["levels"]["PROMISING"]["reached"] is True
     # the nominal bars are unchanged: a good cash comparison does not rescue a bad nominal evaluation
     assert _lv(evaluation=_good_eval(oos_mean_total_bps_per_row=-1.0))["levels"]["PROMISING"]["reached"] is False
+    # every basis that RAN must pass: the lowest bar (a lender's-floor series) cannot rescue a candidate the owner's own stated alternative does not
+    mixed = {"HISTORICAL": base, "OWNER_STATED": {**base, "p_adjusted": 0.2}}
+    lv = _lv(evaluation=_good_eval(vs_cash=mixed))["levels"]["PROMISING"]
+    assert lv["reached"] is False and any("OWNER_STATED" in r and "Holm-adjusted p" in r for r in lv["reasons"]), lv["reasons"]
+
+
+def test_a_nan_an_infinity_a_bool_or_a_string_is_never_evidence_for_promising():
+    """Round 18 review: NaN <= 0 and NaN > alpha are both False, so a NaN mean with a NaN p passed every bar; a string observation count raised TypeError."""
+    nan, inf = float("nan"), float("inf")
+    cases = {"nominal_mean_nan": {"oos_mean_total_bps_per_row": nan}, "nominal_mean_inf": {"oos_mean_total_bps_per_row": inf}, "nominal_mean_bool": {"oos_mean_total_bps_per_row": True},
+             "nominal_p_nan": {"p_adjusted": nan}, "nominal_p_negative": {"p_adjusted": -0.5}, "nominal_p_bool": {"p_adjusted": False}, "nominal_nobs_str": {"oos_independent_observations": "80"},
+             "nominal_nobs_nan": {"oos_independent_observations": nan}}
+    for name, over in cases.items():
+        assert _lv(evaluation=_good_eval(**over))["levels"]["PROMISING"]["reached"] is False, name
+    base = GOOD_CASH["OKX_LENDING"]
+    for name, over in {"excess_nan": {"oos_mean_excess_bps_of_capital_per_row": nan}, "excess_inf": {"oos_mean_excess_bps_of_capital_per_row": inf}, "excess_bool": {"oos_mean_excess_bps_of_capital_per_row": True},
+                       "p_nan": {"p_adjusted": nan}, "p_negative": {"p_adjusted": -0.1}, "nobs_str": {"oos_independent_observations": "80"}}.items():
+        lv = _lv(evaluation=_good_eval(vs_cash={"OKX_LENDING": {**base, **over}}))["levels"]["PROMISING"]
+        assert lv["reached"] is False and any("CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED" in r for r in lv["reasons"]), name
 
 
 def test_a_rejected_evaluation_is_rejected_and_not_promising():
@@ -992,12 +1011,14 @@ def test_dataset_report_of_a_tampered_root_reports_the_failure_and_includes_no_s
 
 
 # ================================================================== Round 18: the dataset-state and the immutable dataset identity
-def _add_index_kline(tmp_path, root, uni):
-    """A real COMPLETE index-kline dataset (same writer, same window as the funding request) for every symbol of the fixture's universe."""
+def _add_index_kline(tmp_path, root, uni, only=None):
+    """A real COMPLETE index-kline dataset (same writer, same window as the funding request) for every symbol of the fixture's universe, or only for ``only``."""
     recs, info = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
     delivery = TMH.BASE - 60 * TMH.H8
+    recs = {k: v for k, v in recs.items() if only is None or k in only}
     idata = {("index-kline", s): TMH.grid(TMH.FIRST, 2 * TMH.N - 1, H4) for s in recs if s != "OLDUSDT"}
-    idata[("index-kline", "OLDUSDT")] = TMH.grid(TMH.FIRST, (delivery - TMH.FIRST) // H4 + 1, H4)
+    if "OLDUSDT" in recs:
+        idata[("index-kline", "OLDUSDT")] = TMH.grid(TMH.FIRST, (delivery - TMH.FIRST) // H4 + 1, H4)
     ispecs = MH.build_specs("index-kline", MARK_IV, sorted(recs), TMH.START, TMH.END, recs)
     TMH.run(root, ispecs, TMH.HV(idata), "index-kline", MARK_IV, universe=info)
 
@@ -1008,12 +1029,12 @@ def _dr(root, uni, spot=None):
 
 def test_dataset_state_precedence_verdict_mapping_and_unknown_inputs_raise():
     f = CR.dataset_state
-    assert f({})["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and f({})["sufficient"] is True and f({})["complete_over_required_window"] is True
+    assert f({})["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and f({})["sufficient"] is True and f({})["complete_over_requested_window"] is True
     every = {"unavailable": ["a"], "invalid": ["b"], "incomplete": ["c"], "insufficient": ["d"]}
     assert [f({k: v for k, v in every.items() if k in keep})["state"] for keep in (("unavailable", "invalid", "incomplete", "insufficient"), ("invalid", "incomplete", "insufficient"),
                                                                                     ("incomplete", "insufficient"), ("insufficient",))] \
         == [CR.DATA_UNAVAILABLE, CR.DATA_INVALID, CR.DATA_INCOMPLETE, CR.DATA_VALID_BUT_INSUFFICIENT]
-    assert f({"incomplete": ["x"]})["complete_over_required_window"] is False and f({"insufficient": ["x"]})["complete_over_required_window"] is True
+    assert f({"incomplete": ["x"]})["complete_over_requested_window"] is False and f({"insufficient": ["x"]})["complete_over_requested_window"] is True
     assert f({"insufficient": ["x"]})["sufficient"] is False
     # the evaluator's own word only matters once the data are sufficient
     assert f({}, candidate_verdict="REJECTED")["state"] == CR.DATA_SUFFICIENT_CANDIDATE_REJECTED
@@ -1043,7 +1064,7 @@ def test_a_history_holding_one_of_four_eligible_symbols_is_not_data_ready(tmp_pa
     root, uni, _ = _hist(tmp_path, spot=False, skip_history=("ETHUSDT", "FASTUSDT", "OLDUSDT"), complete_window=True)
     r = _dr(root, uni)
     assert r["status"] == "OK" and r["symbols_included"] == ["BTCUSDT"]
-    assert r["dataset_state"]["state"] == CR.DATA_INCOMPLETE and r["dataset_state"]["complete_over_required_window"] is False
+    assert r["dataset_state"]["state"] == CR.DATA_INCOMPLETE and r["dataset_state"]["complete_over_requested_window"] is False
     assert any("3 of 4 lifecycle-eligible symbols" in x and "ETHUSDT" in x for x in r["dataset_state"]["reasons"]), r["dataset_state"]["reasons"]
     assert r["readiness"]["levels"]["DATA_READY"]["reached"] is False and r["readiness"]["highest"] == "NONE" and r["highest_supportable_verdict"] == "UNTESTED"
     assert r["capabilities"]["perp_only_ranked_funding"] is False
@@ -1100,6 +1121,73 @@ def test_the_hedged_carry_capability_needs_a_spot_snapshot_and_a_complete_index_
     assert r2["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and r2["capabilities"]["spot_hedged_carry"] == {"supported": True, "why_not": []}
     assert r2["dataset_identity"]["digest"] != r["dataset_identity"]["digest"]                             # one more verified dataset under the root is a different dataset
     assert _dr(root, uni)["capabilities"]["spot_hedged_carry"]["supported"] is False                         # without the snapshot every symbol is HEDGE_UNKNOWN
+
+
+def test_an_empty_universe_is_never_sufficient(tmp_path, offline, monkeypatch):
+    """Round 18 review (HIGH), reproduced: 'every eligible symbol is loaded and complete' is vacuously true of an empty set, so a verified capture with NO eligible symbol printed the go signal that
+    RUNBOOKS 6b tells the owner to reserve the one-time holdout on."""
+    f = CR._coverage_findings(eligible=[], covered=[], not_complete=[], ended_unaccounted=0, window_days=900.0, survivorship=CR.DELISTINGS_OBSERVED)
+    assert any("NO_ELIGIBLE_SYMBOLS" in x for x in f["incomplete"]) and f["insufficient"] == []
+    assert CR.dataset_state(f)["state"] == CR.DATA_INCOMPLETE
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    assert CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)[1]["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED          # control: the same data IS sufficient
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV, include_statuses=("Settling",))                               # no instrument has that status
+    assert series == [] and info["history_coverage"]["status"] == "NO_ELIGIBLE_SYMBOLS"
+    assert info["dataset_state"]["state"] == CR.DATA_INCOMPLETE and any("NO_ELIGIBLE_SYMBOLS" in x for x in info["dataset_state"]["reasons"])
+
+
+def test_a_conflicted_dataset_is_invalid_in_the_loader_and_the_report_and_has_no_identity(tmp_path, offline, monkeypatch):
+    """Round 18 review: a CONFLICTED dataset re-hashes fine, so it kept a non-null identity ('archive it') while DATA_INVALID, and the loader called the same data INCOMPLETE."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    t = TMH.FIRST + 5 * TMH.H8
+    bad = TMH.envelope("mark-kline", "ETHUSDT", [TMH.row_for("mark-kline", "ETHUSDT", TMH.BASE), TMH.row_for("mark-kline", "ETHUSDT", t),
+                                                  TMH.row_for("mark-kline", "ETHUSDT", t, row=[str(t), "100", "101", "99", "100.7"])], TMH.SERVER0)
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True, mark_scripts={("mark-kline", "ETHUSDT"): [bad]})
+    _s, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert info["dataset_state"]["state"] == CR.DATA_INVALID and any("CONFLICTED" in x for x in info["dataset_state"]["reasons"])
+    r = _dr(root, uni)
+    assert r["status"] == "OK" and r["dataset_state"]["state"] == CR.DATA_INVALID
+    assert r["dataset_identity"]["digest"] is None and r["dataset_identity"]["identifies_every_component"] is False and "no identity" in r["dataset_identity"]["reason"]
+    assert r["capabilities"]["perp_only_ranked_funding"] is False and r["readiness"]["levels"]["DATA_READY"]["reached"] is False
+
+
+def test_the_hedged_carry_capability_needs_index_coverage_for_every_loaded_symbol_and_a_hedgeable_one(tmp_path, offline, monkeypatch):
+    """Round 18 review: the capability needed only a dataset-level COMPLETE index-kline plus a snapshot, so an index series for ONE of four symbols read 'supported'."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    _add_index_kline(tmp_path, root, uni, only=("BTCUSDT",))
+    r = _dr(root, uni, spot)
+    c = r["capabilities"]["spot_hedged_carry"]
+    assert r["dataset_state"]["sufficient"] is True and c["supported"] is False
+    assert any("index-kline is not COMPLETE for 3 of 4 loaded symbols" in x and "ETHUSDT" in x for x in c["why_not"]), c
+    # a snapshot in which nothing is hedgeable cannot support a carry claim either, whatever the index covers
+    tmp2 = tmp_path / "full"
+    tmp2.mkdir()
+    root2, uni2, spot2 = _hist(tmp2, complete_window=True)
+    _add_index_kline(tmp2, root2, uni2)
+    assert _dr(root2, uni2, spot2)["capabilities"]["spot_hedged_carry"]["supported"] is True                       # control: full index coverage and a trading spot pair
+    orig = MH.hedge_availability
+    monkeypatch.setattr(MH, "hedge_availability", lambda recs, sd: {**orig(recs, sd), "counts": {**orig(recs, sd)["counts"], "SPOT_TRADING": 0}})
+    c2 = _dr(root2, uni2, spot2)["capabilities"]["spot_hedged_carry"]
+    assert c2["supported"] is False and any("nothing is hedgeable" in x for x in c2["why_not"])
+
+
+def test_the_loaded_identity_includes_the_spot_snapshot_the_carry_family_selects_its_universe_with(tmp_path, offline):
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    _s1, with_spot = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    _s2, without = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    assert {c["kind"] for c in with_spot["loaded_identity"]["components"]} == {"market_history", "universe_capture", "spot_snapshot"}
+    assert with_spot["loaded_identity"]["digest"] != without["loaded_identity"]["digest"]                  # SPOT_PERP_CARRY drops every symbol the snapshot does not list: a different input
+
+
+def test_an_evaluation_stamps_the_state_only_from_the_loaders_own_sealed_info(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, complete_window=True)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    sealed = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert sealed["dataset_state"]["state"] == info["dataset_state"]["state"] and sealed["loaded_identity"]["digest"] == info["loaded_identity"]["digest"]
+    forged = CR.evaluate_ranked_funding(series, universe_info=dict(info))                                    # a copy has no seal: the state is not carried (a hand-made dict cannot forge it)
+    assert forged["dataset_state"] is None and forged["loaded_identity"] is None
 
 
 def test_the_dataset_identity_is_a_pure_function_of_the_verified_content(tmp_path, offline):

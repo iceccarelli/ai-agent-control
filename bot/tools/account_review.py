@@ -482,7 +482,8 @@ def _interval(xs: Sequence[float]) -> Dict[str, Any]:
 
 #: A key whose number is a RESULT RATE: annualised, a period or on-capital percentage, or the net / basis P&L in bps of notional (per round trip, mean, sd, notional-weighted). Round 17 withheld every
 #: rate from an ``owner_ledger`` that is not RECONCILED_*; Round 18 applies the rule where the numbers are made: this review prints no result rate under a verdict that is not CONSISTENT_*. The COST
-#: LEVELS ``fee_bps_of_notional`` / ``funding_bps_of_notional`` of a round trip are components (the dollars beside them stay too) and are not in this list; owner_ledger's own rule is the stricter superset.
+#: LEVELS ``fee_bps_of_notional`` (a cost) and ``funding_bps_of_notional`` (an income) of a round trip are COMPONENTS expressed per notional (the dollars beside them stay too) and are not in this list; for
+#: the per-round-trip keys owner_ledger's own rule (``bps_of_notional`` anywhere in the name) is the stricter superset (a test pins it on the real key set).
 RESULT_RATE_KEY_PARTS = ("annualised", "period_pct", "pct_on_", "net_bps", "basis_bps")
 
 #: Gaps that can hide a loss or a cost (a dropped settlement, an excluded trip, a basis that is not known): the review is INCOMPLETE.
@@ -822,15 +823,22 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
     def _finite(v: Any) -> bool:
         return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
     excluded = [t for t in trips if t["status"] != "COMPLETE"]
+    comp_keys = ("funding_usd", "fees_usd", "basis_pnl_usd")
+    with_components = [t for t in excluded if any(_finite(t.get(k)) for k in comp_keys)]
+    without_components = [t for t in excluded if not any(_finite(t.get(k)) for k in comp_keys)]       # open, carried-in, long-exposure, no-short-entry lifecycles carry NO component figures
+
+    def _known(key: str) -> Optional[float]:
+        vals = [t[key] for t in with_components if _finite(t.get(key))]
+        return sum(vals) if vals else None                                                           # a component nobody computed is None, never a sum of nothing printed as 0.00
     excluded_round_trips = {
         "count": len(excluded), "by_status": {k: sum(1 for t in excluded if t["status"] == k) for k in sorted({t["status"] for t in excluded})},
-        "known_funding_usd": sum(t["funding_usd"] for t in excluded if _finite(t.get("funding_usd"))),
-        "known_fees_usd": sum(t["fees_usd"] for t in excluded if _finite(t.get("fees_usd"))),
-        "known_basis_usd": sum(t["basis_pnl_usd"] for t in excluded if _finite(t.get("basis_pnl_usd"))),
+        "known_funding_usd": _known("funding_usd"), "known_fees_usd": _known("fees_usd"), "known_basis_usd": _known("basis_pnl_usd"),
         "round_trips_with_unknown_basis": sum(1 for t in excluded if not _finite(t.get("basis_pnl_usd"))),
+        "round_trips_without_components": len(without_components), "statuses_without_components": sorted({t["status"] for t in without_components}),
         "settlements_missing": sum(int(t.get("settlements_missing") or 0) for t in excluded),
-        "reading": "round trips the economics leave out because a settlement, a spot reference or a settlement span is missing. Their funding is a LOWER BOUND wherever settlements are missing, "
-                   "so these dollars are components and NOT a net; the point is that they are not zero and not in the aggregate"}
+        "reading": "round trips the economics leave out because a settlement, a spot reference or a settlement span is missing, or because the lifecycle is open / carried in. Their funding is a LOWER BOUND "
+                   "wherever settlements are missing, and a lifecycle without component figures (see round_trips_without_components) contributes NOTHING to these sums although its fees were paid: these dollars "
+                   "are components and NOT a net, and a None is unknown, not zero"}
     rates_withheld = not verdict.startswith("CONSISTENT_")
     if rates_withheld:
         trips = [{k: (None if any(part in str(k).lower() for part in RESULT_RATE_KEY_PARTS) and _finite(v) else v) for k, v in t.items()} for t in trips]
@@ -955,6 +963,11 @@ def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bp
                   ignored_columns={"fills": f_ign, "funding": g_ign}, **kw)
 
 
+def _usd(v: Any) -> str:
+    """A dollar figure for the text report; None is UNKNOWN and prints as n/a, never as 0.00."""
+    return "n/a" if v is None else f"{v:.2f}"
+
+
 def render(rep: Mapping[str, Any]) -> str:
     L: List[str] = []
     a = L.append
@@ -987,8 +1000,9 @@ def render(rep: Mapping[str, Any]) -> str:
     if e["tag"] == PROVENANCE and e.get("rates_withheld"):
         a(f"  ECONOMICS PARTIAL, RATES WITHHELD ({rep['verdict']}): over the {e['complete_round_trips']} complete round trip(s) ONLY, {e['settlements_in_them']} settlements: net {e['net_usd']:.2f} USD "
           f"(funding {e['funding_usd']:.2f}, basis {e['basis_pnl_usd']:.2f}, fees -{e['fees_usd']:.2f}); no rate or mean is stated")
-        a(f"    EXCLUDED {x.get('count', 0)} round trip(s) {x.get('by_status', {})}: known funding {x.get('known_funding_usd', 0.0):.2f} (a lower bound), basis {x.get('known_basis_usd', 0.0):.2f}, "
-          f"fees -{x.get('known_fees_usd', 0.0):.2f} USD; {x.get('round_trips_with_unknown_basis', 0)} with an unknown basis. These are components, not a net, and they are not in the figure above")
+        a(f"    EXCLUDED {x.get('count', 0)} round trip(s) {x.get('by_status', {})}: known funding {_usd(x.get('known_funding_usd'))} (a lower bound), basis {_usd(x.get('known_basis_usd'))}, "
+          f"fees -{_usd(x.get('known_fees_usd'))} USD; {x.get('round_trips_with_unknown_basis', 0)} with an unknown basis, {x.get('round_trips_without_components', 0)} with no component figures at all "
+          f"({', '.join(x.get('statuses_without_components') or []) or 'none'}: their fees are NOT in these sums). These are components, not a net, and they are not in the figure above")
         a("    UPPER BOUND: excludes " + "; ".join(e["excludes"]))
     elif e["tag"] == PROVENANCE:
         a(f"  ECONOMICS over {e['complete_round_trips']} complete round trip(s), {e['settlements_in_them']} settlements: net {e['net_usd']:.2f} USD "
@@ -999,7 +1013,8 @@ def render(rep: Mapping[str, Any]) -> str:
     else:
         a(f"  ECONOMICS UNKNOWN: {e['reading']}")
         if x.get("count"):
-            a(f"    EXCLUDED {x['count']} round trip(s) {x.get('by_status', {})}: known funding {x['known_funding_usd']:.2f} (a lower bound), basis {x['known_basis_usd']:.2f}, fees -{x['known_fees_usd']:.2f} USD")
+            a(f"    EXCLUDED {x['count']} round trip(s) {x.get('by_status', {})}: known funding {_usd(x.get('known_funding_usd'))} (a lower bound), basis {_usd(x.get('known_basis_usd'))}, "
+              f"fees -{_usd(x.get('known_fees_usd'))} USD; {x.get('round_trips_without_components', 0)} with no component figures at all")
     su = rep["sufficiency"]
     a(f"  sufficiency: {su['settlements_recorded_in_complete_round_trips']}/{su['engine_floor_settlements']} settlements, "
       f"{su['complete_round_trips']}/{su['engine_floor_round_trips']} round trips ({su['reading']})")

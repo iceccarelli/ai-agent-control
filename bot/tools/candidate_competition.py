@@ -368,6 +368,14 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                "rejection_reasons": reasons[:12], "label": CORPUS_LABEL if name == "cash_and_carry" else None, **extra}
         wired = name in WIRED_EVALUATORS
         row["evaluator"] = {"wired": wired, "code": None if wired else f"NO_EVALUATOR_WIRED:{name}"}
+        if name == "cross_sectional_funding":
+            # The data state of the history this evaluation read, with the candidate's verdict folded in (Round 18 review: the two DATA_SUFFICIENT_* verdict states were never produced). REJECTED on sufficient
+            # data -> DATA_SUFFICIENT_CANDIDATE_REJECTED; PROMISING on the ladder -> ..._ELIGIBLE_FOR_FURTHER_REVIEW; an evaluator that says "not enough" keeps DATA_VALID_BUT_INSUFFICIENT; any data finding wins.
+            fam_ev = (evals or {}).get("cross_sectional_funding") if evals else None
+            ds0 = fam_ev.get("dataset_state") if isinstance(fam_ev, Mapping) else None
+            if isinstance(ds0, Mapping) and isinstance(ds0.get("findings"), Mapping):
+                cv = "PROMISING" if lv["levels"]["PROMISING"]["reached"] else (verdict if verdict in ("REJECTED", "INSUFFICIENT_DATA", "UNTESTED") else "INSUFFICIENT_DATA")
+                row["dataset_state"] = CR.dataset_state(ds0["findings"], candidate_verdict=cv)
         if not wired:                                                # reasons only: no verdict, level, rank or net edge above depends on this
             row["rejection_reasons"] = reasons[:11] + [f"NO_EVALUATOR_WIRED:{name}: no walk-forward evaluator is connected to this family in run_competition, so PROMISING is unreachable "
                                                          "for it whatever the data: NO WINNER for this row is structural, not measured"]

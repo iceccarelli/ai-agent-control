@@ -426,37 +426,42 @@ READINESS_LEVELS = ("DATA_READY", "RESEARCH_READY", "PROMISING", "PROSPECTIVE", 
 MIN_PROMISING_OOS_OBS = SV.MIN_OBSERVATIONS["oos_test"]
 
 
+def _real(x: Any) -> bool:
+    """A finite real number (not a bool): the only kind of value a statistical bar may be passed on. NaN <= 0 and NaN > alpha are both False, so a NaN used to slip through every bar."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
 def _cash_comparison_problems(ev: Mapping[str, Any], alpha: float) -> List[str]:
     """Round 18 (quant specialist): PROMISING used to need only a positive nominal out-of-sample mean (bps of GROSS notional, a zero cost of capital), so an absent or unknown comparison with cash was
     'no objection': a candidate that never beat the owner's alternative on the capital it ties up could be ranked top tier and pass the allocation gate. The decision statistic is the EXCESS over cash on
     the committed capital, so PROMISING now also needs at least one KNOWN cash comparison (``vs_cash``: a walk-forward on that excess) that is not REJECTED and passes the SAME bars as the nominal one:
     a positive out-of-sample mean, a Holm-adjusted p within alpha over the whole family, and enough independent observations. Absent or unknown = CASH_COMPARISON_UNKNOWN: nothing promotes on an
-    unknown cost of capital. This only tightens; a block that is REJECTED already demoted the verdict in evaluate_family."""
+    unknown cost of capital. A basis whose walk-forward did not run (its cash series does not cover enough rows) is unknown and does not decide; EVERY basis that did run must pass (so the lowest bar,
+    a lender's-floor series, cannot rescue a candidate the owner's own stated alternative does not), and at least one must have run. This only tightens; a block that is REJECTED already demoted the
+    verdict in evaluate_family."""
     blocks = ev.get("vs_cash")
     if not isinstance(blocks, Mapping) or not blocks:
         return ["CASH_COMPARISON_UNKNOWN: no excess-over-cash walk-forward is attached (no cash basis was applied, or none covers the window): the nominal bps of notional charge no cost of capital"]
-    known, why = [], []
+    ran, failed, unknown = [], [], []
     for label, b in sorted(blocks.items()):
         if not isinstance(b, Mapping) or b.get("status") != "WALK_FORWARD_DONE":
-            why.append(f"{label}: {b.get('status') if isinstance(b, Mapping) else 'malformed'}")
+            unknown.append(f"{label}: {b.get('status') if isinstance(b, Mapping) else 'malformed'}")
             continue
-        mean, padj, nobs = b.get("oos_mean_excess_bps_of_capital_per_row"), b.get("p_adjusted"), b.get("oos_independent_observations") or 0
+        mean, padj, nobs = b.get("oos_mean_excess_bps_of_capital_per_row"), b.get("p_adjusted"), b.get("oos_independent_observations")
         bad = []
         if b.get("verdict") == "REJECTED":
             bad.append("REJECTED")
-        if not isinstance(mean, (int, float)) or mean <= 0:
-            bad.append(f"excess mean {mean} is not positive")
-        if not isinstance(padj, (int, float)) or padj > alpha:
-            bad.append(f"Holm-adjusted p {padj} > {alpha}")
-        if nobs < MIN_PROMISING_OOS_OBS:
+        if not _real(mean) or mean <= 0:
+            bad.append(f"excess mean {mean} is not a positive number")
+        if not _real(padj) or padj < 0 or padj > alpha:
+            bad.append(f"Holm-adjusted p {padj} is not within [0, {alpha}]")
+        if not _real(nobs) or nobs < MIN_PROMISING_OOS_OBS:
             bad.append(f"{nobs} independent observations < {MIN_PROMISING_OOS_OBS}")
-        if bad:
-            why.append(f"{label}: " + "; ".join(bad))
-        else:
-            known.append(label)
-    if known:
-        return []
-    return ["CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED: no cash basis shows a positive, significant excess over cash on the committed capital (" + " | ".join(why)[:400] + ")"]
+        (failed if bad else ran).append(f"{label}: " + "; ".join(bad) if bad else label)
+    if failed or not ran:
+        return ["CASH_COMPARISON_UNKNOWN_OR_NOT_PASSED: every cash basis that ran must show a positive, significant excess over cash on the committed capital, and at least one must have run ("
+                + " | ".join((failed + unknown))[:400] + ")"]
+    return []
 
 
 def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_ok: bool, survivorship: Optional[str], mechanism_ok: bool,
@@ -498,14 +503,14 @@ def readiness_levels(*, data_ready: bool, data_reasons: Sequence[str] = (), pit_
     if ev is None or ev.get("status") != "WALK_FORWARD_DONE":
         pr.append("no completed walk-forward evaluation" + ("" if ev is None else f" (status {ev.get('status')})"))
     else:
-        mean, padj, nobs = ev.get("oos_mean_total_bps_per_row"), ev.get("p_adjusted"), ev.get("oos_independent_observations") or 0
+        mean, padj, nobs = ev.get("oos_mean_total_bps_per_row"), ev.get("p_adjusted"), ev.get("oos_independent_observations")
         if ev.get("verdict") == "REJECTED":
             pr.append("the evaluation was REJECTED")
-        if not isinstance(mean, (int, float)) or mean <= 0:
-            pr.append(f"out-of-sample mean {mean} is not positive")
-        if not isinstance(padj, (int, float)) or padj > alpha:
-            pr.append(f"Holm-adjusted p {padj} > {alpha} over the whole family")
-        if nobs < MIN_PROMISING_OOS_OBS:
+        if not _real(mean) or mean <= 0:
+            pr.append(f"out-of-sample mean {mean} is not a positive number")
+        if not _real(padj) or padj < 0 or padj > alpha:
+            pr.append(f"Holm-adjusted p {padj} is not within [0, {alpha}] over the whole family")
+        if not _real(nobs) or nobs < MIN_PROMISING_OOS_OBS:
             pr.append(f"{nobs} independent OOS observations < {MIN_PROMISING_OOS_OBS}")
         if ev.get("terminal_exit_unpriced"):
             pr.append("unpriced terminal exits")
@@ -546,7 +551,8 @@ DATA_SUFFICIENT_CANDIDATE_REJECTED = "DATA_SUFFICIENT_CANDIDATE_REJECTED"
 DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW = "DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW"
 DATASET_STATES = (DATA_UNAVAILABLE, DATA_INCOMPLETE, DATA_INVALID, DATA_VALID_BUT_INSUFFICIENT, DATA_SUFFICIENT_NOT_EVALUATED, DATA_SUFFICIENT_CANDIDATE_REJECTED,
                   DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW)
-#: the states in which every lifecycle-eligible symbol is verified and COMPLETE over the whole required window: the only ones a dataset-level DATA_READY may stand on
+#: the states in which every lifecycle-eligible symbol is verified and COMPLETE over the whole REQUESTED window (the window the funding manifest asked for, or the explicit one; not the 457 days: a
+#: complete but short history is DATA_VALID_BUT_INSUFFICIENT): the only states a dataset-level DATA_READY may stand on
 COMPLETE_DATA_STATES = DATASET_STATES[3:]
 SUFFICIENT_DATA_STATES = DATASET_STATES[4:]
 #: the evaluation geometry the sufficiency window is measured against: pinned by a test to ``evaluate_ranked_funding``'s own defaults (the 457 days of backfill_plan.required_window)
@@ -582,7 +588,7 @@ def dataset_state(findings: Mapping[str, Sequence[str]], *, candidate_verdict: O
     else:
         state, why = DATA_VALID_BUT_INSUFFICIENT, [f"the evaluator's own verdict is {candidate_verdict}: the sample cannot carry a claim"]
     return {"schema": SCHEMA + "/dataset_state", "state": state, "reasons": why, "findings": f, "candidate_verdict": candidate_verdict,
-            "complete_over_required_window": state in COMPLETE_DATA_STATES, "sufficient": state in SUFFICIENT_DATA_STATES,
+            "complete_over_requested_window": state in COMPLETE_DATA_STATES, "sufficient": state in SUFFICIENT_DATA_STATES,
             "note": "a statement about verified bytes and coverage only: no DATA_SUFFICIENT_* state is an edge, an authority to trade or a profit; DATA_READY stands on it"}
 
 
@@ -606,6 +612,8 @@ def _coverage_findings(*, eligible: Sequence[str], covered: Sequence[str], not_c
     symbols, ``covered`` = those with a loaded series, ``not_complete`` = loaded symbols not COMPLETE over the whole required window in every required dataset. A cross-section of the
     symbols somebody happened to collect is not the universe: every eligible symbol must be loaded AND complete before the dataset is complete."""
     out: Dict[str, List[str]] = {"incomplete": [], "insufficient": []}
+    if not eligible:                 # "every eligible symbol is complete" is vacuously true of an empty set: Round 18 review, a verified capture with NO eligible symbol printed the go signal
+        out["incomplete"].append("NO_ELIGIBLE_SYMBOLS: the universe has no lifecycle-eligible perpetual in the window (or none has a series before the holdout cut): there is nothing for a cross-section to be complete over")
     missing = sorted(set(eligible) - set(covered))
     if missing:
         out["incomplete"].append(f"{len(missing)} of {len(eligible)} lifecycle-eligible symbols have no usable history in the datasets (first: {missing[:5]})")
@@ -1213,8 +1221,8 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                            "closed_in_universe_not_in_series": cin, "key_basis_unverified": bool(unkeyed),
                            "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED,
                            "history_coverage": (universe_info or {}).get("history_coverage") if isinstance(universe_info, Mapping) else None,
-                           "dataset_state": (universe_info or {}).get("dataset_state") if isinstance(universe_info, Mapping) else None,
-                           "loaded_identity": (universe_info or {}).get("loaded_identity") if isinstance(universe_info, Mapping) else None,
+                           "dataset_state": universe_info.get("dataset_state") if _verified_verdict(universe_info) is not None else None,        # only the loader's own sealed info: a hand-made dict cannot forge it
+                           "loaded_identity": universe_info.get("loaded_identity") if _verified_verdict(universe_info) is not None else None,
                            "survivorship_claim_note": ("DELISTINGS_OBSERVED: Closed contracts the venue still serves were observed; an absent symbol is still not proof it was never delisted"
                                                        if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
                            "universe_info_verified": verdict is not None,
@@ -1578,22 +1586,26 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                              not_complete=[s for s in set(fn.loadable) - set(fn.complete) if s not in _cut_set], ended_unaccounted=len(closed_missing),
                              window_days=(w1 - w0) / MS_DAY, survivorship=survivorship)
     state_findings: Dict[str, List[str]] = {"unavailable": [], "invalid": [], **_sf}
-    for _nm, _man in (("funding", fman), (mark_name, mman)):
-        if _man.get("dataset_status") != "COMPLETE":
-            state_findings["incomplete"].append(f"dataset {_nm} dataset_status is {_man.get('dataset_status')!r}, not COMPLETE")
-    if uinfo.get("dataset_status") != "COMPLETE":
-        state_findings["incomplete"].append(f"the universe capture's re-derived dataset_status is {uinfo.get('dataset_status')!r}, not COMPLETE")
+    for _nm, _man in (("funding", fman), (mark_name, mman), ("the universe capture", uinfo)):
+        _st = _man.get("dataset_status")
+        if _st in ("CONFLICTED", "UNVERIFIED"):
+            state_findings["invalid"].append(f"{_nm}: dataset_status is {_st!r}")
+        elif _st != "COMPLETE":
+            state_findings["incomplete"].append(f"{_nm}: dataset_status is {_st!r}, not COMPLETE")
+    id_components = [{"kind": "market_history", "name": "funding", "digest": fman.get("manifest_digest"), "verified": True},        # _verified_dataset / load_universe_dir raised unless they re-hashed
+                     {"kind": "market_history", "name": mark_name, "digest": mman.get("manifest_digest"), "verified": True},
+                     {"kind": "universe_capture", "name": "universe", "digest": uinfo.get("manifest_sha256"), "verified": True}]
+    if spot_dir is not None:             # re-verified by hedge_availability above (it raised otherwise); the carry family's universe is selected by it, so a different snapshot is a different input
+        id_components.append({"kind": "spot_snapshot", "name": "spot", "digest": (_read_manifest(os.path.join(spot_dir, "manifest.json")) or {}).get("manifest_digest"), "verified": True})
     identity = dataset_identity(
-        [{"kind": "market_history", "name": "funding", "digest": fman.get("manifest_digest"), "verified": True},        # _verified_dataset / load_universe_dir raised unless they re-hashed
-         {"kind": "market_history", "name": mark_name, "digest": mman.get("manifest_digest"), "verified": True},
-         {"kind": "universe_capture", "name": "universe", "digest": uinfo.get("manifest_sha256"), "verified": True}],
+        id_components,
         extra={"funnel_digest": fn.report().get("funnel_digest"), "window_ms": [w0, w1], "mark_interval": mark_iv, "holdout_cut_ms": cut_ms,
                "include_statuses": list(include_statuses), "quote_coins": list(quote_coins) if quote_coins else None})
     if not identity["identifies_every_component"]:
         state_findings["invalid"].append("a loaded manifest carries no digest: the dataset cannot be identified")
     info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
                        "dataset_state": dataset_state(state_findings), "loaded_identity": identity,
-                       "loaded_identity_scope": "the funding + mark-kline datasets and the universe capture this load READ (the spot snapshot only labels legs; index-kline / open-interest are not loaded): "
+                       "loaded_identity_scope": "the funding + mark-kline datasets, the universe capture and (when supplied) the spot snapshot this load READ; index-kline / open-interest are not loaded: "
                                                 "the report-level dataset_identity of dataset_report covers every manifest under the data root",
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
@@ -1987,8 +1999,8 @@ def evaluate_family(series: Sequence[SymbolSeries], kind: str, *, ledger_path: O
                            "cost_basis": "carry_costs authoritative names: fee VENUE_STATED (base tier), spread ASSUMED 0.4, maker MODELLED", "symbols": len(series),
                            "hedgeability_basis": HEDGE_BASIS, "multiple_testing_scope": "PERSISTENT_LEDGER_FILE", "ledger_path": ledger_path and os.path.abspath(ledger_path),
                            "time_mode": "REPLAY_OBSERVATION_TIME", "selection": "formation-window information only; never realised future funding",
-                           "dataset_state": (universe_info or {}).get("dataset_state") if isinstance(universe_info, Mapping) else None,
-                           "loaded_identity": (universe_info or {}).get("loaded_identity") if isinstance(universe_info, Mapping) else None}
+                           "dataset_state": universe_info.get("dataset_state") if _verified_verdict(universe_info) is not None else None,
+                           "loaded_identity": universe_info.get("loaded_identity") if _verified_verdict(universe_info) is not None else None}
     if any(s.interval_min is None for s in series):
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "FUNDING_NORMALISATION_UNKNOWN", "reason": "a symbol carries no fundingInterval"})
         return out
@@ -2304,18 +2316,32 @@ def dataset_report(*, data_root: Optional[str], universe_dir: Optional[str], spo
     dstate = dataset_state(findings)
     idx_ds = next((d for d in inv["datasets"] if d["dataset"] == "index-kline"), None)
     basis_ok = bool(idx_ds and idx_ds["verified"] and idx_ds["dataset_status"] == "COMPLETE")
+    idx_missing: List[str] = []
+    if basis_ok:                                   # a dataset-level COMPLETE is not per-symbol coverage (the same defect the state fixes for funding and mark): every loaded symbol needs its own COMPLETE index series
+        try:
+            with open(os.path.join(idx_ds["dir"], "manifest.json"), "rb") as _fh:
+                _isyms = (json.loads(_fh.read()).get("symbols") or {})
+        except (OSError, ValueError, AttributeError):
+            _isyms = {}
+        idx_missing = sorted(sy for sy in rep["symbols_included"] if not (isinstance(_isyms, dict) and isinstance(_isyms.get(sy), dict) and _isyms[sy].get("status") == "COMPLETE"))
+    hedgeable = int((rep.get("hedge_counts") or {}).get("SPOT_TRADING", 0) or 0)
     carry_why = ([] if spot_dir is not None else ["no spot-instruments snapshot: hedgeability is unknown for every symbol"]) \
+        + ([] if spot_dir is None or hedgeable > 0 else ["no loaded symbol has a Bybit spot pair that is trading (SPOT_TRADING count 0): nothing is hedgeable"]) \
         + ([] if basis_ok else ["no verified COMPLETE index-kline dataset: the spot-vs-perp basis is UNMEASURED, so a hedged-carry claim is impossible"]) \
+        + ([] if not idx_missing else [f"index-kline is not COMPLETE for {len(idx_missing)} of {len(rep['symbols_included'])} loaded symbols (first: {idx_missing[:5]}): the basis is UNMEASURED for them"]) \
         + ([] if dstate["sufficient"] else ["the dataset itself is not " + DATA_SUFFICIENT_NOT_EVALUATED])
     rep["dataset_state"] = dstate
     rep["dataset_identity"] = dataset_identity(
         [{"kind": m["kind"], "name": m["kind"], "digest": m["digest"], "verified": m["verified"]} for m in manifests],
         extra={"funnel_digest": ((info or {}).get("funnel") or {}).get("funnel_digest"), "history_window": (info or {}).get("history_window"), "mark_interval": (info or {}).get("mark_interval")})
-    if not rep["dataset_identity"]["identifies_every_component"] and dstate["complete_over_required_window"]:
+    if not rep["dataset_identity"]["identifies_every_component"] and dstate["complete_over_requested_window"]:
         findings["invalid"].append("a manifest carries no digest: the dataset cannot be identified")
         dstate = rep["dataset_state"] = dataset_state(findings)
+    if dstate["state"] in (DATA_UNAVAILABLE, DATA_INVALID):          # the identity of a dataset that is not usable must never read as a certificate (a CONFLICTED dataset re-hashes fine)
+        rep["dataset_identity"] = {**rep["dataset_identity"], "digest": None, "identifies_every_component": False,
+                                   "reason": f"{dstate['state']}: a dataset that is not usable has no identity"}
     rep["capabilities"] = {"perp_only_ranked_funding": dstate["sufficient"],
-                           "spot_hedged_carry": {"supported": dstate["sufficient"] and spot_dir is not None and basis_ok, "why_not": carry_why}}
+                           "spot_hedged_carry": {"supported": bool(dstate["sufficient"] and spot_dir is not None and basis_ok and not idx_missing and hedgeable > 0), "why_not": carry_why}}
     data_ready = dstate["state"] in COMPLETE_DATA_STATES
     rep["readiness"] = readiness_levels(
         data_ready=data_ready, data_reasons=[] if data_ready else (dstate["reasons"] or [rep["reason"] or "funding/mark-kline/universe not all verified and COMPLETE"]),

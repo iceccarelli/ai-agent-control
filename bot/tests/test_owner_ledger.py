@@ -195,6 +195,29 @@ def test_the_strategy_contribution_is_exact_for_the_complete_round_trip_and_kept
     assert rep["equity_bridge"]["change_in_equity_usd"] != pytest.approx(s["net_usd"])
 
 
+def test_a_partial_perp_review_states_no_strategy_rate_and_keeps_the_dollars(tmp_path, monkeypatch):
+    """Round 18 review: when the perp review excludes round trips whose records are incomplete (OPEN_LIFECYCLE, NO_SPOT_REFERENCE ... are strategy limits, not account gaps) the ledger can still
+    reconcile and used to publish a strategy return on capital from the complete trips only: the number the review itself withholds."""
+    w = World()
+    w.lines = _statement(w)
+    normal = ledger(w, tmp_path)
+    assert normal["strategy_contribution"]["status"] == "COMPUTED" and normal["strategy_contribution"]["partial"] is False
+    orig = AR.review
+
+    def partial_review(*a, **k):
+        r = orig(*a, **k)
+        r["economics"] = {**r["economics"], "partial": True, "rates_withheld": True}
+        r["excluded_round_trips"] = {**r["excluded_round_trips"], "count": 1, "by_status": {"EXCLUDED_OPEN": 1}}
+        return r
+    monkeypatch.setattr(AR, "review", partial_review)
+    rep = ledger(w, tmp_path)
+    s = rep["strategy_contribution"]
+    assert s["status"] == "COMPUTED" and s["partial"] is True and s["excluded_round_trips"]["count"] == 1 and s["net_usd"] == pytest.approx(normal["strategy_contribution"]["net_usd"])      # dollars unchanged
+    c = rep["economic_capital"]
+    assert c.get("strategy_return_on_capital_period") is None and c.get("strategy_return_on_capital_annualised_simple_pct") is None and "partial" in c.get("strategy_return_withheld", "")
+    assert (c.get("return_on_hedged_notional") or {}).get("strategy_return_period") is None
+
+
 def test_without_a_spot_reference_the_account_still_reconciles_but_the_strategy_basis_is_unknown_and_says_why(tmp_path):
     w = World()
     for f in w.fills:

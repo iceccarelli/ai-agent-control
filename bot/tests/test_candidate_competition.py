@@ -232,6 +232,25 @@ def test_with_verified_data_and_a_universe_the_three_families_are_evaluated_and_
     assert rep["winner"] is None
 
 
+def test_the_cross_sectional_row_carries_the_data_state_with_the_evaluators_verdict_folded_in(tmp_path, offline, monkeypatch):
+    """Round 18 review: the two DATA_SUFFICIENT_* verdict states were never produced by any code. The competition row is where an evaluation's verdict meets the state of the data it read."""
+    _reset()
+    root, uni, spot = _hist(tmp_path)                                                      # the default fixture: three symbols are PARTIAL over the window
+    x = row(CC_.run_competition(data_root=root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), unreserved_exploratory=True), "cross_sectional_funding")
+    assert x["dataset_state"]["state"] == "DATA_INCOMPLETE" and x["readiness_levels"]["DATA_READY"] is False
+    _reset()
+    other = tmp_path / "ok"
+    other.mkdir()
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 10)                                          # complete data that the registered 60 rows would call insufficient is sufficient for 10 rows ...
+    root2, uni2, spot2 = _hist(other, complete_window=True)
+    y = row(CC_.run_competition(data_root=root2, universe_dir=uni2, spot_dir=spot2, mark_interval=MARK_IV, ledger_dir=str(other / "led"), unreserved_exploratory=True), "cross_sectional_funding")
+    assert y["dataset_state"]["state"] == "DATA_VALID_BUT_INSUFFICIENT" and any("evaluator's own verdict is INSUFFICIENT_DATA" in r for r in y["dataset_state"]["reasons"])      # ... until the evaluator says not enough
+    for r in (x, y):
+        assert r["verdict"] == "INSUFFICIENT_DATA"                                         # the state never changes a verdict, level or rank
+    rest = [r for r in CC_.run_competition(ledger_dir=str(tmp_path / "led2"))["results"] if r["name"] != "cross_sectional_funding"]
+    assert all("dataset_state" not in r for r in rest)
+
+
 def test_the_ledger_is_persistent_by_default_a_fresh_process_keeps_the_count_and_an_identical_rerun_does_not_inflate_it(tmp_path, monkeypatch):
     monkeypatch.delenv("CANDIDATE_LEDGER_DIR", raising=False)         # the suite isolates the variable for the whole session; this test is about the DEFAULT resolution without it
     _reset()
