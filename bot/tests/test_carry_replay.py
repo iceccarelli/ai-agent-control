@@ -613,3 +613,17 @@ class TestTheReplayStatesItsFinancing:
                       execution_mode="overlay")
         assert r["usdt_financing"]["usdt_borrow_apr"] is None
         assert r["net_after_usdt_financing_usd"] is None
+
+
+class TestAcquireHasNoUsdtFinancingProfile:
+    def test_in_acquire_the_spot_purchase_is_committed_capital_not_a_deficit(self):
+        for apr in (None, 0.05):
+            r = rp.replay(_rally_rows(), notional=100_000.0, borrow_apr=0.0,
+                          execution_mode="acquire", usdt_borrow_apr=apr)
+            f = r["usdt_financing"]
+            assert f["available"] is False and "ACQUIRE" in f["why"]
+            assert f["interest_usd"] is None and r["net_after_usdt_financing_usd"] is None
+            assert not any("negative usdt" in x.lower() for x in r["not_modelled"])
+            assert "break_even_status" not in r["owner_capital"]
+            text = "\n".join(rp.usdt_financing_lines(f, net_usd=r["net_usd"]))
+            assert "not measured" in text

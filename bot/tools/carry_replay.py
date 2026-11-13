@@ -1320,9 +1320,23 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     span_days = max((rows[-1].ms - rows[0].ms) / float(DAY_MS), 1.0)
     years = span_days / 365.25
     net = funding_usd + basis_usd - fees_usd - borrow_usd
-    financing = usdt_financing_profile(
-        journal, start_ms=int(rows[0].ms), end_ms=int(rows[-1].ms),
-        notional=notional, usdt_borrow_apr=usdt_borrow_apr)
+    if execution_mode == cb.OVERLAY:
+        financing = usdt_financing_profile(
+            journal, start_ms=int(rows[0].ms), end_ms=int(rows[-1].ms),
+            notional=notional, usdt_borrow_apr=usdt_borrow_apr)
+    else:
+        # In ACQUIRE the journal's USDT account carries the spot leg's PURCHASE
+        # (cash the book commits, priced by the capital rule and `borrow_apr`), not
+        # a deficit from realised short losses: reporting it as financing would
+        # present committed capital as a loan and double-count `borrow_apr`.
+        financing = {
+            "available": False, "state": "UNSTATED" if usdt_borrow_apr is None
+            else "STATED", "usdt_borrow_apr": usdt_borrow_apr,
+            "interest_usd": None, "interest_after_margin_cash_usd": None,
+            "why": "the profile is defined for the OVERLAY (the short's realised "
+                   "losses are the only cash that moves); in ACQUIRE the journal's "
+                   "USDT account carries the spot purchase, which is committed "
+                   "capital, not a financing deficit"}
     held = sum(t["prints_held"] for t in trades) / cb.FUNDING_PERIODS_PER_DAY
     liquidation_report = _liquidation_report(
         liquidation, require_liquidation_evidence, raw_broker.liq_stats,

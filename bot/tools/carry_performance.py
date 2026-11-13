@@ -528,8 +528,11 @@ def _economic_net_of(c: Mapping[str, Any]) -> Tuple[Optional[float], str]:
 
 #: How far an acquire cycle's spot leg may differ from its hedge and still be the
 #: hedge: the engine's own DELTA_BAND (carry_engine.DELTA_BAND, pinned equal by a
-#: test), because the hedge is the perp short snapped to the lot, which can sit up
-#: to about a lot under the BTC actually held.
+#: test), measured the engine's way, `CarryPosition.delta_fraction`: |spot qty -
+#: perp qty| as a fraction of BOTH legs (about 3.9% of the larger one at the band),
+#: because the hedge is the perp short snapped to the lot, which can sit up to about
+#: a lot under the BTC actually held. A pair the engine itself accepts is therefore
+#: never withheld here.
 ACQUIRE_HEDGE_TOLERANCE = 0.02
 
 
@@ -552,10 +555,11 @@ def _acquire_spot_leg_problem(c: Mapping[str, Any]) -> Optional[str]:
                 "pair's")
     if hedged <= 0 or bought <= 0:
         return "no hedged quantity or no spot purchase to compare"
-    if abs(bought - hedged) > ACQUIRE_HEDGE_TOLERANCE * max(bought, hedged):
+    if abs(bought - hedged) > ACQUIRE_HEDGE_TOLERANCE * (bought + hedged):
         return (f"the spot leg ({bought:.8f} BTC bought) was not the size of "
-                f"the perp short ({hedged:.8f} BTC): an under-sized hedge is "
-                "not a delta-neutral pair")
+                f"the perp short ({hedged:.8f} BTC) within the engine's delta "
+                "band: a directional position wearing a hedge is not a "
+                "delta-neutral pair")
     return None
 
 

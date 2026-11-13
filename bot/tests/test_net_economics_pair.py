@@ -504,14 +504,32 @@ def test_a_flat_acquire_pair_and_a_measured_overlay_do_not_follow_the_btc_price(
 
 def test_a_hedge_within_the_engines_delta_band_is_still_a_pair():
     """The perp short is snapped to the lot, so it can sit a little under the BTC
-    held: inside the engine's DELTA_BAND that is a pair, outside it is not."""
-    inside, outside = L.Journal(), L.Journal()
-    acquire_shaped(inside, 0, 10, tag="a", close=95_000.0, buy=1.0, perp=0.99,
-                   sell=1.0)
-    acquire_shaped(outside, 0, 10, tag="b", close=95_000.0, buy=1.0, perp=0.95,
-                   sell=1.0)
-    assert perf.cycles_from_journal(inside)[0]["economic_net_usd"] is not None
-    assert perf.cycles_from_journal(outside)[0]["economic_net_usd"] is None
+    held: inside the engine's DELTA_BAND (|spot - perp| / both legs, as
+    `CarryPosition.delta_fraction`) that is a pair, outside it is not. The boundary
+    is the engine's own, not half of it."""
+    for perp, is_pair in ((0.99, True), (0.961, True), (0.96, False), (0.95, False),
+                          (1.04, True), (1.041, False)):
+        j = L.Journal()
+        acquire_shaped(j, 0, 10, tag="a", close=95_000.0, buy=1.0, perp=perp, sell=1.0)
+        got = perf.cycles_from_journal(j)[0]["economic_net_usd"]
+        assert (got is not None) is is_pair, (perp, got)
+
+
+@pytest.mark.parametrize("spot,perp", [(1.0, 0.99), (1.0, 0.961), (1.0, 0.96), (1.0, 0.9), (0.9, 1.0), (1.0, 1.04), (1.0, 1.041),
+                                      (0.5, 1.0), (0.0015, 0.001), (0.0016, 0.001), (0.002, 0.001)])
+def test_the_pair_boundary_is_exactly_the_engines_own_delta_fraction(spot, perp):
+    """The same quantities through `CarryPosition.delta_fraction` (the number that trips the engine's rebalance): the engine calls them a hedge iff its
+    fraction is within the band, and so does the report. A pair the engine would accept is never withheld; one it would rebalance is never a pair."""
+    import carry_engine as CE
+    price = 100_000.0
+    pos = CE.CarryPosition(
+        spot=CE.Leg(symbol="BTCUSDT", side="Buy", product="spot", requested_qty=spot, filled_qty=spot, avg_price=price),
+        perp=CE.Leg(symbol="BTCUSDT", side="Sell", product="linear", requested_qty=perp, filled_qty=perp, avg_price=price))
+    engine_says_hedge = pos.delta_fraction(price) <= CE.DELTA_BAND
+    j = L.Journal()
+    acquire_shaped(j, 0, 10, tag="a", close=95_000.0, buy=spot, perp=perp, sell=spot)
+    report_says_pair = perf.cycles_from_journal(j)[0]["economic_net_usd"] is not None
+    assert report_says_pair is engine_says_hedge, (spot, perp, pos.delta_fraction(price))
 
 
 def test_the_acquire_hedge_tolerance_is_the_engines_delta_band():
