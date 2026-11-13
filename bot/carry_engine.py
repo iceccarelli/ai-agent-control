@@ -1853,6 +1853,12 @@ class CarryEngine:
             logger.warning("carry: the funding shortfall could not be "
                            "advanced (capital cost %r, print %r)", c,
                            funding_bps)
+            # The print is NOT in the accumulator, so what it holds is no longer
+            # the bleed paid: an unknown stays unknown (it is never read as 0 =
+            # "funding is paying for the hold"), and it does not become known again
+            # because a later print could be stepped. The original rule decides,
+            # exactly as for a restored pair whose shortfall was not persisted.
+            pos.exit_shortfall_known = False
             return
         pos.exit_shortfall_bps = stepped
 

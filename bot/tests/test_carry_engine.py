@@ -651,3 +651,58 @@ class TestContinuationExit:
         rules = {r["id"]: r for r in legacy._exit_outlook(100_000.0)["rules"]}
         assert rules["FUNDING_INVERTED"]["decides"] is True
         assert rules["FUNDING_SHORTFALL"]["active"] is None
+
+
+# ---------------------------------------------------------------------------
+# Round 17 red team on the continuation exit: a held print that cannot advance
+# the shortfall leaves the accumulator one print short, and the position still
+# read as "known" (shortfall 0 -> "funding is paying for the hold" -> stay). An
+# unknown must stay unknown: the original rule then decides, as for a restored
+# pair. And a borrow rate the engine cannot price is refused at construction,
+# like the opportunity cost, not discovered one silent print at a time.
+# ---------------------------------------------------------------------------
+
+class TestAnUnadvanceableShortfallIsUnknown:
+    @staticmethod
+    def _held():
+        return TestContinuationExit._held("continuation")
+
+    def test_a_print_that_cannot_advance_the_shortfall_makes_it_unknown(self):
+        eng = self._held()
+        assert eng.position.exit_shortfall_known is True
+        eng.borrow_apr = float("nan")           # an unusable capital cost: the step cannot be taken
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)   # worth far more than a round trip
+        assert eng.position is not None and eng.position.exit_shortfall_known is False
+        assert eng.position.exit_shortfall_bps == 0.0, "the missed print is not guessed into the accumulator"
+        assert d.action == "hold"               # one negative print is below the legacy rule's three
+
+    def test_the_legacy_rule_decides_while_the_shortfall_is_unknown(self):
+        eng = self._held()
+        eng.borrow_apr = float("nan")
+        for _ in range(2):
+            eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
+        d = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
+        assert d.action == "unwound" and d.reason == "FUNDING_INVERTED"
+
+    def test_it_does_not_become_known_again_because_a_later_print_could_be_stepped(self):
+        eng = self._held()
+        eng.borrow_apr = float("nan")
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
+        eng.borrow_apr = 0.0                    # the cost is usable again, but the missed print is still missing
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=6.0)
+        assert eng.position.exit_shortfall_known is False
+
+    def test_the_unknown_survives_a_restart(self):
+        eng = self._held()
+        eng.borrow_apr = float("nan")
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-50.0)
+        assert eng.to_state()["position"]["exit_shortfall_known"] is False
+
+    @pytest.mark.parametrize("bad", [-0.01, float("nan"), float("inf")])
+    def test_an_unusable_borrow_rate_leaves_every_held_shortfall_unknown(self, bad):
+        """The engine is built with the rate as given (the gate refuses every ENTRY on it, pinned in test_entry_gate_parity; config and build_bot already
+        refuse it upstream): a position that is nevertheless held can never advance its shortfall, and each such print leaves it unknown, never 0."""
+        eng = self._held()
+        eng.borrow_apr = bad
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.1)
+        assert eng.position.exit_shortfall_known is False
