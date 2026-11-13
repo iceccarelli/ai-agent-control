@@ -128,10 +128,52 @@ def _one(row: Any, label: str, now_ms: int) -> Tuple[int, decimal.Decimal]:
     return ts, exact
 
 
-def build(paths: Sequence[str], now_ms: Optional[int] = None) -> Dict[str, Any]:
+def check_capture_manifest(paths: Sequence[str], manifest_path: Optional[str] = None) -> Dict[str, Any]:
+    """Re-hash the pages against the manifest ``funding_capture`` wrote, or say that there is none. Round 19 (reproduced): ``build`` took only ``--in`` files and never read ``manifest.json``, so a page
+    edited after the capture ('0.0001' -> '0.0003' moved the mean from 1.17 to 2.50 bps) or a middle page dropped (the manifest said ``missing_on_grid`` 1, the report said coverage 1.0) was accepted.
+
+    With ``manifest_path`` (a manifest.json or a capture directory), or when every input sits in ONE directory holding a ``manifest.json``, the set of inputs must EQUAL the manifest's page set, every
+    page must re-hash to the manifest's sha256, and a capture that stopped at ``max_pages`` (truncated) is refused. Inputs with no manifest are hand-saved: no lineage is claimed for them."""
+    mp = manifest_path
+    if mp is None:
+        dirs = {os.path.dirname(os.path.abspath(p)) for p in paths}
+        cand = os.path.join(next(iter(dirs)), "manifest.json") if len(dirs) == 1 else None
+        if cand is None or not os.path.isfile(cand):
+            return {"status": "NO_MANIFEST_HAND_SAVED_INPUTS", "note": "no manifest.json beside the inputs: the pages are operator-saved, so that they are the complete, unedited history of the window cannot be shown "
+                                                                          "(use tools/funding_capture.py and pass its directory)"}
+        mp = cand
+    if os.path.isdir(mp):
+        mp = os.path.join(mp, "manifest.json")
+    try:
+        raw, man_sha = _read(mp)
+        doc = json.loads(raw.decode("utf-8", "strict"))
+        pages = doc["pages"]
+        expected = {os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(mp)), str(pg["file"]))): str(pg["sha256"]) for pg in pages}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, PrintsError) as exc:
+        raise PrintsError(f"MANIFEST_UNREADABLE: {os.path.basename(str(mp))}: {type(exc).__name__}") from exc
+    given = {os.path.realpath(p) for p in paths}
+    missing = sorted(os.path.basename(f) for f in set(expected) - given)
+    extra = sorted(os.path.basename(f) for f in given - set(expected))
+    if missing or extra:
+        raise PrintsError(f"PAGE_SET_DIFFERS: the inputs are not the manifest's pages (missing: {missing[:5]}; not in the manifest: {extra[:5]}): a page dropped or added after the capture changes the "
+                          f"evidence without changing a hash")
+    for f, want in sorted(expected.items()):
+        _data, got = _read(f)
+        if got != want:
+            raise PrintsError(f"PAGE_HASH_MISMATCH: {os.path.basename(f)} no longer hashes to the manifest's sha256: the page was edited after the capture")
+    if doc.get("stopped_because") == "max_pages":
+        raise PrintsError("CAPTURE_TRUNCATED: the capture stopped at its page cap, not at the start of the window: the history is incomplete; capture again with a larger cap")
+    miss = doc.get("missing_on_grid")
+    return {"status": "VERIFIED", "file": os.path.basename(mp), "sha256": man_sha, "pages": len(expected), "stopped_because": doc.get("stopped_because"),
+            "missing_on_grid": len(miss) if isinstance(miss, list) else None, "expected_on_grid": doc.get("expected_on_grid"), "distinct_settlements": doc.get("distinct_settlements"),
+            "note": "every input re-hashes to the manifest and the set equals the manifest's; the manifest itself is the capturer's word (a hash shows what was read, not who produced it)"}
+
+
+def build(paths: Sequence[str], now_ms: Optional[int] = None, manifest_path: Optional[str] = None) -> Dict[str, Any]:
     """Parse and merge. Returns the in-window prints and a report; writes nothing."""
     if not paths:
         raise PrintsError("no input files")
+    capture_manifest = check_capture_manifest(paths, manifest_path)
     now = _now_ms() if now_ms is None else min(int(now_ms), _now_ms())       # a caller can only move the clock EARLIER, never claim a later one
     merged: Dict[int, decimal.Decimal] = {}
     digests: List[Dict[str, Any]] = []
@@ -157,7 +199,7 @@ def build(paths: Sequence[str], now_ms: Optional[int] = None) -> Dict[str, Any]:
     inside = sorted((t, float(v)) for t, v in merged.items() if CP.WINDOW_START_MS <= t < CP.WINDOW_END_MS)
     cov = CP.coverage(inside, now)
     return {"prints": inside, "report": {
-        "inputs": digests, "distinct_settlements_read": len(merged), "written": len(inside),
+        "inputs": digests, "manifest": capture_manifest, "distinct_settlements_read": len(merged), "written": len(inside),
         "before_the_window_not_written": len(before), "after_the_window_not_written": len(after),
         "window": {"start": AR._iso(CP.WINDOW_START_MS), "end": AR._iso(CP.WINDOW_END_MS)}, "coverage": cov,
         "first": AR._iso(inside[0][0]) if inside else None, "last": AR._iso(inside[-1][0]) if inside else None,
@@ -194,9 +236,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Saved Bybit V5 funding-history responses -> the registered prospective input. Offline; no request, no credential.")
     ap.add_argument("--in", dest="inputs", action="append", required=True, help="a saved response file (repeat for each page)")
     ap.add_argument("--out", required=True, help="the prints file to create (never overwritten)")
+    ap.add_argument("--manifest", default=None, help="the capture's manifest.json or its directory (default: the manifest.json beside the inputs, when there is one). The inputs must equal its page set "
+                                                      "and re-hash to it")
     a = ap.parse_args(argv)
     try:
-        built = build(a.inputs)
+        built = build(a.inputs, manifest_path=a.manifest)
         digest = write(built["prints"], a.out)
     except (PrintsError, AR.RecordError, OSError) as exc:
         print(f"prospective_prints: {type(exc).__name__}: {exc}", file=sys.stderr)
