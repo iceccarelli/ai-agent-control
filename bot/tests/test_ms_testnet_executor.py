@@ -1182,3 +1182,89 @@ def test_a_blank_execfee_on_a_trade_row_is_surfaced_as_an_unknown_fee_not_a_meas
     w.fake.execs = [stated]
     z = [x for x in ex.venue_state()["executions"] if x["link_id"] == "g1-q"][0]
     assert z["fee_known"] is True and z["fee_signed_usd"] == 0.0 and z["prov"] == "MEASURED"      # a fee the venue STATED as zero is still measured
+
+
+# ---- Round 19 (capital specialist F5): committed margin, borrow and interest are READ from the venue's wallet answer, observation only; whatever the venue does not state is UNKNOWN, never 0
+def _real_wallet_result():
+    """The committed REAL Testnet wallet-balance answer (23 reads in artifacts/testnet_conformance_evidence.jsonl; every one flat: margin 0, borrow 0, interest 0)."""
+    path = os.path.join(os.path.dirname(HERE), "artifacts", "testnet_conformance_evidence.jsonl")
+
+    def find(x):
+        if isinstance(x, dict):
+            if "totalInitialMargin" in x and isinstance(x.get("coin"), list):
+                return x
+            for v in x.values():
+                r = find(v)
+                if r is not None:
+                    return r
+        elif isinstance(x, list):
+            for v in x:
+                r = find(v)
+                if r is not None:
+                    return r
+        return None
+    for line in open(path, encoding="utf-8"):
+        try:
+            acct = find(json.loads(line))
+        except ValueError:
+            continue
+        if acct is not None:
+            return {"list": [json.loads(json.dumps(acct))]}
+    raise AssertionError("the committed Testnet capture has no wallet-balance answer")
+
+
+def test_the_real_wallet_answer_yields_the_committed_margin_borrow_and_interest_the_venue_stated():
+    facts = TE.parse_wallet_facts(_real_wallet_result())
+    assert facts["readable"] is True and facts["unparsed"] == []
+    assert facts["account"]["totalInitialMargin"] == "0" and facts["account"]["totalMaintenanceMargin"] == "0" and facts["account"]["accountMMRate"] == "0"
+    assert facts["account"]["totalEquity"] and facts["account"]["totalAvailableBalance"]
+    assert set(facts["coins"]) >= {"BTC", "USDT"}
+    assert all(D(c["borrowAmount"]) == 0 and D(c["accruedInterest"]) == 0 for c in facts["coins"].values()), "stated zeros (the venue spells borrowAmount '0.000000000000000000': its text is kept as stated)"
+    d = facts["derived"]
+    assert d["committed_initial_margin"] == "0", "a venue-STATED zero is a measurement: the account was flat"
+    assert d["borrow_stated"] is False and d["accrued_interest_stated"] is False and d["usdt_shortfall"] == "0"
+
+
+def test_a_field_the_venue_did_not_state_is_unknown_never_zero():
+    res = _real_wallet_result()
+    acct = res["list"][0]
+    acct.pop("totalInitialMargin")
+    acct["totalMaintenanceMargin"] = ""
+    acct["accountLTV"] = "abc"
+    for c in acct["coin"]:
+        c.pop("borrowAmount")
+    facts = TE.parse_wallet_facts(res)
+    assert facts["account"]["totalInitialMargin"] is None and facts["account"]["totalMaintenanceMargin"] is None and facts["account"]["accountLTV"] is None
+    assert facts["unparsed"] == ["account.accountLTV"], "a figure that is not a number is listed, not coerced"
+    assert facts["derived"]["committed_initial_margin"] is None, "no stated margin is NOT 'no margin'"
+    assert facts["derived"]["borrow_stated"] is None, "an absent borrowAmount is not 'nothing borrowed'"
+    assert facts["derived"]["accrued_interest_stated"] is False, "the fields that WERE stated still count"
+
+
+def test_a_stated_loan_and_a_negative_usdt_balance_are_surfaced():
+    res = _real_wallet_result()
+    for c in res["list"][0]["coin"]:
+        if c["coin"] == "USDT":
+            c["borrowAmount"], c["walletBalance"], c["accruedInterest"] = "12.5", "-5.25", "0.0004"
+    d = TE.parse_wallet_facts(res)["derived"]
+    assert d["borrow_stated"] is True and d["accrued_interest_stated"] is True and d["usdt_shortfall"] == "5.25"
+
+
+@pytest.mark.parametrize("bad", [None, {}, {"list": []}, {"list": [None]}, {"list": [{"coin": "x"}]}, "text"])
+def test_an_unreadable_wallet_answer_has_no_facts_and_never_raises(bad):
+    facts = TE.parse_wallet_facts(bad)
+    assert facts["readable"] is False and facts["account"] == {} and facts["coins"] == {} and set(facts["derived"].values()) == {None}
+
+
+def test_the_executor_records_the_wallet_facts_without_touching_the_trading_answer(w):
+    """The fake Testnet states no margin, borrow or interest field: the recorded facts say None (unknown), the account state answer is exactly what it was, and a malformed answer still raises."""
+    run, ctx, rec = begin(w, submit=False)
+    before = run.ex.account_state({}, 0)
+    assert run.ex.wallet_facts and run.ex.wallet_facts[-1]["facts"]["readable"] is True
+    sample = run.ex.wallet_facts[-1]
+    assert isinstance(sample["ts_ms"], int) and sample["facts"]["account"]["totalInitialMargin"] is None and sample["facts"]["derived"]["committed_initial_margin"] is None
+    assert run.ex.account_state({}, 0)["equity_usd"] == before["equity_usd"]
+    n = len(run.ex.wallet_facts)
+    run.ex.account_state({}, 0)
+    assert len(run.ex.wallet_facts) == n, "an unchanged answer inside the sampling interval adds nothing"
+    assert len(run.ex.wallet_facts) <= TE.WALLET_FACT_SAMPLES_MAX

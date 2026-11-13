@@ -873,6 +873,10 @@ class Run:
                 meas.setdefault(link, {}).update({k: x for k, x in v.items() if x is not None})
             ws = {(int(t), str(v)) for t, v in (meas.get("__wallet__", {}).get("samples", []))} | {(int(t), str(v)) for t, v in self.ex.wallet_samples}
             meas["__wallet__"] = {"samples": [[t, v] for t, v in sorted(ws)][-5000:]}
+            facts = {int(x["ts_ms"]): x for x in (meas.get("__wallet_facts__", {}).get("samples", []) or []) if isinstance(x, dict) and isinstance(x.get("ts_ms"), int)}
+            facts.update({int(x["ts_ms"]): x for x in getattr(self.ex, "wallet_facts", [])})       # Round 19: committed margin / borrow / interest as the venue STATED them (None = not stated)
+            ordered = [facts[k] for k in sorted(facts)]
+            meas["__wallet_facts__"] = {"samples": ordered[:1] + ordered[1:][-399:] if ordered else []}
             _write_json(self.ctx.path("meas"), meas)
             dec = _read_json(self.ctx.path("decision"))
             decision_id = dec.get("decision_id") if isinstance(dec, dict) else None
