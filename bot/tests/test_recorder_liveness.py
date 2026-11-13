@@ -157,6 +157,25 @@ def test_a_stale_status_without_a_supervisor_file_still_says_the_age(tmp_path):
     assert obs["state"] == "STALE" and "900" in obs["detail"] and "no supervisor status" in obs["detail"]
 
 
+def test_a_status_stamped_in_the_future_is_a_fault_not_a_healthy_recorder(tmp_path):
+    """Round 19 (data specialist F7, reproduced): only ``age > 300 s`` was STALE, so a status file stamped seven days AHEAD (a frozen file after a forward clock step, followed by a dead recorder) read
+    RECORDING with age_s = -604800, and a negative growth_age_s read RECORDING too: a dead recorder reported healthy, the data-gap alert suppressed."""
+    p, now = status_file(tmp_path, age_s=-7 * 86400)
+    obs = RM.recorder_observation(p, now=now)
+    assert obs["state"] == "FAULT" and "future" in obs["detail"] and "604800" in obs["detail"], obs
+    p, now = status_file(tmp_path, age_s=-RM.RECORDER_FUTURE_SKEW_S - 1)
+    assert RM.recorder_observation(p, now=now)["state"] == "FAULT", "just past the tolerance"
+    p, now = status_file(tmp_path, age_s=-RM.RECORDER_FUTURE_SKEW_S + 5)
+    assert RM.recorder_observation(p, now=now)["state"] == "RECORDING", "a few seconds of clock skew between the writer and the reader is not a fault"
+    p, now = status_file(tmp_path, age_s=2, growth_age_s=-40.0)
+    neg = RM.recorder_observation(p, now=now)
+    assert neg["state"] == "FAULT" and "growth_age_s" in neg["detail"], "a log whose age is negative has not been measured against the same clock"
+    p, now = status_file(tmp_path, age_s=2)
+    assert RM.recorder_observation(p, now=now)["state"] == "RECORDING", "control: a fresh status"
+    p, now = status_file(tmp_path, age_s=1830)
+    assert RM.recorder_observation(p, now=now)["state"] == "STALE", "control: an old one is still STALE (precedence unchanged)"
+
+
 def test_a_live_heartbeat_over_a_log_that_stopped_growing_is_not_persisting_not_recording(tmp_path):
     p, now = status_file(tmp_path, age_s=10, growth_age_s=900)
     obs = RM.recorder_observation(p, now=now)
