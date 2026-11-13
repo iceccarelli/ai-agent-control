@@ -286,7 +286,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
         net_basis = "UNKNOWN: no committed or supplied data measures this edge"
         extra: Dict[str, Any] = {}
         mt_led, mt_path = _ledger(RH.normalise_family(r["multiple_testing"]["family"]), ldir)
-        mt = {"family": r["multiple_testing"]["family"], "n_variants_counted": mt_led.n_variants, "scope": "PERSISTENT_LEDGER_FILE", "ledger_path": mt_path}
+        persisted_trials = mt_led.n_variants                 # what the family's PERSISTENT ledger file counts (the cross-sectional row below re-states n_variants_counted from this run's evaluation)
+        mt = {"family": r["multiple_testing"]["family"], "n_variants_counted": persisted_trials, "scope": "PERSISTENT_LEDGER_FILE", "ledger_path": mt_path}
         if name == "cash_and_carry" and econ is not None and "unconditional_forced_hold" in econ:
             pols = btc_policies(econ)
             lost = [p for p in pols if p["verdict"] == "REJECTED"]
@@ -340,7 +341,9 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
             verdict = "UNTESTED"
         # A family whose persistent ledger has COUNTED trials has been tried: 'no test has been run' is false, its data was read once, and offering it as a next
         # hypothesis would invite a further variant on that data (a wider multiple-testing family). Round 17: reg-1 and reg-2 were counted yet the row said UNTESTED.
-        n_counted = mt.get("n_variants_counted") or 0
+        # Only the PERSISTENT ledger counts here (`persisted_trials`): a refused or unevaluated run states a count of its own (the cross-sectional row's re-stated total) and has
+        # recorded nothing, which `tests/test_history_holdout.py` pins (a refused run leaves no ledger file and stays UNTESTED).
+        n_counted = persisted_trials or 0
         if verdict == "UNTESTED" and name not in RESEARCH_ONLY and n_counted > 0:
             verdict = "INSUFFICIENT_DATA"
             reasons = [x for x in reasons if not x.startswith("no test has been run")]
