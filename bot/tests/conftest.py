@@ -67,9 +67,12 @@ os.environ["CAPITAL_ANCHOR_DIR"] = os.path.join(_SESSION_OWNER_STATE, "capital_a
 
 
 def _real_owner_state_fingerprint():
-    """(name, size, mtime_ns) of what a test run must never change under the real ``~/.ai-agent-control``: the holdout registry and its sidecars, the capital anchor directory, the autopilot's engine root book."""
+    """(name, size, mtime_ns) of what a test run must never change under the real ``~/.ai-agent-control``: the holdout registry and its sidecars, the capital anchor directory, the autopilot's engine root
+    book AND its high-water mark ``capital_hwm.json`` (Round 18: it was named protected but not fingerprinted), and every file of the anchor and candidate-ledger directories by size AND mtime (a same-size
+    in-place rewrite of a lineage or ledger file used to pass)."""
     out = []
-    for rel in ("history_holdout.jsonl", "history_holdout.jsonl.chain", "history_holdout.jsonl.head", "ms_autopilot/capital.json", "ms_testnet_capability.json", "ms_autopilot_grant.json"):
+    for rel in ("history_holdout.jsonl", "history_holdout.jsonl.chain", "history_holdout.jsonl.head", "ms_autopilot/capital.json", "ms_autopilot/capital_hwm.json", "ms_testnet_capability.json",
+                "ms_autopilot_grant.json"):
         p = os.path.join(_REAL_OWNER_HOME, rel)
         try:
             st = os.stat(p)
@@ -78,12 +81,12 @@ def _real_owner_state_fingerprint():
             out.append((rel, None, None))
     anchor = os.path.join(_REAL_OWNER_HOME, "capital_anchor")
     try:
-        out.append(("capital_anchor/", tuple(sorted((n, os.stat(os.path.join(anchor, n)).st_size) for n in os.listdir(anchor)))))
+        out.append(("capital_anchor/", tuple(sorted((n, os.stat(os.path.join(anchor, n)).st_size, os.stat(os.path.join(anchor, n)).st_mtime_ns) for n in os.listdir(anchor)))))
     except OSError:
         out.append(("capital_anchor/", None))
     ledgers = _REAL_CANDIDATE_LEDGERS
     try:
-        out.append(("candidate_ledgers/", tuple(sorted((n, os.stat(os.path.join(ledgers, n)).st_size) for n in os.listdir(ledgers)))))
+        out.append(("candidate_ledgers/", tuple(sorted((n, os.stat(os.path.join(ledgers, n)).st_size, os.stat(os.path.join(ledgers, n)).st_mtime_ns) for n in os.listdir(ledgers)))))
     except OSError:
         out.append(("candidate_ledgers/", None))
     return tuple(out)

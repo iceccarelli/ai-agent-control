@@ -57,3 +57,28 @@ def test_the_session_end_check_sees_a_change_to_the_real_owner_state(monkeypatch
     before2 = CF._real_owner_state_fingerprint()
     (fake_ledgers / "cash_and_carry.jsonl").write_text("{}\n")
     assert CF._real_owner_state_fingerprint() != before2
+
+
+def test_the_session_end_check_sees_the_high_water_mark_and_a_same_size_rewrite(monkeypatch, tmp_path):
+    """Round 18 (quant specialist): ``ms_autopilot/capital_hwm.json`` is named protected in CLAUDE.md but was not fingerprinted, and the anchor and ledger directories were compared by (name, size)
+    only, so a same-size in-place rewrite of a lineage or ledger file passed the session-end check."""
+    import conftest as CF
+    fake_home = tmp_path / ".ai-agent-control"
+    (fake_home / "ms_autopilot").mkdir(parents=True)
+    (fake_home / "capital_anchor").mkdir()
+    fake_ledgers = tmp_path / "cache" / "candidate_ledgers"
+    fake_ledgers.mkdir(parents=True)
+    monkeypatch.setattr(CF, "_REAL_OWNER_HOME", str(fake_home))
+    monkeypatch.setattr(CF, "_REAL_CANDIDATE_LEDGERS", str(fake_ledgers))
+    hwm, lineage, ledger = fake_home / "ms_autopilot" / "capital_hwm.json", fake_home / "capital_anchor" / "lineage_a.jsonl", fake_ledgers / "cash_and_carry.jsonl"
+    for p in (hwm, lineage, ledger):
+        p.write_text("0123456789\n")
+    stamps = {p: os.stat(p).st_mtime_ns for p in (hwm, lineage, ledger)}
+    before = CF._real_owner_state_fingerprint()
+    for p in (hwm, lineage, ledger):                                  # the SAME number of bytes, different content, a later mtime
+        p.write_text("9876543210\n")
+        os.utime(p, ns=(stamps[p] + 10_000_000, stamps[p] + 10_000_000))
+        assert CF._real_owner_state_fingerprint() != before, p.name
+        p.write_text("0123456789\n")
+        os.utime(p, ns=(stamps[p], stamps[p]))
+        assert CF._real_owner_state_fingerprint() == before, "restoring the bytes and the mtime restores the fingerprint (the check is a sensor, not a lock)"

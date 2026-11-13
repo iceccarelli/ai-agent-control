@@ -318,6 +318,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             failed = True
             continue
         print(json.dumps(report, indent=2))
+        if report.get("error"):       # Round 18: a refresh that WOULD REWRITE HISTORY is refused in the report (not raised), so the exit code said 0 for a refused refresh
+            print(f"REFUSED {ccy}: {report['error']}", file=sys.stderr)
+            failed = True
     return 1 if failed else 0
 
 
