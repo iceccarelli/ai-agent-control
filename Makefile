@@ -107,9 +107,9 @@ control-centre-stop:
 # time, so it does not matter which root, ledger directory or mark interval a later read goes through; $(DATA)/ledgers here only lets --reserve DETECT earlier evaluations (PRIOR_EVALUATION_DETECTED:
 # then add --prior-reads-through <UTC instant> through RESERVE_ARGS=). holdout-status is read-only and prints the window arithmetic (the 660-day explore requirement is NOT enough for a final read).
 reserve-holdout:
-	@test -n "$(EVALHIST)" || { echo "set HIST= (history data root)"; exit 2; }
+	@test -n "$(EVALHIST)" -a -n "$(UNI)" || { echo "set HIST= (history data root) and UNI= (the universe capture): the holdout is reserved only over a dataset the dataset gate calls COMPLETE and sufficient (candidate_readiness.py --dataset-report must print DATA_SUFFICIENT_NOT_EVALUATED first)"; exit 2; }
 	@mkdir -p -m 700 $(DATA)/ledgers
-	cd $(BOT) && $(PY) tools/history_holdout.py --reserve --history-root $(EVALHIST) --mark-interval 240 --ledger-dir $(DATA)/ledgers $(RESERVE_ARGS)
+	cd $(BOT) && $(PY) tools/history_holdout.py --reserve --history-root $(EVALHIST) --universe-dir $(UNI) $(if $(SPOT),--spot-dir "$(SPOT)") --mark-interval 240 --ledger-dir $(DATA)/ledgers $(RESERVE_ARGS)
 
 holdout-status:
 	@test -n "$(EVALHIST)" || { echo "set HIST= (history data root)"; exit 2; }
