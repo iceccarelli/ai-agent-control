@@ -142,8 +142,9 @@ def test_the_verdict_without_a_statement_is_incomplete_and_never_account_verifie
     assert "UNVERIFIED_BY_DESIGN" in rep["custody"]["authenticity"]
 
 
-def _statement(w):
-    """The account's own lines for a world, with a running cash balance: the independent record of every USDT movement."""
+def _statement(w, with_flows=False):
+    """The account's own lines for a world, with a running cash balance: the independent record of every USDT movement. `with_flows` also
+    lists the world's declared USDT deposits and withdrawals (category EXTERNAL, ref = the flow id), as the account's own statement does."""
     rows, bal, n = [], w.usdt0, 0
 
     def add(ts, cat, change, ref=None):
@@ -156,6 +157,16 @@ def _statement(w):
         add(r["ts_ms"], "FUNDING", r["payment_usd"], r["exec_id"])
     add(w.fills[1]["ts_ms"], "TRADE", w.realised, w.fills[1]["exec_id"])
     add(w.fills[1]["ts_ms"], "FEE", -w.fills[1]["fee_usd"], w.fills[1]["exec_id"])
+    if with_flows:
+        for f in w.flows:
+            if f["coin"] == "USDT" and not f["kind"].startswith("INTERNAL"):
+                rows.append({"line_id": f"X-{f['flow_id']}", "ts_ms": f["ts_ms"], "coin": "USDT", "category": "EXTERNAL", "change": f["amount"],
+                             "cash_balance": None, "ref_id": f["flow_id"]})
+        rows.sort(key=lambda r: (r["ts_ms"], r["line_id"]))
+        bal = w.usdt0
+        for r in rows:                                                          # the running balance follows the sorted order
+            bal += r["change"]
+            r["cash_balance"] = bal
     rows.sort(key=lambda r: (r["ts_ms"], r["line_id"]))
     return rows
 
@@ -202,7 +213,9 @@ def test_a_usdt_deposit_is_not_profit_and_moves_the_money_weighted_return_by_its
     w = World()
     t_dep = w.t_open + (w.t_close - w.t_open) // 2
     w.flows = [{"flow_id": "D1", "ts_ms": t_dep, "coin": "USDT", "amount": 5_000.0, "kind": "DEPOSIT"}]
+    w.lines = _statement(w, with_flows=True)                                      # a rate is stated only for a RECONCILED ledger
     rep = ledger(w, tmp_path)
+    assert rep["verdict"].startswith("RECONCILED"), (rep["verdict"], rep["flags"])
     b = rep["equity_bridge"]
     assert b["external_flows_usd"] == 5_000.0 and hard(rep) == []
     assert b["unexplained_usd"] == pytest.approx(0.0, abs=1e-6)
@@ -1128,10 +1141,16 @@ def test_no_figure_is_annualised_over_a_window_shorter_than_thirty_days(tmp_path
     w = World()                                                                      # four days
     w.lines = _statement(w)
     mid_ts = (w.t_open + w.t_close) // 2
-    mid = {"snapshot_id": "mid", "ts_ms": mid_ts, "usdt": w.usdt0 + 0.0, "btc": w.btc0, "btc_price": _open_at(mid_ts), "perp_upl_usd": 0.0, "perp_qty": 0.0}
-    # a middle snapshot that is coherent at that instant: USDT after the opening fill's fee is paid and before anything else (fills are far later)
+    # a middle snapshot that is COHERENT at that instant: the cash after the opening fee and the funding so far, the open short's unrealised
+    # P&L at the mark, its average entry. (An incoherent one is a HARD contradiction, and a contradicted ledger states no rate at all.)
+    mid = {"snapshot_id": "mid", "ts_ms": mid_ts, "btc": w.btc0, "btc_price": _open_at(mid_ts), "perp_qty": -0.5, "perp_mark": _open_at(mid_ts),
+           "perp_avg_entry": w.fills[0]["price"], "perp_upl_usd": 0.5 * (w.fills[0]["price"] - _open_at(mid_ts)),
+           "usdt": w.usdt0 - w.fills[0]["fee_usd"] + sum(r["payment_usd"] for r in w.funding if r["ts_ms"] <= mid_ts),
+           "margin_posted_usd": 0.0, "reserve_usd": 1000.0}
     rep = ledger(w, tmp_path, snapshots=w.snapshots() + [mid])
+    assert rep["verdict"].startswith("RECONCILED") and "MIDDLE_SNAPSHOT_UNRECONCILED" not in codes(rep), (rep["verdict"], rep["flags"])
     r = rep["returns"]
+    assert r["status"] == "COMPUTED"
     assert r["account_linked"] is None or r["account_linked"]["annualised_simple_pct"] is None
     c = rep["economic_capital"]
     assert c.get("strategy_return_on_capital_annualised_simple_pct") is None and "30 days" in c.get("annualised_why_not", "")
@@ -1326,3 +1345,83 @@ def test_a_sane_btc_flow_without_a_public_bar_is_not_rejected_by_the_envelope(tm
 def test_a_malformed_column_map_entry_is_a_clean_refusal_not_a_traceback(spec):
     with pytest.raises(OL.RecordError):
         OL.apply_column_map([{"A": "1"}], {"exec_id": spec}, None, "x.csv")
+
+
+# ------------------------------------------------------------------------------- no rate of return on a ledger that is not reconciled
+# Round 17 review: a $50,000 undeclared USDT deposit read as +65.65 % Modified Dietz and +75.7 % on capital on an INCOMPLETE ledger whose true
+# result was -1.25 %: the return formulas cannot tell an unexplained inflow from trading. The dollar items stay; the RATES are withheld.
+
+UNEXPLAINED = 50_000.0
+
+
+def _world_with_unexplained_usdt(how, extra=UNEXPLAINED):
+    """A world whose closing snapshot holds `extra` USDT more than the records explain, three ways: nothing declared, a statement line labelled
+    OTHER, or one side of an INTERNAL transfer whose other side never appears."""
+    w = World()
+    t_dep = w.t_open + (w.t_close - w.t_open) // 2
+    if how == "labelled_other":
+        w.lines = _statement(w) + [{"line_id": "O1", "ts_ms": t_dep, "coin": "USDT", "category": "OTHER", "change": extra, "cash_balance": None, "ref_id": None}]
+    elif how == "unpaired_internal":
+        w.flows = [{"flow_id": "I1", "ts_ms": t_dep, "coin": "USDT", "amount": extra, "kind": "INTERNAL_IN"}]
+    return w, w.snapshots(usdt1=w.expected_usdt1() + extra)
+
+
+@pytest.mark.parametrize("how", ["undeclared", "labelled_other", "unpaired_internal"])
+def test_an_unexplained_deposit_never_reads_as_a_return(tmp_path, how):
+    w, snaps = _world_with_unexplained_usdt(how)
+    rep = ledger(w, tmp_path, snapshots=snaps, alternative_return_pct=4.5)
+    assert rep["verdict"] == "INCOMPLETE", (rep["verdict"], codes(rep))
+    r = rep["returns"]
+    assert r["status"] == "WITHHELD_UNRECONCILED_LEDGER" and "INCOMPLETE" in r["why"]
+    assert "account_money_weighted" not in r and "account_irr" not in r and "account_linked" not in r
+    assert r["alternative_return_pct"] == 4.5                                   # the owner's own input is echoed, never compared
+    c = rep["economic_capital"]
+    assert c["returns_withheld"] and c["account_return_on_capital_period"] is None
+    assert c.get("strategy_return_on_capital_period") is None and c.get("strategy_return_on_capital_annualised_simple_pct") is None
+    assert "RETURNS: withheld" in OL.render(rep) and "withheld (INCOMPLETE)" in OL.render(rep)
+    text = json.dumps(rep, default=str)
+    assert "account_money_weighted" not in text
+    if how != "labelled_other":                                                # the dollars stay visible: the residual is NOT hidden
+        assert rep["equity_bridge"]["unexplained_usd"] == pytest.approx(UNEXPLAINED, rel=1e-6)
+    assert rep["strategy_contribution"]["status"] == "COMPUTED" and rep["strategy_contribution"]["net_usd"] is not None   # dollar items unchanged
+
+
+def test_the_same_deposit_declared_on_the_statement_is_the_control_and_gets_its_return(tmp_path):
+    w = World()
+    t_dep = w.t_open + (w.t_close - w.t_open) // 2
+    w.flows = [{"flow_id": "D1", "ts_ms": t_dep, "coin": "USDT", "amount": UNEXPLAINED, "kind": "DEPOSIT"}]
+    w.lines = _statement(w, with_flows=True)
+    rep = ledger(w, tmp_path)
+    assert rep["verdict"] == "RECONCILED_NOT_AUTHENTICATED", (rep["verdict"], rep["flags"])
+    md = rep["returns"]["account_money_weighted"]["period_return"]
+    assert abs(md) < 0.05, "the deposit is not profit: the return is the few-percent trading result, never +65 %"
+    assert rep["economic_capital"]["account_return_on_capital_period"] is not None and not rep["economic_capital"].get("returns_withheld")
+
+
+def test_a_rejected_ledger_states_no_rate_either(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    mid_ts = (w.t_open + w.t_close) // 2
+    bad_mid = {"snapshot_id": "mid", "ts_ms": mid_ts, "usdt": w.usdt0, "btc": w.btc0, "btc_price": _open_at(mid_ts), "perp_upl_usd": 0.0, "perp_qty": 0.0}
+    rep = ledger(w, tmp_path, snapshots=w.snapshots() + [bad_mid])
+    assert rep["verdict"] == "REJECTED_RECORDS_CONTRADICT" and "MIDDLE_SNAPSHOT_UNRECONCILED" in codes(rep, OL.SEVERITY_HARD)
+    assert rep["returns"]["status"] == "WITHHELD_UNRECONCILED_LEDGER"
+    assert rep["economic_capital"]["account_return_on_capital_period"] is None
+
+
+def test_the_withholding_is_exactly_the_non_reconciled_verdicts():
+    computed = {"status": "COMPUTED", "account_money_weighted": {"period_return": 0.01}, "alternative_return_pct": None}
+    cap = {"status": "COMPUTED", "account_return_on_capital_period": 0.02, "strategy_return_on_capital_period": 0.03,
+           "return_on_hedged_notional": {"average_short_notional_usd": 1.0, "strategy_return_period": 0.04}}
+    for verdict in ("RECONCILED_BUT_UNCHECKED", "RECONCILED_NOT_AUTHENTICATED"):
+        r, c = OL.withhold_unreconciled_returns(dict(computed), dict(cap), verdict)
+        assert r["status"] == "COMPUTED" and c["account_return_on_capital_period"] == 0.02 and "returns_withheld" not in c
+    for verdict in ("INCOMPLETE", "REJECTED_RECORDS_CONTRADICT", "NO_TRADING_RECORDS", "SOMETHING_NEW"):
+        r, c = OL.withhold_unreconciled_returns(dict(computed), dict(cap), verdict)
+        assert r["status"] == "WITHHELD_UNRECONCILED_LEDGER", verdict
+        assert c["account_return_on_capital_period"] is None and c["strategy_return_on_capital_period"] is None, verdict
+        assert c["return_on_hedged_notional"]["strategy_return_period"] is None, verdict
+        assert c["return_on_hedged_notional"]["average_short_notional_usd"] == 1.0         # the dollar item stays
+    # a status that is already withheld or never computed is left as it is
+    unpriced = {"status": "WITHHELD_UNPRICED_BTC_FLOW", "why": "x"}
+    assert OL.withhold_unreconciled_returns(dict(unpriced), {"status": "NOT_COMPUTED"}, "INCOMPLETE")[0] == unpriced

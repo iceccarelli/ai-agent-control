@@ -1061,6 +1061,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         verdict = "RECONCILED_BUT_UNCHECKED"
     else:
         verdict = "RECONCILED_NOT_AUTHENTICATED"
+    returns, capital = withhold_unreconciled_returns(returns, capital, verdict)
     conclusions = {
         "NO_TRADING_RECORDS": "no perpetual execution or settlement is in the window: realised proprietary trading P&L has NOT been established (paper and testnet "
                               "records are not live evidence)",
@@ -1086,6 +1087,39 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
                     "how_this_could_be_verified": "only through a separately authorised mechanism (an account-side read by the repository's own ledger tooling "
                                                   "or an independent statement from the venue); nothing here holds credentials or calls the venue"},
     }
+
+
+#: The rates in the economic-capital block (each is a dollar amount divided by capital): none is stated for a ledger that is not RECONCILED.
+UNRECONCILED_CAPITAL_RATE_KEYS = ("account_return_on_capital_period", "strategy_return_on_capital_period",
+                                  "strategy_return_on_capital_annualised_simple_pct", "annualised_why_not")
+UNRECONCILED_HEDGED_RATE_KEYS = ("strategy_return_period", "strategy_return_annualised_simple_pct", "annualised_why_not")
+
+
+def withhold_unreconciled_returns(returns: Dict[str, Any], capital: Dict[str, Any], verdict: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """No RATE of return survives a ledger whose verdict is not RECONCILED_*.
+
+    An undeclared deposit or withdrawal, a missing record or an unexplained balance moves equity without being trading, and the return formulas
+    (Modified Dietz, IRR, linked returns, return on capital) cannot tell the two apart: the whole residual would read as profit or loss. Reproduced
+    (Round 17): a $50,000 undeclared USDT deposit read as +65.65 % Modified Dietz and +75.7 % on capital on an INCOMPLETE ledger whose true result
+    was -1.25 %, whether the deposit was undeclared, labelled OTHER or disguised as an internal transfer. The dollar items of the bridge stay as the
+    records state them (they carry their own residual lines); only the rates are withheld, with the verdict as the reason."""
+    if verdict.startswith("RECONCILED"):
+        return returns, capital
+    why = (f"the ledger verdict is {verdict}: equity moved by amounts the records do not explain (an undeclared deposit or withdrawal, a missing record "
+           "or a contradiction) and a rate of return cannot tell those from trading, so the unexplained part would read as profit or loss; no rate is "
+           "stated until the verdict is RECONCILED_*")
+    if returns.get("status") == "COMPUTED":
+        returns = {"status": "WITHHELD_UNRECONCILED_LEDGER", "why": why, "alternative_return_pct": returns.get("alternative_return_pct")}
+    if capital.get("status") == "COMPUTED":
+        capital = dict(capital)
+        for k in UNRECONCILED_CAPITAL_RATE_KEYS:
+            if k in capital:
+                capital[k] = None
+        hedged = capital.get("return_on_hedged_notional")
+        if isinstance(hedged, dict):
+            capital["return_on_hedged_notional"] = {k: (None if k in UNRECONCILED_HEDGED_RATE_KEYS else v) for k, v in hedged.items()}
+        capital["returns_withheld"] = why
+    return returns, capital
 
 
 def _hedged_notional_return(fills, funding, perp_rep, window_days, t0, t1, opening_qty, strategy) -> Dict[str, Any]:
@@ -1340,7 +1374,7 @@ def render(rep: Mapping[str, Any]) -> str:
         a(f"  ECONOMIC CAPITAL (average): {c['average_economic_capital_usd']}")
         for k in ("strategy_return_on_capital_period", "strategy_return_on_capital_annualised_simple_pct"):
             if k in c:
-                a(f"    {k}: {c[k]}")
+                a(f"    {k}: {c[k]}" if c[k] is not None or not c.get("returns_withheld") else f"    {k}: withheld ({rep['verdict']})")
     a("  FLAGS")
     for f in rep["flags"] or []:
         a(f"    [{f['severity']}] {f['code']} x{f['count']}: {f['detail']}" + (f"  e.g. {', '.join(map(str, f['examples']))}" if f["examples"] else ""))
