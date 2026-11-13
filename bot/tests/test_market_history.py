@@ -744,12 +744,45 @@ def test_a_missing_page_file_is_detected_by_verify_and_repaired_by_resume(root):
 
 
 def test_resume_with_a_different_window_is_refused_not_mixed(root):
+    """Round 19 (data specialist F4, reproduced): the per-symbol PARAMS_MISMATCH kept the PAGES unmixed, but run_dataset then REWROTE manifest.json from this invocation alone, so a COMPLETE, sealed
+    dataset read UNVERIFIED (3 of 4 symbols) after one re-run with a window that moved by three settlements: the very command a refreshed plan prints. The whole run is now refused before any
+    fetch, the manifest is untouched, and the dataset still verifies COMPLETE."""
     v = funding_venue()
     run(root, funding_specs(), v)
+    mpath = os.path.join(ddir(root), "manifest.json")
+    before = open(mpath, "rb").read()
+    urls = len(v.urls)
     other = MH.build_specs("funding", None, ["BTCUSDT"], START + 1, END, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 480}})
-    man = run(root, other, v)
-    s = sym_of(man)
-    assert s["status"] == "UNVERIFIED" and "PARAMS_MISMATCH" in json.dumps(s["run"]["errors"])
+    with pytest.raises(MH.HistoryError, match="RERUN_REFUSED_WINDOW_CHANGED"):
+        run(root, other, v)
+    assert open(mpath, "rb").read() == before and len(v.urls) == urls, "a refused re-run must not fetch, write or demote anything"
+    chk = MH.verify_dataset(ddir(root))
+    assert chk["ok"] and json.loads(before)["dataset_status"] == "COMPLETE"
+    assert run(root, funding_specs(), v)["dataset_status"] == "COMPLETE", "the ORIGINAL window still resumes (nothing to fetch, nothing lost)"
+
+
+def test_a_rerun_that_would_drop_collected_symbols_from_the_manifest_is_refused(root):
+    """Round 19 (data specialist F4): re-running with ``--symbols BTCUSDT`` over a two-symbol dataset rewrote the manifest with ONE symbol while the other directory stayed on disk, unlisted."""
+    syms = ("BTCUSDT", "ETHUSDT")
+    v = funding_venue(syms)
+    run(root, funding_specs(syms), v)
+    mpath = os.path.join(ddir(root), "manifest.json")
+    before = open(mpath, "rb").read()
+    with pytest.raises(MH.HistoryError, match="RERUN_REFUSED_WOULD_DROP_SYMBOLS.*ETHUSDT"):
+        run(root, funding_specs(("BTCUSDT",)), v)
+    assert open(mpath, "rb").read() == before
+    again = run(root, funding_specs(syms), v)
+    assert sorted(again["symbols"]) == ["BTCUSDT", "ETHUSDT"] and again["dataset_status"] == "COMPLETE"
+
+
+def test_the_manifest_an_accepted_rerun_replaces_is_kept_beside_it(root):
+    v = funding_venue()
+    run(root, funding_specs(), v)
+    first = open(os.path.join(ddir(root), "manifest.json"), "rb").read()
+    run(root, funding_specs(), v)
+    kept = [n for n in os.listdir(ddir(root)) if n.startswith("manifest.superseded")]
+    assert kept == ["manifest.superseded.json"] and open(os.path.join(ddir(root), kept[0]), "rb").read() == first
+    assert MH.verify_dataset(ddir(root))["ok"], "the archived copy is not a symbol and does not make the dataset fail verification"
 
 
 def test_page_cap_stops_a_symbol_and_the_next_run_continues(root):
