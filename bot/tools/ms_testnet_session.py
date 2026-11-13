@@ -63,7 +63,8 @@ DEFAULT_MAX_PREFLIGHT_AGE_MIN = 15
 MAX_PLAN_AGE_MIN = 120
 EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 2
 FILES = {"record": "testnet_session.json", "plan": "plan.json", "preflight": "preflight.json", "journal": "engine_journal.jsonl", "kill": "MS_KILL", "owner_unwind": "OWNER_UNWIND",
-         "meas": "exec_measurements.json", "quality": "execution_quality.json", "decision": "decision.json", "funding": "funding_settlement.json"}
+         "meas": "exec_measurements.json", "quality": "execution_quality.json", "decision": "decision.json", "funding": "funding_settlement.json",
+         "recon": "reconciliation.json"}
 
 
 # ---------------------------------------------------------------------------------------------------- small helpers
@@ -964,10 +965,28 @@ class Run:
         except Exception as exc:                                       # noqa: BLE001 - the record's own net is already unknown; a document that cannot be rewritten is stated, never trusted
             self.ctx.out(f"funding document could not be withdrawn ({type(exc).__name__}); treat its figures as UNKNOWN")
 
+    def write_reconciliation(self, view_complete: bool) -> None:
+        """Round 18 (execution specialist): the ledger-vs-venue result of the FINAL reconcile was assigned to ``self.venue_recon`` and never read or persisted, so whether a session's executions, ledger
+        fills, positions and fees agreed with the venue could not be audited afterwards. Written to ``reconciliation.json`` (finding CODES only, never a free-text detail) beside the other session
+        documents; evidence only: it feeds no halt, flat or authority decision, and a write that fails changes nothing."""
+        vr = self.venue_recon if isinstance(self.venue_recon, dict) else None
+        rr = self.recon_report
+        doc = {"schema": "ms_session_reconciliation/1", "view_complete": bool(view_complete),
+               "venue_reconciled": None if vr is None else vr.get("venue_reconciled") is True,
+               "finding_codes": [] if vr is None else sorted({str(f.get("code"))[:60] for f in (vr.get("findings") or []) if isinstance(f, dict) and f.get("code")})[:12],
+               "checked": None if vr is None else {k: v for k, v in (vr.get("checked") or {}).items() if k in ("executions", "ledger_fills", "wallet")},
+               "halt_new_exposure": None if rr is None else bool(getattr(rr, "halt_new_exposure", False)),
+               "note": "evidence only: no halt, flat or authority decision reads this document"}
+        try:
+            _write_json(self.ctx.path("recon"), doc)
+        except Exception:                                              # noqa: BLE001 - evidence must never affect safety or availability
+            pass
+
     def snapshot_record(self, rec: Dict[str, Any], final: bool = False) -> Dict[str, Any]:
         view = self.ex.venue_state()
-        rec["orders"] = _orders_for_record(view["orders"], self.gid)
-        rec["executions"] = _execs_for_record(view["executions"], self.gid)
+        if view.get("complete") or not (rec.get("orders") or rec.get("executions")):       # an INCOMPLETE read never erases rows an earlier complete read already recorded
+            rec["orders"] = _orders_for_record(view["orders"], self.gid)
+            rec["executions"] = _execs_for_record(view["executions"], self.gid)
         rec["basis"] = "EXCHANGE_REPORTED" if rec["orders"] or rec["executions"] else "NOT_RUN"
         if final:
             pos = view["positions"]
@@ -982,6 +1001,7 @@ class Run:
             if flat:
                 self.recognise_funding(view)                         # only once the position is closed: the held window is then complete
             self.reconcile_step(int(self.ctx.clock()))
+            self.write_reconciliation(complete)
             cn = self.ledger.canonical_net()                          # worker F's canonical net: None (never zero) wherever a component is unknown (funding is not read here)
             rec["net"] = {"fees_usd": cn["fees"], "funding_usd": cn["funding"], "price_pnl_usd": cn["price_leg"] if flat else None, "note": NOTE}
             errors_before = getattr(self, "quality_errors", 0)
@@ -989,7 +1009,10 @@ class Run:
             integrity = [f for f in cn.get("flags", []) if str(f).startswith(AC.INTEGRITY_FLAG_PREFIXES)]
             quality_failed = getattr(self, "quality_errors", 0) > errors_before                     # the final measurement RAISED: the incomplete-fills safeguard below never ran
             incomplete = bool(doc) and "fills_incomplete" in (doc.get("group") or {}).get("unknown", [])
-            if integrity or quality_failed or incomplete:
+            if not complete or integrity or quality_failed or incomplete:
+                # (0) Round 18 (execution specialist): the FINAL venue read itself was incomplete. A symbol's order and execution reads share one try-block, so an order-read failure also drops that symbol's
+                # executions: the ledger holds only what THIS read returned (a lower bound, or a measured 0.0 with both entry legs filled and fees paid) and no `fills_incomplete` flag can fire when the order
+                # rows are missing too. Nothing from an incomplete final read is a measurement.
                 # (1) An order the VENUE says filled has no (or too few) execution rows: the ledger, which is fed only from executions, then holds a LOWER BOUND of the fees and the price leg, not a
                 # measurement. (2) The ledger itself flags a conflict in its inputs (a duplicate fill with different content, an orphan fill ...): its partial sums are not a net. (3) The measurement that
                 # would have told us (1) failed. Publishing any of them would turn "we could not tell" into a measured number (the capital book's `known` is None whenever either is None, so such a
@@ -998,7 +1021,7 @@ class Run:
                 # that start wrong, a settlement the pair was really held through falls BEFORE it, "no settlement while held" is declared (a DERIVED zero) and a held +0.48 USD was published as 0.0 into the record, the
                 # evidence event and the research feedback row. An unknown window cannot be a zero.
                 rec["net"] = {**rec["net"], "fees_usd": None, "price_pnl_usd": None, "funding_usd": None}
-                self._suppress_funding_doc("FILLS_INCOMPLETE" if incomplete else ("LEDGER_INTEGRITY" if integrity else "MEASUREMENT_FAILED"))
+                self._suppress_funding_doc("INCOMPLETE_FINAL_READ" if not complete else ("FILLS_INCOMPLETE" if incomplete else ("LEDGER_INTEGRITY" if integrity else "MEASUREMENT_FAILED")))
         elif rec["orders"] or rec["executions"]:
             self.execution_quality(view, False, None)
         return view

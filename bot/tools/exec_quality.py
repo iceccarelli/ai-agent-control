@@ -71,8 +71,11 @@ def normalise_fill(x: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     if not fid or qty is None or px is None or qty <= 0 or px <= 0:
         return None
     fee = None if x.get("fee_known") is False else (_d(x.get("fee_signed_usd")) if x.get("fee_signed_usd") is not None else _d(x.get("fee_usd")))      # a blank venue fee is UNKNOWN, never zero
-    liq = x.get("liquidity")
-    return {"fill_id": str(fid), "qty": qty, "price": px, "fee": fee, "fee_ccy": x.get("fee_ccy") or UNKNOWN,
+    # Round 18 (execution specialist): the Testnet executor labels a row with NO ``isMaker`` flag TAKER (a default, not the venue's statement: ``is_maker_reported`` says which) and always carries the
+    # QUOTE currency as ``fee_ccy`` (the valuation currency) while the venue's own charge currency is ``fee_ccy_venue`` (BTC for a spot buy). Both fields were produced and never read.
+    liq = x.get("liquidity") if x.get("is_maker_reported", True) is not False else None
+    venue_ccy = x.get("fee_ccy_venue")
+    return {"fill_id": str(fid), "qty": qty, "price": px, "fee": fee, "fee_ccy": (venue_ccy or UNKNOWN) if venue_ccy is not None else (x.get("fee_ccy") or UNKNOWN),
             "fee_rate": _d(x.get("fee_rate")), "liquidity": liq if liq in ("MAKER", "TAKER") else None, "ts_ms": _i(x.get("ts_ms")),
             "side": x.get("side"), "symbol": x.get("symbol")}
 

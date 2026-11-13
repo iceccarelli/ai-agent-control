@@ -533,6 +533,10 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
         S._write_json(os.path.join(d, "decision.json"), drec)          # the decision this session executes: the session's measured execution quality carries its id
     except OSError:
         pass                                                           # evidence only: never a reason to refuse or to trade
+    try:                                                              # Round 18: the FULL decision record is durable evidence under the session's id, not only a file on the volume
+        on_event("DECISION", "DECISION_RECORDED", drec)                # (deterministic event id per session: a duplicate is a no-op; the loop's own 8-key DECISION summary is a different event)
+    except Exception:                                                  # noqa: BLE001 - evidence must never affect safety or availability
+        pass
     try:
         return {**_run_session(env, inner, clock, sleep, d, sym, g, hold_s, rate, session_class, verdict, manifest, engine_root or DEFAULT_ROOT, lease, int(nxt), on_state, on_event),
                 "decision_id": did}
@@ -687,8 +691,9 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     summary["allocation"] = alloc.as_dict()
     funding = ES.read_json(os.path.join(d, "funding_settlement.json"))
     quality = ES.read_json(os.path.join(d, "execution_quality.json"))               # measured per-leg execution quality (observation only; None when it was not written)
+    recon = ES.read_json(os.path.join(d, "reconciliation.json"))                    # the FINAL ledger-vs-venue result (evidence only; None when it was not written)
     for evt in EL.session_events(rec, "REFUSED" if rc == S.EXIT_REFUSED else ("DONE" if rec.get("flat_verified") is True else "NOT_FLAT"), quality if isinstance(quality, dict) else None,
-                                funding if isinstance(funding, dict) else None):
+                                funding if isinstance(funding, dict) else None, recon if isinstance(recon, dict) else None):
         emit(evt)
     try:                                                              # research feedback: measured vs modelled, one chained row per session that SENT an order (evidence only; never affects safety)
         if not rec.get("orders"):

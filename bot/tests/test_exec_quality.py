@@ -484,3 +484,21 @@ def test_a_blank_venue_fee_is_unknown_not_a_measured_zero():
     assert "fee" in r["unknown"] and r["cost"]["total_usd"] is None and r["fee"]["usd_signed"] is None
     zero = leg("Buy", [{**fill(2, "1", "100.20"), "fee_usd": 0.0, "fee_signed_usd": 0.0, "fee_known": True}], qty="1")
     assert "fee" not in zero["unknown"] and D(zero["cost"]["fee_usd"]) == 0            # a fee the venue STATED as zero is still a measured zero
+
+
+def test_a_fill_row_without_a_venue_maker_flag_has_no_liquidity_class():
+    """Round 18: the executor labels a row with no ``isMaker`` flag TAKER (a default). Only the venue's own statement may name the liquidity class (the docstring's rule)."""
+    row = {"exec_id": "E1", "qty": 0.001, "price": 60000.0, "fee_usd": 0.033, "fee_ccy": "USDT", "liquidity": "TAKER", "is_maker_reported": False, "ts_ms": 1, "side": "Buy", "symbol": "BTCUSDT"}
+    assert EQ.normalise_fill(row)["liquidity"] is None
+    assert EQ.normalise_fill({**row, "is_maker_reported": True})["liquidity"] == "TAKER"                     # a flagged row keeps its class
+    assert EQ.normalise_fill({k: v for k, v in row.items() if k != "is_maker_reported"})["liquidity"] == "TAKER"        # a row from another source (no such key) is unchanged
+    assert EQ.normalise_fill({**row, "is_maker_reported": True, "liquidity": "MAKER"})["liquidity"] == "MAKER"
+
+
+def test_the_fee_currency_is_the_one_the_venue_charged_not_the_valuation_currency():
+    row = {"exec_id": "E1", "qty": 0.000999, "price": 60001.01, "fee_usd": 0.06, "fee_ccy": "USDT", "fee_ccy_venue": "BTC", "liquidity": "TAKER", "is_maker_reported": True, "ts_ms": 1,
+           "side": "Buy", "symbol": "BTCUSDT"}
+    n = EQ.normalise_fill(row)
+    assert n["fee_ccy"] == "BTC" and n["fee"] == EQ._d(0.06)                                                 # the label changes, the USD figure does not
+    assert EQ.normalise_fill({**row, "fee_ccy_venue": ""})["fee_ccy"] == EQ.UNKNOWN                          # a blank venue currency is unknown, not the valuation currency
+    assert EQ.normalise_fill({k: v for k, v in row.items() if k != "fee_ccy_venue"})["fee_ccy"] == "USDT"     # a row without the venue field keeps its own label

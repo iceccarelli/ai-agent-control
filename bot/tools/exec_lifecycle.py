@@ -126,9 +126,16 @@ def costs(rec: Mapping[str, Any]) -> Event:
                                      "funding_was_read": n.get("funding_usd") is not None, "note": "components only: realised cash is settled from the venue wallet read, not from this"})
 
 
-def session_reconciled(rec: Mapping[str, Any], result: str) -> Event:
-    return ("RECONCILIATION", "SESSION_RECONCILED", {"source": "VENUE", "result": result, "venue_flat_verified": rec.get("flat_verified") is True, "basis": str(rec.get("basis"))[:30],
-                                                     "orders": len(rec.get("orders") or []), "fills": len(rec.get("executions") or [])})
+def session_reconciled(rec: Mapping[str, Any], result: str, reconciliation: Optional[Mapping[str, Any]] = None) -> Event:
+    """``reconciliation`` = the session's ``reconciliation.json`` (the FINAL ledger-vs-venue result). Absent (an older session, a write that failed) the payload is exactly what it was: nothing is
+    invented, and a missing outcome is never read as 'reconciled'."""
+    payload: Dict[str, Any] = {"source": "VENUE", "result": result, "venue_flat_verified": rec.get("flat_verified") is True, "basis": str(rec.get("basis"))[:30],
+                               "orders": len(rec.get("orders") or []), "fills": len(rec.get("executions") or [])}
+    if isinstance(reconciliation, Mapping) and reconciliation.get("schema") == "ms_session_reconciliation/1":
+        payload["venue_reconciled"] = reconciliation.get("venue_reconciled") if isinstance(reconciliation.get("venue_reconciled"), bool) else None
+        payload["view_complete"] = reconciliation.get("view_complete") is True
+        payload["finding_codes"] = [str(c)[:60] for c in (reconciliation.get("finding_codes") or [])][:12]
+    return ("RECONCILIATION", "SESSION_RECONCILED", payload)
 
 
 def capital_settled(settled: Mapping[str, Any]) -> Optional[Event]:
@@ -292,6 +299,8 @@ def funding_events(doc: Optional[Mapping[str, Any]]) -> List[Event]:
     return out
 
 
-def session_events(rec: Mapping[str, Any], result: str, quality: Optional[Mapping[str, Any]] = None, funding: Optional[Mapping[str, Any]] = None) -> List[Event]:
-    """Everything the venue and the ledger said about a finished session, in lifecycle order (``quality`` = the session's measured execution quality, ``funding`` = its settlement recognition, when written)."""
-    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), *execution_quality(quality), *funding_events(funding), session_reconciled(rec, result)]
+def session_events(rec: Mapping[str, Any], result: str, quality: Optional[Mapping[str, Any]] = None, funding: Optional[Mapping[str, Any]] = None,
+                   reconciliation: Optional[Mapping[str, Any]] = None) -> List[Event]:
+    """Everything the venue and the ledger said about a finished session, in lifecycle order (``quality`` = the session's measured execution quality, ``funding`` = its settlement recognition,
+    ``reconciliation`` = its final ledger-vs-venue result, when written)."""
+    return [*orders(rec), *fills(rec), venue_flat(rec), costs(rec), *execution_quality(quality), *funding_events(funding), session_reconciled(rec, result, reconciliation)]

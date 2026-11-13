@@ -1204,6 +1204,22 @@ def test_a_session_emits_the_whole_lifecycle_in_order_and_every_event_passes_the
         seen_ids.add(ev["event_id"])
 
 
+def test_the_executed_sessions_full_decision_record_and_reconciliation_outcome_are_durable_events(w):
+    """Round 18 (execution): the full decision record lived only in ``<session dir>/decision.json`` on the volume, so losing it lost what was evaluated, under which limits, on which code and
+    candidate; and the ledger-vs-venue reconciliation outcome was never recorded anywhere."""
+    _profit_world(w)
+    res, got = _collect(w)
+    assert res["result"] == "DONE", res
+    stages = [g[1] for g in got]
+    dec = [g for g in got if g[1] == "DECISION_RECORDED"]
+    assert len(dec) == 1 and dec[0][0] == "DECISION" and stages.index("DECISION_RECORDED") < stages.index("CAPITAL_ALLOCATED")
+    assert dec[0][2]["decision_id"] == res["decision_id"] and {"inputs_ref", "risk_limits", "candidate", "code_sha"} <= set(dec[0][2]), sorted(dec[0][2])
+    on_disk = json.load(open(os.path.join(res["state_dir"], "decision.json")))
+    assert on_disk["decision_id"] == dec[0][2]["decision_id"]                                                            # the durable event IS the file's record
+    rc = next(g for g in got if g[1] == "SESSION_RECONCILED")[2]
+    assert rc["venue_reconciled"] is True and rc["view_complete"] is True and rc["finding_codes"] == [] and rc["venue_flat_verified"] is True
+
+
 def test_lifecycle_evidence_names_who_said_it_and_never_leaks_raw_venue_ids(w):
     _profit_world(w)
     res, got = _collect(w)
@@ -1245,7 +1261,8 @@ def test_an_unexplained_cash_refusal_still_leaves_evidence(w):
     b.ensure_baseline("1")
     b.park("prev_session", "1", "0.50", True, True)
     res, got = _collect(w, "eng_ev2")
-    assert res["result"] == "REFUSED" and [g[1] for g in got] == ["CAPITAL_SETTLED"] and got[0][2]["status"] == "UNEXPLAINED_CASH"
+    # Round 18: the durable stream also carries the decision this refused session was about to execute (DECISION_RECORDED, emitted when the session starts), then the refusal's own evidence
+    assert res["result"] == "REFUSED" and [g[1] for g in got] == ["DECISION_RECORDED", "CAPITAL_SETTLED"] and got[1][2]["status"] == "UNEXPLAINED_CASH"
 
 
 def test_the_loop_routes_lifecycle_events_into_the_real_outbox_with_deterministic_ids(w, tmp_path):
