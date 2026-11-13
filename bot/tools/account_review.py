@@ -480,6 +480,11 @@ def _interval(xs: Sequence[float]) -> Dict[str, Any]:
             "reading": "indicative only: round trips are serially dependent and few, so the true coverage is lower"}
 
 
+#: A key whose number is a RESULT RATE: annualised, a period or on-capital percentage, or the net / basis P&L in bps of notional (per round trip, mean, sd, notional-weighted). Round 17 withheld every
+#: rate from an ``owner_ledger`` that is not RECONCILED_*; Round 18 applies the rule where the numbers are made: this review prints no result rate under a verdict that is not CONSISTENT_*. The COST
+#: LEVELS ``fee_bps_of_notional`` / ``funding_bps_of_notional`` of a round trip are components (the dollars beside them stay too) and are not in this list; owner_ledger's own rule is the stricter superset.
+RESULT_RATE_KEY_PARTS = ("annualised", "period_pct", "pct_on_", "net_bps", "basis_bps")
+
 #: Gaps that can hide a loss or a cost (a dropped settlement, an excluded trip, a basis that is not known): the review is INCOMPLETE.
 STRUCTURAL_GAPS = ("MISSING_SETTLEMENT", "OPEN_LIFECYCLE", "NO_SPOT_REFERENCE", "SPOT_REF_IS_A_COPY_OF_THE_PRICE", "AMBIGUOUS_SETTLEMENT",
                    "FUNDING_ROW_IN_AMBIGUOUS_WINDOW", "ROUND_TRIP_WITHOUT_SETTLEMENT")
@@ -811,13 +816,36 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
         verdict = "CONSISTENT_BUT_TOO_SMALL"
     else:
         verdict = "CONSISTENT_NOT_VERIFIED"
+    # ---- Round 18 (capital specialist): selection by completeness is not independent of P&L. A review that is not CONSISTENT_* left out the round trips whose records are incomplete, and those
+    # are exactly where a loss can hide (reproduced: one complete trip read net -12 USD / -3.7 bps while the excluded trip carried a known basis of -83 USD and fees of -38 USD; all twelve of
+    # its settlements gave -92 USD). So: the known components of every excluded round trip are always stated, and no RATE (per round trip or aggregate) is printed under such a verdict.
+    def _finite(v: Any) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    excluded = [t for t in trips if t["status"] != "COMPLETE"]
+    excluded_round_trips = {
+        "count": len(excluded), "by_status": {k: sum(1 for t in excluded if t["status"] == k) for k in sorted({t["status"] for t in excluded})},
+        "known_funding_usd": sum(t["funding_usd"] for t in excluded if _finite(t.get("funding_usd"))),
+        "known_fees_usd": sum(t["fees_usd"] for t in excluded if _finite(t.get("fees_usd"))),
+        "known_basis_usd": sum(t["basis_pnl_usd"] for t in excluded if _finite(t.get("basis_pnl_usd"))),
+        "round_trips_with_unknown_basis": sum(1 for t in excluded if not _finite(t.get("basis_pnl_usd"))),
+        "settlements_missing": sum(int(t.get("settlements_missing") or 0) for t in excluded),
+        "reading": "round trips the economics leave out because a settlement, a spot reference or a settlement span is missing. Their funding is a LOWER BOUND wherever settlements are missing, "
+                   "so these dollars are components and NOT a net; the point is that they are not zero and not in the aggregate"}
+    rates_withheld = not verdict.startswith("CONSISTENT_")
+    if rates_withheld:
+        trips = [{k: (None if any(part in str(k).lower() for part in RESULT_RATE_KEY_PARTS) and _finite(v) else v) for k, v in t.items()} for t in trips]
+        if economics.get("tag") == PROVENANCE:
+            economics = {**economics, "mean_net_bps_of_notional": None, "sd_net_bps_of_notional": None, "notional_weighted_net_bps": None, "interval": None,
+                         "reason": f"WITHHELD: the verdict is {verdict}", "rates_withheld": True, "partial": True,
+                         "partial_reading": f"net and components are over the {len(complete)} COMPLETE round trip(s) ONLY; {len(excluded)} round trip(s) are excluded (excluded_round_trips) and no rate is "
+                                            f"stated while the verdict is {verdict}"}
     return {
         "provenance": PROVENANCE, "verdict": verdict, "authorizes_trading": False, "changes_any_status": False,
         "inputs": {"fills": len(fills), "funding_rows": len(funding), "first_fill": _iso(first_ms), "last_fill": _iso(last_fill_ms),
                    "sha256": dict(digests or {}), "ignored_columns": {k: list(v) for k, v in (ignored_columns or {}).items()}},
         "settlements": {"held": len(held), "recorded_for_held": len(held) - len(missing), "missing": len(missing), "ambiguous": len(ambiguous),
                         "funding_rows_unattributed": len(off_book)},
-        "fees": fees, "slippage_vs_reference": slippage, "round_trips": trips, "economics": economics,
+        "fees": fees, "slippage_vs_reference": slippage, "round_trips": trips, "economics": economics, "excluded_round_trips": excluded_round_trips,
         "actual_vs_assumed": comparison, "sufficiency": sufficiency, "flags": flags,
         "what_would_upgrade_this": [
             "the same records read from the account by the repository's own ledger and reconciliation tooling, not from an export",
@@ -947,13 +975,22 @@ def render(rep: Mapping[str, Any]) -> str:
     a("  ROUND TRIPS")
     for t in rep["round_trips"]:
         extra = ""
-        if t["status"] == "COMPLETE":
+        if t["status"] == "COMPLETE" and t.get("net_bps_of_notional") is None:
+            extra = f"  net {t['net_usd']:.2f} USD (funding {t['funding_usd']:.2f}, basis {t['basis_pnl_usd']:.2f}, fees -{t['fees_usd']:.2f}); rate withheld: the verdict is not CONSISTENT_*"
+        elif t["status"] == "COMPLETE":
             extra = f"  net {t['net_bps_of_notional']:.2f} bps (funding {t['funding_bps_of_notional']:.2f}, basis {t['basis_bps_of_notional']:.2f}, fees -{t['fee_bps_of_notional']:.2f})"
         elif "cash_only_usd" in t:
             extra = f"  cash-only {t['cash_only_usd']:.2f} USD (excludes basis)"
         a(f"    {t['start']} .. {t['end']}  {t['status']}{extra}")
     e = rep["economics"]
-    if e["tag"] == PROVENANCE:
+    x = rep.get("excluded_round_trips") or {}
+    if e["tag"] == PROVENANCE and e.get("rates_withheld"):
+        a(f"  ECONOMICS PARTIAL, RATES WITHHELD ({rep['verdict']}): over the {e['complete_round_trips']} complete round trip(s) ONLY, {e['settlements_in_them']} settlements: net {e['net_usd']:.2f} USD "
+          f"(funding {e['funding_usd']:.2f}, basis {e['basis_pnl_usd']:.2f}, fees -{e['fees_usd']:.2f}); no rate or mean is stated")
+        a(f"    EXCLUDED {x.get('count', 0)} round trip(s) {x.get('by_status', {})}: known funding {x.get('known_funding_usd', 0.0):.2f} (a lower bound), basis {x.get('known_basis_usd', 0.0):.2f}, "
+          f"fees -{x.get('known_fees_usd', 0.0):.2f} USD; {x.get('round_trips_with_unknown_basis', 0)} with an unknown basis. These are components, not a net, and they are not in the figure above")
+        a("    UPPER BOUND: excludes " + "; ".join(e["excludes"]))
+    elif e["tag"] == PROVENANCE:
         a(f"  ECONOMICS over {e['complete_round_trips']} complete round trip(s), {e['settlements_in_them']} settlements: net {e['net_usd']:.2f} USD "
           f"(funding {e['funding_usd']:.2f}, basis {e['basis_pnl_usd']:.2f}, fees -{e['fees_usd']:.2f}); mean {e['mean_net_bps_of_notional']:.2f} bps per round trip")
         a("    " + (f"95% interval {e['interval'][0]:.2f}..{e['interval'][1]:.2f} bps ({e['reading']})" if e.get("interval") else e["reason"]))
@@ -961,6 +998,8 @@ def render(rep: Mapping[str, Any]) -> str:
         a("    " + e["basis_reading"])
     else:
         a(f"  ECONOMICS UNKNOWN: {e['reading']}")
+        if x.get("count"):
+            a(f"    EXCLUDED {x['count']} round trip(s) {x.get('by_status', {})}: known funding {x['known_funding_usd']:.2f} (a lower bound), basis {x['known_basis_usd']:.2f}, fees -{x['known_fees_usd']:.2f} USD")
     su = rep["sufficiency"]
     a(f"  sufficiency: {su['settlements_recorded_in_complete_round_trips']}/{su['engine_floor_settlements']} settlements, "
       f"{su['complete_round_trips']}/{su['engine_floor_round_trips']} round trips ({su['reading']})")

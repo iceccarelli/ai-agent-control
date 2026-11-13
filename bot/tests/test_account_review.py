@@ -131,6 +131,75 @@ def test_a_consistent_trip_reconciles_to_the_closed_form(tmp_path):
     assert rep["economics"]["net_usd"] == pytest.approx(e["net_usd"])
 
 
+def _rate_leaves(node, path=""):
+    """Every (path, value) whose key names a RATE and whose value is a number or None (withheld): the rule owner_ledger applies to its own output, here applied to the review itself."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if any(part in str(k).lower() for part in AR.RESULT_RATE_KEY_PARTS) and (v is None or (isinstance(v, (int, float)) and not isinstance(v, bool))):
+                yield f"{path}.{k}", v
+            else:
+                yield from _rate_leaves(v, f"{path}.{k}")
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _rate_leaves(v, f"{path}[{i}]")
+
+
+def _winner_and_a_loser_with_missing_settlements():
+    """Round 18 (capital specialist), the reproduction: trip A is complete; trip B widens its basis by 24.5 bps (inside the 30 bps public-bar screen, so no hard flag) and its export misses 5 of
+    its 12 settlements. The review is INCOMPLETE; it used to print the complete trip's net as the ECONOMICS and annualised rates, while the excluded trip carried most of the known loss."""
+    fa, ga, _ = make_trip(2000, 12, qty=0.5, b_in=2.0, b_out=0.5, fee_bps=5.5, tag="a")
+    fb, gb, _ = make_trip(2100, 12, qty=0.5, b_in=0.5, b_out=25.0, fee_bps=5.5, tag="b")
+    gb_cut = [r for r in gb if int(r["exec_id"].split("f")[-1]) < 7]
+    return fa + fb, ga + gb_cut, fa + fb, ga + gb
+
+
+def test_an_incomplete_review_withholds_every_rate_and_states_what_the_excluded_trips_carry(tmp_path):
+    f, g, f_all, g_all = _winner_and_a_loser_with_missing_settlements()
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5, capital_usd=100000.0)
+    assert rep["verdict"] == "INCOMPLETE" and hard(rep) == [] and "MISSING_SETTLEMENT" in codes(rep, AR.SEVERITY_GAP)
+    leaves = list(_rate_leaves(rep))
+    assert leaves and all(v is None for _p, v in leaves), [x for x in leaves if x[1] is not None]           # no per-trip and no aggregate rate survives (the keys remain, as None)
+    e = rep["economics"]
+    assert e["rates_withheld"] is True and e["partial"] is True and e["interval"] is None and "WITHHELD" in e["reason"]
+    assert e["complete_round_trips"] == 1 and e["net_usd"] == pytest.approx(rep["round_trips"][0]["net_usd"])        # the dollars of the COMPLETE trip stay: owner_ledger decomposes with them
+    x = rep["excluded_round_trips"]
+    assert x["count"] == 1 and x["by_status"] == {"INCOMPLETE_FUNDING": 1} and x["settlements_missing"] == 5
+    assert x["known_basis_usd"] < -50 and x["known_fees_usd"] > 30 and x["round_trips_with_unknown_basis"] == 0       # the loss the aggregate does not show (about -83 and 38 USD)
+    assert x["known_basis_usd"] + e["basis_pnl_usd"] < e["basis_pnl_usd"]
+    full = review_rows(f_all, g_all, tmp_path, taker_bps=5.5, capital_usd=100000.0)
+    assert full["economics"]["net_usd"] < e["net_usd"] - 50                                                         # with every settlement the same records read a much worse net (about -92 vs -12)
+    text = AR.render(rep)
+    assert "ECONOMICS PARTIAL, RATES WITHHELD" in text and "EXCLUDED 1 round trip" in text and "bps per round trip" not in text and "annualised" not in text
+
+
+def test_a_rejected_review_withholds_its_rates_too(tmp_path):
+    fills, funding, _ = make_trip()
+    funding = funding + [dict(funding[0], exec_id="stray", ts_ms=TS[K0 + 40])]                                     # one funding row no held position can explain: UNATTRIBUTED_FUNDING, a HARD flag
+    rep = review_rows(fills, funding, tmp_path, taker_bps=5.5)
+    assert rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+    assert all(v is None for _p, v in _rate_leaves(rep)), [x for x in _rate_leaves(rep) if x[1] is not None]
+    assert "bps per round trip" not in AR.render(rep)
+
+
+def test_a_consistent_review_keeps_every_rate_and_excludes_nothing(tmp_path):
+    fills, funding, _ = make_trip()
+    rep = review_rows(fills, funding, tmp_path, taker_bps=5.5, capital_usd=100000.0)
+    assert rep["verdict"].startswith("CONSISTENT_") and rep["excluded_round_trips"]["count"] == 0
+    t, e = rep["round_trips"][0], rep["economics"]
+    for k in ("net_bps_of_notional", "funding_bps_of_notional", "basis_bps_of_notional", "fee_bps_of_notional", "annualised_pct_on_notional", "annualised_pct_on_stated_capital"):
+        assert isinstance(t[k], float), k                                                                            # good data is not blanked
+    assert isinstance(e["mean_net_bps_of_notional"], float) and isinstance(e["notional_weighted_net_bps"], float)
+    assert e.get("rates_withheld") is None and e.get("partial") is None and "bps per round trip" in AR.render(rep)
+
+
+def test_every_result_rate_account_review_withholds_is_also_withheld_by_the_owner_ledger_rule():
+    """account_review's list is the narrower one (it keeps the fee and funding cost LEVELS of a round trip); owner_ledger's rule is a superset, so nothing the review withholds can reappear there."""
+    import owner_ledger as OL
+    for k in ("net_bps_of_notional", "basis_bps_of_notional", "annualised_pct_on_notional", "annualised_pct_on_stated_capital"):
+        assert any(p in k for p in AR.RESULT_RATE_KEY_PARTS) and any(p in k for p in OL._RATE_KEY_PARTS), k
+    assert not any(p in "fee_bps_of_notional" for p in AR.RESULT_RATE_KEY_PARTS)
+
+
 def test_one_small_trip_is_consistent_but_too_small_never_verified(tmp_path):
     fills, funding, _ = make_trip()
     rep = review_rows(fills, funding, tmp_path, taker_bps=5.5)
