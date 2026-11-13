@@ -496,3 +496,49 @@ def test_a_typo_in_a_safety_flag_on_a_mapping_config_is_never_read_as_live():
                "BYBIT_API_KEY": "k", "BYBIT_API_SECRET": "s"}
     allowed, why = C.is_live_authorized(mapping)
     assert allowed is False and "LIVE_BLOCKED" in why
+
+
+# ---------------------------------------------------------------------------
+# Round 16: the funding exit is an explicit owner choice, never a default.
+# ---------------------------------------------------------------------------
+
+def test_the_funding_exit_defaults_to_the_original_rule_and_accepts_only_two_values():
+    import config as _config
+    assert _config.load({}).CARRY_EXIT_POLICY == "funding_streak"
+    assert _config.load({"CARRY_EXIT_POLICY": "CONTINUATION",
+                         "CARRY_OPPORTUNITY_COST_APR": "0.04"}
+                        ).CARRY_EXIT_POLICY == "continuation"
+    with pytest.raises(_config.ConfigError):
+        _config.load({"CARRY_EXIT_POLICY": "hold_forever"})
+
+
+def test_the_continuation_exit_is_refused_without_a_stated_cost_of_capital():
+    """REVIEW FINDING (Round 16): with no cost of capital stated the exit ran on
+    a cost of zero, so any non-negative print 'paid for the hold': a default,
+    not the owner's rate. An explicit 0 IS a statement; an absent value is not."""
+    import config as _config
+    for env in ({"CARRY_EXIT_POLICY": "continuation"},
+                {"CARRY_EXIT_POLICY": "continuation",
+                 "CARRY_OPPORTUNITY_COST_APR": ""},
+                {"CARRY_EXIT_POLICY": "continuation",
+                 "CARRY_OPPORTUNITY_COST_APR": "   "}):
+        with pytest.raises(_config.ConfigError, match="stated by the owner"):
+            _config.load(env)
+    ok = _config.load({"CARRY_EXIT_POLICY": "continuation",
+                       "CARRY_OPPORTUNITY_COST_APR": "0"})
+    assert ok.CARRY_EXIT_POLICY == "continuation"
+    assert ok.CARRY_OPPORTUNITY_COST_APR_SUPPLIED is True
+    # the original rule needs no statement
+    assert _config.load({}).CARRY_EXIT_POLICY == "funding_streak"
+
+
+def test_the_fingerprint_records_the_exit_policy_and_whether_a_cost_of_capital_was_stated():
+    import config as _config
+    import fingerprint as fp
+    summary = fp.config_summary(_config.load({"CARRY_EXIT_POLICY": "continuation",
+                                              "CARRY_OPPORTUNITY_COST_APR": "0.04"}))
+    assert summary["CARRY_EXIT_POLICY"] == "continuation"
+    assert summary["CARRY_OPPORTUNITY_COST_APR"] == 0.04
+    assert summary["CARRY_OPPORTUNITY_COST_APR_SUPPLIED"] is True
+    bare = fp.config_summary(_config.load({}))
+    assert bare["CARRY_OPPORTUNITY_COST_APR_SUPPLIED"] is False

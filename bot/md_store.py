@@ -193,6 +193,9 @@ class MarketStore:
         self.emergency_prunes_denied = 0
         self.last_rollback_lost = 0                              # read-and-reset by the engine: how many rows a failed commit dropped
         self._last_emergency: Optional[float] = None
+        #: time.monotonic() when retention first saw the volume below the write reserve, None while
+        #: it is not. A stepped wall clock cannot move it: it is how long the stall has REALLY lasted.
+        self._stalled_since: Optional[float] = None
         segs = self.segments()
         if segs:
             self._latest_day = segs[-1][3:11]
@@ -465,7 +468,22 @@ class MarketStore:
                     stalled = self.free_bytes() < self.min_free_bytes
                 except OSError:
                     stalled = False
-            slack_ms = 86_400_000 if stalled else 0
+            # The allowance is ONE day while the stall is new, plus one more for every full day the
+            # stall has LASTED on the monotonic clock. It used to be one day for good, so a store whose
+            # retained days could not be freed by ONE dropped day (two segments, retention 2) never
+            # recovered however many days went by: each day past retention stayed, so space was never
+            # freed, so writes never resumed. A wall clock stepped ahead cannot grow it (the stall's
+            # age is monotonic), the cutoff is still never inside the retention window measured from the
+            # wall clock, and the newest segment is never removed.
+            slack_days = 0
+            if stalled:
+                now_mono = time.monotonic()
+                if self._stalled_since is None:
+                    self._stalled_since = now_mono
+                slack_days = 1 + max(0, int((now_mono - self._stalled_since) // 86_400.0))
+            else:
+                self._stalled_since = None
+            slack_ms = slack_days * 86_400_000
             cutoff = min(cutoff, _utc_day(newest_ms + slack_ms - int(retention_days) * 86_400_000))
         return self.prune_segments_before(cutoff)
 

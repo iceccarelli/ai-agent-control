@@ -612,6 +612,13 @@ class Config:
     #: who chose zero cannot be told from one who never decided. Reporting only;
     #: nothing in the entry gate reads it.
     CARRY_OPPORTUNITY_COST_APR_SUPPLIED: bool = False
+    #: The funding exit of the carry book. "funding_streak" (the default, the original rule) leaves
+    #: after three consecutive negative prints; "continuation" leaves when the funding shortfall paid
+    #: while holding reaches the priced round trip (carry_costs.continuation_exit). An explicit owner
+    #: choice: the evidence for "continuation" is IN-SAMPLE (Round 16) and it is never the default.
+    #: It changes only the funding exit; every margin, liquidation, venue and collateral exit is
+    #: unchanged.
+    CARRY_EXIT_POLICY: str = "funding_streak"
     #: "enforce" refuses an entry the net-benefit gate refuses; "observe" records
     #: what it WOULD refuse and lets the entry continue (an explicit operator
     #: choice for gathering evidence). Anything else is rejected at load.
@@ -868,6 +875,24 @@ def assert_sandbox(cfg: Any = None) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _exit_policy(env: Mapping[str, str]) -> str:
+    """CARRY_EXIT_POLICY. The CONTINUATION exit prices holding against the
+    owner's cost of capital, so it is refused unless the owner STATED one (an
+    explicit CARRY_OPPORTUNITY_COST_APR, 0 included, is a statement; an absent
+    value is not): with none the exit would run on a cost of capital of zero,
+    which is a default and not the owner's rate."""
+    policy = parse_choice(env, "CARRY_EXIT_POLICY", "funding_streak",
+                          ("funding_streak", "continuation"))
+    if policy == "continuation" and not str(
+            env.get("CARRY_OPPORTUNITY_COST_APR") or "").strip():
+        raise ConfigError(
+            "CARRY_EXIT_POLICY=continuation needs CARRY_OPPORTUNITY_COST_APR "
+            "stated by the owner (an explicit 0 is a statement; an absent "
+            "value is not): the exit prices the shortfall against the cost of "
+            "holding the capital, and an unstated cost is not zero")
+    return policy
+
+
 def load(env: Optional[Mapping[str, str]] = None) -> Config:
     """Build a Config from ``env`` (defaults to ``os.environ``).
 
@@ -1081,6 +1106,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
             env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
         CARRY_OPPORTUNITY_COST_APR_SUPPLIED=bool(
             str(env.get("CARRY_OPPORTUNITY_COST_APR") or "").strip()),
+        CARRY_EXIT_POLICY=_exit_policy(env),
         RISK_POLICY_PATH=parse_str(env, "RISK_POLICY_PATH", ""),
         CARRY_ENTRY_BENEFIT_MODE=parse_choice(
             env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")),

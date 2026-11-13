@@ -23,6 +23,16 @@ state between calls, and cannot reach anything that loses money. It must agree
 with tools/carry_backtest.py TO THE CENT, and tests/test_carry_core.py fails
 the build if it does not.
 
+SCOPE OF THE EXIT RULE (Round 16). The core implements ONE funding exit: leave
+after `negative_exit_prints` consecutive negative prints (`carry_engine`'s
+"funding_streak" policy, the default everywhere). The engine, the replay and
+`carry_backtest.simulate_settlements_series` also offer a "continuation" exit
+(`carry_costs.continuation_exit`: leave when the funding shortfall paid while
+holding reaches the priced round trip). The core does NOT implement it and has
+no parameter for it: a sweep through this module is never a statement about the
+continuation exit, and agreement with the Python simulator is asserted only for
+the default policy.
+
     python3 tools/carry_core.py --build
     python3 tools/carry_core.py --bench
 """

@@ -34,7 +34,10 @@ def code_digest(root: Optional[str] = None) -> str:
 #: The only config fields that go into the fingerprint. No credential-shaped name
 #: belongs here and a test pins that.
 SAFE_FIELDS = ("BYBIT_VENUE", "USE_TESTNET", "PAPER_TRADING", "BOOK_MODE", "CARRY_EXECUTION_MODE",
-               "CARRY_EXECUTION_STYLE", "CARRY_ENTRY_BENEFIT_MODE", "MARKET_FEED_ENABLED")
+               "CARRY_EXECUTION_STYLE", "CARRY_ENTRY_BENEFIT_MODE", "MARKET_FEED_ENABLED",
+               # the economics the entry and exit decide on: the funding exit in force, and whether the
+               # owner STATED a cost of capital (a bare 0.0 is not a statement)
+               "CARRY_EXIT_POLICY", "CARRY_OPPORTUNITY_COST_APR", "CARRY_OPPORTUNITY_COST_APR_SUPPLIED")
 
 
 def config_summary(cfg: Any) -> Dict[str, Any]:

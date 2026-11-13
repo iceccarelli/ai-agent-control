@@ -193,8 +193,22 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
         if recorder.get("chain_head"):
             line["recorder_chain_file"] = recorder.get("chain_file")
             line["recorder_chain_head"] = recorder["chain_head"]
+        # Where the free-space figure came from: "statvfs" is the volume read NOW by the monitor
+        # (always the case once the status file is STALE); "recorder_status" is the recorder's own
+        # reading. Without it a history line cannot say whether 510 MiB is current or a dead
+        # recorder's last value.
+        if isinstance(recorder.get("free_mb_source"), str):
+            line["recorder_free_mb_source"] = recorder["free_mb_source"]
         if recorder.get("fault") or recorder.get("detail"):
-            line["recorder_detail"] = str(recorder.get("fault") or recorder.get("detail"))[:300]
+            # The state's OWN explanation comes first (a STALE or NOT_PERSISTING recorder says why it
+            # is not reporting or not persisting), then the store's last fault. The fault used to
+            # REPLACE it: a recorder whose status file stopped updating kept an old "free space below
+            # the reserve" fault, and the history then said "full disk" for a recorder whose process
+            # or heartbeat was dead, hiding the supervisor's restart counters and the file's age.
+            why, last = recorder.get("detail"), recorder.get("fault")
+            line["recorder_detail"] = (
+                str(why or last)[:300] if not (why and last)
+                else f"{str(why)[:200]} | last fault: {str(last)[:150]}")
     shadow = record.get("shadow")
     if isinstance(shadow, dict):
         line["shadow_state"] = shadow.get("state")

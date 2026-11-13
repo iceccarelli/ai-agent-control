@@ -152,3 +152,22 @@ class TestNothingIsRetuned:
                   borrow_apr=0.0, round_trip_bps=11.0)
         assert carry_costs.evaluate_entry(**kw).net_edge_bps_per_day == \
             carry_costs.evaluate_entry(**kw, hold_days=before).net_edge_bps_per_day
+
+
+# ---------------------------------------------------------------------------
+# Round 16: the audit's per-trade nets exclude borrow; it must say so, and its
+# net identity must close with borrow as its own term.
+# ---------------------------------------------------------------------------
+
+def test_the_net_identity_closes_with_borrow_as_its_own_term():
+    a = ha.run_audit(notional=100_000.0, borrow_apr=0.05)
+    assert a["reconciles_net"] is True
+    assert a["per_trade_stats_exclude_borrow_usd"] < -1_000.0
+    assert any("EXCLUDE" in c and "borrow" in c for c in a["caveats"])
+
+
+def test_with_no_borrow_there_is_nothing_to_exclude():
+    a = ha.run_audit(notional=100_000.0, borrow_apr=0.0)
+    assert a["reconciles_net"] is True
+    assert abs(a["per_trade_stats_exclude_borrow_usd"]) < 0.005
+    assert not any("EXCLUDE" in c for c in a["caveats"])

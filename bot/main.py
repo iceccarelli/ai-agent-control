@@ -2595,6 +2595,17 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 ("UNKNOWN (an inventory leg was not valued)"
                  if _st["pair_net_usd"] is None else f"${_st['pair_net_usd']:.2f}"))
 
+        # The continuation exit prices holding against the owner's cost of
+        # capital: `config.load` refuses it unless one was STATED, and a Config
+        # object built by any other route (a caller passing `config=`) must meet
+        # the same rule here, before the engine exists. An unstated cost is not
+        # zero. (Read as `cfg.CARRY_*`, never through a getattr fallback.)
+        if (str(cfg.CARRY_EXIT_POLICY) == "continuation"
+                and not cfg.CARRY_OPPORTUNITY_COST_APR_SUPPLIED):
+            raise _config.ConfigError(
+                "CARRY_EXIT_POLICY=continuation needs CARRY_OPPORTUNITY_COST_APR "
+                "stated by the owner (an explicit 0 is a statement; an absent "
+                "value is not)")
         bot.carry = CarryEngine(
             broker=_ledger.LedgerBroker(
                 CarryBroker(
@@ -2642,6 +2653,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # What the capital behind the hedge could earn elsewhere; 0.0
             # unless an operator supplies a rate (none is invented).
             opportunity_cost_apr=float(cfg.CARRY_OPPORTUNITY_COST_APR),
+            # The funding exit: the original rule unless the owner chose the
+            # continuation exit (CARRY_EXIT_POLICY; in-sample evidence only).
+            exit_policy=str(cfg.CARRY_EXIT_POLICY),
             entries_enabled=bool(attach_strategy),
             # What that gate reads each held tick is kept (additive table, no
             # new venue request) so a later replay can run on the venue's own

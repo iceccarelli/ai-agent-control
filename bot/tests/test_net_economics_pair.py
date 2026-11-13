@@ -4,9 +4,11 @@ An overlay hedges the client's own BTC. The live journal books the short's price
 leg and never revalues the inventory it hedges, so a cycle's booked net is the
 net of an UNHEDGED SHORT: a BTC rally reads as a large loss and a fall as a
 large win, neither of which is carry. These tests pin that the report states the
-hedged-pair net beside the booked one (additive; the booked net and the verdict
-code are unchanged), that every derived number says what it excludes, and that a
-missing input is UNAVAILABLE, never zero.
+hedged-pair net beside the booked CASH net, that the verdict, the returns, the
+benchmark comparison and the risk statistics are taken on the PAIR for an
+overlay (never on the cash net of an unhedged short, whose sign follows BTC),
+that every derived number says what it excludes, and that a missing input is
+UNAVAILABLE, never zero.
 
 Figures are hand-computed FIXTURES, not observations.
 """
@@ -89,9 +91,21 @@ def test_a_btc_rally_is_not_a_carry_loss_for_an_overlay():
     j = L.Journal()
     overlay(j, 0, 10, tag="a", close=105_000.0)       # short loses 5000
     ne, cycles = economics(j)
-    # unchanged: the BOOKED net is the net of the unhedged short
+    # unchanged: the BOOKED net is the net of the unhedged short, kept as the
+    # labelled CASH figure
     assert ne["headline"]["net_usd"] == pytest.approx(300 - 110 - 5000)
-    assert ne["verdict"]["code"] == "FUNDING_POSITIVE_BUT_NET_NEGATIVE"
+    assert "unhedged short" in ne["headline"]["net_usd_meaning"]
+    # CHANGED (Round 16): the verdict used to read this as the carry LOSING
+    # money (FUNDING_POSITIVE_BUT_NET_NEGATIVE) because BTC rallied. A rally is
+    # not a carry loss for a hedged pair. With the inventory leg only DERIVED
+    # from perp prices (basis not measured) the verdict claims neither a profit
+    # nor a loss: it states the two figures and what each is.
+    assert ne["verdict"]["code"] == "OVERLAY_PAIR_DERIVED_NOT_BOOKED"
+    # a DERIVED pair is funding - fees by construction (basis unmeasured): it is
+    # shown, labelled, as hedged_pair_net_usd and is NOT the economic net
+    assert ne["headline"]["economic_net_usd"] is None
+    assert ne["headline"]["economic_net_basis"] == "DERIVED_NOT_BOOKED"
+    assert ne["verdict"]["economic_net_usd"] is None
     # new, additive: the pair, with the inventory leg derived and labelled
     m = ne["metrics"]["hedged_pair_net_usd"]
     assert m["value"] == pytest.approx(190.0)
@@ -141,6 +155,244 @@ def test_a_booked_inventory_mark_is_added_to_the_pair_once_and_never_to_cash():
     assert "never revalued" not in ne["verdict"]["statement"]
 
 
+def _im_obs(opened_d=0, im=10_000.0):
+    return {"cycle_opened_ms": T0 + opened_d * DAY, "position_im_usd": im}
+
+
+def test_the_overlay_verdict_and_returns_do_not_follow_btc():
+    """THE invariant: identical funding, fees and basis with BTC +5% or -5%
+    give the same economic net, the same return on committed capital and the
+    same verdict. Only the CASH figure (the net of an unhedged short) moves."""
+    out = {}
+    for name, close in (("rally", 105_000.0), ("fall", 95_000.0)):
+        j = L.Journal()
+        overlay(j, 0, 10, tag="a", close=close, revalue=True)
+        out[name], _ = economics(j, obs=[_im_obs()])
+    r, f = out["rally"], out["fall"]
+    assert r["headline"]["net_usd"] == pytest.approx(300 - 110 - 5000)
+    assert f["headline"]["net_usd"] == pytest.approx(300 - 110 + 5000)
+    for ne in (r, f):
+        assert ne["headline"]["economic_net_usd"] == pytest.approx(190.0)
+        assert ne["headline"]["economic_net_basis"] == "COMPUTED"
+        m = ne["metrics"]["return_on_committed_capital_pct"]
+        # capital = observed margin 10,000 + the client's BTC at entry 100,000
+        assert m["value"] == pytest.approx(100.0 * 190.0 / 110_000.0)
+        assert m["numerator_basis"] == "COMPUTED"
+        assert ne["verdict"]["economic_net_usd"] == pytest.approx(190.0)
+        assert ne["verdict"]["booked_net_usd"] == pytest.approx(
+            ne["headline"]["net_usd"])
+    assert r["verdict"]["code"] == f["verdict"]["code"]
+    assert r["verdict"]["code"] not in (
+        "FUNDING_POSITIVE_BUT_NET_NEGATIVE", "NET_NEGATIVE")
+    assert r["metrics"]["max_drawdown_usd"]["value"] == pytest.approx(
+        f["metrics"]["max_drawdown_usd"]["value"])
+    # the unhedged comparison is on the pair too: pair - unhedged = the hedge's
+    # own increment, which is the cash net
+    assert r["metrics"]["vs_unhedged_btc_hold"][
+        "hedged_pair_minus_unhedged_usd"] == pytest.approx(190.0 - 5000.0)
+    assert f["metrics"]["vs_unhedged_btc_hold"][
+        "hedged_pair_minus_unhedged_usd"] == pytest.approx(190.0 + 5000.0)
+
+
+def test_a_phantom_overlay_win_is_not_reported_as_a_return():
+    """BTC falls 10% and the unhedged short 'wins' 10,000 in cash. The book's
+    economic result is the pair's -ve/+ve few hundred dollars, never +10%."""
+    j = L.Journal()
+    overlay(j, 0, 10, tag="a", close=90_000.0, revalue=True, funding=20.0)
+    ne, _ = economics(j, obs=[_im_obs()])
+    assert ne["headline"]["net_usd"] == pytest.approx(20 - 110 + 10_000)
+    assert ne["headline"]["economic_net_usd"] == pytest.approx(20 - 110)
+    ret = ne["metrics"]["return_on_committed_capital_pct"]["value"]
+    assert ret == pytest.approx(100.0 * (20 - 110) / 110_000.0)
+    assert ret < 0, "funding 20 does not pay 110 of fees: it is not a +9% win"
+    assert ne["verdict"]["code"] != "NET_POSITIVE"
+    assert ne["verdict"]["economic_net_usd"] == pytest.approx(-90.0)
+
+
+def test_an_overlay_without_a_pair_has_no_return_not_the_cash_return():
+    j = L.Journal()
+    j.post(L.Entry(ms=T0, kind="perp_open", ref="o",
+                   lines=[L.Line(L.PERP, 0.0, qty=-1.0), L.Line(L.FEES, 55.0),
+                          L.Line(L.USDT, -55.0, qty=-55.0)],
+                   memo="not a readable memo", fee_status="confirmed"))
+    j.post(L.Entry(ms=T0 + 5 * DAY, kind="perp_close", ref="c",
+                   lines=[L.Line(L.PERP, 0.0, qty=1.0), L.Line(L.FEES, 55.0),
+                          L.Line(L.USDT, -55.0, qty=-55.0)],
+                   memo="not a readable memo", fee_status="confirmed"))
+    ne, cycles = economics(j, obs=[_im_obs()])
+    assert cycles[0]["overlay"] is True      # a perp with no spot leg bought
+    assert ne["headline"]["economic_net_usd"] is None
+    assert ne["verdict"]["code"] == "OVERLAY_PAIR_NOT_COMPUTABLE"
+    for k in ("return_on_committed_capital_pct",
+              "annualised_return_on_committed_capital_pct",
+              "max_drawdown_usd", "expectancy_after_costs_usd"):
+        assert ne["metrics"][k]["value"] is None, k
+        assert "OVERLAY_PAIR_NOT_COMPUTABLE" in str(ne["metrics"][k]["why"]), k
+
+
+def test_a_derived_overlay_book_publishes_no_return_and_no_statistics():
+    """REVIEW FINDING (Round 16): with the inventory leg only DERIVED from perp
+    prices the pair is funding - fees by construction, so its basis is
+    unmeasured (counted as zero). A return on it overstated (+5.39%/yr annualised
+    and +$295 expectancy per cycle in the reviewer's reproduction while the
+    unmeasured basis was worth about -$300 per cycle). It is shown, labelled,
+    as the derived pair; it is never a return, benchmark or statistics base."""
+    j = L.Journal()
+    for i in range(6):
+        overlay(j, 20 * i, 20 * i + 10, tag=f"d{i}", funding=400.0,
+                close=P0 * 1.00)
+    cycles = perf.cycles_from_journal(j)
+    obs = [{"cycle_opened_ms": perf._cycle_ms(c["cycle_id"]),
+            "position_im_usd": 10_000.0} for c in cycles]
+    ne, _ = economics(j, obs=obs)
+    m = ne["metrics"]
+    assert m["hedged_pair_net_usd"]["status"] == "DERIVED_NOT_BOOKED"
+    assert m["hedged_pair_net_usd"]["value"] == pytest.approx(6 * (400 - 110))
+    assert ne["headline"]["economic_net_usd"] is None
+    for k in ("return_on_committed_capital_pct",
+              "annualised_return_on_committed_capital_pct",
+              "net_return_per_capital_day_pct", "expectancy_after_costs_usd",
+              "max_drawdown_usd", "net_excluding_largest_winner_usd"):
+        assert m[k]["value"] is None, k
+        assert "OVERLAY_PAIR_DERIVED_NOT_BOOKED" in str(m[k]["why"]), k
+    assert ne["headline"]["annualised_return_on_committed_capital_pct"] is None
+    assert ne["verdict"]["code"] == "OVERLAY_PAIR_DERIVED_NOT_BOOKED"
+
+
+def test_the_per_cycle_pair_carries_the_basis_when_the_marks_are_verified():
+    """REVIEW FINDING (Round 16): `unhedged + increment` took the BTC's move
+    from the perp fill prices, which cancels the price legs by construction and
+    leaves the basis out. With verified marks the per-cycle pair is the MEASURED
+    one (cash net + the booked inventory move): here the spot rose 4,000 while
+    the perp the short lost 5,000, a basis of -1,000."""
+    import performance_analytics as pa
+    j = L.Journal()
+    L.perp_open(j, ms=T0, ref="b-o", qty=1.0, price=P0, fee_usd=55.0,
+                fee_status="confirmed")
+    L.funding(j, ms=T0 + 5 * DAY, ref="b-f", usd=300.0, basis="venue",
+              raw=_vraw("b-f", T0 + 5 * DAY, 300.0))
+    L.revalue_inventory(
+        j, ms=T0 + 10 * DAY - 1, ref="b-rv", qty=1.0, from_price=P0,
+        to_price=P0 + 4_000.0,
+        raw={"valuation": L.MARK_VALUATION, "qty": 1.0, "entry_spot": P0,
+             "exit_spot": P0 + 4_000.0, "exit_mark_source": "tick_spot_mark",
+             "exit_mark_observed_ms": T0 + 10 * DAY - 1,
+             "fill_ms": T0 + 10 * DAY})
+    L.perp_close(j, ms=T0 + 10 * DAY, ref="b-c", qty=1.0, price=P0 + 5_000.0,
+                 entry_price=P0, fee_usd=55.0, fee_status="confirmed")
+    _, cycles = economics(j, obs=[_im_obs()])
+    c = cycles[0]
+    assert c["mark_status"] == "VERIFIED"
+    true_pair = 300 - 110 - 5_000 + 4_000
+    assert perf.hedged_pair(c)["net_usd"] == pytest.approx(true_pair)
+    opp = pa.overlay_opportunity_cost(c, benchmark_apr_pct=None)
+    assert opp["vs_unhedged_btc"]["hedged_pair_pnl_usd"] == pytest.approx(true_pair)
+    # without verified marks it stays the derived figure (basis-blind, labelled)
+    c2 = dict(c, mark_status="UNVERIFIED")
+    derived = pa.overlay_opportunity_cost(c2, benchmark_apr_pct=None)
+    assert derived["vs_unhedged_btc"]["hedged_pair_pnl_usd"] == pytest.approx(
+        5_000.0 + (300 - 110 - 5_000 + 0.0))
+
+
+def test_a_derived_book_withholds_every_edge_cushion_and_return():
+    """REVIEW FINDING (Round 16, second pass): pair_economics still used the
+    derived pair for four positive figures (+1.77% on posted margin, +2.95 bps
+    per notional-day, +0.98 bps of cushion over break-even, 29.5 bps of extra
+    round trip to zero) while the unmeasured basis was about -$300 per cycle.
+    The cost-recovery LEVELS stay (what must be earned, labelled basis-unmeasured);
+    an edge, a cushion or a return on a derived pair does not."""
+    j = L.Journal()
+    for i in range(6):
+        overlay(j, 20 * i, 20 * i + 10, tag=f"d{i}", funding=400.0)
+    cycles = perf.cycles_from_journal(j)
+    obs = [{"cycle_opened_ms": perf._cycle_ms(c["cycle_id"]),
+            "position_im_usd": 10_000.0} for c in cycles]
+    ne, _ = economics(j, obs=obs)
+    m = ne["metrics"]
+    for k in ("funding_margin_over_break_even_bps", "net_bps_per_notional_day",
+              "pair_return_on_posted_margin_pct"):
+        assert m[k]["value"] is None, k
+        assert "OVERLAY_PAIR_DERIVED_NOT_BOOKED" in m[k]["why"], k
+    s = m["execution_cost_sensitivity"]
+    assert s["extra_round_trip_bps_to_zero_net"] is None
+    assert s["fee_multiple_to_zero_net"] is None
+    assert s["basis_pnl_included"] is False and s["cushion_withheld"]
+    # the cost-recovery levels are still reported, labelled basis-unmeasured
+    be = m["break_even_funding_bps_per_settlement"]
+    assert be["value"] is not None and be["basis_pnl_included"] is False
+    assert m["min_holding_days_to_cover_costs"]["value"] is not None
+
+
+def test_a_verified_flat_mark_is_a_measured_pair_per_cycle():
+    """REVIEW FINDING (Round 16, second pass): `if reval and ...` read a
+    VERIFIED mark of exactly 0.0 (spot flat while the perp moved) as 'no mark',
+    so the per-cycle pair stayed the basis-blind derived one (+190) while the
+    measured pair is -160: a $350 basis loss hidden."""
+    import performance_analytics as pa
+    j = L.Journal()
+    L.perp_open(j, ms=T0, ref="f-o", qty=1.0, price=P0, fee_usd=55.0,
+                fee_status="confirmed")
+    L.funding(j, ms=T0 + 5 * DAY, ref="f-f", usd=300.0, basis="venue",
+              raw=_vraw("f-f", T0 + 5 * DAY, 300.0))
+    L.revalue_inventory(
+        j, ms=T0 + 10 * DAY - 1, ref="f-rv", qty=1.0, from_price=P0,
+        to_price=P0,
+        raw={"valuation": L.MARK_VALUATION, "qty": 1.0, "entry_spot": P0,
+             "exit_spot": P0, "exit_mark_source": "tick_spot_mark",
+             "exit_mark_observed_ms": T0 + 10 * DAY - 1,
+             "fill_ms": T0 + 10 * DAY})
+    L.perp_close(j, ms=T0 + 10 * DAY, ref="f-c", qty=1.0, price=P0 + 350.0,
+                 entry_price=P0, fee_usd=55.0, fee_status="confirmed")
+    _, cycles = economics(j, obs=[_im_obs()])
+    c = cycles[0]
+    assert c["mark_status"] == "VERIFIED" and c["revalue_entries"] == 1
+    assert c["revalue_usd"] == 0.0
+    true_pair = 300 - 110 - 350
+    assert perf.hedged_pair(c)["net_usd"] == pytest.approx(true_pair)
+    opp = pa.overlay_opportunity_cost(c, benchmark_apr_pct=None)
+    u = opp["vs_unhedged_btc"]
+    assert u["hedged_pair_pnl_usd"] == pytest.approx(true_pair)
+    assert u["pair_basis"] == "MEASURED_MARK"
+
+
+def test_the_per_cycle_benchmark_needs_a_measured_pair():
+    """REVIEW FINDING (Round 16, second pass): a derived pair read 'beats 5%'
+    (+$21 per cycle in the repro) with its basis counted as zero. Measured
+    pairs (booked, verified marks) are still compared; derived ones are not."""
+    import performance_analytics as pa
+    j = L.Journal()
+    overlay(j, 0, 10, tag="m", close=105_000.0, revalue=True)        # measured
+    overlay(j, 20, 30, tag="d", close=105_000.0)                      # derived
+    _, cycles = economics(j, obs=[_im_obs(0), _im_obs(20)])
+    measured, derived = cycles
+    ok = pa.overlay_opportunity_cost(measured, benchmark_apr_pct=5.0)
+    assert ok["vs_benchmark_rate"]["available"] is True
+    assert ok["vs_unhedged_btc"]["pair_basis"] == "MEASURED_MARK"
+    no = pa.overlay_opportunity_cost(derived, benchmark_apr_pct=5.0)
+    assert no["vs_benchmark_rate"]["available"] is False
+    assert "OVERLAY_PAIR_DERIVED_NOT_BOOKED" in no["vs_benchmark_rate"]["why"]
+    assert no["vs_unhedged_btc"]["pair_basis"] == "DERIVED_BASIS_UNMEASURED"
+
+
+def test_the_overlay_increment_does_not_subtract_the_inventory_mark_twice():
+    """The cycle's cash net already EXCLUDES the revaluation entry, so the
+    hedge's increment is the cash net and pair = unhedged + increment is the
+    hedged pair (cash + mark). Subtracting the mark again read the pair `mark`
+    too low."""
+    import performance_analytics as pa
+    j = L.Journal()
+    overlay(j, 0, 10, tag="a", close=105_000.0, revalue=True)
+    _, cycles = economics(j, obs=[_im_obs()])
+    c = cycles[0]
+    assert c["revalue_usd"] == pytest.approx(5000.0)
+    opp = pa.overlay_opportunity_cost(c, benchmark_apr_pct=None)
+    assert opp["overlay_increment_usd"] == pytest.approx(c["net_usd"])
+    assert opp["overlay_increment_usd"] == pytest.approx(300 - 110 - 5000)
+    pair = opp["vs_unhedged_btc"]["hedged_pair_pnl_usd"]
+    assert pair == pytest.approx(5000.0 + (300 - 110 - 5000))
+    assert pair == pytest.approx(perf.hedged_pair(c)["net_usd"])
+
+
 def test_an_acquire_cycle_already_holds_both_legs():
     j = L.Journal()
     acquire(j, 0, 10, tag="a", close=105_000.0)
@@ -178,7 +430,9 @@ def test_a_cycle_without_readable_perp_prices_gets_no_pair_not_zero():
 
 def test_break_even_funding_holding_period_and_required_edge():
     j = L.Journal()
-    overlay(j, 0, 10, tag="a", close=105_000.0)       # pair net 190
+    # a MEASURED pair (the BTC marked with the perp: pair net 190): the edge,
+    # cushion and return figures below need a measured basis
+    overlay(j, 0, 10, tag="a", close=105_000.0, revalue=True)
     ne, _ = economics(j)
     M = ne["metrics"]
     # 30 settlements on a 100k notional: funding 300 = 1.0 bps per settlement
@@ -186,7 +440,7 @@ def test_break_even_funding_holding_period_and_required_edge():
     # fees 110 = 11 bps of notional; break-even = 11 / 30 settlements
     be = M["break_even_funding_bps_per_settlement"]
     assert be["value"] == pytest.approx(11.0 / 30.0)
-    assert be["basis_pnl_included"] is False
+    assert be["basis_pnl_included"] is True
     assert M["funding_margin_over_break_even_bps"]["value"] == pytest.approx(
         1.0 - 11.0 / 30.0)
     # 3 bps/day of funding pays back an 11 bps fixed cost in 11/3 days
@@ -226,7 +480,8 @@ def test_financing_enters_the_break_even_per_day_not_as_a_fixed_cost():
 
 def test_execution_cost_sensitivity_is_arithmetic_on_stated_shocks():
     j = L.Journal()
-    overlay(j, 0, 10, tag="a", close=105_000.0)       # pair net 190, fees 110
+    # measured pair net 190, fees 110
+    overlay(j, 0, 10, tag="a", close=105_000.0, revalue=True)
     ne, _ = economics(j)
     s = ne["metrics"]["execution_cost_sensitivity"]
     assert s["evidence_class"] == perf.HISTORICAL_SIMULATION
@@ -287,8 +542,9 @@ def test_the_report_carries_the_pair_metrics_under_the_paper_class(tmp_path):
     assert r["headline"]["hedged_pair_net_usd"] == pytest.approx(190.0)
     assert r["headline"]["net_usd"] == pytest.approx(-4810.0)
     m = ne["metrics"]
-    # margin 10k observed: 190 / 10k
-    assert m["pair_return_on_posted_margin_pct"]["value"] == pytest.approx(1.9)
+    # the inventory leg here is only DERIVED (basis unmeasured): no return on it
+    assert m["pair_return_on_posted_margin_pct"]["value"] is None
+    assert "OVERLAY_PAIR_DERIVED_NOT_BOOKED" in m["pair_return_on_posted_margin_pct"]["why"]
     # nothing in it claims cash
     assert r["sections"]["realized_cash"]["evidence_class"] == perf.UNAVAILABLE
     # the evidence feed reads the pair figure off the detail cycle

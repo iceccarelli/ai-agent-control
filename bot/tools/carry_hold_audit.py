@@ -157,7 +157,8 @@ def _trade_net(t: Dict[str, Any], *, taker_perp_bps: float,
 
 def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
               mode: str = "overlay", style: str = "taker",
-              borrow_apr: float = 0.0) -> Dict[str, Any]:
+              borrow_apr: float = 0.0,
+              exit_policy: str = "funding_streak") -> Dict[str, Any]:
     import carry_backtest as cb
     import carry_costs as cc
     import carry_replay as cr
@@ -166,7 +167,8 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
     rows, meta = cb.load_bybit_settlements(repo)
     impact = cb.impact_bps_per_leg(repo, notional)[0]
     r = cr.replay(rows, notional=notional, borrow_apr=borrow_apr,
-                  execution_mode=mode, execution_style=style, impact_bps=impact)
+                  execution_mode=mode, execution_style=style, impact_bps=impact,
+                  exit_policy=exit_policy)
     trades: List[Dict[str, Any]] = r["trade_rows"]
     idx = {int(x.ms): i for i, x in enumerate(rows)}
     taker_perp, taker_spot = cc.TAKER_BPS_PERP, cc.TAKER_BPS_SPOT
@@ -204,6 +206,14 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
     reconciles = (abs(tot["funding"] - r["funding_usd"]) < 1.0
                   and abs(tot["basis"] - r["basis_usd"]) < 1.0
                   and abs(tot["fees"] + r["fees_usd"]) < 1.0)
+    # THE NET IDENTITY (Round 16). The per-trade nets are funding + basis - fees
+    # and EXCLUDE borrow, which the replay charges inside `net_usd`; the check
+    # above compares only three components, so it said "reconciles" at a 5%
+    # borrow while every per-trade net (and the losing share) was too high by
+    # that trade's financing. The identity is stated here with borrow as its
+    # own term, so a figure that does not close cannot read as one that does.
+    reconciles_net = abs(tot["net"] + r["borrow_usd"] - r["net_usd"]) < 1.0
+    borrow_excluded = float(r["borrow_usd"])
 
     def capped(t: Dict[str, Any], cap_days: float) -> Dict[str, float]:
         i0, i1 = idx[int(t["opened_ms"])], idx[int(t["closed_ms"])]
@@ -269,6 +279,7 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
 
     result = {
         "corpus": meta.get("corpus"), "mode": mode, "style": style,
+        "exit_policy": exit_policy,
         "window": r["window"], "prints": len(rows), "years": r["years"],
         "notional_usd": notional, "borrow_apr": borrow_apr,
         "round_trip_bps": round_trip, "engine_funding_history": history,
@@ -293,11 +304,18 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
         "assessment": None,
         "liquidation": r["liquidation"],
         "reconciles_with_replay": reconciles,
+        "reconciles_net": reconciles_net,
+        "per_trade_stats_exclude_borrow_usd": borrow_excluded,
         "gate_reproduces_every_historical_entry": reproduces == len(trades),
         "gate_reproduced_entries": reproduces,
         "sensitivity_to_early_exit": cap_table,
         "sensitivity_to_assumed_hold_in_sample": horizon_table,
-        "caveats": [
+        "caveats": ([
+            f"per-trade statistics (losing share, median, mean, the early-exit "
+            f"and assumed-hold tables) EXCLUDE ${-borrow_excluded:,.2f} of "
+            "borrow that the replay charges inside its net: at this borrow "
+            "rate every per-trade net below is too high by that trade's "
+            "financing"] if abs(borrow_excluded) > 0.005 else []) + [
             "historical replay of the real engine, not live evidence",
             "sensitivity_to_assumed_hold is in-sample and must not be used to "
             "pick a horizon",
@@ -321,7 +339,12 @@ def _print(a: Dict[str, Any]) -> None:
           f"{a['years']:.2f} yr)")
     print(f"  book   {a['mode'].upper()}/{a['style']}  ${a['notional_usd']:,.0f}  "
           f"round trip {a['round_trip_bps']:.1f} bps  borrow "
-          f"{a['borrow_apr'] * 100:.1f}%/yr")
+          f"{a['borrow_apr'] * 100:.1f}%/yr  exit policy {a['exit_policy']}")
+    if a["exit_policy"] == "continuation" and a["borrow_apr"] == 0.0:
+        print("  !! exit policy 'continuation' with no cost of capital: its "
+              "shortfall is measured against 0.0 (capital treated as FREE at "
+              "the exit; this tool takes no --opportunity-cost-apr, use "
+              "tools/carry_replay.py for a stated one)")
     if not a["liquidation"]["production_equivalent"]:
         print(f"  !! NOT PRODUCTION-EQUIVALENT: liquidation gate "
               f"{a['liquidation']['gate']} (no liqPrice/accountMMRate in the "
@@ -374,10 +397,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--mode", choices=("overlay", "acquire"), default="overlay")
     ap.add_argument("--style", choices=("taker", "maker_first"), default="taker")
     ap.add_argument("--borrow-apr", type=float, default=0.0)
+    ap.add_argument("--exit-policy", choices=("funding_streak", "continuation"),
+                    default="funding_streak",
+                    help="the engine's funding exit (see carry_replay); the "
+                         "default reproduces the frozen baseline")
     ap.add_argument("--json", default="")
     args = ap.parse_args(argv)
     audit = run_audit(args.repo, notional=args.notional, mode=args.mode,
-                      style=args.style, borrow_apr=args.borrow_apr)
+                      style=args.style, borrow_apr=args.borrow_apr,
+                      exit_policy=args.exit_policy)
     _print(audit)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:

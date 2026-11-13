@@ -25,11 +25,27 @@ T0 = 1_700_000_000_000
 
 
 def cyc(j, d0, d1, *, funding, close=100_000.0, tag, fee_status="confirmed",
-        basis="venue", mark=None):
+        basis="venue", mark=None, inventory_mark=True):
+    """A perp-only (overlay) cycle. By default the client's BTC is booked and
+    marked FLAT (a verified, zero-move revaluation), so the perp's move
+    `close - 100_000` is a real BASIS loss/gain of the measured hedged pair and
+    the pair net equals the booked net. That is what lets these fixtures keep
+    exercising the verdict thresholds: an overlay with NO inventory leg booked
+    is the net of an unhedged short, whose verdict is not a profit or loss
+    claim (tests/test_net_economics_pair.py)."""
     L.perp_open(j, ms=T0 + d0 * DAY, ref=f"{tag}-o", qty=1.0, price=100_000.0,
                 fee_usd=55.0, fee_status=fee_status, decision_mark=mark)
     L.funding(j, ms=T0 + ((d0 + d1) // 2) * DAY, ref=f"{tag}-f", usd=funding,
               basis=basis, raw=(_vraw(f"{tag}-f", T0 + ((d0 + d1) // 2) * DAY, funding) if basis == "venue" else None))
+    if inventory_mark:
+        L.revalue_inventory(
+            j, ms=T0 + d1 * DAY - 1, ref=f"{tag}-rv", qty=1.0,
+            from_price=100_000.0, to_price=100_000.0,
+            raw={"valuation": L.MARK_VALUATION, "qty": 1.0,
+                 "entry_spot": 100_000.0, "exit_spot": 100_000.0,
+                 "exit_mark_source": "tick_spot_mark",
+                 "exit_mark_observed_ms": T0 + d1 * DAY - 1,
+                 "fill_ms": T0 + d1 * DAY})
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=1.0, price=close,
                  entry_price=100_000.0, fee_usd=55.0, fee_status=fee_status,
                  decision_mark=mark)
@@ -246,6 +262,35 @@ def test_net_positive_below_benchmark_is_not_called_profit():
             "position_im_usd": 10_000.0} for c in cycles]
     ne, _ = economics(j, obs=obs, apr=50.0)
     assert ne["verdict"]["code"] == "NET_POSITIVE_BELOW_BENCHMARK_RATE"
+
+
+def _six_profitable_cycles():
+    j = L.Journal()
+    cyc(j, 0, 10, funding=300.0, tag="a")          # net +190 on 110k
+    for i in range(1, 6):
+        cyc(j, 10 + 11 * i, 20 + 11 * i, funding=300.0, tag=f"x{i}")
+    cycles = perf.cycles_from_journal(j)
+    obs = [{"cycle_opened_ms": perf._cycle_ms(c["cycle_id"]),
+            "position_im_usd": 10_000.0} for c in cycles]
+    return j, obs
+
+
+def test_a_positive_net_with_no_benchmark_is_not_a_profit_claim():
+    """REVIEW FINDING (Round 16): with no --cash-apr the verdict read plain
+    NET_POSITIVE. The question is what the same capital earns elsewhere, and
+    nothing was told it: no alternative stated is not 'beats nothing'."""
+    j, obs = _six_profitable_cycles()
+    ne, _ = economics(j, obs=obs, apr=None)
+    v = ne["verdict"]
+    assert v["code"] == "NET_POSITIVE_BENCHMARK_UNSTATED"
+    assert "NOT a statement that the book beats" in v["statement"]
+
+
+def test_a_positive_net_ahead_of_a_stated_benchmark_is_net_positive():
+    j, obs = _six_profitable_cycles()
+    ne, _ = economics(j, obs=obs, apr=0.5)         # a 0.5%/yr alternative
+    assert ne["verdict"]["code"] == "NET_POSITIVE"
+    assert "ahead of the supplied benchmark rate" in ne["verdict"]["statement"]
 
 
 def test_report_carries_a_top_level_verdict_and_stays_valid(tmp_path, capsys):

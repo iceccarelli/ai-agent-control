@@ -239,3 +239,35 @@ class TestTheGateChecksWhereOrdersActuallyGo:
                             "CARRY_EXECUTION_MODE": "overlay"})
         allowed, _why = _main.carry_orders_permitted_for(cfg, mock.Mock())
         assert allowed is False
+
+
+class TestTheContinuationExitNeedsAStatedCost:
+    """REVIEW FINDING (Round 16, second pass): `build_bot(config=<Config>)` never
+    passes through config.load, so its refusal of the continuation exit without
+    a stated cost of capital did not reach a Config built by another route."""
+
+    STATED = {"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05",
+              "CARRY_EXECUTION_MODE": "acquire",
+              "CARRY_EXIT_POLICY": "continuation",
+              "CARRY_OPPORTUNITY_COST_APR": "0.04"}
+
+    def _build(self, cfg):
+        return _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
+                               risk_manager=mock.Mock(), engine=mock.Mock())
+
+    def test_a_stated_cost_builds_and_the_policy_reaches_the_engine(self):
+        bot = self._build(_config.load(self.STATED))
+        assert bot.carry.exit_policy == "continuation"
+        assert bot.carry.opportunity_cost_apr == pytest.approx(0.04)
+
+    def test_the_default_policy_reaches_the_engine_unchanged(self):
+        bot = _build("carry")
+        assert bot.carry.exit_policy == "funding_streak"
+
+    def test_a_config_object_that_never_stated_a_cost_is_refused(self):
+        import dataclasses
+        stated = _config.load(self.STATED)
+        unstated = dataclasses.replace(
+            stated, CARRY_OPPORTUNITY_COST_APR_SUPPLIED=False)
+        with pytest.raises(_config.ConfigError, match="stated by the owner"):
+            self._build(unstated)

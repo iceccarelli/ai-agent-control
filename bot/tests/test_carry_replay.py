@@ -353,3 +353,81 @@ class TestTheReplayDoesNotPresentAnUnchargedSpreadAsATotal:
         report = rp.replay(rows(30), notional=100_000.0, borrow_apr=0.0, impact_bps=1.0)
         assert report["impact_bps_per_leg"] == 1.0 and report["execution_cost_warning"] is None
         assert "not a total" in " ".join(report["not_modelled"]).lower()          # a declared haircut is still not a measured cost
+
+
+# ---------------------------------------------------------------------------
+# Round 16: the owner-capital view. The headline return divides by the fixed
+# ENTRY notional; the owner's alternative is judged on the capital the pair
+# actually commits (economic_model.hedged_pair_capital_usd). The view says what
+# the net is on that capital, that this IS the break-even cost of capital, and
+# never reads an unstated cost of capital as a stated zero.
+# ---------------------------------------------------------------------------
+
+class TestTheOwnerCapitalView:
+    D = {"avg_marked_hedged_notional_usd": 100_000.0}
+
+    def test_the_net_is_judged_on_the_capital_the_repo_rule_commits(self):
+        v = rp.owner_capital_view(self.D, net_usd=10_000.0, years=2.0)
+        assert v["available"] is True
+        assert v["capital_multiple_of_marked_notional"] == pytest.approx(2.04)
+        assert v["avg_committed_capital_usd"] == pytest.approx(204_000.0)
+        assert v["net_return_on_committed_capital_pct_per_year"] == pytest.approx(
+            100.0 * 10_000.0 / 204_000.0 / 2.0)
+
+    def test_that_return_is_the_break_even_cost_of_capital(self):
+        v = rp.owner_capital_view(self.D, net_usd=10_000.0, years=2.0)
+        assert v["break_even_cost_of_capital_pct"] == pytest.approx(
+            v["net_return_on_committed_capital_pct_per_year"])
+
+    def test_leverage_changes_the_committed_capital_not_a_constant(self):
+        v2 = rp.owner_capital_view(self.D, net_usd=10_000.0, years=2.0,
+                                   leverage=2.0)
+        assert v2["capital_multiple_of_marked_notional"] == pytest.approx(
+            (1 + 1 / 2.0) * 1.02)
+        v1 = rp.owner_capital_view(self.D, net_usd=10_000.0, years=2.0)
+        assert (v2["net_return_on_committed_capital_pct_per_year"]
+                > v1["net_return_on_committed_capital_pct_per_year"])
+
+    def test_an_unstated_cost_of_capital_is_unstated_not_zero(self):
+        v = rp.owner_capital_view(self.D, net_usd=10_000.0, years=2.0)
+        assert v["cost_of_capital"] == {"state": "UNSTATED", "apr": None,
+                                        "source": None}
+        assert "excess_over_stated_cost_pct_per_year" not in v
+        text = "\n".join(rp.owner_capital_lines(v))
+        assert "COST OF CAPITAL UNSTATED" in text
+        assert "NOT assumed" in text
+
+    def test_a_stated_cost_gives_the_excess_on_the_same_capital(self):
+        v = rp.owner_capital_view(self.D, net_usd=10_000.0, years=2.0,
+                                  stated_apr=0.04)
+        assert v["cost_of_capital"]["state"] == "STATED"
+        assert v["excess_over_stated_cost_pct_per_year"] == pytest.approx(
+            v["net_return_on_committed_capital_pct_per_year"] - 4.0)
+        assert "UNSTATED" not in "\n".join(rp.owner_capital_lines(v))
+
+    def test_an_explicit_zero_is_a_stated_zero_and_an_absent_value_is_not(self):
+        zero = rp.owner_capital_view(self.D, net_usd=1.0, years=1.0,
+                                     stated_apr=0.0)
+        assert zero["cost_of_capital"]["state"] == "STATED"
+        none = rp.owner_capital_view(self.D, net_usd=1.0, years=1.0)
+        assert none["cost_of_capital"]["state"] == "UNSTATED"
+
+    @pytest.mark.parametrize("d", [{}, {"avg_marked_hedged_notional_usd": None},
+                                   {"avg_marked_hedged_notional_usd": 0.0},
+                                   {"avg_marked_hedged_notional_usd": float("nan")}])
+    def test_an_unreproducible_notional_claims_nothing(self, d):
+        v = rp.owner_capital_view(d, net_usd=10_000.0, years=2.0)
+        assert v["available"] is False and v["why"]
+        assert "not claimed" in "\n".join(rp.owner_capital_lines(v))
+
+    def test_a_real_replay_carries_the_view_and_says_it_is_unstated(self):
+        r = rp.replay(rows(n=240), notional=100_000.0, borrow_apr=0.0,
+                      execution_mode="overlay")
+        v = r["owner_capital"]
+        assert v["cost_of_capital"]["state"] == "UNSTATED"
+        if v["available"]:
+            assert v["capital_multiple_of_marked_notional"] == pytest.approx(2.04)
+        stated = rp.replay(rows(n=240), notional=100_000.0, borrow_apr=0.0,
+                           execution_mode="overlay", opportunity_cost_apr=0.03,
+                           cost_of_capital_stated=True)
+        assert stated["owner_capital"]["cost_of_capital"]["state"] == "STATED"

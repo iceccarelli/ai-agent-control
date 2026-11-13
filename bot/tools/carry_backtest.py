@@ -1050,7 +1050,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 negative_exit_prints: int = NEGATIVE_EXIT_PRINTS,
                                 hold_days: Optional[float] = None,
                                 demonstrated_hold_days: Optional[float] = None,
-                                opportunity_cost_apr: float = 0.0
+                                opportunity_cost_apr: float = 0.0,
+                                exit_policy: str = "funding_streak"
                                 ) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
@@ -1080,7 +1081,17 @@ def simulate_settlements_series(rows: List[Settlement], *,
     capital: the gate charges it beside borrow, and each held print accrues
     it on qty * spot exactly as scalar borrow does. It is reported as
     `opportunity_cost_usd` and `net_after_opportunity_cost_usd`; `net_usd`
-    stays cash. carrycore.cpp takes the same parameter."""
+    stays cash. carrycore.cpp takes the same parameter.
+
+    `exit_policy` is the engine's funding exit: "funding_streak" (default,
+    `negative_exit_prints` consecutive negative prints) or "continuation" (the
+    funding shortfall paid while holding reaches the priced round trip,
+    `carry_costs.continuation_exit`, the SAME pure functions the engine calls).
+    The native core implements only "funding_streak": a sweep through it is
+    never a statement about the continuation exit."""
+    if exit_policy not in _carry_costs().EXIT_POLICIES:
+        raise ValueError(f"exit_policy {exit_policy!r} is not one of "
+                         f"{_carry_costs().EXIT_POLICIES}")
     if int(latency_rows) < 0:
         raise ValueError("latency_rows cannot be negative")
     latency_rows = int(latency_rows)
@@ -1115,6 +1126,12 @@ def simulate_settlements_series(rows: List[Settlement], *,
     trades: List[Trade] = []
     live: Optional[Trade] = None
     streak = 0
+    #: The funding shortfall paid while holding (bps of hedged notional): the
+    #: engine's `exit_shortfall_bps`, maintained under both policies.
+    shortfall = 0.0
+    capital_cost_bps = cc.capital_cost_bps_per_print(borrow_apr,
+                                                     opportunity_cost_apr)
+    exit_round_trip_bps = round_trip_bps_for(mode)
     history: List[float] = []
     refusals: Dict[str, int] = {}
     per_print_borrow = borrow_apr / (365.0 * FUNDING_PERIODS_PER_DAY)
@@ -1155,13 +1172,13 @@ def simulate_settlements_series(rows: List[Settlement], *,
     unresolved_entries = unresolved_exits = 0
 
     def close_live(st: Settlement, reason: str) -> None:
-        nonlocal live, streak, exit_fill_at, exit_signalled
+        nonlocal live, streak, shortfall, exit_fill_at, exit_signalled
         live.closed = _when(st.ms)
         live.exit_spot, live.exit_perp = st.spot, st.perp
         charge(live, st.spot, st.perp)
         live.reason = reason
         trades.append(live)
-        live, streak = None, 0
+        live, streak, shortfall = None, 0, 0.0
         exit_fill_at, exit_signalled = None, False
 
     for index, st in enumerate(rows):
@@ -1176,13 +1193,13 @@ def simulate_settlements_series(rows: List[Settlement], *,
                 # The decision row's price was gated; this row's was not. An
                 # unusable price is no fill, never a crash or an infinite qty.
                 unresolved_entries += 1
-                streak, entry_fill_at = 0, None
+                streak, shortfall, entry_fill_at = 0, 0.0, None
                 continue
             qty = notional / st.perp
             live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
                          entry_perp=st.perp)
             charge(live, st.spot, st.perp)
-            streak, entry_fill_at = 0, None
+            streak, shortfall, entry_fill_at = 0, 0.0, None
             continue
 
         if live is not None:
@@ -1212,7 +1229,21 @@ def simulate_settlements_series(rows: List[Settlement], *,
             if exit_signalled:
                 continue
             streak = streak + 1 if r_bps < 0 else 0
-            if streak >= int(negative_exit_prints):
+            stepped = cc.exit_shortfall_step(shortfall, r_bps, capital_cost_bps)
+            if stepped is not None:
+                shortfall = stepped
+            should_exit = streak >= int(negative_exit_prints)
+            if exit_policy == cc.EXIT_POLICY_CONTINUATION and shortfall > 0.0:
+                verdict = cc.continuation_exit(
+                    shortfall_bps=shortfall,
+                    round_trip_bps=exit_round_trip_bps)
+                # an unjudgeable exit falls back to the legacy rule, as the
+                # engine does; a judged one decides alone
+                should_exit = (verdict.close if verdict.close is not None
+                               else should_exit)
+            elif exit_policy == cc.EXIT_POLICY_CONTINUATION:
+                should_exit = False
+            if should_exit:
                 if latency_rows == 0:
                     close_live(st, "FUNDING_INVERTED")
                 elif index + latency_rows <= last_index:
@@ -1252,7 +1283,7 @@ def simulate_settlements_series(rows: List[Settlement], *,
                 live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
                              entry_perp=st.perp)
                 charge(live, st.spot, st.perp)
-                streak = 0
+                streak, shortfall = 0, 0.0
         else:
             entry_fill_at = fill_row
 
@@ -1298,6 +1329,7 @@ def simulate_settlements_series(rows: List[Settlement], *,
         "net_annualised_pct": (100.0 * a["net_usd"] / notional) / years,
         "naive_funding_sum_pct_per_yr": 100.0 * sum(s.rate for s in rows) / years,
         "borrow_apr": borrow_apr, "impact_bps_per_leg": impact_bps,
+        "exit_policy": exit_policy,
         "opportunity_cost_apr": opportunity_cost_apr,
         "opportunity_cost_usd": -sum(t.opportunity for t in trades),
         "net_after_opportunity_cost_usd": (
