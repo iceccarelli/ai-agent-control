@@ -166,6 +166,82 @@ def parse_wallet(res: Any) -> Tuple[D, Dict[str, D]]:
         raise ExecutorError("wallet answer malformed") from None
 
 
+#: Round 19: the wallet fields that say what the venue actually COMMITTED and CHARGED, read as OBSERVATION (never an input to a trading decision). Whatever the venue does not state is None: unknown, never 0.
+WALLET_ACCOUNT_FACTS = ("totalEquity", "totalWalletBalance", "totalMarginBalance", "totalAvailableBalance", "totalPerpUPL", "totalInitialMargin", "totalMaintenanceMargin",
+                        "accountIMRate", "accountMMRate", "accountLTV")
+WALLET_COIN_FACTS = ("walletBalance", "equity", "usdValue", "locked", "borrowAmount", "accruedInterest", "spotBorrow", "totalOrderIM", "totalPositionIM", "totalPositionMM",
+                     "unrealisedPnl", "cumRealisedPnl")
+WALLET_COIN_FLAGS = ("marginCollateral", "collateralSwitch")
+WALLET_FACT_SAMPLES_MAX = 400
+WALLET_FACT_INTERVAL_MS = 60_000
+
+
+def _stated_number(v: Any) -> Tuple[Optional[str], bool]:
+    """(canonical decimal text or None, unparsable). Absent, None and '' are 'not stated' (None, False); a bool or anything that is not a finite number is None and unparsable (True)."""
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return None, False
+    if isinstance(v, bool) or not isinstance(v, (str, int)):
+        return None, True
+    text = str(v).strip()
+    if len(text) > 64:                                           # no wallet figure is this long: bounded work and bounded storage whatever the venue (or a proxy) sends
+        return None, True
+    try:
+        d = D(text)
+    except (ArithmeticError, ValueError):
+        return None, True
+    if not d.is_finite() or (d != 0 and not -30 <= d.adjusted() <= 30):      # checked BEFORE the number is expanded: format(Decimal('1E+999999999'), 'f') is a ~1 GB string
+        return None, True
+    return format(d, "f"), False
+
+
+def parse_wallet_facts(res: Any) -> Dict[str, Any]:
+    """What a ``/v5/account/wallet-balance`` answer states about committed margin, borrowing and interest: the venue's own figures as text (``None`` = not stated), and four derived facts.
+
+    ``derived.committed_initial_margin`` = ``totalInitialMargin`` when stated; ``borrow_stated`` is True when any coin states a positive ``borrowAmount``, False only when EVERY coin states one and
+    none is positive, else None; ``accrued_interest_stated`` likewise for ``accruedInterest``; ``usdt_shortfall`` = ``-walletBalance`` of USDT when it is negative, ``"0"`` when it is stated
+    non-negative, None when it is not stated. NEVER raises (observation only): an unreadable answer is ``readable: False`` with nothing derived. The real Testnet account's capture is flat in
+    every read (margin 0, borrow 0, interest 0): committed margin has never been OBSERVED while a position was open."""
+    empty = {"readable": False, "account": {}, "coins": {}, "unparsed": [], "derived": {"committed_initial_margin": None, "borrow_stated": None, "accrued_interest_stated": None, "usdt_shortfall": None}}
+    try:
+        accts = res.get("list") if isinstance(res, Mapping) else None
+        if not isinstance(accts, list) or not accts or not isinstance(accts[0], Mapping):
+            return empty
+        acct = accts[0]
+        rows = acct.get("coin")
+        if not isinstance(rows, list) or any(not isinstance(c, Mapping) for c in rows):
+            return empty
+        unparsed: List[str] = []
+        account: Dict[str, Optional[str]] = {}
+        for k in WALLET_ACCOUNT_FACTS:
+            account[k], bad = _stated_number(acct.get(k))
+            if bad:
+                unparsed.append(f"account.{k}")
+        coins: Dict[str, Dict[str, Any]] = {}
+        for c in rows:
+            name = str(c.get("coin"))
+            row: Dict[str, Any] = {}
+            for k in WALLET_COIN_FACTS:
+                row[k], bad = _stated_number(c.get(k))
+                if bad:
+                    unparsed.append(f"{name}.{k}")
+            for k in WALLET_COIN_FLAGS:
+                row[k] = c.get(k) if isinstance(c.get(k), bool) else None
+            coins[name] = row
+
+        def positive_anywhere(field: str) -> Optional[bool]:
+            vals = [D(r[field]) if r[field] is not None else None for r in coins.values()]
+            if any(v is not None and v > 0 for v in vals):
+                return True
+            return False if vals and all(v is not None for v in vals) else None
+        wb = coins.get("USDT", {}).get("walletBalance")
+        shortfall = None if wb is None else (format(-D(wb), "f") if D(wb) < 0 else "0")
+        return {"readable": True, "account": account, "coins": coins, "unparsed": unparsed,
+                "derived": {"committed_initial_margin": account["totalInitialMargin"], "borrow_stated": positive_anywhere("borrowAmount"),
+                            "accrued_interest_stated": positive_anywhere("accruedInterest"), "usdt_shortfall": shortfall}}
+    except (AttributeError, TypeError, KeyError, ArithmeticError, ValueError):
+        return empty
+
+
 def _wallet_usd_values(res: Any) -> Dict[str, D]:
     """{coin: usdValue} from a wallet-balance result (the venue's own valuation, the basis of totalEquity); a coin without a usable figure is simply absent."""
     out: Dict[str, D] = {}
@@ -202,6 +278,7 @@ class TestnetExecutor:
         self._seen_exec: set = set()
         #: MEASUREMENTS per order link id (local clock): what we saw and when. Pure observation: nothing here feeds a decision, a gate or a retry.
         self.meas: Dict[str, Dict[str, Any]] = {}
+        self.wallet_facts: List[Dict[str, Any]] = []                  # Round 19: [{ts_ms, facts}] from parse_wallet_facts at account reads (observation only; the first sample is pinned)
         self.wallet_samples: List[Tuple[int, str]] = []                # (local ms, USDT walletBalance) at every account read: lets a settlement be checked against the wallet's own delta
         self._quotes: Dict[Tuple[str, str], Dict[str, Any]] = {}      # (category, symbol) -> the latest ticker quote this executor read
 
@@ -581,6 +658,20 @@ class TestnetExecutor:
         except (ExecutorError, KeyError, TypeError, ValueError):
             return None
 
+    def _record_wallet_facts(self, res: Any) -> None:
+        """Observation only: a fault here must never reach the trading path. One sample when the stated facts change or every ``WALLET_FACT_INTERVAL_MS``; bounded, the first sample kept."""
+        try:
+            facts = parse_wallet_facts(res)
+            ts = int(self.clock())
+            last = self.wallet_facts[-1] if self.wallet_facts else None
+            if last is not None and last["facts"] == facts and ts - last["ts_ms"] < WALLET_FACT_INTERVAL_MS:
+                return
+            self.wallet_facts.append({"ts_ms": ts, "facts": facts})
+            if len(self.wallet_facts) > WALLET_FACT_SAMPLES_MAX:
+                del self.wallet_facts[1: 1 + len(self.wallet_facts) - WALLET_FACT_SAMPLES_MAX]
+        except Exception:                                                # noqa: BLE001 - never reaches the trading path
+            return
+
     # ---------------------------------------------------------------- account / market reads for the authority
     def account_state(self, baseline: Optional[Mapping[str, float]] = None, open_groups: int = 0) -> Dict[str, Any]:
         """The ``ms_risk`` account state from FRESH reads (raises ``ExecutorError`` if any read fails: no guess). ``baseline`` = spot balances the client held before the session."""
@@ -598,6 +689,7 @@ class TestnetExecutor:
             view_pos[sym] = {"category": "linear", "notional_usd": float(size * m * (1 if side == "Buy" else -1)), "qty": float(size)}
         w = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, signed=True)
         eq, coins = parse_wallet(w)
+        self._record_wallet_facts(w)
         if QUOTE in coins:
             ts, val = int(self.clock()), str(coins[QUOTE])
             last = self.wallet_samples[-1] if self.wallet_samples else None

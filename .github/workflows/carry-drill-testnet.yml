@@ -156,7 +156,10 @@ jobs:
 
       - name: Close anything left open (always; reduce-only, testnet, <= 0.0015 BTC)
         id: flat
-        if: always() && steps.window.outputs.inside == 'true'
+        # Round 19: only when THIS run's armed drill step ran and was not refused (exit 2 = the single-writer guard refused it and nothing was opened). Without this the step ran after a
+        # skipped or refused drill and bought back whatever perp short the shared Testnet account showed (<= 0.0015 BTC): another executor's hedge, leaving its spot leg naked.
+        # The tool itself now also takes the single-writer authority (exit 3 when it cannot), and this workflow has no Supabase wiring, so on a non-flat venue it fails closed.
+        if: always() && steps.window.outputs.inside == 'true' && steps.drill.outcome != 'skipped' && steps.drill.outputs.exit != '2'
         env:
           BYBIT_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
@@ -198,6 +201,7 @@ jobs:
         run: |
           code="${{ steps.drill.outputs.exit }}"
           echo "preflight: ${{ steps.preflight.outcome }}  drill exit: ${code:-not run}  ensure-flat: ${{ steps.flat.outcome }}"
+          if [ "${{ steps.flat.outcome }}" = "skipped" ] && [ "$code" = "2" ]; then echo "the drill was REFUSED before any order (exit 2: another executor holds the account, or the executor guard is not configured): nothing was opened and the close-out was deliberately not run; this run FAILED on the drill's authority, it is not a finding about the account"; exit 1; fi
           if [ "${{ steps.flat.outcome }}" != "success" ]; then echo "THE VENUE COULD NOT BE VERIFIED FLAT: look at the testnet account"; exit 1; fi
           if [ "${{ steps.preflight.outcome }}" != "success" ]; then echo "preflight failed (not flat, or the venue could not be read): no drill was run"; exit 1; fi
           case "$code" in 0|5) echo "drill finished (exit $code)";; *) echo "drill exit code $code is not a clean finish"; exit 1;; esac

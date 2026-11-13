@@ -156,3 +156,13 @@ def test_the_real_container_smoke_script_is_offline_and_arms_nothing():
     assert all("--network none" in ln for ln in runs), [ln for ln in runs if "--network none" not in ln]
     assert not re.search(r"-e\s+(LIVE_TRADING_ACK|USE_TESTNET=0|PAPER_TRADING=|BYBIT_(TESTNET_)?API_(KEY|SECRET))", text), "the smoke script must not set a credential or an arming variable"
     assert "docker build -f Dockerfile.drill" in text and "set -eu" in text
+
+
+def test_the_read_only_drill_image_and_app_do_not_bake_the_order_arming_flag():
+    """Round 19 (adversarial review): Dockerfile.drill ENV and fly.drill.toml set PAPER_TRADING=0, so any command run in the image (a `fly ssh` session, close_testnet_short, main.py) started
+    order-permitted on Testnet. The orchestrator forces its own env for the order-capable child (tests/test_unattended_drill.py), so the default must be read-only."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    docker = re.sub(r"\\\n", " ", open(os.path.join(root, "Dockerfile.drill"), encoding="utf-8").read())
+    assert not re.search(r"^ENV .*PAPER_TRADING=0", docker, re.M) and re.search(r"^ENV .*PAPER_TRADING=1", docker, re.M)
+    toml = open(os.path.join(root, "fly.drill.toml"), encoding="utf-8").read()
+    assert re.search(r'^PAPER_TRADING = "1"', toml, re.M) and not re.search(r'^PAPER_TRADING = "0"', toml, re.M)

@@ -256,3 +256,86 @@ def test_a_hedge_ratio_within_a_billionth_of_whole_is_a_whole_hedge_claim(ratio)
 def test_a_hedge_that_is_measured_or_not_whole_is_not_flagged():
     for q in (Q(D(1), "measured", "ratio"), Q(D(1), "venue_stated", "ratio"), Q(D("0.999"), "derived", "ratio"), Q(D("0.6"), "modelled", "ratio")):
         assert "hedge_ratio" not in EM.evaluate_chain(overlay(hedge_ratio=q)).assumed_inputs, q
+
+
+# ------------------------------------------------------------------ Round 19: ONE structure-keyed capital definition (capital specialist F1/F6, quant specialist F1)
+@pytest.mark.parametrize("lev", [1, 2, 3, 5])
+def test_the_structure_registry_is_the_one_definition_the_two_wrappers_read(lev):
+    assert EM.structure_capital_usd(EM.ACQUIRED_SPOT_PERP, 1, lev).value == EM.hedged_pair_capital_usd(1, lev).value
+    assert EM.structure_capital_usd(EM.PERP_ONLY, 1, lev).value == EM.perp_only_capital_usd(1, lev).value
+    # coin the owner already holds is capital that could be SOLD (it earns its alternative either way), so with no collateral credit claimed it commits what the bought pair does
+    assert EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 1, lev).value == EM.hedged_pair_capital_usd(1, lev).value
+    assert set(EM.CAPITAL_STRUCTURES) == {EM.ACQUIRED_SPOT_PERP, EM.OWNED_INVENTORY_OVERLAY, EM.PERP_ONLY}
+
+
+def test_the_two_wrappers_are_byte_identical_to_the_expressions_they_always_used():
+    """Independent review: the wrappers were compared only with the function they call. Oracle = the pre-Round-19 expressions, on every leverage including the non-terminating 3, 7 and 9 (where
+    n + n/lev differs from n x (1 + 1/lev) in the 28th digit) and on 2,000 pseudo-random notionals."""
+    import random
+    rnd = random.Random(19)
+    buf = EM.PLAN_BUFFER_FRACTION
+    for lev in (1, 2, 3, 4, 5, 7, 9, 10, D("1.5"), D("2.5")):
+        for n in [D(rnd.randint(1, 10 ** 7)) / D(rnd.choice((1, 10, 100, 1000))) for _ in range(200)] + [D(5000), D(200), D("375")]:
+            L = D(lev)
+            assert EM.hedged_pair_capital_usd(n, lev).value == n * (D(1) + D(1) / L) * (D(1) + buf), (n, lev)
+            assert EM.perp_only_capital_usd(n, lev).value == n / L * (D(1) + buf), (n, lev)
+            assert EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, n, lev).value == EM.hedged_pair_capital_usd(n, lev).value
+    assert str(EM.hedged_pair_capital_usd(5000, 3).value) == "6799.999999999999999999999998", "the historical digits, not a rounder number"
+
+
+def test_an_unstated_collateral_ratio_is_an_upper_bound_labelled_assumed_and_a_stated_one_is_derived():
+    unstated = EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 100_000, 1)
+    assert unstated.value == D("204000") and unstated.provenance == "assumed", "no credit is claimed for held coin until the owner states the venue's collateral ratio: the margin is paid separately"
+    stated = EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 100_000, 1, inventory_collateral_ratio=D("0.9"))
+    assert stated.value == D("112200") and stated.provenance == "derived", "0.9 of the held coin backs the margin: only 10% of it is paid in cash, plus the 2% buffer on both"
+    full = EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 100_000, 5, inventory_collateral_ratio=D("1"))
+    assert full.value == D("102000"), "the credit can never exceed the margin it backs: capital is the inventory plus its buffer, never less"
+    for bad in (D("-0.1"), D("1.01"), float("nan"), D("inf")):
+        with pytest.raises(EM.EconomicModelError):
+            EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 1, 1, inventory_collateral_ratio=bad)
+    assert EM.structure_capital_usd(EM.ACQUIRED_SPOT_PERP, 1, 1).provenance == "derived" and EM.structure_capital_usd(EM.PERP_ONLY, 1, 1).provenance == "derived"
+    with pytest.raises(EM.EconomicModelError):
+        EM.structure_capital_usd("SOMETHING_ELSE", 1, 1)
+    with pytest.raises(EM.EconomicModelError):
+        EM.structure_capital_usd(EM.PERP_ONLY, 1, 1, inventory_collateral_ratio=D("0.9"))           # a ratio that nothing reads is a mistake, not a default
+
+
+_CAPITAL_MULTIPLE_LITERALS = {1.16, 2.04, 2.003, 2.02, 1.122, 1.224}
+_CAPITAL_MULTIPLE_TEXTS = {str(v) for v in _CAPITAL_MULTIPLE_LITERALS}
+_ALLOWED_CAPITAL_LITERALS = {("opportunity_map.py", 1.16): "the research overlay: BTC already held + an ASSUMED ~15% perp margin + 1% buffer (pinned to 1 + 0.15 + 0.01 and below the executor's 2.04)"}
+
+
+def _capital_literals(sources):
+    """``(basename, value, line)`` for every literal in ``sources`` ((name, python source) pairs) that is a capital multiple: a float, or a string spelling one (``Decimal("2.04")``, ``"2.04"``)."""
+    import ast
+    out = []
+    for name, src in sources:
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, float) and node.value in _CAPITAL_MULTIPLE_LITERALS:
+                out.append((os.path.basename(name), node.value, node.lineno))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.strip() in _CAPITAL_MULTIPLE_TEXTS:
+                out.append((os.path.basename(name), float(node.value), node.lineno))
+    return out
+
+
+def test_the_capital_literal_tripwire_sees_a_planted_multiple_in_every_spelling_it_polices():
+    planted = {"x = 2.04": 2.04, "def f():\n    return 1.16": 1.16, "CAP = {'a': 2.003}": 2.003, "y = n * 2.02": 2.02, "z = 1.122": 1.122, "w = (1.224)": 1.224,
+               "from decimal import Decimal\nq = Decimal('2.04')": 2.04, "r = '1.16'": 1.16, "s = Decimal(\"2.003\")": 2.003}
+    for src, value in planted.items():
+        got = _capital_literals([("tools/new_module.py", src)])
+        assert [(b, v) for b, v, _l in got] == [("new_module.py", value)], src
+    assert _capital_literals([("tools/ok.py", "x = 1.02  # a tolerance\ny = 2.5\nz = 'a string 2.04 inside prose'\nw = '2.040'")]) == [], "prose and other numbers are not multiples"
+
+
+def test_every_capital_multiple_in_production_code_comes_from_the_registry_or_is_a_named_assumption():
+    """The tripwire (quant F1, capital F1): the same hedge was priced at 1.0 / 1.10 / 1.16 / 1.2 / 2.003 / 2.02 / 2.04 by different modules. A numeric literal that IS a capital multiple may exist
+    in exactly one place, the research overlay's labelled ASSUMPTION; every other multiple is computed by ``economic_model.structure_capital_usd`` (or its two wrappers). Every Python file under
+    ``bot/`` outside ``tests/`` is walked (not only ``bot/*.py`` and ``bot/tools``). A multiple spelled as a sum or a ratio (``1 + 1.04``) is not seen by any literal scan: the registry's tests are the guard."""
+    import glob
+    root = os.path.dirname(HERE)
+    files = sorted(p for p in glob.glob(os.path.join(root, "**", "*.py"), recursive=True) if os.sep + "tests" + os.sep not in p and os.sep + ".venv" not in p)
+    assert len(files) > 100, "the walker found no shipped code: the tripwire would pass vacuously"
+    hits = [(name, base, value, line) for name in files for (base, value, line) in _capital_literals([(name, open(name, encoding="utf-8").read())])]
+    offenders = [f"{os.path.relpath(name, root)}:{line} = {value}" for name, base, value, line in hits if (base, value) not in _ALLOWED_CAPITAL_LITERALS]
+    assert not offenders, f"a numeric capital multiple outside the registry: {offenders}; compute it with economic_model.structure_capital_usd"
+    assert set(_ALLOWED_CAPITAL_LITERALS) <= {(base, value) for _n, base, value, _l in hits}, "the allow-list names a literal that no longer exists (delete the entry)"

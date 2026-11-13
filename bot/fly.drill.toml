@@ -31,7 +31,7 @@ retries = 10
 
 [env]
 USE_TESTNET = "1"
-PAPER_TRADING = "0"
+PAPER_TRADING = "1"          # Round 19: the app default is read-only; the orchestrator forces PAPER_TRADING=0 only inside the order-capable child it starts
 BYBIT_VENUE = "testnet"
 # "observe" LETS ENTRIES PROCEED while recording what the entry net-benefit
 # gate would have refused; it is not read-only and not a safety setting. Today

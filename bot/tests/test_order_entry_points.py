@@ -32,7 +32,7 @@ ENTRY_POINTS: Dict[str, str] = {
     "tools/ms_testnet_session.py": "3 execute: guarded_main lease (renewed) + account lock; reconcile: account lock + kill handoff; unwind never blocked",
     "tools/unattended_drill.py": "3 guarded_run_once: shared lease + account lock",
     "tools/drill.py": "3 --arm: single_writer_guard (account lock + shared lease, or its guarded parent)",
-    "tools/close_testnet_short.py": "2 reduce-only Buy, ungated on purpose",
+    "tools/close_testnet_short.py": "2 reduce-only Buy; --arm takes single_writer_guard (account lock + shared lease, or its guarded parent)",
     "main.py": "3 carry book: config-gated (PAPER_TRADING, venue, approved risk policy); the carry-book app stays stopped",
     "tools/testnet_session.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check)",
     "tools/testnet_conformance_run.py": "3 legacy armed tool: its __main__ goes through run_guarded_cli (single-writer authority unless help / dry-run / offline self-check)",

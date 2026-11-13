@@ -28,7 +28,13 @@ WHAT IT REFUSES
   * a quantity it cannot read or that is not positive and finite;
   * `--arm` without the confirmation typed exactly, or without a terminal;
   * running while a drill process holds the same evidence file (use a fresh
-    `--evidence-path`).
+    `--evidence-path`);
+  * an armed close without the single-writer authority every other
+    order-capable tool takes (the local account lock AND the shared lease, or
+    the guarded unattended-drill parent that holds both): REFUSED, exit 3,
+    nothing sent. It cannot close a stray short from a shell with no lease
+    configuration or while another executor holds the account; the lease-free,
+    holder-aware unwind is `ms_testnet_session reconcile --unwind`.
   The order is reduce-only, so the venue itself refuses any quantity that would
   open or flip a position.
 
@@ -473,6 +479,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                   file=sys.stderr)
             return 3
 
+    # Round 19: the close sends an order on the shared Testnet account, so it takes the SAME single-writer authority as every other order-capable tool (the local account lock AND the shared
+    # lease, or the guarded unattended-drill parent that holds both). Buying back a perp short while another executor holds its hedge leaves that executor's spot leg naked and lands an orphan
+    # fill in its journal. Refused = nothing sent, exit 3. No guard is taken for the unarmed look, a flat venue or any refusal above (none of them can send an order). There is no
+    # --ignore-lease flag: the lease-free, holder-aware unwind is `ms_testnet_session reconcile --unwind`. Spelled D.single_writer_guard so tests satisfy it through conftest's one stub.
+    release_writer, writer_why = D.single_writer_guard(D._executor_env().guard_env())
+    if release_writer is None:
+        print(f"REFUSED: {writer_why}. Nothing was sent.", file=sys.stderr)
+        return 3
+    try:
+        return _send_and_verify(args, broker, state, D)
+    finally:
+        release_writer()
+
+
+def _send_and_verify(args, broker, state, D) -> int:
     D.InterruptGuard().install()
     try:
         outcome = close_short(broker, args.symbol,

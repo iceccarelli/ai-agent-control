@@ -2,7 +2,7 @@
 """Reserve the holdout BEFORE the first evaluation read of Bybit history, and make the reserved region unreadable until the one test that may read it.
 
     python3 tools/history_holdout.py --status  --history-root R [--mark-interval M] [--ledger-dir L]
-    python3 tools/history_holdout.py --reserve --history-root R [--mark-interval M] [--ledger-dir L] [--fraction 0.30] [--prior-reads-through 2026-10-30T00:00:00Z]
+    python3 tools/history_holdout.py --reserve --history-root R --universe-dir U [--spot-dir S] [--mark-interval M] [--ledger-dir L] [--fraction 0.30] [--prior-reads-through 2026-10-30T00:00:00Z]
 
 WHY THIS EXISTS
 ===============
@@ -52,7 +52,7 @@ import fcntl
 import json
 import os
 import sys
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _p in (BOT, os.path.join(BOT, "tools")):
@@ -338,7 +338,7 @@ def corpus_overlap(venue: str, cut_ms: int, end_ms: int, *, manifest_path: Optio
 
 def _reserve_command(root: str, mark_interval: Optional[str]) -> str:
     mi = f" --mark-interval {mark_interval}" if mark_interval else ""
-    return f"python3 tools/history_holdout.py --reserve --history-root {root}{mi}"
+    return f"python3 tools/history_holdout.py --reserve --history-root {root} --universe-dir <the universe capture directory>{mi}"
 
 
 def _not_reserved(root: str, mark_interval: Optional[str], path: str, st: Dict[str, Any]) -> RH.HarnessError:
@@ -376,12 +376,47 @@ def _arithmetic(a: int, b: int, cut: int, *, requested: Optional[Tuple[int, int]
     return out
 
 
+# ------------------------------------------------------------------ the dataset gate (Round 19)
+def _state_text(ds: Mapping[str, Any]) -> str:
+    return f"{ds.get('state')}: " + ("; ".join(str(x) for x in list(ds.get("reasons") or ())[:3]) or "no reason recorded")
+
+
+def _identity_evidence(info: Mapping[str, Any]) -> Dict[str, Any]:
+    """What a load judged, as evidence for the registry: its state, the dataset identity digest and the universe capture's manifest sha256 (None when the load does not state them)."""
+    ident = info.get("loaded_identity") if isinstance(info.get("loaded_identity"), Mapping) else {}
+    uni = info.get("universe") if isinstance(info.get("universe"), Mapping) else {}
+    ds = info.get("dataset_state") if isinstance(info.get("dataset_state"), Mapping) else {}
+    return {"state": ds.get("state"), "loaded_identity_digest": ident.get("digest"), "universe_manifest_sha256": uni.get("manifest_sha256")}
+
+
+def dataset_problem_for_a_reservation(root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], cut: int) -> Tuple[Optional[str], Dict[str, Any]]:
+    """``(refusal or None, evidence)``: None when the dataset may carry a one-time holdout, else the refusal text; the evidence names the dataset the gate judged. The holdout is an asset that can be reserved once and read once and never un-spent, so it is only ever
+    reserved on data the Round 18 dataset-state calls (1) COMPLETE over the whole requested window (every lifecycle-eligible symbol verified and COMPLETE: a reserved region holding a partial
+    cross-section is a region nobody can use) and (2) SUFFICIENT for one registered evaluation on the window that is LEFT to explore after the cut (a window that carries one test only
+    before the reserve cannot carry it after: 457 days of history reserve down to 320). Both are read from the loader's own coverage state; nothing is evaluated and no series is returned."""
+    _whole, w_info = CR.load_history_root(root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+    whole = w_info.get("dataset_state") or {}
+    evidence = _identity_evidence(w_info)
+    if not whole.get("complete_over_requested_window"):
+        return (f"DATASET_NOT_COMPLETE_FOR_A_HOLDOUT: the dataset reads {_state_text(whole) if whole else 'no dataset state'}; a holdout is reserved only over a dataset every lifecycle-eligible symbol of which "
+                f"is COMPLETE"), evidence
+    _explore, e_info = CR.load_history_root(root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, cut_ms=cut)
+    explore = e_info.get("dataset_state") or {}
+    if not explore.get("sufficient"):
+        return (f"EXPLORE_WINDOW_NOT_SUFFICIENT_AFTER_THE_RESERVE: after reserving from {_iso(cut)} the window left to explore reads {_state_text(explore) if explore else 'no dataset state'}; "
+                f"collect a longer history (the whole window must be at least the registered need divided by 1 - the reserved fraction) before reserving"), evidence
+    return None, evidence
+
+
 # ------------------------------------------------------------------ reserve / status
-def reserve(registry: str, root: str, *, mark_interval: Optional[str] = None, frac: float = RESERVED_FRACTION, ledger_dir: Optional[str] = None,
-            prior_reads_through_ms: Optional[int] = None, reader: str = "") -> Dict[str, Any]:
+def reserve(registry: str, root: str, *, universe_dir: str, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, frac: float = RESERVED_FRACTION,
+            ledger_dir: Optional[str] = None, prior_reads_through_ms: Optional[int] = None, reader: str = "") -> Dict[str, Any]:
     """Reserve the last ``frac`` of the funding window of ``root``, once per venue. Idempotent: an existing reservation is returned unchanged (``already_reserved``), whatever the data has
     grown to since. Refused when a recorded read burned the time the boundary falls in (ALREADY_READ, or RESERVATION_OVERLAPS_A_SPENT_HOLDOUT after a final read), and when the research
-    ledgers beside the data show earlier evaluations (PRIOR_EVALUATION_DETECTED) unless ``prior_reads_through_ms`` states, on the record, how far those reads reached."""
+    ledgers beside the data show earlier evaluations (PRIOR_EVALUATION_DETECTED) unless ``prior_reads_through_ms`` states, on the record, how far those reads reached.
+
+    Round 19: ``universe_dir`` is REQUIRED (a missing argument must never be a silent opt-out of the gate): the holdout is reserved only over a dataset the dataset-state calls complete over its
+    whole window and sufficient on the window left to explore (``dataset_problem_for_a_reservation``). A refused reservation records nothing."""
     _check_fraction(frac)
     CR._verified_dataset(root, MH.FUNDING)                              # the window is evidence: the datasets must verify before they are relied on ...
     mark_name, _iv = CR._mark_dataset_name(root, mark_interval)
@@ -397,10 +432,15 @@ def reserve(registry: str, root: str, *, mark_interval: Optional[str] = None, fr
             if abs(float(st["active"].get("frac", frac)) - float(frac)) > 1e-12:
                 out["requested_fraction_ignored"] = float(frac)             # the boundary never moves: the ledgered one stays
             return out
+        if not isinstance(universe_dir, str) or not universe_dir:      # an EXISTING reservation is returned above without it; one that would be CREATED needs the gate's input
+            raise RH.HarnessError("UNIVERSE_DIR_REQUIRED: a holdout is reserved only after the dataset gate has read the universe capture: pass --universe-dir (the dataset gate cannot judge a window without it)")
         cut = cut_for(a, b, frac)
         problem, (ea, eb) = reservation_problem(root, a, b, cut)
         if problem:
             raise RH.HarnessError(f"{problem}. (The boundary is the last {frac:.0%} of the REQUESTED window {_iso(a)}..{_iso(b)}. Nothing was recorded.)")
+        data_problem, data_evidence = dataset_problem_for_a_reservation(root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, cut=cut)
+        if data_problem:
+            raise RH.HarnessError(f"{data_problem}. Nothing was recorded; registry: {registry}")
         prior, scanned = prior_evaluations_anywhere(root, ledger_dir)
         stated = any(r.get("purpose") == PRIOR_STATED for r in st["reads"])
         if prior and prior_reads_through_ms is None and not stated:
@@ -420,7 +460,7 @@ def reserve(registry: str, root: str, *, mark_interval: Optional[str] = None, fr
                                   f"boundary {_iso(cut)} a {frac:.0%} reservation would use: that time can no longer be a holdout, whichever root, ledger directory or mark dataset reached it. "
                                   f"The window must grow to at least {_iso(needed)} before a holdout exists, or treat every result on it as exploratory; registry: {registry}")
         row = {"kind": "reserve", "schema": SCHEMA, "venue": v, "from_ms": cut, "window_ms": [a, b], "frac": float(frac), "reader": reader, "prior_evaluations": prior, "ledger_dirs_scanned": scanned,
-               "mark_dataset": mark_name, "served_window_ms": [ea, eb], "btc_corpus_overlap": corpus_overlap(v, cut, eb),
+               "mark_dataset": mark_name, "served_window_ms": [ea, eb], "btc_corpus_overlap": corpus_overlap(v, cut, eb), "dataset_at_reservation": data_evidence,
                **{k: x for k, x in _arithmetic(ea, eb, cut, requested=(a, b)).items() if k in ("explore_days", "reserved_days", "reserved_rows_possible", "data_ends_before_the_requested_end_days")}}
         _append(registry, row)
         return row
@@ -531,11 +571,18 @@ def final_read(root: str, *, universe_dir: str, spot_dir: Optional[str] = None, 
                 raise RH.HarnessError(f"FINAL_READ_ALREADY_SPENT: the reserved region of this venue was read once and is no longer a holdout; registry: {ledger_path}")
             raise _not_reserved(root, mark_interval, ledger_path, st)
         series, info = CR.load_history_root(root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval)
+        ds = info.get("dataset_state") or {}
+        if not ds.get("complete_over_requested_window"):            # Round 19: the one read is never spent on data that is no longer a complete cross-section (a gap, a conflicted or unverified dataset)
+            raise RH.HarnessError(f"FINAL_READ_REFUSED_DATASET_NOT_COMPLETE: the dataset reads {_state_text(ds) if ds else 'no dataset state'}; the holdout is still reserved and nothing was recorded "
+                                  f"(repair the dataset, re-verify it, then read once); registry: {ledger_path}")
         _a, b = _window(root)
         cut = int(act["from_ms"])
-        _append(ledger_path, {"kind": "read", "schema": SCHEMA, "venue": v, "purpose": FINAL, "from_ms": cut, "to_ms": b, "reader": reader})
+        at_read = _identity_evidence(info)
+        was = act.get("dataset_at_reservation") if isinstance(act.get("dataset_at_reservation"), Mapping) else {}
+        at_read["identity_differs_from_reservation"] = bool(was) and (was.get("loaded_identity_digest") != at_read["loaded_identity_digest"] or was.get("universe_manifest_sha256") != at_read["universe_manifest_sha256"])
+        _append(ledger_path, {"kind": "read", "schema": SCHEMA, "venue": v, "purpose": FINAL, "from_ms": cut, "to_ms": b, "reader": reader, "dataset_at_read": at_read})
     info["holdout"] = _info_stamp(ledger_path, "SPENT", FINAL, None, "FINAL_READ: the reserved region has now been read once and is spent", venue=v, evaluate_only_from_ms=cut,
-                                  evaluate_only_from=_iso(cut))
+                                  evaluate_only_from=_iso(cut), dataset_at_read=at_read)
     return series, info
 
 
@@ -557,6 +604,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     g.add_argument("--status", action="store_true", help="read-only: what is reserved, what is burned, and what the window arithmetic allows")
     ap.add_argument("--history-root", required=True)
     ap.add_argument("--mark-interval", default=None)
+    ap.add_argument("--universe-dir", default=None, help="REQUIRED with --reserve: the universe capture the dataset gate reads (the holdout is reserved only over a complete, sufficient dataset)")
+    ap.add_argument("--spot-dir", default=None, help="the spot-instruments snapshot (optional; the hedged-carry family needs it, and the dataset identity then includes it)")
     ap.add_argument("--registry", default=None, help=f"the registry file (default: ${REGISTRY_ENV} or {REGISTRY_DEFAULT}); one per user, independent of the data root and of --ledger-dir")
     ap.add_argument("--ledger-dir", default=None, help="the research ledger directory the multiple-testing counts live in (only used to DETECT earlier evaluations)")
     ap.add_argument("--fraction", type=float, default=RESERVED_FRACTION, help=f"reserved fraction of the window, in [{MIN_FRACTION}, {MAX_FRACTION}] (default {RESERVED_FRACTION})")
@@ -566,7 +615,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     path = os.path.abspath(a.registry) if a.registry else default_registry_path()
     try:
         if a.reserve:
-            reserve(path, a.history_root, mark_interval=a.mark_interval, frac=a.fraction, ledger_dir=a.ledger_dir, prior_reads_through_ms=a.prior_reads_through, reader="history_holdout.py --reserve")
+            reserve(path, a.history_root, universe_dir=a.universe_dir or "", spot_dir=a.spot_dir, mark_interval=a.mark_interval, frac=a.fraction, ledger_dir=a.ledger_dir,
+                    prior_reads_through_ms=a.prior_reads_through, reader="history_holdout.py --reserve")
         out = status(path, a.history_root, mark_interval=a.mark_interval, ledger_dir=a.ledger_dir)
     except RH.HarnessError as exc:
         print(f"refused: {exc}", file=sys.stderr)

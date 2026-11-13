@@ -63,6 +63,11 @@ def _cap(names: Sequence[str]) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- window
 
+#: The fraction of the funding window ``history_holdout`` reserves (RESERVED_FRACTION; pinned equal by a test: this module cannot import it, ``candidate_readiness`` imports this one). Every evaluation of
+#: the history is refused until a holdout is reserved, so the window that carries ONE registered test is the window LEFT AFTER the reserve, not the whole one.
+HOLDOUT_RESERVE_FRACTION = 0.30
+
+
 def required_window(study_from_ms: Optional[int], study_to_ms: int, formation_days: int, hold_days: int, min_holding_rows: int, warmup_days: int) -> Dict[str, Any]:
     for k, v in (("formation_days", formation_days), ("hold_days", hold_days), ("min_holding_rows", min_holding_rows)):
         if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
@@ -79,10 +84,16 @@ def required_window(study_from_ms: Optional[int], study_to_ms: int, formation_da
             raise PlanError("study_from_ms must be before study_to_ms")
         span_days = math.ceil((study_to_ms - study_from_ms) / DAY_MS)
     days = max(needed, span_days)
+    keep = 1.0 - HOLDOUT_RESERVE_FRACTION
+    needed_after = math.ceil(needed / keep - 1e-9)                       # the whole window that leaves ``needed`` days to explore once the last fraction is reserved
+    explore_after = math.floor(span_days * keep + 1e-9) if span_days else None
     return {"components": {"warmup_days": warmup_days, "formation_days": formation_days, "holding_days": holding_days, "hold_days": hold_days, "min_holding_rows": min_holding_rows},
             "needed_days": needed, "needed_ms": needed * DAY_MS, "study_span_days": span_days or None,
             "effective_days": days, "effective_ms": days * DAY_MS, "effective_from_ms": study_to_ms - days * DAY_MS, "effective_to_ms": study_to_ms,
             "study_window_sufficient": span_days == 0 or span_days >= needed or study_from_ms is None,
+            "needed_days_after_holdout_reserve": needed_after, "explore_days_after_holdout_reserve": explore_after,
+            "study_window_sufficient_after_holdout_reserve": span_days == 0 or study_from_ms is None or explore_after >= needed,
+            "holdout_reserve_fraction": HOLDOUT_RESERVE_FRACTION,
             "formula": "warmup_days + formation_days + min_holding_rows * hold_days (non-overlapping hold windows after the formation lead-in)"}
 
 
@@ -627,6 +638,9 @@ def plan(universe_dir: str, history_root: Optional[str] = None, *, study_from_ms
         blockers.append({"code": "NO_ELIGIBLE_SYMBOLS", "detail": "no instrument of the verified universe overlaps the window under these filters"})
     if not win["study_window_sufficient"]:
         blockers.append({"code": "STUDY_WINDOW_TOO_SHORT", "detail": f"study span {win['study_span_days']}d < needed {win['needed_days']}d; the plan collects {win['effective_days']}d regardless"})
+    if not win["study_window_sufficient_after_holdout_reserve"]:
+        caveats.append(f"HOLDOUT: a {win['study_span_days']}-day study span leaves {win['explore_days_after_holdout_reserve']} days to explore after the {HOLDOUT_RESERVE_FRACTION:.0%} holdout reserve, short of the "
+                       f"{win['needed_days']} days one registered evaluation needs: history_holdout --reserve will refuse it; collect at least {win['needed_days_after_holdout_reserve']} days")
     if uinfo.get("dataset_status") != "COMPLETE":
         caveats.append(f"universe capture re-derived dataset_status {uinfo.get('dataset_status')!r}: the symbol list is only as complete as that capture")
     cov = uinfo.get("status_coverage") if isinstance(uinfo.get("status_coverage"), dict) else {}

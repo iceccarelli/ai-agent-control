@@ -179,3 +179,96 @@ def test_create_exclusive_never_overwrites_an_existing_file(tmp_path):
     with pytest.raises(FC.CaptureError, match="never overwritten"):
         FC._create_exclusive(str(f), b"two")
     assert f.read_bytes() == b"one"
+
+
+# ---- Round 19 (data specialist F3, reproduced): the prints builder never read the capture's manifest
+def _in_window_capture(tmp_path, n=12, size=3, **kw):
+    import carry_prospective as CP
+    stamps = [CP.WINDOW_START_MS + i * H8 for i in range(n)]
+    out = tmp_path / "cap"
+    man = FC.capture(str(out), stamps[0], stamps[-1], fetch=Venue(stamps, size=size), sleep=lambda _s: None, now_ms=stamps[-1] + H8, **kw)
+    files = sorted(str(out / p["file"]) for p in man["pages"])
+    return out, man, files, stamps
+
+
+def test_an_untouched_capture_passes_and_the_report_names_the_manifest(tmp_path):
+    out, man, files, stamps = _in_window_capture(tmp_path)
+    built = PP.build(files, now_ms=stamps[-1] + H8)
+    m = built["report"]["manifest"]
+    assert m["status"] == "VERIFIED" and m["pages"] == len(files) and m["stopped_because"] == "reached_start" and m["missing_on_grid"] == 0
+    import hashlib
+    assert m["sha256"] == hashlib.sha256((out / "manifest.json").read_bytes()).hexdigest(), "the report carries the digest of the manifest it checked the pages against"
+    assert PP.build(files, now_ms=stamps[-1] + H8, manifest_path=str(out))["report"]["manifest"]["sha256"] == m["sha256"], "an explicit --manifest (a directory) agrees"
+
+
+def test_a_page_edited_after_the_manifest_was_written_is_refused(tmp_path):
+    """Reproduced: replacing '0.0001' with '0.0003' in the newest page after capture moved the mean from 1.17 to 2.50 bps and build() accepted it."""
+    out, man, files, stamps = _in_window_capture(tmp_path)
+    newest = files[-1]
+    body = open(newest, "rb").read()
+    assert b"0.0001" in body
+    open(newest, "wb").write(body.replace(b"0.0001", b"0.0003"))
+    with pytest.raises(PP.PrintsError, match="PAGE_HASH_MISMATCH"):
+        PP.build(files, now_ms=stamps[-1] + H8)
+
+
+def test_a_dropped_page_or_a_stray_page_is_refused(tmp_path):
+    """Reproduced: dropping a middle page was accepted and the report said coverage 1.0 while the manifest said missing_on_grid=1."""
+    out, man, files, stamps = _in_window_capture(tmp_path)
+    assert len(files) >= 3
+    with pytest.raises(PP.PrintsError, match="PAGE_SET_DIFFERS.*missing"):
+        PP.build(files[:1] + files[2:], now_ms=stamps[-1] + H8)
+    stray = tmp_path / "stray.json"
+    stray.write_bytes(open(files[0], "rb").read())
+    with pytest.raises(PP.PrintsError, match="PAGE_SET_DIFFERS.*not in the manifest"):
+        PP.build(files + [str(stray)], now_ms=stamps[-1] + H8, manifest_path=str(out))
+
+
+def test_a_truncated_capture_is_refused(tmp_path):
+    out, man, files, stamps = _in_window_capture(tmp_path, max_pages=2)
+    assert man["stopped_because"] == "max_pages"
+    with pytest.raises(PP.PrintsError, match="CAPTURE_TRUNCATED"):
+        PP.build(files, now_ms=stamps[-1] + H8)
+
+
+def test_hand_saved_inputs_without_a_manifest_say_so_in_the_report(tmp_path):
+    out, man, files, stamps = _in_window_capture(tmp_path)
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    copies = []
+    for f in files:
+        c = loose / os.path.basename(f)
+        c.write_bytes(open(f, "rb").read())
+        copies.append(str(c))
+    m = PP.build(copies, now_ms=stamps[-1] + H8)["report"]["manifest"]
+    assert m["status"] == "NO_MANIFEST_HAND_SAVED_INPUTS" and "cannot be shown" in m["note"], "no lineage is claimed for files nothing recorded"
+
+
+def test_a_capture_with_gaps_is_verified_with_gaps_not_plain_verified(tmp_path):
+    """Independent review: status read VERIFIED even when the manifest listed settlements missing on the grid (only the count was reported)."""
+    import carry_prospective as CP
+    stamps = [CP.WINDOW_START_MS + i * H8 for i in range(12)]
+    gappy = [t for i, t in enumerate(stamps) if i != 5]
+    out = tmp_path / "cap"
+    man = FC.capture(str(out), stamps[0], stamps[-1], fetch=Venue(gappy, size=3), sleep=lambda _s: None, now_ms=stamps[-1] + H8)
+    assert man["missing_on_grid"] == [stamps[5]]
+    m = PP.build(sorted(str(out / p["file"]) for p in man["pages"]), now_ms=stamps[-1] + H8)["report"]["manifest"]
+    assert m["status"] == "VERIFIED_WITH_GAPS" and m["missing_on_grid"] == 1
+
+
+def test_an_unrelated_manifest_beside_hand_saved_pages_is_not_a_crash_and_a_glob_gets_a_hint(tmp_path):
+    out, man, files, stamps = _in_window_capture(tmp_path)
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    copies = []
+    for f in files:
+        c = loose / os.path.basename(f)
+        c.write_bytes(open(f, "rb").read())
+        copies.append(str(c))
+    (loose / "manifest.json").write_text(json.dumps({"schema": "market_history", "dataset": "funding"}))          # some OTHER tool's manifest: no `pages`
+    m = PP.build(copies, now_ms=stamps[-1] + H8)["report"]["manifest"]
+    assert m["status"] == "NO_MANIFEST_HAND_SAVED_INPUTS" and "not a funding_capture manifest" in m["note"]
+    with pytest.raises(PP.PrintsError, match="MANIFEST_UNREADABLE"):
+        PP.build(copies, now_ms=stamps[-1] + H8, manifest_path=str(loose / "manifest.json"))                      # asked for explicitly: refused, not ignored
+    with pytest.raises(PP.PrintsError, match="PAGE_SET_DIFFERS.*manifest.json.*list the page"):
+        PP.build(files + [str(out / "manifest.json")], now_ms=stamps[-1] + H8)

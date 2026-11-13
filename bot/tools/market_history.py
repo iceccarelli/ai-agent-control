@@ -1059,6 +1059,38 @@ def build_specs(dataset: str, interval: Optional[str], symbols: Sequence[str], s
     return out
 
 
+def _rerun_problem(prior: Mapping[str, Any], specs: Sequence[Mapping[str, Any]], excluded: Mapping[str, Any]) -> Optional[str]:
+    """None when a re-run over an existing dataset directory may proceed, else the refusal. Round 19 (reproduced): ``run_dataset`` rewrote ``manifest.json`` from the CURRENT invocation alone, so a
+    re-run with a window that had moved by three settlements (the command a refreshed plan prints) demoted a COMPLETE, sealed dataset to UNVERIFIED, and a re-run of a subset listed ONLY the subset
+    while the other symbols' directories stayed on disk, unlisted. The pages were never mixed (the per-symbol PARAMS_MISMATCH saw to that); the MANIFEST was the casualty."""
+    req = prior.get("request") if isinstance(prior.get("request"), Mapping) else {}
+    ps, pe = req.get("start_ms"), req.get("end_ms")
+    ns, ne = specs[0]["start_ms"], specs[0]["window_end_ms"]
+    if isinstance(ps, int) and isinstance(pe, int) and (ps, pe) != (ns, ne):
+        return (f"RERUN_REFUSED_WINDOW_CHANGED: this dataset directory was collected for the window {ps}..{pe} and this run asks for {ns}..{ne}. Its pages are only valid for their own window and a "
+                f"refreshed plan moves the end every day: use a NEW root for a new window, or re-run with the ORIGINAL window to resume. Nothing was fetched or written.")
+    prior_syms = prior.get("symbols") if isinstance(prior.get("symbols"), Mapping) else {}
+    for x in specs:                                              # the SAME fields resume compares per symbol (_begin_row): a clamped end, another interval, another start, another limit
+        old_spec = (prior_syms.get(x["symbol"]) or {}).get("spec") if isinstance(prior_syms.get(x["symbol"]), Mapping) else None
+        if not isinstance(old_spec, Mapping):
+            continue
+        try:
+            was, now = _begin_row(old_spec), _begin_row(x)
+        except (KeyError, TypeError):
+            continue                                             # an older-schema spec cannot be compared: the per-symbol PARAMS_MISMATCH still guards the pages
+        diff = [f"{k}: {was[k]!r} -> {now[k]!r}" for k in now if was.get(k) != now[k]]
+        if diff:
+            return (f"RERUN_REFUSED_SPEC_CHANGED: {x['symbol']} was collected with different parameters ({'; '.join(diff[:3])}), typically because the universe record was refreshed (a delivery time "
+                    f"clamps a symbol's end). The pages are only valid for their own parameters: re-run with the ORIGINAL plan, or use a NEW root. Nothing was fetched or written.")
+    listed = set(prior_syms) | set((prior.get("excluded") or {})) if prior_syms else set()
+    asked = {x["symbol"] for x in specs} | set(excluded)
+    dropped = sorted(listed - asked)
+    if dropped:
+        return (f"RERUN_REFUSED_WOULD_DROP_SYMBOLS: the manifest lists {len(listed)} symbols and this run covers {len(asked)}; it would drop {dropped[:8]}{'...' if len(dropped) > 8 else ''} from the manifest while "
+                f"their directories stay on disk. Re-run with the complete symbol set (resume re-verifies complete symbols and fetches nothing for them). Nothing was fetched or written.")
+    return None
+
+
 def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequence[Mapping[str, Any]], *, fetch: Callable[[str], bytes] = http_fetch,
                 clock: Callable[[], int] = lambda: int(time.time() * 1000), sleep: Callable[[float], None] = time.sleep, mono: Callable[[], float] = time.monotonic,
                 workers: int = DEFAULT_WORKERS, rate: float = DEFAULT_RATE, max_pages: int = DEFAULT_MAX_PAGES, reserve_bytes: int = MC.DEFAULT_RESERVE_BYTES,
@@ -1102,7 +1134,19 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
             return spec["symbol"], {"errors": [f"{type(exc).__name__}: {exc}"], "stop_reason": None, "pages_fetched": 0, "pages_resumed": 0, "quarantined": [],
                                     "rate_limit_events": 0, "requests": 0}
 
+    mpath = os.path.join(ddir, "manifest.json")
     with MC._locked(ddir):
+        prior_bytes: Optional[bytes] = None
+        try:
+            with open(mpath, "rb") as fh:
+                prior_bytes = fh.read()
+            prior = json.loads(prior_bytes.decode("utf-8"))
+        except (OSError, ValueError):
+            prior = None                                           # no usable earlier manifest: nothing to protect (verify_dataset reports an unreadable one)
+        if isinstance(prior, dict):
+            problem = _rerun_problem(prior, specs, excluded)
+            if problem:
+                raise HistoryError(problem)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for sym, res in ex.map(work, specs):
                 results[sym] = res
@@ -1141,7 +1185,18 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
                "universe": dict(universe) if universe else None, "selection": sel, "excluded": excluded, "time_fields": list(TIME_FIELDS), "symbols": symbols,
                "note": "raw pages are the evidence; gaps/rejects/conflicts are reported, never filled; a hash shows what was read, not who produced it"}
         man["manifest_digest"] = _sha(_canon({k: v for k, v in man.items() if k != "manifest_digest"}))
-        _write_atomic(os.path.join(ddir, "manifest.json"), (json.dumps(man, indent=1, sort_keys=True, allow_nan=False) + "\n").encode())
+        if prior_bytes is not None and isinstance(prior, dict):
+            arch = os.path.join(ddir, "manifest.superseded.json")
+            keep_old = False
+            if prior.get("dataset_status") != "COMPLETE":            # a one-step undo must not be overwritten by a WORSE manifest: an archived COMPLETE one stays until a COMPLETE one replaces it
+                try:
+                    with open(arch, "rb") as fh:
+                        keep_old = json.loads(fh.read().decode("utf-8")).get("dataset_status") == "COMPLETE"
+                except (OSError, ValueError, AttributeError):
+                    keep_old = False
+            if not keep_old:
+                _write_atomic(arch, prior_bytes)                     # the manifest this run replaces (the pages are the evidence; this is the index)
+        _write_atomic(mpath, (json.dumps(man, indent=1, sort_keys=True, allow_nan=False) + "\n").encode())
     return man
 
 

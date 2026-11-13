@@ -46,6 +46,10 @@ if BOT not in sys.path:
 
 import anchor_archive as AA       # noqa: E402
 import capital_survival as CAP    # noqa: E402
+
+#: structure OWNED_INVENTORY_OVERLAY as the screens read it: inventory = notional, plus a 10% idle USDT reserve (carry_teardown's ``--reserve`` default). Named, not a bare 1.1: it is an ILLUSTRATIVE
+#: reserve, not the capital the executor commits (``economic_model.structure_capital_usd``).
+OVERLAY_RESERVE_FRACTION = 0.10
 import capacity_schema as CS      # noqa: E402
 import carry_costs as CC          # noqa: E402
 import evidence_chain as EC       # noqa: E402
@@ -130,7 +134,7 @@ def _power_section(fe: Optional[Dict[str, Any]], notional_usd: float, hold_days:
     lowest = min(TE.SCREENING_HURDLES_PCT)
     # mean funding per settlement (bps of hedged notional) at which an ILLUSTRATIVE position (inventory = notional, 10 % reserve)
     # earns the lowest screen after an ASSUMED round trip (carry_costs: 11.0 fee + 0.4 assumed spread): reserve-inclusive capital x hurdle x hold / 365, plus the cost
-    threshold = (1.1 * lowest / 100.0 * hold_days / 365.0 * 1e4 + CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY) / n_settle
+    threshold = ((1.0 + OVERLAY_RESERVE_FRACTION) * lowest / 100.0 * hold_days / 365.0 * 1e4 + CC.ROUND_TRIP_TOTAL_COST_BPS_PERP_OVERLAY) / n_settle
     rows = []
     for edge in (0.1, 0.25, 0.5):
         r = SP.required_observations(rb["sd"], edge, alpha=0.05, power=0.8, n_hypotheses=OE.FAMILY_TRIALS, adjust="holm",

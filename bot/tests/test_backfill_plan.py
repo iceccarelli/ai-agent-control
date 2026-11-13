@@ -139,9 +139,12 @@ def venue_for(syms, recs, start, end):
     return Venue(g)
 
 
-def full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.FUNDING, MH.MARK), start=W0, end=T):
+def full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.FUNDING, MH.MARK), start=W0, end=T, drop_head=None):
+    """``drop_head`` = {(dataset, symbol): n}: the venue serves that symbol's rows starting n rows LATE over the full requested window (a real head gap, collected in one run)."""
     recs, _ = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
     v = venue_for(syms, {s: {k: str(x) if k in ("launchTime", "deliveryTime") else x for k, x in recs[s].items()} for s in syms}, start, end)
+    for key, n in (drop_head or {}).items():
+        v.grids[key] = v.grids[key][n:]
     for ds in datasets:
         collect(root, uni, ds, None if ds == MH.FUNDING else "240", list(syms), start, end, v)
     return v
@@ -166,6 +169,33 @@ def test_a_longer_operator_window_wins_and_a_shorter_one_is_flagged():
     assert w["effective_days"] == 500 and w["study_window_sufficient"] is True
     short = BP.required_window(T - 100 * DAY, T, 30, 7, 60, 7)
     assert short["effective_days"] == 457 and short["study_window_sufficient"] is False
+
+
+def test_a_study_window_is_sufficient_for_a_holdout_study_only_after_the_reserve():
+    """Round 19 (data specialist F1): `study_window_sufficient` meant 'enough for ONE evaluation'. The registry refuses any evaluation before a holdout is reserved, so the window that matters is
+    the one left AFTER the reserve: a 591-day span (sufficient for 457) leaves 413 days to explore, 44 short of the evaluator's own need."""
+    import math
+    import history_holdout as HH
+    assert BP.HOLDOUT_RESERVE_FRACTION == HH.RESERVED_FRACTION == 0.30, "one number, two modules: a changed reserved fraction must change the plan with it"
+    w = BP.required_window(None, T, 30, 7, 60, 7)
+    assert w["needed_days_after_holdout_reserve"] == math.ceil(457 / (1 - 0.30)) == 653
+    mid = BP.required_window(T - 591 * DAY, T, 30, 7, 60, 7)
+    assert mid["study_window_sufficient"] is True and mid["study_window_sufficient_after_holdout_reserve"] is False
+    assert mid["explore_days_after_holdout_reserve"] == 413 and mid["effective_days"] == 591
+    ok = BP.required_window(T - 700 * DAY, T, 30, 7, 60, 7)
+    assert ok["study_window_sufficient_after_holdout_reserve"] is True and ok["explore_days_after_holdout_reserve"] == 490
+    assert BP.required_window(T - 100 * DAY, T, 30, 7, 60, 7)["study_window_sufficient_after_holdout_reserve"] is False
+    assert w["study_window_sufficient_after_holdout_reserve"] is True, "no study span stated: nothing to flag (the plan collects the effective window)"
+
+
+def test_the_plan_says_when_the_collected_window_cannot_carry_a_holdout(tmp_path):
+    uni = make_universe(tmp_path)
+    registered = dict(formation_days=30, hold_days=7, min_holding_rows=60, warmup_days=7)                       # the registered geometry (457 days), not the suite's 6-day one
+    short = do_plan(uni, study_from_ms=T - 591 * DAY, **registered)
+    assert any("holdout" in c and "413" in c and "653" in c for c in short["caveats"]), short["caveats"]
+    assert not any(b["code"] == "STUDY_WINDOW_TOO_SHORT" for b in short["blockers"]), "one evaluation is still possible: the holdout shortfall is a caveat, not a blocker"
+    enough = do_plan(uni, study_from_ms=T - 700 * DAY, **registered)
+    assert not any("holdout" in c.lower() for c in enough["caveats"]), enough["caveats"]
 
 
 @pytest.mark.parametrize("bad", [dict(formation_days=0), dict(hold_days=-1), dict(min_holding_rows=0), dict(warmup_days=-1)])

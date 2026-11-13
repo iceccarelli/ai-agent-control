@@ -40,6 +40,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
 
 import carry_costs as CC  # noqa: E402
 import cash_basis as CB  # noqa: E402
+import economic_model as EM  # noqa: E402
 import opportunity_map as OM  # noqa: E402
 import research_harness as RH  # noqa: E402
 import statistical_power as SP  # noqa: E402
@@ -562,6 +563,51 @@ _VERDICT_TO_STATE = {"REJECTED": DATA_SUFFICIENT_CANDIDATE_REJECTED, "PROMISING"
 _EVALUATOR_NOT_ENOUGH = ("INSUFFICIENT_DATA", "UNTESTED")
 
 
+#: A mark price that does not move for this long is not a market: a stalled index, a halted or delivering contract, a feed that repeats its last value. The price leg of a funding position on such a
+#: series is exactly zero for every hold, so the series reads as a PERFECT hedge and the squeeze or crash a short suffers is erased (a planted +0.03%/print rally in two top-funding names inflated the
+#: out-of-sample mean 12x, 4.3 -> 51.6 bps/row, with nothing flagged). Frozen BEFORE the owner's data is read; a funding rate is NOT held to the same rule (a run of the 1 bp baseline is real).
+FROZEN_MARK_MIN_HOURS = 48
+#: ... and never fewer than this many candles whatever the interval: two equal DAILY closes are a low-priced coin on a coarse tick, not a stalled feed (the registered evaluators read 240-minute marks: 12 candles).
+FROZEN_MARK_MIN_CANDLES = 12
+
+
+def frozen_mark_threshold(interval_ms: Optional[int]) -> int:
+    """How many identical consecutive closes make a mark series frozen: 48 hours of candles, never fewer than ``FROZEN_MARK_MIN_CANDLES`` (and 12 when the interval is not stated)."""
+    if not isinstance(interval_ms, int) or isinstance(interval_ms, bool) or interval_ms <= 0:
+        return FROZEN_MARK_MIN_CANDLES
+    return max(FROZEN_MARK_MIN_CANDLES, int(math.ceil(FROZEN_MARK_MIN_HOURS * 3_600_000 / interval_ms)))
+
+
+def has_stuck_window(values: Sequence[Any], window: int, max_distinct: int = 2) -> bool:
+    """True when ANY run of ``window`` consecutive values holds at most ``max_distinct`` distinct values (a feed that dithers by a tick is as stuck as one that repeats). Shorter input: False."""
+    n = len(values)
+    if window <= 0 or n < window:
+        return False
+    counts: Dict[Any, int] = {}
+    for i, v in enumerate(values):
+        counts[v] = counts.get(v, 0) + 1
+        if i >= window:
+            out = values[i - window]
+            counts[out] -= 1
+            if not counts[out]:
+                del counts[out]
+        if i >= window - 1 and len(counts) <= max_distinct:
+            return True
+    return False
+
+
+def longest_identical_run(values: Sequence[Any]) -> int:
+    """The longest run of consecutive EQUAL values (0 for an empty sequence)."""
+    best = run = 0
+    prev: Any = object()
+    for v in values:
+        run = run + 1 if v == prev else 1
+        prev = v
+        if run > best:
+            best = run
+    return best
+
+
 def dataset_state(findings: Mapping[str, Sequence[str]], *, candidate_verdict: Optional[str] = None) -> Dict[str, Any]:
     """The state of a dataset from its findings (a dict of reason lists keyed ``unavailable`` / ``invalid`` / ``incomplete`` / ``insufficient``; absent = none). The worst non-empty
     class names the state and its reasons; ``candidate_verdict`` (the evaluator's own word: REJECTED / PROMISING / QUALIFIED / INSUFFICIENT_DATA / UNTESTED, or None = none was run)
@@ -683,7 +729,10 @@ def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_co
     is the most favourable denominator there is: a hedged position that does not beat USD cash is not a money-maker however positive its notional net. The cash series is the repo's own OKX USDT
     lending history (a lender's floor, not the owner's opportunity cost) and a hold the series cannot cover is UNKNOWN and dropped, never free."""
     curve = OM.load_cash_curve(BOT)
-    base = {"capital_per_notional": OM.CAPITAL_PER_NOTIONAL,
+    # Round 19: ONE definition per structure. The overlay keeps the research assumption (the FAVOURABLE basis: used to REJECT, since a carry that fails on it fails on every dearer one), and the
+    # ACQUIRE class is priced at what the executor commits (the registry's 2.04x at leverage 1), no longer at the favourable overlay factor.
+    factors = {CAP_OVERLAY: float(OM.CAPITAL_PER_NOTIONAL), CAP_ACQUIRE: float(EM.structure_capital_usd(EM.ACQUIRED_SPOT_PERP, 1, 1).value)}
+    base = {"capital_per_notional": OM.CAPITAL_PER_NOTIONAL, "capital_per_notional_by_class": factors,
             "capital_basis": "spot leg (paid, or owned and so forgone) + an ASSUMED ~15% perp initial margin + 1% buffer per USD of notional (the research overlay basis; the live Testnet plan at leverage 1 "
                              "commits 2.04x, so this is the FAVOURABLE basis for carry)",
             "cash_series": {"source": OM.OKX_LENDING, "label": OM.CASH_BENCHMARK_LABEL, "first_utc": OM._iso(curve.first_ms()), "last_utc": OM._iso(curve.last_ms())}, "label": LABEL_CORPUS}
@@ -695,18 +744,29 @@ def _on_capital_after_cash(rows: Sequence[Any], c: Mapping[str, Any], overlay_co
     for cls, cost in classes.items():
         holds: Dict[str, Any] = {}
         for h in HOLDS_PRINTS:
-            ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - cost, "cost_bps": cost} for e in base_entries[h]], curve)
+            ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - cost, "cost_bps": cost} for e in base_entries[h]], curve, capital_factor=factors[cls])
             holds[str(h)] = OM.excess_summary(ent, unk, hold=h)
             if cls == CAP_OVERLAY and ent and holds[str(h)].get("cash_coverage_ok"):          # how strong is the loss, by the repo's own rejection standard (the policies the competition ranks)
                 holds[str(h)]["rejection_bars"] = {"nominal": rejection_bar([e["net_bps"] for e in ent], basis="mean_net_bps_of_notional_zero_capital_cost"),
                                                    "excess": rejection_bar([e["excess_over_cash_bps_of_capital"] for e in ent], basis="mean_excess_over_cash_bps_of_capital")}
         out[cls] = {"round_trip_bps": cost, "holds": holds}
+    # the same overlay hold priced at each stated capital multiple, so a favourable-basis figure is never read as evidence about the executed structure (the sign flips with the multiple: committed
+    # data, +1.4%/yr at 1.0x, +0.2% at 1.16x, -3.1% at 2.04x on the whole replay)
+    grid_hold = OM.HOLD_LONG_PRINTS if OM.HOLD_LONG_PRINTS in HOLDS_PRINTS else max(HOLDS_PRINTS)
+    upper = float(EM.structure_capital_usd(EM.OWNED_INVENTORY_OVERLAY, 1, 1).value)
+    grid: Dict[str, Any] = {}
+    for label, f, what in (("inventory_only", 1.0, "the held coin only: its margin is covered by it as collateral at ratio 1 (a best case the venue must state)"),
+                           ("research_assumption", float(OM.CAPITAL_PER_NOTIONAL), "the research overlay: held coin + an ASSUMED ~15% margin + 1% buffer (the favourable basis; used to reject)"),
+                           ("no_collateral_credit", upper, "held coin + the perp margin paid in separate cash + the plan buffer: the upper bound until the owner states the venue's collateral ratio")):
+        ent, unk = OM.on_capital([{**e, "net_bps": e["net_bps"] - overlay_cost_bps, "cost_bps": overlay_cost_bps} for e in base_entries[grid_hold]], curve, capital_factor=f)
+        sm = OM.excess_summary(ent, unk, hold=grid_hold)
+        grid[label] = {"capital_per_notional": f, "hold_prints": grid_hold, "n": sm.get("n"), "mean_excess_over_cash_bps_of_capital": sm.get("mean_excess_over_cash_bps_of_capital"), "meaning": what}
     gt, gunk = OM.on_capital(list(gated["trades"]), curve)
     gs = OM.excess_summary(gt, gunk, hold=OM.HOLD_PRINTS)
     if gt and gs.get("cash_coverage_ok"):
         gs["rejection_bars"] = {"nominal": rejection_bar([e["net_bps"] for e in gt], basis="mean_net_bps_of_notional_zero_capital_cost"),
                                 "excess": rejection_bar([e["excess_over_cash_bps_of_capital"] for e in gt], basis="mean_excess_over_cash_bps_of_capital")}
-    return {**base, "status": "COMPUTED", "classes": out, "gated_sequential_overlay": gs,
+    return {**base, "status": "COMPUTED", "classes": out, "gated_sequential_overlay": gs, "overlay_capital_grid": grid,
             "reading": "mean_excess_over_cash_bps_of_capital below zero = the position earns LESS than the cash alternative on the capital it ties up, after every modelled cost; "
                        "the nominal bps-of-notional figures elsewhere in this report do not charge that capital"}
 
@@ -739,7 +799,10 @@ def _carry_verdict(econ: Mapping[str, Any]) -> Tuple[str, List[str], Dict[str, A
         reasons.append(f"ON CAPITAL, AFTER CASH (capital {cap['capital_per_notional']}x notional; cash = {cap['cash_series']['label']}): the {OM.HOLD_LONG_PRINTS}-print hold's nominal net "
                        f"{o['mean_nominal_net_bps_of_notional']:.1f} bps of notional is {o['mean_net_bps_on_capital']:.1f} bps on capital and {o['mean_excess_over_cash_bps_of_capital']:.1f} bps EXCESS over cash "
                        f"(overlay; block-CI90 {None if ci is None else [round(x, 1) for x in ci]}, {o['annualised_excess_pct_of_capital']:.2f}%/yr extrapolated"
-                       + (f"; acquire {a['mean_excess_over_cash_bps_of_capital']:.1f} bps" if a.get("mean_excess_over_cash_bps_of_capital") is not None else "") + f") [{LABEL_CORPUS}]")
+                       + (f"; acquire at {cap['capital_per_notional_by_class'][CAP_ACQUIRE]:.2f}x {a['mean_excess_over_cash_bps_of_capital']:.1f} bps" if a.get("mean_excess_over_cash_bps_of_capital") is not None else "") + f")"
+                       + (f"; overlay at the executed no-credit basis {cap['overlay_capital_grid']['no_collateral_credit']['capital_per_notional']:.2f}x "
+                          f"{cap['overlay_capital_grid']['no_collateral_credit']['mean_excess_over_cash_bps_of_capital']:.1f} bps"
+                          if ((cap.get('overlay_capital_grid') or {}).get('no_collateral_credit') or {}).get('mean_excess_over_cash_bps_of_capital') is not None else "") + f" [{LABEL_CORPUS}]")
     else:
         reasons.append("CASH_UNKNOWN: the cost of capital could not be applied (no cash series, or it covers too little of the history); every net figure above is bps of NOTIONAL with ZERO capital cost, "
                        "not a return on capital")
@@ -1493,6 +1556,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         if man.get("dataset_status") != "COMPLETE":
             warnings.append(f"dataset {nm} dataset_status {man.get('dataset_status')!r}: the evaluation inherits that")
     excluded = [{"symbol": sy, "reason": why} for sy, why in sorted(fn.reasons_for_symbols_in_datasets().items())]
+    frozen_marks: List[Dict[str, Any]] = []
     series: List[SymbolSeries] = []
     cut_dropped: List[str] = []
     delivery_hidden: List[str] = []                                         # symbols whose delisting instant lies in the reserved region (hidden from the explore series)
@@ -1513,6 +1577,12 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                     raise RH.LookAheadError(f"{sym}: a mark row claims its close is knowable before the candle ended (observation_time {ot!r}, candle start {r['ts']}, interval {iv_ms!r})")
             fund = sorted((r["observation_time"], float(Decimal(r["v"]["fundingRate"]) * 10000)) for r in frows if cut_ms is None or r["observation_time"] < cut_ms)
             mark = sorted((r["observation_time"], float(Decimal(r["v"]["close"]))) for r in mrows if cut_ms is None or r["observation_time"] < cut_ms)
+            _need = frozen_mark_threshold(iv_ms)
+            _closes = [c for _t, c in mark]
+            _run = longest_identical_run(_closes)
+            _stuck = has_stuck_window(_closes, 2 * _need)
+            if _run >= _need or _stuck:
+                frozen_marks.append({"symbol": sym, "run_candles": _run, "min_candles": _need, "min_hours": FROZEN_MARK_MIN_HOURS, "stuck_window_candles": 2 * _need if _stuck else None})
         except RH.HarnessError:
             raise
         except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
@@ -1586,6 +1656,10 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                              not_complete=[s for s in set(fn.loadable) - set(fn.complete) if s not in _cut_set], ended_unaccounted=len(closed_missing),
                              window_days=(w1 - w0) / MS_DAY, survivorship=survivorship)
     state_findings: Dict[str, List[str]] = {"unavailable": [], "invalid": [], **_sf}
+    for _fm in frozen_marks:
+        state_findings["invalid"].append(f"{_fm['symbol']}: the mark price is frozen ({_fm['run_candles']} identical consecutive candles against a limit of {_fm['min_candles']}"
+                                         + (f"; and a window of {_fm['stuck_window_candles']} candles holds at most two distinct closes" if _fm["stuck_window_candles"] else "")
+                                         + f"): not a market price series, its price leg is near zero for every hold (confirm against the venue's public klines, then collect a NEW root without it)")
     for _nm, _man in (("funding", fman), (mark_name, mman), ("the universe capture", uinfo)):
         _st = _man.get("dataset_status")
         if _st in ("CONFLICTED", "UNVERIFIED"):
@@ -1604,7 +1678,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     if not identity["identifies_every_component"]:
         state_findings["invalid"].append("a loaded manifest carries no digest: the dataset cannot be identified")
     info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
-                       "dataset_state": dataset_state(state_findings), "loaded_identity": identity,
+                       "dataset_state": dataset_state(state_findings), "loaded_identity": identity, "frozen_mark_symbols": frozen_marks,
                        "loaded_identity_scope": "the funding + mark-kline datasets, the universe capture and (when supplied) the spot snapshot this load READ; index-kline / open-interest are not loaded: "
                                                 "the report-level dataset_identity of dataset_report covers every manifest under the data root",
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},

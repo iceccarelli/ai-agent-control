@@ -1049,6 +1049,14 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
                 capital["strategy_return_on_capital_annualised_simple_pct"] = ann
                 if why:
                     capital["annualised_why_not"] = why
+        if not all(p[2] for p in pts):
+            # Round 19 (capital specialist F2): without margin_posted_usd and reserve_usd on EVERY snapshot the denominator is the BTC value alone, and a separately margined short (or any cash reserve)
+            # commits up to as much again: the rate would be overstated up to 2x while the verdict still read RECONCILED. The dollars stay; every capital-based rate is withheld by name.
+            for k in ("account_return_on_capital_period", "strategy_return_on_capital_period", "strategy_return_on_capital_annualised_simple_pct", "annualised_why_not"):
+                if k in capital:
+                    capital[k] = None
+            capital["rates_withheld_capital_components_unstated"] = ("CAPITAL_COMPONENTS_UNSTATED: margin_posted_usd and reserve_usd are not stated on every snapshot, so the economic capital is the BTC value "
+                                                                      "alone (a LOWER bound on the committed capital) and a return on it would be overstated; state both (zero is a statement) to get a rate")
         if perp is not None and fills:
             capital["return_on_hedged_notional"] = _hedged_notional_return(fills, funding, perp_rep, window_days, t0, t1, opening_qty, strategy)
 
@@ -1396,7 +1404,10 @@ def render(rep: Mapping[str, Any]) -> str:
         a(f"  ECONOMIC CAPITAL (average): {c['average_economic_capital_usd']}")
         for k in ("strategy_return_on_capital_period", "strategy_return_on_capital_annualised_simple_pct"):
             if k in c:
-                a(f"    {k}: {c[k]}" if c[k] is not None or not c.get("returns_withheld") else f"    {k}: withheld ({rep['verdict']})")
+                if c.get(k) is None and c.get("rates_withheld_capital_components_unstated"):
+                    a(f"    {k}: withheld (CAPITAL_COMPONENTS_UNSTATED)")
+                else:
+                    a(f"    {k}: {c[k]}" if c[k] is not None or not c.get("returns_withheld") else f"    {k}: withheld ({rep['verdict']})")
     a("  FLAGS")
     for f in rep["flags"] or []:
         a(f"    [{f['severity']}] {f['code']} x{f['count']}: {f['detail']}" + (f"  e.g. {', '.join(map(str, f['examples']))}" if f["examples"] else ""))

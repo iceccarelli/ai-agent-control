@@ -564,8 +564,13 @@ def test_no_data_is_never_data_ready_or_research_ready_even_with_a_plan(tmp_path
 
 
 def test_a_dataset_with_a_partial_symbol_is_not_data_ready(tmp_path):
-    root, uni, _d, pf = plan_world(tmp_path, syms=("AAAUSDT", "BBBUSDT"))
-    BPT.full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.MARK,), start=BPT.W0 + 2 * 86_400_000)      # a shorter window: head gap
+    # Round 19: a dataset directory is collected for ONE window and a re-run over a different one is refused (it used to rewrite the manifest), so the head-gap mark dataset is BUILT with its shorter
+    # window instead of overwriting a full-window one.
+    root = tmp_path / "hist"
+    os.mkdir(root, 0o700)
+    uni = BPT.make_universe(tmp_path)
+    BPT.full_history(root, uni, syms=("AAAUSDT", "BBBUSDT"), datasets=(MH.FUNDING,))
+    BPT.full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.MARK,), drop_head={(MH.MARK, "AAAUSDT"): 12})      # AAAUSDT's candles start two days late: a real head gap over the full window
     rep = DA.audit(str(root), now_ms=NOW)
     h = vocab(rep)["data_ready"]
     assert h["per_dataset"]["funding"]["data_ready"] is True

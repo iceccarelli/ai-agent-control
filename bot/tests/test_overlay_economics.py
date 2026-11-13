@@ -656,9 +656,13 @@ def test_every_return_is_expressed_on_the_same_inventory_value():
         -1_000.0 + e["carry_bps"], abs=1e-6)
 
 
-def test_financing_is_stated_as_zero_for_an_overlay_not_silently_omitted():
+def test_financing_is_stated_as_not_modelled_not_as_zero_for_an_overlay():
+    """Round 19 (capital specialist F4): the record said ``financing_bps = 0.0`` because 'the overlay borrows nothing'. An overlay whose perp margin is paid from USDT cash BORROWS the moment that
+    balance goes negative: ``carry_replay``'s journal on the committed replay held an average USDT deficit of 0.89x notional for 81% of the window (interest $18,198 at 5%, 47% of gross funding).
+    A cost this record does not measure is UNKNOWN, never zero."""
     e = episode()
-    assert e["financing_bps"] == 0.0 and "borrows nothing" in e["financing_note"]
+    assert e["financing_bps"] is None and e["financing_status"] == "NOT_MODELLED"
+    assert "borrows nothing" not in e["financing_note"] and "NOT MODELLED" in e["financing_note"] and "deficit" in e["financing_note"]
 
 
 def test_an_overlay_that_trails_passive_btc_per_unit_of_risk_is_not_go():

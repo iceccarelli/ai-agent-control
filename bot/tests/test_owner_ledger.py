@@ -1126,6 +1126,29 @@ def test_capital_notes_describe_the_return_figure_and_do_not_lower_the_reconcili
     assert sev.get("TWO_POINT_CAPITAL_AVERAGE") == "INFO"
 
 
+def test_a_return_on_capital_is_withheld_when_margin_and_reserve_are_not_stated(tmp_path):
+    """Round 19 (capital specialist F2, reproduced): with margin_posted_usd / reserve_usd omitted the economic capital was the BTC value alone and a return on it was PUBLISHED, flagged INFO only. For a
+    structure that commits separate cash margin the denominator then omits up to half the committed capital (a rate overstated up to 2x). Dollars stay; the capital-based RATES are withheld."""
+    w, rep = _clean_with_statement(tmp_path)
+    cap = rep["economic_capital"]
+    assert cap["status"] == "COMPUTED" and cap["strategy_return_on_capital_period"] is not None, "control: stated components publish the rate as before"
+    assert "CAPITAL_COMPONENTS_UNSTATED" not in codes(rep, "INFO") and "rates_withheld_capital_components_unstated" not in cap
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    w2 = World()
+    w2.lines = _statement(w2)
+    snaps = [{k: v for k, v in s.items() if k not in ("margin_posted_usd", "reserve_usd")} for s in w2.snapshots()]
+    rep2 = ledger(w2, bare, snapshots=snaps)
+    cap2 = rep2["economic_capital"]
+    assert rep2["verdict"] == "RECONCILED_NOT_AUTHENTICATED", "the books still reconcile: only the rate is withheld"
+    assert "CAPITAL_COMPONENTS_UNSTATED" in codes(rep2, "INFO")
+    assert cap2["average_economic_capital_usd"] is not None, "the dollar figure stays, as the BTC value alone (a lower bound on committed capital)"
+    for k in ("account_return_on_capital_period", "strategy_return_on_capital_period", "strategy_return_on_capital_annualised_simple_pct"):
+        assert cap2.get(k) is None, k
+    assert "CAPITAL_COMPONENTS_UNSTATED" in cap2["rates_withheld_capital_components_unstated"]
+    assert "withheld (CAPITAL_COMPONENTS_UNSTATED)" in OL.render(rep2)
+
+
 # ============================================================================================ regressions from the second independent review
 
 def test_a_usd_labelled_statement_cannot_escape_the_usdt_anchors_or_the_cent_tolerance(tmp_path):

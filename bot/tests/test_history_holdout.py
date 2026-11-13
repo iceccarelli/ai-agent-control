@@ -51,9 +51,18 @@ def _hermetic_ledger_lookup(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "isolated_home"))
 
 
+@pytest.fixture(autouse=True)
+def _registered_bar_for_synthetic_fixtures(monkeypatch):
+    """Round 19: ``--reserve`` refuses a dataset whose explore window cannot carry one registered test. The synthetic fixtures are ~200 days (139 left to explore after the cut), so the module runs
+    against a LOWER registered bar: 14 rows = 7 + 30 + 14 x 7 = 135 days, which the explore window carries (15 rows = 142 does not: the refusal test below uses exactly that pair). The production
+    bar (60 rows, 457 days) is pinned by ``test_the_production_bar_refuses_a_short_history_without_any_patching``."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 14)
+
+
 @pytest.fixture()
 def world(tmp_path, offline, monkeypatch):
-    root, uni, spot = _hist(tmp_path)
+    # Round 19: --reserve refuses a dataset that is not COMPLETE over its whole requested window, so the world is a COMPLETE window (the mark dataset asks for the funding dataset's window).
+    root, uni, spot = _hist(tmp_path, complete_window=True)
     reg = str(tmp_path / "registry" / "history_holdout.jsonl")
     monkeypatch.setenv(HH.REGISTRY_ENV, reg)                 # the CLIs resolve the per-user registry from the environment
     return {"root": root, "uni": uni, "spot": spot, "reg": reg, "ldir": str(tmp_path / "ledgers"), "tmp": tmp_path}
@@ -75,11 +84,20 @@ def _load(w, **kw):
 
 def _reserve(w, **kw):
     kw.setdefault("ledger_dir", w["ldir"])
+    kw.setdefault("universe_dir", w["uni"])
+    kw.setdefault("spot_dir", w["spot"])
     return HH.reserve(w["reg"], w["root"], mark_interval=MARK_IV, **kw)
 
 
 def _final(w):
     return HH.final_read(w["root"], universe_dir=w["uni"], spot_dir=w["spot"], mark_interval=MARK_IV, ledger_path=w["reg"])
+
+
+def _reserve_past_the_dataset_gate(monkeypatch, reg, root, uni, spot, led):
+    """For tests whose subject is the LOADER's cut (a regime change or a late listing inside the reserved region). Those fixtures are partial datasets the Round 19 gate rightly refuses to
+    reserve on (an unproven funding-interval change and a symbol whose data starts after its launch both read DATA_INCOMPLETE), so they reserve past the gate on purpose and only the gate."""
+    monkeypatch.setattr(HH, "dataset_problem_for_a_reservation", lambda *a, **k: (None, {}))
+    return HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=led, universe_dir=uni, spot_dir=spot)
 
 
 def _last_ts(series):
@@ -154,7 +172,7 @@ def test_reserving_twice_is_idempotent_and_never_moves_the_boundary(world):
 def test_a_mark_interval_that_does_not_exist_is_not_a_window(world):
     """'60' names no dataset in this root: the first version accepted it as a different dataset id and let the same funding window be reserved (and read) twice."""
     with pytest.raises(RH.HarnessError):
-        HH.reserve(world["reg"], world["root"], mark_interval="60", ledger_dir=world["ldir"])
+        HH.reserve(world["reg"], world["root"], mark_interval="60", ledger_dir=world["ldir"], universe_dir=world["uni"], spot_dir=world["spot"])
     assert not os.path.exists(world["reg"])
 
 
@@ -222,11 +240,11 @@ def _late_listing_world(tmp_path, cut):
     return str(root), str(uni), res["dir"]
 
 
-def test_a_symbol_whose_first_row_is_at_the_boundary_is_dropped_and_listed_never_a_permanent_abort(tmp_path, offline):
+def test_a_symbol_whose_first_row_is_at_the_boundary_is_dropped_and_listed_never_a_permanent_abort(tmp_path, offline, monkeypatch):
     cut = HH.cut_for(TMH.START, TMH.END)
     root, uni, spot = _late_listing_world(tmp_path, cut)
     reg = str(tmp_path / "reg.jsonl")
-    HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"))
+    _reserve_past_the_dataset_gate(monkeypatch, reg, root, uni, spot, str(tmp_path / "led"))
     series, info = HH.load(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_path=reg)
     assert "ETHUSDT" not in {s.symbol for s in series} and {"BTCUSDT", "FASTUSDT"} <= {s.symbol for s in series}
     assert info["holdout_dropped_no_rows_before_cut"] == ["ETHUSDT"]
@@ -271,7 +289,7 @@ def test_a_delisting_inside_the_reserved_region_is_hidden_from_the_explore_serie
     assert next(x for x in before if x.symbol == "OLDUSDT").delivery_ms == real and binfo["holdout_delivery_hidden"] == [], "a delisting BEFORE the boundary is history and stays"
 
 
-def test_an_interval_change_inside_the_reserved_region_does_not_reach_the_explore_series(tmp_path, offline):
+def test_an_interval_change_inside_the_reserved_region_does_not_reach_the_explore_series(tmp_path, offline, monkeypatch):
     """The 8h -> 4h regime change a funding cap produces is a fact about the reserved region; the segments the series carries end at the boundary."""
     cut = HH.cut_for(TMH.START, TMH.END)
     H8 = TMH.H8
@@ -279,7 +297,7 @@ def test_an_interval_change_inside_the_reserved_region_does_not_reach_the_explor
     ts4 = [ts8[-1] + (i + 1) * H4 for i in range((TMH.BASE - ts8[-1]) // H4)]
     root, uni, spot = _hist(tmp_path, funding_override={"BTCUSDT": ts8 + ts4})
     reg = str(tmp_path / "reg.jsonl")
-    HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"))
+    _reserve_past_the_dataset_gate(monkeypatch, reg, root, uni, spot, str(tmp_path / "led"))
     uncut, _ = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
     assert any(seg[2] == 240 for seg in {s.symbol: s for s in uncut}["BTCUSDT"].funding_intervals), "the fixture must contain the regime change or the test proves nothing"
     series, _info = HH.load(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV, ledger_path=reg)
@@ -307,8 +325,8 @@ def test_the_same_history_reached_through_another_root_or_ledger_directory_is_th
     copy = str(tmp_path / "copy_of_the_root")
     shutil.copytree(world["root"], copy)
     with pytest.raises(RH.HarnessError, match="ALREADY_READ"):
-        HH.reserve(world["reg"], copy, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "a_completely_different_ledger_dir"))
-    assert HH.main(["--reserve", "--history-root", world["root"], "--mark-interval", MARK_IV, "--ledger-dir", str(tmp_path / "yet_another")]) == 2
+        HH.reserve(world["reg"], copy, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "a_completely_different_ledger_dir"), universe_dir=world["uni"], spot_dir=world["spot"])
+    assert HH.main(["--reserve", "--history-root", world["root"], "--mark-interval", MARK_IV, "--universe-dir", world["uni"], "--ledger-dir", str(tmp_path / "yet_another")]) == 2
     assert [r["kind"] for r in _rows(world["reg"])] == ["read"]
 
 
@@ -319,7 +337,7 @@ def test_a_reservation_after_a_stated_early_read_is_allowed_and_after_a_late_one
         _reserve(world, prior_reads_through_ms=cut + DAY)
     assert [r["purpose"] for r in _rows(world["reg"])] == ["PRIOR_STATED"], "the statement is recorded even when it makes the reservation impossible"
     reg2 = str(world["tmp"] / "reg2.jsonl")
-    r = HH.reserve(reg2, world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], prior_reads_through_ms=a + 10 * DAY)
+    r = HH.reserve(reg2, world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], prior_reads_through_ms=a + 10 * DAY, universe_dir=world["uni"], spot_dir=world["spot"])
     assert r["from_ms"] == cut and [x["purpose"] if x["kind"] == "read" else "reserve" for x in _rows(reg2)] == ["PRIOR_STATED", "reserve"]
 
 
@@ -338,7 +356,8 @@ def test_a_reservation_that_lands_while_an_unreserved_read_is_loading_refuses_wi
 
     def racing(*a, **k):
         out = real(*a, **k)
-        HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")      # another process reserves while this one loaded the whole window
+        monkeypatch.setattr(CR, "load_history_root", real)                    # the OTHER process has its own, unpatched loader (and reserve now loads the dataset itself under the registry lock)
+        HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])      # another process reserves while this one loaded the whole window
         return out
     monkeypatch.setattr(CR, "load_history_root", racing)
     with pytest.raises(RH.HarnessError, match="HOLDOUT_CHANGED_WHILE_LOADING") as e:
@@ -602,6 +621,7 @@ def test_a_boundary_the_served_data_cannot_support_is_refused_with_its_own_code_
     monkeypatch.setattr(HH, "served_window", lambda root: None)                            # a verified dataset with no rows
     refused("NO_SERVED_COVERAGE")
     monkeypatch.undo()
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 14)                                          # undo() also reverted the module's fixture bar (autouse); the control below is about the window, not the bar
     monkeypatch.setenv(HH.REGISTRY_ENV, world["reg"])
     # the empty-region code, at the function that decides: a boundary less than a day before the last served row
     problem, _w = HH.reservation_problem(world["root"], sa, sb, sb - DAY // 2)
@@ -617,10 +637,10 @@ def test_the_arithmetic_counts_the_data_that_exists_not_the_window_that_was_requ
     sa, sb = HH.served_window(world["root"])
     assert HH.effective_window(world["root"], a, b) == (max(a, sa), min(b, sb)) and sa >= a and sb <= b
     assert HH.effective_window(world["root"], a - 10 * DAY, b + 10 * DAY) == (sa, sb), "the request is clipped to what was served"
-    control = HH.reserve(str(tmp_path / "control.jsonl"), world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
+    control = HH.reserve(str(tmp_path / "control.jsonl"), world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], universe_dir=world["uni"], spot_dir=world["spot"])
     assert round(control["reserved_days"], 3) == round((sb - control["from_ms"]) / DAY, 3) and control["explore_days"] == round((control["from_ms"] - max(a, sa)) / DAY, 3)
     assert "data_ends_before_the_requested_end_days" not in control, "control: a collection that reaches its request's end has nothing to warn about"
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])           # reserved on the real window (a 40-day shortfall would now be REFUSED at reserve) ...
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], universe_dir=world["uni"], spot_dir=world["spot"])           # reserved on the real window (a 40-day shortfall would now be REFUSED at reserve) ...
     monkeypatch.setattr(HH, "_window", lambda root: (a, b + 40 * DAY))                     # ... then the manifest's request is read as ending 40 days after the data (the stamps must not count them)
     requested_reserved = round(((b + 40 * DAY) - r["from_ms"]) / DAY, 3)
     served_reserved = round((min(b + 40 * DAY, sb) - r["from_ms"]) / DAY, 3)
@@ -696,7 +716,7 @@ def test_the_status_of_a_burned_venue_says_why_it_cannot_be_reserved(world):
 
 # ------------------------------------------------------------------ the CLI
 def test_the_cli_reserves_reports_and_refuses_a_bad_request(world, capsys):
-    argv = ["--history-root", world["root"], "--mark-interval", MARK_IV, "--ledger-dir", world["ldir"]]
+    argv = ["--history-root", world["root"], "--mark-interval", MARK_IV, "--ledger-dir", world["ldir"], "--universe-dir", world["uni"], "--spot-dir", world["spot"]]
     assert HH.main(["--status", *argv]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "NOT_RESERVED"
     assert HH.main(["--reserve", *argv]) == 0
@@ -710,7 +730,7 @@ def test_the_cli_reserves_reports_and_refuses_a_bad_request(world, capsys):
 def test_the_cli_takes_the_owners_statement_of_earlier_reads_as_an_instant(world, capsys):
     os.makedirs(world["ldir"])
     RH.VariantLedger("funding_regime_conditioned_entry", path=os.path.join(world["ldir"], "funding_regime_conditioned_entry.jsonl")).record_rejected("reg-1", {"x": 1}, "short")
-    argv = ["--history-root", world["root"], "--mark-interval", MARK_IV, "--ledger-dir", world["ldir"]]
+    argv = ["--history-root", world["root"], "--mark-interval", MARK_IV, "--ledger-dir", world["ldir"], "--universe-dir", world["uni"], "--spot-dir", world["spot"]]
     assert HH.main(["--reserve", *argv]) == 2 and "PRIOR_EVALUATION_DETECTED" in capsys.readouterr().err
     assert HH.main(["--reserve", *argv, "--prior-reads-through", "2026-07-01T00:00:00Z"]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "RESERVED"
@@ -776,7 +796,7 @@ def test_the_readiness_cli_refuses_an_unreserved_dataset_then_evaluates_the_expl
         CR.main(argv)
     assert e.value.code == 2 and "HOLDOUT_NOT_RESERVED" in capsys.readouterr().err
     assert _family_ledgers(world["ldir"]) == [], "a refused run must not enlarge the multiple-testing count"
-    HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")      # a ledger dir with no earlier evaluations
+    HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])      # a ledger dir with no earlier evaluations
     assert CR.main(argv) == 0
     assert "ranked funding:" in capsys.readouterr().out and _family_ledgers(world["ldir"])
 
@@ -790,7 +810,7 @@ def test_the_competition_refuses_an_unreserved_dataset_says_so_in_the_row_and_co
 
 
 def test_the_competition_on_a_reserved_dataset_runs_the_explore_window_and_the_table_shows_survivorship_and_the_holdout(world):
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     rep = CC_.run_competition(data_root=world["root"], universe_dir=world["uni"], spot_dir=world["spot"], mark_interval=MARK_IV, ledger_dir=world["ldir"])
     x = next(r_ for r_ in rep["results"] if r_["name"] == "cross_sectional_funding")
     assert x["holdout"]["status"] == "RESERVED" and x["holdout"]["cut_ms"] == r["from_ms"]
@@ -815,7 +835,7 @@ def test_the_regime_cli_refuses_an_unreserved_dataset_then_runs_the_explore_wind
             "--json", str(world["tmp"] / "o.json")]
     assert RE.main(argv) == 2 and "HOLDOUT_NOT_RESERVED" in capsys.readouterr().err
     assert not os.path.exists(str(world["tmp"] / "o.json"))
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     assert RE.main(argv) == 0
     out = json.load(open(str(world["tmp"] / "o.json")))
     assert out["input"]["holdout"]["status"] == "RESERVED" and out["input"]["history_window"]["to_ms"] == r["from_ms"]
@@ -824,7 +844,7 @@ def test_the_regime_cli_refuses_an_unreserved_dataset_then_runs_the_explore_wind
 def test_run_on_root_hands_the_cut_to_the_index_series_read(world, monkeypatch):
     """The basis measurement is a SECOND read of the same window (index-kline closes): the cut has to reach it through run_on_root, not only through the loader (a mutant that stopped passing it
     survived the first version's tests because the fixture has no index dataset)."""
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     seen = {}
 
     def spy(root, interval, symbols, *, cut_ms=None):
@@ -856,7 +876,7 @@ def _pipeline_args(world, cmd="validate", **over):
 def test_the_pipeline_cli_refuses_an_unreserved_dataset_and_the_identity_says_which_window_was_read(world, capsys):
     code, doc = TPC.cli(capsys, _pipeline_args(world))
     assert code == 2 and doc["error"]["code"] == "HOLDOUT_NOT_RESERVED" and "history_holdout.py --reserve" in doc["error"]["message"]
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     code, cut_doc = TPC.cli(capsys, _pipeline_args(world))
     assert code == 0, cut_doc
     assert cut_doc["data_parts"]["holdout"] == f"RESERVED:{r['from_ms']}"
@@ -868,7 +888,7 @@ def test_the_pipeline_identity_differs_between_a_cut_run_and_a_whole_window_run(
     code, full_doc = TPC.cli(capsys, _pipeline_args(world, unreserved_exploratory=True))
     assert code == 0 and full_doc["data_parts"]["holdout"] == "UNRESERVED_EXPLORATORY"
     monkeypatch.setenv(HH.REGISTRY_ENV, str(world["tmp"] / "second_user" / "history_holdout.jsonl"))
-    HH.reserve(os.environ[HH.REGISTRY_ENV], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    HH.reserve(os.environ[HH.REGISTRY_ENV], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     code, cut_doc = TPC.cli(capsys, _pipeline_args(world))
     assert code == 0 and cut_doc["data_parts"]["holdout"].startswith("RESERVED:")
     assert cut_doc["data_digest"] != full_doc["data_digest"], "a cut run and a full-window run read different data: the identity must differ"
@@ -877,7 +897,7 @@ def test_the_pipeline_identity_differs_between_a_cut_run_and_a_whole_window_run(
 def test_a_reserved_run_may_not_extend_past_the_boundary_through_the_cli(world, capsys):
     """Independent re-review, finding 1: ``validate`` returned code 0 for ``--end-ms`` thirty days past the boundary with ``data_parts.holdout = RESERVED:<cut>``: a run stamped as keeping the reserved
     region unread whose window reached into it. The window may now end at the boundary at the latest."""
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     cut = r["from_ms"]
     DAYS = 86_400_000
     for cmd in ("validate", "run"):
@@ -899,7 +919,7 @@ def test_the_pipeline_library_refuses_a_reserved_window_past_the_boundary_and_at
     import ms_pipeline as MP
     import ms_replay as RP
     import types as _t
-    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty")
+    r = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"] + "_empty", universe_dir=world["uni"], spot_dir=world["spot"])
     cut = r["from_ms"]
     H1 = 3_600_000
 
@@ -954,6 +974,7 @@ ALLOWED_REFERENCES = {("candidate_readiness.py", "dataset_report", "load_history
                       ("backfill_plan.py", "_run_loader", "load_history_root"): "diagnose checks that the loader and the funnel agree: metadata only",
                       ("history_holdout.py", "load", "load_history_root"): "THE guard (evaluation reads, cut at the boundary)",
                       ("history_holdout.py", "final_read", "load_history_root"): "THE guard (the one read of the reserved region)",
+                      ("history_holdout.py", "dataset_problem_for_a_reservation", "load_history_root"): "the reservation gate (Round 19): coverage state only, run BEFORE a boundary exists; it returns a refusal text, never a series",
                       ("regime_entry_eval.py", "load_index_series", "_rows"): "the second read of the window (index closes): given the cut by run_on_root"}
 
 
@@ -1070,3 +1091,116 @@ def test_the_explicit_opt_out_never_appears_in_shipped_code():
     assert len(files) > 100 and any(os.sep + "tools" + os.sep in p for _n, p in files), "the walker found no shipped code: the tripwire would pass vacuously"
     offenders = [f"{os.path.relpath(p, BOT)}:{line}" for _n, p in files for line in _opt_out_references(ast.parse(open(p, encoding="utf-8").read()))]
     assert not offenders, f"UNGUARDED is for tests and embeddings: {offenders}"
+
+
+# ------------------------------------------------------------------ Round 19: the one-time holdout is never reserved or spent on data the dataset gate does not call complete and sufficient
+def _bytes(path):
+    return open(path, "rb").read() if os.path.exists(path) else None
+
+
+def test_a_reservation_on_a_dataset_the_gate_calls_incomplete_is_refused_and_records_nothing(tmp_path, offline, monkeypatch):
+    """Round 19 (data specialist F1, reproduced): the default fixture reads DATA_INCOMPLETE (three symbols PARTIAL over the funding window) and `--reserve` froze the boundary on it. It is
+    irreversible: the reserved region can never be un-reserved, so a reservation on a partial cross-section spends the one holdout the owner has."""
+    root, uni, spot = _hist(tmp_path)                                       # complete_window=False: the mark request ends 989 ms before the funding request
+    _s, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    assert info["dataset_state"]["state"] == CR.DATA_INCOMPLETE
+    reg = str(tmp_path / "registry" / "h.jsonl")
+    with pytest.raises(RH.HarnessError, match="DATASET_NOT_COMPLETE_FOR_A_HOLDOUT.*DATA_INCOMPLETE"):
+        HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), universe_dir=uni, spot_dir=spot)
+    assert not os.path.exists(reg), "a refused reservation must not create or touch the registry"
+    assert HH.main(["--reserve", "--history-root", root, "--mark-interval", MARK_IV, "--universe-dir", uni, "--spot-dir", spot, "--registry", reg, "--ledger-dir", str(tmp_path / "led")]) == 2
+    assert not os.path.exists(reg)
+
+
+def test_a_reservation_without_the_universe_capture_is_refused_not_unguarded(world):
+    for missing in (None, ""):
+        with pytest.raises(RH.HarnessError, match="UNIVERSE_DIR_REQUIRED"):
+            HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], universe_dir=missing)
+    assert HH.main(["--reserve", "--history-root", world["root"], "--mark-interval", MARK_IV, "--ledger-dir", world["ldir"]]) == 2
+    assert not os.path.exists(world["reg"])
+
+
+def test_a_window_that_carries_one_test_but_not_one_test_after_the_reserve_is_refused(world, monkeypatch):
+    """The window is sufficient for ONE registered evaluation only BEFORE the cut (15 rows = 142 days against a 199.7-day window): after reserving 30% the explore window is 139 days. The
+    historical plan arithmetic called this 'sufficient' (591 days study span against a 457-day need leaves 413 after the reserve) and the reservation went through."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 15)
+    _s, whole = CR.load_history_root(world["root"], universe_dir=world["uni"], spot_dir=world["spot"], mark_interval=MARK_IV)
+    assert whole["dataset_state"]["sufficient"] is True, whole["dataset_state"]
+    with pytest.raises(RH.HarnessError, match="EXPLORE_WINDOW_NOT_SUFFICIENT_AFTER_THE_RESERVE.*DATA_VALID_BUT_INSUFFICIENT"):
+        _reserve(world)
+    assert not os.path.exists(world["reg"])
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 14)                             # the same data against the bar its explore window carries (135 days <= 139): the reservation is made
+    assert _reserve(world)["kind"] == "reserve"
+
+
+def test_the_registered_bar_refuses_a_short_history(tmp_path, offline, monkeypatch):
+    """The REGISTERED 60 rows (457 days), not the module's lowered fixture bar, against the 199.7-day fixture. The registered value is read from the EVALUATOR's own default (the module fixture
+    lowers ``STATE_MIN_ROWS``; test_candidate_readiness pins it equal to that default), so this does not assert a number it just set. The reservation that used to succeed here is refused."""
+    import inspect
+    registered = inspect.signature(CR.evaluate_ranked_funding).parameters["min_rows"].default
+    assert registered == 60
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", registered)
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    reg = str(tmp_path / "r.jsonl")
+    with pytest.raises(RH.HarnessError, match="EXPLORE_WINDOW_NOT_SUFFICIENT_AFTER_THE_RESERVE"):
+        HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), universe_dir=uni, spot_dir=spot)
+    assert not os.path.exists(reg)
+
+
+def test_an_existing_reservation_is_still_returned_unchanged_whatever_the_gate_now_says(world, monkeypatch):
+    first = _reserve(world)
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 60)                             # the gate would now refuse: an existing reservation is idempotent, never re-judged or moved
+    again = _reserve(world)
+    assert again["already_reserved"] is True and again["from_ms"] == first["from_ms"]
+
+
+def test_the_final_read_is_not_spent_on_a_dataset_that_is_no_longer_complete(world, monkeypatch):
+    """Round 19 (data specialist F1): `final_read` computed `info['dataset_state']` and recorded the one read whatever it said (DATA_INCOMPLETE on 3 of 4 symbols: spent, and a second read
+    refused). The refusal comes before the record: the registry is byte-identical, the holdout is still reserved, and the read can still be made once the dataset is repaired."""
+    _reserve(world)
+    before = _bytes(world["reg"])
+    real = CR.load_history_root
+
+    def regressed(*a, **k):
+        series, info = real(*a, **k)
+        info["dataset_state"] = CR.dataset_state({"incomplete": ["3 loaded symbols are not COMPLETE over the whole required window"]})
+        return series, info
+    monkeypatch.setattr(CR, "load_history_root", regressed)
+    with pytest.raises(RH.HarnessError, match="FINAL_READ_REFUSED_DATASET_NOT_COMPLETE.*DATA_INCOMPLETE"):
+        _final(world)
+    assert _bytes(world["reg"]) == before and HH.status(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"])["state"] == "RESERVED"
+    monkeypatch.setattr(CR, "load_history_root", real)                         # repaired: the read is still available, once
+    series, info = _final(world)
+    assert info["holdout"]["status"] == "SPENT" and series
+    with pytest.raises(RH.HarnessError, match="FINAL_READ_ALREADY_SPENT"):
+        _final(world)
+
+
+def test_a_holdout_is_not_reserved_on_a_dataset_whose_mark_prices_are_frozen(tmp_path, offline, monkeypatch):
+    """Round 19 (data specialist F2): a frozen price series passed as COMPLETE, so the one holdout could be reserved on a perfect-hedge illusion. It now reads DATA_INVALID."""
+    monkeypatch.setattr(TMH, "FROZEN_MARK_SYMBOLS", {"BTCUSDT"})
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    reg = str(tmp_path / "r.jsonl")
+    with pytest.raises(RH.HarnessError, match="DATASET_NOT_COMPLETE_FOR_A_HOLDOUT.*DATA_INVALID.*BTCUSDT.*frozen"):
+        HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), universe_dir=uni, spot_dir=spot)
+    assert not os.path.exists(reg)
+
+
+def test_the_reservation_and_the_final_read_record_which_dataset_they_judged(world):
+    """Round 19 (independent review): completeness is judged against the lifecycle-eligible set of whichever --universe-dir is passed, and the registry recorded neither the universe nor the dataset, so
+    the reserve and the one final read could be judged against different symbol sets with nothing to show it. Recorded as EVIDENCE (a later read legitimately sees more forward data, so a changed
+    identity is stated, not refused)."""
+    r = _reserve(world)
+    ev = r["dataset_at_reservation"]
+    assert ev["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and len(ev["loaded_identity_digest"]) == 64 and len(ev["universe_manifest_sha256"]) == 64
+    series, info = _final(world)
+    fin = [x for x in _rows(world["reg"]) if x.get("purpose") == HH.FINAL][-1]
+    assert fin["dataset_at_read"]["loaded_identity_digest"] == ev["loaded_identity_digest"] and fin["dataset_at_read"]["universe_manifest_sha256"] == ev["universe_manifest_sha256"]
+    assert fin["dataset_at_read"]["identity_differs_from_reservation"] is False and info["holdout"]["dataset_at_read"]["identity_differs_from_reservation"] is False
+
+
+def test_an_existing_reservation_is_returned_without_a_universe_dir(world):
+    """The idempotent path is cheap and unchanged: UNIVERSE_DIR_REQUIRED applies when a reservation would be CREATED (independent review: it was checked before the idempotent return)."""
+    first = _reserve(world)
+    again = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], universe_dir="")
+    assert again["already_reserved"] is True and again["from_ms"] == first["from_ms"]

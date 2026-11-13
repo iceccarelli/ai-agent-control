@@ -6,6 +6,7 @@ data/real_bybit_btc_4h corpus and are IN-SAMPLE.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import sys
@@ -1792,3 +1793,62 @@ def test_the_competition_row_says_when_a_family_was_rejected_early_and_on_how_ma
     assert out["families"]["F"]["rejected_early"] is True and out["families"]["F"]["oos_independent_observations"] == 28
     out2 = CCmp._xs_summary({"status": "EVALUATED", "evaluation": {"families": {"F": {**fam, "reject_early": None}}}})
     assert out2["families"]["F"]["rejected_early"] is False
+
+
+def test_the_acquire_class_is_priced_at_the_executed_capital_and_the_overlay_grid_states_every_multiple():
+    """Round 19 (capital F6, quant F1): the acquire class was priced at the research overlay's FAVOURABLE 1.16x while the executor commits 2.04x, and no report said how the overlay's excess over
+    cash moves with the capital multiple (+1.4%/yr at 1.0x, +0.2% at 1.16x, -3.1% at 2.04x on the whole replay: the sign flips). A pass on the favourable basis is not evidence about the executed one."""
+    econ = CR.btc_carry_economics()
+    cap = econ["on_capital_after_cash"]
+    assert cap["status"] == "COMPUTED"
+    by_class = cap["capital_per_notional_by_class"]
+    assert by_class[CR.CAP_ACQUIRE] == pytest.approx(2.04) == pytest.approx(float(CR.EM.hedged_pair_capital_usd(1, 1).value)) and by_class[CR.CAP_OVERLAY] == pytest.approx(CR.OM.CAPITAL_PER_NOTIONAL)
+    a51 = cap["classes"][CR.CAP_ACQUIRE]["holds"]["51"]["mean_excess_over_cash_bps_of_capital"]
+    assert a51 == pytest.approx(-23.07, abs=0.05) and a51 < -22.99, "dearer capital, same hold: more negative than the -22.99 the favourable factor gave"
+    grid = cap["overlay_capital_grid"]
+    keys = ("inventory_only", "research_assumption", "no_collateral_credit")
+    assert [grid[k]["capital_per_notional"] for k in keys] == [1.0, pytest.approx(1.16), pytest.approx(2.04)]
+    ex = [grid[k]["mean_excess_over_cash_bps_of_capital"] for k in keys]
+    assert all(x is not None for x in ex) and ex[0] > ex[1] > ex[2], "a dearer capital basis never improves the excess over cash of a positive-net hold"
+    assert grid["research_assumption"]["mean_excess_over_cash_bps_of_capital"] == pytest.approx(cap["classes"][CR.CAP_OVERLAY]["holds"]["51"]["mean_excess_over_cash_bps_of_capital"])
+    _verdict, reasons, _p = CR._carry_verdict(econ)
+    assert any("executed no-credit basis 2.04x" in r for r in reasons), "the verdict names the executed basis next to the favourable one"
+
+
+def test_the_longest_identical_run_and_the_frozen_mark_threshold():
+    assert CR.longest_identical_run([]) == 0 and CR.longest_identical_run([5]) == 1
+    assert CR.longest_identical_run([1, 1, 2, 2, 2, 1]) == 3 and CR.longest_identical_run(["a", "a", "a"]) == 3
+    h = 3_600_000
+    assert CR.FROZEN_MARK_MIN_HOURS == 48 and CR.frozen_mark_threshold(4 * h) == 12, "48 hours of 4h candles"
+    assert CR.frozen_mark_threshold(h) == 48 and CR.frozen_mark_threshold(None) == 12
+    assert CR.frozen_mark_threshold(24 * h) == 12 and CR.frozen_mark_threshold(7 * 24 * h) == 12, "independent review: two equal DAILY closes are a low-tick coin, not a frozen feed; a coarse interval needs the same 12 candles"
+
+
+def test_a_stuck_window_is_found_even_when_a_single_tick_dither_breaks_the_run():
+    """Independent review: one different close resets the run, so [1]*11 + [2] + [1]*11 (a 1-tick dither) passed. A window of twice the threshold holding at most two distinct closes is stuck."""
+    dithered = [100.0] * 11 + [100.1] + [100.0] * 11 + [100.1]                     # 24 candles: every run is at most 11 (below the 12 needed), two distinct closes in all
+    assert CR.longest_identical_run(dithered) == 11 and CR.has_stuck_window(dithered, 24) is True
+    assert CR.has_stuck_window([100.0 + (i % 7) * 0.01 for i in range(200)], 24) is False, "a moving series (seven distinct closes) is never stuck"
+    assert CR.has_stuck_window([1.0] * 8 + [2.0] * 8 + [3.0] * 8, 24) is False, "three distinct closes in the window"
+    assert CR.has_stuck_window([1.0] * 10, 24) is False, "shorter than the window: nothing to judge"
+
+
+def test_a_frozen_mark_price_series_makes_the_dataset_invalid_and_names_the_symbol(tmp_path, offline, monkeypatch):
+    """Round 19 (data specialist F2, reproduced): 999 identical closes per symbol read COMPLETE and loaded with no warning, and a planted +0.03%/print rally in two top-funding names inflated the
+    out-of-sample mean 12x (4.3 -> 51.6 bps/row) once their marks were frozen: a zero-variance price leg is a perfect hedge. A mark that does not move for 48 hours is not a market."""
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 14)
+    ok = tmp_path / "moving"
+    ok.mkdir()
+    root, uni, spot = _hist(ok, complete_window=True)
+    _s, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    assert info["dataset_state"]["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and info["frozen_mark_symbols"] == [], "control: moving closes (and the fixture's constant FUNDING, which is legitimate) pass"
+    monkeypatch.setattr(TMH, "FROZEN_MARK_SYMBOLS", {"FASTUSDT"})
+    bad = tmp_path / "frozen"
+    bad.mkdir()
+    root2, uni2, spot2 = _hist(bad, complete_window=True)
+    _s2, info2 = CR.load_history_root(root2, universe_dir=uni2, spot_dir=spot2, mark_interval=MARK_IV)
+    st = info2["dataset_state"]
+    assert st["state"] == CR.DATA_INVALID and st["complete_over_requested_window"] is False
+    assert [f["symbol"] for f in info2["frozen_mark_symbols"]] == ["FASTUSDT"] and info2["frozen_mark_symbols"][0]["run_candles"] >= 12
+    assert any("FASTUSDT" in r and "frozen" in r for r in st["reasons"]), st["reasons"]
+    assert info2["loaded_identity"]["digest"] is not None, "the bytes verify: the identity names exactly the data that was refused as a price series"

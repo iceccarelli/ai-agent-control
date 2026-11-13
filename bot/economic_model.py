@@ -176,23 +176,59 @@ def structural_zero(unit: str, reason: str) -> Quantity:
 PLAN_BUFFER_FRACTION = Decimal("0.02")
 
 
-def hedged_pair_capital_usd(notional_usd: Any, leverage: Any, *, buffer_fraction: Any = PLAN_BUFFER_FRACTION) -> Quantity:
-    """The cash a spot-buy + perp-short pair COMMITS at ``leverage``: the spot leg paid in full, plus the perp initial margin (notional / leverage), plus the plan's buffer. ONE definition, derived from the plan's
-    own inputs and never a constant per USD (a per-USD constant silently encodes one leverage): the plan's cash need, the allocator's margin cap, the decision record's ``capital_required_usd`` and the
-    cost of capital charged by the executor's gate all read it. (The research overlay's 1.16x is a DIFFERENT, assumed construction: BTC the owner already holds plus ~15% perp margin.)"""
+#: The capital STRUCTURES (Round 19). The same hedge was priced at 1.0 / 1.10 / 1.16 / 1.2 / 2.003 / 2.02 / 2.04 times its notional by different modules, so a verdict could pass on one denominator and
+#: fail on another. A structure is a construction with ONE formula; a module that needs capital names the structure it is pricing and calls ``structure_capital_usd``.
+ACQUIRED_SPOT_PERP = "ACQUIRED_SPOT_PERP"          # B: the spot leg is BOUGHT for the pair (paid in full) + a short perp margined with cash
+OWNED_INVENTORY_OVERLAY = "OWNED_INVENTORY_OVERLAY"  # A: coin the owner already holds + a short perp; the held coin is capital that could be sold, so it carries the alternative's cost too
+PERP_ONLY = "PERP_ONLY"                            # C: no spot leg (a funding spread or a directional short): margin cash only, and the price risk is NOT hedged
+CAPITAL_STRUCTURES = (ACQUIRED_SPOT_PERP, OWNED_INVENTORY_OVERLAY, PERP_ONLY)
+
+
+def structure_capital_usd(structure: str, notional_usd: Any, leverage: Any, *, buffer_fraction: Any = PLAN_BUFFER_FRACTION, inventory_collateral_ratio: Any = None) -> Quantity:
+    """The cash a ``structure`` COMMITS per ``notional_usd`` of perp notional at ``leverage``. ONE definition; ``hedged_pair_capital_usd`` and ``perp_only_capital_usd`` are the two wrappers older code reads.
+
+    * ``ACQUIRED_SPOT_PERP``: notional (spot paid in full) + notional / leverage (perp initial margin), times 1 + the plan's buffer (2.04x at leverage 1).
+    * ``PERP_ONLY``: notional / leverage, times 1 + buffer (1.02x at leverage 1).
+    * ``OWNED_INVENTORY_OVERLAY``: the held inventory (notional) + the margin cash NOT backed by the held coin, times 1 + buffer. ``inventory_collateral_ratio`` is the fraction of the held coin's value the
+      VENUE accepts as margin (a venue fact, never a default): the credit is ``ratio x notional`` but never more than the margin it backs. UNSTATED, no credit is claimed and the result is the upper
+      bound (2.04x at leverage 1) with provenance ``assumed``: an assumed capital can never support a PASS. Stated, the result is ``derived`` from that ratio (0.9 at leverage 1 gives 1.122x).
+
+    Capital is cash committed; a financing deficit is a LIABILITY charged separately as interest at the owner's stated borrow rate, never netted against it."""
+    if structure not in CAPITAL_STRUCTURES:
+        raise EconomicModelError(f"unknown capital structure {structure!r}: one of {CAPITAL_STRUCTURES}")
     n, lev, buf = to_decimal(notional_usd), to_decimal(leverage), to_decimal(buffer_fraction)
     if n <= 0 or lev < 1 or buf < 0:
         raise EconomicModelError("a capital basis needs notional > 0, leverage >= 1 and a buffer >= 0")
-    return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "derived", "usd")
+    if inventory_collateral_ratio is not None and structure != OWNED_INVENTORY_OVERLAY:
+        raise EconomicModelError("inventory_collateral_ratio belongs to OWNED_INVENTORY_OVERLAY only: a ratio nothing reads is a mistake, not a default")
+    margin = n / lev
+    # the EXACT expressions the two wrappers always used (byte-identical at every leverage, including the non-terminating 3, 7 and 9: n x (1 + 1/lev) and n / lev differ from n + n/lev in the 28th digit)
+    if structure == PERP_ONLY:
+        return Quantity(n / lev * (Decimal(1) + buf), "derived", "usd")
+    if structure == ACQUIRED_SPOT_PERP:
+        return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "derived", "usd")
+    if inventory_collateral_ratio is None:
+        return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "assumed", "usd")
+    ratio = to_decimal(inventory_collateral_ratio)
+    if not (Decimal(0) <= ratio <= Decimal(1)):
+        raise EconomicModelError("inventory_collateral_ratio must be in [0, 1]")
+    cash_margin = margin - min(margin, ratio * n)
+    return Quantity((n + cash_margin) * (Decimal(1) + buf), "derived", "usd")
+
+
+def hedged_pair_capital_usd(notional_usd: Any, leverage: Any, *, buffer_fraction: Any = PLAN_BUFFER_FRACTION) -> Quantity:
+    """The cash a spot-buy + perp-short pair COMMITS at ``leverage`` (``structure_capital_usd(ACQUIRED_SPOT_PERP, ...)``): the spot leg paid in full, plus the perp initial margin (notional / leverage), plus
+    the plan's buffer. ONE definition, derived from the plan's own inputs and never a constant per USD (a per-USD constant silently encodes one leverage): the plan's cash need, the allocator's margin
+    cap, the decision record's ``capital_required_usd`` and the cost of capital charged by the executor's gate all read it. (The research overlay's 1.16x is a DIFFERENT, assumed construction: BTC the
+    owner already holds plus ~15% perp margin.)"""
+    return structure_capital_usd(ACQUIRED_SPOT_PERP, notional_usd, leverage, buffer_fraction=buffer_fraction)
 
 
 def perp_only_capital_usd(notional_usd: Any, leverage: Any, *, buffer_fraction: Any = PLAN_BUFFER_FRACTION) -> Quantity:
-    """The cash a PERP-ONLY book (a funding spread or a directional short: no spot leg) COMMITS per ``notional_usd`` of gross perp notional at ``leverage``: the initial margin (notional / leverage) plus the same
-    buffer the pair uses. The sibling of ``hedged_pair_capital_usd`` (which adds the spot leg paid in full): one definition per construction, never a per-USD constant that silently encodes leverage 1."""
-    n, lev, buf = to_decimal(notional_usd), to_decimal(leverage), to_decimal(buffer_fraction)
-    if n <= 0 or lev < 1 or buf < 0:
-        raise EconomicModelError("a capital basis needs notional > 0, leverage >= 1 and a buffer >= 0")
-    return Quantity(n / lev * (Decimal(1) + buf), "derived", "usd")
+    """The cash a PERP-ONLY book (a funding spread or a directional short: no spot leg) COMMITS per ``notional_usd`` of gross perp notional at ``leverage`` (``structure_capital_usd(PERP_ONLY, ...)``): the
+    initial margin (notional / leverage) plus the same buffer the pair uses. The sibling of ``hedged_pair_capital_usd`` (which adds the spot leg paid in full): one definition per construction, never a
+    per-USD constant that silently encodes leverage 1."""
+    return structure_capital_usd(PERP_ONLY, notional_usd, leverage, buffer_fraction=buffer_fraction)
 
 
 def at_least(q: Quantity, floor: Any) -> Optional[bool]:

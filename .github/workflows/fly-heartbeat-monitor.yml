@@ -42,6 +42,10 @@ jobs:
   monitor:
     name: worker health (reads Supabase only)
     if: github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.FLY_MONITOR_ENABLED == 'true'
+    # Round 19: a repository-level secret is delivered to a workflow run from ANY branch (workflow_dispatch from a pushed branch whose copy of this file drops the `if:` above), an environment
+    # secret with a main-only deployment-branch policy is not (carry-drill-testnet.yml does the same). OWNER: create the environment `monitor-readonly` (Settings > Environments, deployment branches: main only),
+    # move the secrets below into it, then delete the repository-level copies. Naming the environment here changes nothing until then (repository secrets still resolve).
+    environment: monitor-readonly
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

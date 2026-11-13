@@ -227,6 +227,8 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
 #: A recorder status file older than this is a recorder that has stopped reporting
 #: (it writes every 30 s); five minutes is ten missed beats.
 RECORDER_STALE_S = 300.0
+#: A status stamped further than this AHEAD of the reader's clock is not a fresh heartbeat (a frozen file after a forward clock step, a writer whose clock is wrong): FAULT, never RECORDING. Round 19.
+RECORDER_FUTURE_SKEW_S = 120.0
 #: A recorder whose HEARTBEAT is fresh but whose log has not grown for this long is alive and not persisting (a dead feed, a wedged writer, a full volume). BTCUSDT's books update many
 #: times a second, so five minutes without one new record is not a quiet market.
 RECORDER_NO_GROWTH_S = 300.0
@@ -278,14 +280,22 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None
         fault = store.get("fault")
         progress = st.get("progress") or {}
         growth_age = progress.get("growth_age_s")
+        future = age < -RECORDER_FUTURE_SKEW_S or (isinstance(growth_age, (int, float)) and growth_age < 0)
         state = ("STALE" if age > RECORDER_STALE_S
-                 else "FAULT" if fault or not feed.get("threads_alive", False)
+                 else "FAULT" if fault or future or not feed.get("threads_alive", False)
                  else "NOT_PERSISTING" if isinstance(growth_age, (int, float)) and growth_age > RECORDER_NO_GROWTH_S
                  else "RECORDING")
         detail = None
         if state == "STALE":
             detail = (f"recorder_status.json is {age:.0f} s old (limit {RECORDER_STALE_S:.0f} s): the recorder has stopped reporting; "
                       f"{_supervisor_summary(path)}")[:300]
+        elif future:
+            why = []
+            if age < -RECORDER_FUTURE_SKEW_S:
+                why.append(f"is stamped {-age:.0f} s in the future (tolerance {RECORDER_FUTURE_SKEW_S:.0f} s)")
+            if isinstance(growth_age, (int, float)) and growth_age < 0:
+                why.append(f"reports a negative growth_age_s ({growth_age!r})")
+            detail = (f"recorder_status.json {' and '.join(why)}: a clock step or a frozen file, so its health cannot be read from it; {_supervisor_summary(path)}")[:300]
         elif state == "NOT_PERSISTING":
             detail = (f"the recorder reports (heartbeat {age:.0f} s old) but its log has not grown for {growth_age:.0f} s "
                       f"(limit {RECORDER_NO_GROWTH_S:.0f} s): nothing is being persisted; {_supervisor_summary(path)}")[:300]

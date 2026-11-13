@@ -456,9 +456,13 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
     out["directional_component_usd"] = -qty * (spot_out - spot_in)
     out["inventory_value_in_usd"] = qty * spot_in
     out["passive_return_bps"] = (spot_out / spot_in - 1.0) * 1e4
-    out["financing_bps"] = 0.0
-    out["financing_note"] = ("overlay borrows nothing and trades no spot: "
-                             "mainnet_public.GATE_BORROW_APR is 0.0")
+    # Round 19: UNKNOWN, not zero. An overlay whose perp margin is paid from USDT cash borrows the moment that balance goes negative (the replay journal on the committed corpus: an average USDT
+    # deficit of 0.89x notional for 81% of the window), so "borrows nothing" was a claim this record cannot make. The registered protocol's verdict does not read this field.
+    out["financing_bps"] = None
+    out["financing_status"] = "NOT_MODELLED"
+    out["financing_note"] = ("NOT MODELLED: this episode record charges no financing. The overlay trades no spot, but its perp margin is paid from USDT cash and a negative USDT balance IS a "
+                             "loan (carry_replay measured an average USDT deficit of 0.89x notional on the committed replay): the cost is unknown here, not zero; it needs the owner's "
+                             "stated borrow rate and collateral mode")
     out["impact_upper_bps"] = cost.get("impact_upper_bps")
     if cost["status"] == UNAVAILABLE:
         out["worst_path_usd"] = None

@@ -127,6 +127,22 @@ def _isolated_capital_anchor(tmp_path_factory, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _fresh_multiple_testing_high_water():
+    """``research_harness`` keeps PROCESS-WIDE high-water marks of every ledger's variant count (``_FAMILY_HIGH_WATER`` by family NAME, ``_PATH_HIGH_WATER`` by path) so a ledger truncated inside one process is
+    caught. They can only OVERSTATE a count (conservative: Holm never gets looser), but across TESTS they leak: whichever test ran earlier in the same xdist worker lifted the family's mark, and
+    ``test_new_data_or_a_new_variant_still_enlarges_the_family`` then saw first == grown (Round 19 data specialist F5, reproduced by running the test body twice in one process). Each test starts clean,
+    exactly as the tests that reset them by hand already do; a PRODUCTION run is one process per run and is unaffected."""
+    try:
+        import research_harness as _rh
+    except ImportError:                                  # pragma: no cover - a test that does not import the harness needs nothing reset
+        yield
+        return
+    _rh._FAMILY_HIGH_WATER.clear()
+    _rh._PATH_HIGH_WATER.clear()
+    yield
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _restore_caller_environment():
     yield
