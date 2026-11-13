@@ -537,14 +537,19 @@ class Feed:
             self.emergency_retention()
 
     def emergency_retention(self) -> List[str]:
-        """When the volume is below its reserve, free the OLDEST closed segment now instead of waiting for the age-based pass (a volume that fills inside one retention window would sit in
-        FAULT for ever). Counted in ``emergency_prunes``; a failure is counted, never raised into the feed."""
+        """When the volume is below its reserve, first run the AGE-based retention now (the same rule, never a segment inside the retention window, which the hourly pass would
+        otherwise leave for up to ~59 minutes after every UTC midnight: the day that just expired is exactly what frees the space the next day's segment needs), and only if that
+        frees nothing free the OLDEST closed segment under the backup-key rule (a volume that fills inside one retention window would sit in FAULT for ever). Counted in
+        ``emergency_prunes``; a failure is counted, never raised into the feed."""
         store = self.engine.store
         if store is None or not hasattr(store, "low_space") or self.cfg.retention_days <= 0:     # retention 0 = keep everything
             return []
         try:
             if not store.low_space():
                 return []
+            expired = self.apply_retention()
+            if expired:
+                return expired
             with self.engine.lock:
                 return store.emergency_prune(self.emergency_may_prune)
         except Exception:  # noqa: BLE001

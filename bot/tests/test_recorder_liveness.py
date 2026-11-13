@@ -371,6 +371,9 @@ def test_the_feed_runs_the_emergency_pass_only_when_the_reserve_is_breached(tmp_
     store.min_free_bytes = 10 ** 15
     import dataclasses
     rec.feed.cfg = dataclasses.replace(rec.feed.cfg, retention_days=2)
+    # the scenario is a volume that fills INSIDE the retention window (nothing is expired by age): with the wall clock at the newest segment's day, the age pass that
+    # now runs first finds nothing, and only the backup-key rule can free a day
+    rec.feed.wall_ms = lambda: 1_700_000_000_000 + 2 * day
     assert rec.feed.emergency_retention() == [] and store.emergency_prunes == 0 and store.emergency_prunes_denied == 1      # no verified backup named: refused, counted
     rec.feed.emergency_may_prune = lambda n: True
     assert len(rec.feed.emergency_retention()) >= 1 and store.emergency_prunes >= 1
