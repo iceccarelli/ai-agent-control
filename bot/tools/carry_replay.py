@@ -782,8 +782,8 @@ def usdt_financing_profile(journal: Any, *, start_ms: int, end_ms: int,
     journal opens with 0 USDT, so its USDT balance after any posting IS the
     cash the book would have had to find. On the 4.1-year Bybit corpus that
     balance was negative for most of the window (average deficit $88,644 over the
-    window; the signed mean balance is -$86,887; lasting low about -$175.9k on
-    2024-12-20), and interest on it at 5-8%/yr is $18,198-$29,117, i.e. 55-88% of
+    window; the signed mean balance is -$86,887; lasting maximum $178,750 on
+    2025-06-10), and interest on it at 5-8%/yr is $18,198-$29,117, i.e. 55-88% of
     the $33,050 net (Round 17 A4/A1, re-derived by the red team). A net that omits
     it is an UPPER BOUND.
 
@@ -799,10 +799,15 @@ def usdt_financing_profile(journal: Any, *, start_ms: int, end_ms: int,
     loss; `owner_capital_view` takes the break-even on the first. No default rate
     exists: an unstated rate stays UNSTATED and the interest is None, never 0.0.
     Funding is booked at the exit in this journal (it is paid per print live): the
-    lump is conservative for the interest (about 1% more dollar-years than per
-    print on the corpus) and is why the share of time in deficit counts only
-    deficits above `MATERIAL_DEFICIT_FRACTION` of the notional. A posting amount
-    that is not a finite number gives no profile rather than a silent zero."""
+    lump is conservative for the interest (about 1.1% more dollar-years than per
+    print on the corpus) but it DOES move the share of time in deficit, which is
+    about 81% as booked and about 71-72% had each print's funding been credited when
+    it was paid (one 572-print trade collects $18,987 that the journal credits only
+    at its exit): the share is therefore reported as a figure that depends on when
+    funding is credited, not as a measurement of the live account. The
+    `MATERIAL_DEFICIT_FRACTION` floor only keeps fee-sized balances out of it. A
+    posting amount that is not a finite number gives no profile rather than a silent
+    zero."""
     import economic_model as EM
     import ledger as L
     if usdt_borrow_apr is not None and (
@@ -895,7 +900,8 @@ def usdt_financing_lines(f: Dict[str, Any], *, net_usd: float) -> List[str]:
         return ["  usdt financing: not measured (" + str(f.get("why")) + ")"]
     lines = [
         f"  USDT FINANCING (the journal opens with 0 USDT; the short's realised losses are cash it must find): negative by more than "
-        f"${f['deficit_floor_usd']:,.0f} for {100.0 * f['share_of_time_in_deficit']:.0f}% of the window ({100.0 * f['share_of_time_in_any_deficit']:.0f}% at any amount), "
+        f"${f['deficit_floor_usd']:,.0f} for {100.0 * f['share_of_time_in_deficit']:.0f}% of the window ({100.0 * f['share_of_time_in_any_deficit']:.0f}% at any amount; "
+        f"lower if funding were credited per print: this journal credits it at each exit), "
         f"average deficit ${f['avg_deficit_usd']:,.0f} over the window, lasting maximum ${f['max_deficit_usd']:,.0f}"
         + (f" on {f['max_deficit_at']}" if f["max_deficit_at"] else ""),
         f"    beyond the margin cash the capital rule commits (${f['margin_cash_assumed_usd']:,.0f}; optimistic: that cash is still posted as margin): average deficit "

@@ -547,16 +547,24 @@ SPOT_DUST_USD = 1.0
 
 def _spot_dust_qty(c: Mapping[str, Any]) -> float:
     """The largest unsold/oversold BTC quantity treated as dust for this cycle:
-    SPOT_DUST_USD at the cycle's entry price, never below the ledger's own dust.
-    No readable price: the ledger's strict dust only."""
+    SPOT_DUST_USD at the cycle's HIGHEST readable entry price (the perp fill's and
+    the spot purchase's), never below the ledger's own dust. Two readable prices
+    that disagree by more than 5% (a mis-scaled memo) mean neither can value the
+    remainder: only the ledger's strict dust is allowed then, and with no readable
+    price too."""
     floor = max(L.DUST[L.BTC], 1e-9)
+    prices = []
+    spot_qty = c.get("spot_buy_net_qty")
     for price in (c.get("perp_entry_price"),
-                  (c.get("spot_buy_gross_usd") or 0.0)
-                  / c["spot_buy_net_qty"] if c.get("spot_buy_net_qty") else None):
+                  (c.get("spot_buy_gross_usd") or 0.0) / spot_qty
+                  if isinstance(spot_qty, (int, float)) and spot_qty > 0
+                  else None):
         if (isinstance(price, (int, float)) and not isinstance(price, bool)
                 and math.isfinite(price) and price > 0):
-            return max(floor, SPOT_DUST_USD / price)
-    return floor
+            prices.append(float(price))
+    if not prices or (len(prices) == 2 and max(prices) > 1.05 * min(prices)):
+        return floor
+    return max(floor, SPOT_DUST_USD / max(prices))
 
 
 def _acquire_spot_leg_problem(c: Mapping[str, Any]) -> Optional[str]:

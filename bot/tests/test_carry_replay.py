@@ -436,8 +436,9 @@ class TestTheOwnerCapitalView:
 # ---------------------------------------------------------------------------
 # Round 17: the overlay's hedge loses CASH when BTC rises, and the journal holds
 # no USDT to pay it from. A4/A1 reproduced on the 4.1-year corpus that the
-# journal's USDT account was negative 81% of the time (average -$86,887, low
-# -$180,747), so the interest on it is 55-88% of the $33,050 net at 5-8%. The
+# journal's USDT account was negative about 81% of the time as booked (average
+# deficit $88,644, lasting maximum $178,750 on 2025-06-10), so the interest on it is
+# 55-88% of the $33,050 net at 5-8%. The
 # replay MEASURES the deficit always and charges interest ONLY on a rate the
 # operator states (never a default), without moving the journal or net_usd.
 # ---------------------------------------------------------------------------

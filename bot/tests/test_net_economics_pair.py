@@ -568,6 +568,23 @@ def test_the_dust_threshold_is_a_value_at_the_cycles_own_entry_price():
         assert (perf._acquire_spot_leg_problem(c) is None) is is_pair, price
 
 
+def test_a_mis_scaled_perp_price_cannot_turn_an_unsold_coin_into_dust():
+    """Red team round 3: the first readable price used to win, so a perp memo price of 1.0 against a 100,000 spot purchase made 1 BTC unsold 'dust'."""
+    j = L.Journal()
+    L.spot_buy(j, ms=T0, ref="sb", qty=1.0, price=P0, fee_btc=0.0, fee_usdt=0.0, fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 1, ref="o", qty=1.0, price=1.0, fee_usd=0.0, fee_status="confirmed")
+    L.perp_close(j, ms=T0 + 10 * DAY, ref="c", qty=1.0, price=0.95, entry_price=1.0, fee_usd=0.0, fee_status="confirmed")
+    c = perf.cycles_from_journal(j)[0]
+    assert c["economic_net_usd"] is None and "SPOT_LEG_NOT_FLAT" in perf.hedged_pair(c)["why"]
+    for perp_price in (1e-6, 1e6):
+        d = {"spot_residual_qty": 1.0, "perp_entry_price": perp_price, "spot_buy_net_qty": 1.0, "hedged_qty": 1.0, "spot_buy_gross_usd": P0}
+        assert perf._acquire_spot_leg_problem(d) is not None, perp_price
+        assert perf._spot_dust_qty(d) < 1e-6                     # the strict ledger dust, never an inflated allowance
+    # prices that agree within 5% value the dust at the higher of them
+    d = {"spot_residual_qty": 0.0, "perp_entry_price": P0 * 1.02, "spot_buy_net_qty": 1.0, "hedged_qty": 1.0, "spot_buy_gross_usd": P0}
+    assert perf._spot_dust_qty(d) == pytest.approx(1.0 / (P0 * 1.02))
+
+
 def test_a_whole_unsold_leg_is_still_refused_whatever_the_dust_rule():
     j = L.Journal()
     acquire_shaped(j, 0, 10, tag="u", close=95_000.0, sell=0.0)

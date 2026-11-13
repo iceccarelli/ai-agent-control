@@ -1391,7 +1391,7 @@ _ALLOWED_RATE_LIKE = {"equity_bridge.btc_leg_price_sensitivity_usd_per_1pct"}   
 
 def _numeric_rate_like_keys(node, path=""):
     import re
-    pat = re.compile(r"(pct|return|annuali|apr|apy|yield)", re.I)
+    pat = re.compile(r"(pct|return|annuali|apr|apy|yield|bps_of)", re.I)
     found = []
     if isinstance(node, dict):
         for k, v in node.items():
@@ -1414,7 +1414,8 @@ def test_no_numeric_rate_survives_anywhere_in_the_json_of_an_unreconciled_ledger
     assert _numeric_rate_like_keys(json.loads(json.dumps(rep, default=str))) == []
     for rt in (rep["perp_review"] or {}).get("round_trips", []):
         assert rt["annualised_pct_on_notional"] is None and rt.get("annualised_pct_on_stated_capital") is None
-        assert "net_usd" in rt or "net_pnl_usd" in rt or True               # the dollar fields are untouched
+        for k in ("net_bps_of_notional", "funding_bps_of_notional", "basis_bps_of_notional", "fee_bps_of_notional"):
+            assert rt.get(k) is None, k
     # the control: the SAME fields are numbers on a reconciled ledger
     w2 = World()
     w2.lines = _statement(w2)
@@ -1422,6 +1423,7 @@ def test_no_numeric_rate_survives_anywhere_in_the_json_of_an_unreconciled_ledger
     ok = ledger(w2, tmp_path / "ok")
     assert ok["verdict"].startswith("RECONCILED")
     assert any(rt.get("annualised_pct_on_notional") is not None for rt in (ok["perp_review"] or {}).get("round_trips", []))
+    assert any(rt.get("net_bps_of_notional") is not None for rt in (ok["perp_review"] or {}).get("round_trips", []))
 
 
 def test_the_same_deposit_declared_on_the_statement_is_the_control_and_gets_its_return(tmp_path):

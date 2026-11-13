@@ -1122,9 +1122,9 @@ def withhold_unreconciled_returns(returns: Dict[str, Any], capital: Dict[str, An
     return returns, capital
 
 
-#: A key whose number is a RATE (annualised, a period or an on-capital percentage). The perp review's per-round-trip rows carry `annualised_pct_on_notional` and
-#: `annualised_pct_on_stated_capital`; a dollar sensitivity named `..._usd_per_1pct` is not one.
-_RATE_KEY_PARTS = ("annualised", "period_pct", "pct_on_")
+#: A key whose number is a RATE (annualised, a period or an on-capital percentage, or bps of notional). The perp review's per-round-trip rows carry
+#: `annualised_pct_on_notional`, `annualised_pct_on_stated_capital` and `net/funding/basis/fee_bps_of_notional`; a dollar sensitivity named `..._usd_per_1pct` is not one.
+_RATE_KEY_PARTS = ("annualised", "period_pct", "pct_on_", "bps_of_notional")
 
 
 def scrub_unreconciled_rates(node: Any, verdict: str) -> Any:
