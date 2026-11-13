@@ -1171,3 +1171,13 @@ def test_the_final_read_is_not_spent_on_a_dataset_that_is_no_longer_complete(wor
     assert info["holdout"]["status"] == "SPENT" and series
     with pytest.raises(RH.HarnessError, match="FINAL_READ_ALREADY_SPENT"):
         _final(world)
+
+
+def test_a_holdout_is_not_reserved_on_a_dataset_whose_mark_prices_are_frozen(tmp_path, offline, monkeypatch):
+    """Round 19 (data specialist F2): a frozen price series passed as COMPLETE, so the one holdout could be reserved on a perfect-hedge illusion. It now reads DATA_INVALID."""
+    monkeypatch.setattr(TMH, "FROZEN_MARK_SYMBOLS", {"BTCUSDT"})
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    reg = str(tmp_path / "r.jsonl")
+    with pytest.raises(RH.HarnessError, match="DATASET_NOT_COMPLETE_FOR_A_HOLDOUT.*DATA_INVALID.*BTCUSDT.*frozen"):
+        HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), universe_dir=uni, spot_dir=spot)
+    assert not os.path.exists(reg)

@@ -563,6 +563,24 @@ _VERDICT_TO_STATE = {"REJECTED": DATA_SUFFICIENT_CANDIDATE_REJECTED, "PROMISING"
 _EVALUATOR_NOT_ENOUGH = ("INSUFFICIENT_DATA", "UNTESTED")
 
 
+#: A mark price that does not move for this long is not a market: a stalled index, a halted or delivering contract, a feed that repeats its last value. The price leg of a funding position on such a
+#: series is exactly zero for every hold, so the series reads as a PERFECT hedge and the squeeze or crash a short suffers is erased (a planted +0.03%/print rally in two top-funding names inflated the
+#: out-of-sample mean 12x, 4.3 -> 51.6 bps/row, with nothing flagged). Frozen BEFORE the owner's data is read; a funding rate is NOT held to the same rule (a run of the 1 bp baseline is real).
+FROZEN_MARK_MIN_HOURS = 48
+
+
+def longest_identical_run(values: Sequence[Any]) -> int:
+    """The longest run of consecutive EQUAL values (0 for an empty sequence)."""
+    best = run = 0
+    prev: Any = object()
+    for v in values:
+        run = run + 1 if v == prev else 1
+        prev = v
+        if run > best:
+            best = run
+    return best
+
+
 def dataset_state(findings: Mapping[str, Sequence[str]], *, candidate_verdict: Optional[str] = None) -> Dict[str, Any]:
     """The state of a dataset from its findings (a dict of reason lists keyed ``unavailable`` / ``invalid`` / ``incomplete`` / ``insufficient``; absent = none). The worst non-empty
     class names the state and its reasons; ``candidate_verdict`` (the evaluator's own word: REJECTED / PROMISING / QUALIFIED / INSUFFICIENT_DATA / UNTESTED, or None = none was run)
@@ -1511,6 +1529,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         if man.get("dataset_status") != "COMPLETE":
             warnings.append(f"dataset {nm} dataset_status {man.get('dataset_status')!r}: the evaluation inherits that")
     excluded = [{"symbol": sy, "reason": why} for sy, why in sorted(fn.reasons_for_symbols_in_datasets().items())]
+    frozen_marks: List[Dict[str, Any]] = []
     series: List[SymbolSeries] = []
     cut_dropped: List[str] = []
     delivery_hidden: List[str] = []                                         # symbols whose delisting instant lies in the reserved region (hidden from the explore series)
@@ -1531,6 +1550,11 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                     raise RH.LookAheadError(f"{sym}: a mark row claims its close is knowable before the candle ended (observation_time {ot!r}, candle start {r['ts']}, interval {iv_ms!r})")
             fund = sorted((r["observation_time"], float(Decimal(r["v"]["fundingRate"]) * 10000)) for r in frows if cut_ms is None or r["observation_time"] < cut_ms)
             mark = sorted((r["observation_time"], float(Decimal(r["v"]["close"]))) for r in mrows if cut_ms is None or r["observation_time"] < cut_ms)
+            _iv = iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None
+            _need = max(2, int(math.ceil(FROZEN_MARK_MIN_HOURS * 3_600_000 / _iv))) if _iv else 12
+            _run = longest_identical_run([c for _t, c in mark])
+            if _run >= _need:
+                frozen_marks.append({"symbol": sym, "run_candles": _run, "min_candles": _need, "min_hours": FROZEN_MARK_MIN_HOURS})
         except RH.HarnessError:
             raise
         except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
@@ -1604,6 +1628,9 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                              not_complete=[s for s in set(fn.loadable) - set(fn.complete) if s not in _cut_set], ended_unaccounted=len(closed_missing),
                              window_days=(w1 - w0) / MS_DAY, survivorship=survivorship)
     state_findings: Dict[str, List[str]] = {"unavailable": [], "invalid": [], **_sf}
+    for _fm in frozen_marks:
+        state_findings["invalid"].append(f"{_fm['symbol']}: the mark price is frozen for {_fm['run_candles']} consecutive candles (>= {_fm['min_candles']} = {_fm['min_hours']} h): not a market price series, "
+                                         f"its price leg is zero for every hold")
     for _nm, _man in (("funding", fman), (mark_name, mman), ("the universe capture", uinfo)):
         _st = _man.get("dataset_status")
         if _st in ("CONFLICTED", "UNVERIFIED"):
@@ -1622,7 +1649,7 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     if not identity["identifies_every_component"]:
         state_findings["invalid"].append("a loaded manifest carries no digest: the dataset cannot be identified")
     info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
-                       "dataset_state": dataset_state(state_findings), "loaded_identity": identity,
+                       "dataset_state": dataset_state(state_findings), "loaded_identity": identity, "frozen_mark_symbols": frozen_marks,
                        "loaded_identity_scope": "the funding + mark-kline datasets, the universe capture and (when supplied) the spot snapshot this load READ; index-kline / open-interest are not loaded: "
                                                 "the report-level dataset_identity of dataset_report covers every manifest under the data root",
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},

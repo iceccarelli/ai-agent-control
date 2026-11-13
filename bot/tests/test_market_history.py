@@ -73,6 +73,9 @@ class Clock:
             return self.t
 
 
+FROZEN_MARK_SYMBOLS = set()                          # symbols whose mark closes stay constant (the frozen-price tests set it)
+
+
 def row_for(dataset, sym, ts, **over):
     if dataset == MH.FUNDING:
         r = {"symbol": sym, "fundingRate": "0.0001", "fundingRateTimestamp": str(ts)}
@@ -84,7 +87,14 @@ def row_for(dataset, sym, ts, **over):
         return r
     if dataset == MH.KLINE:
         return over.get("row", [str(ts), "100", "101", "99", "100.5", "10", "1000"])
-    return over.get("row", [str(ts), "100", "101", "99", "100.5"])
+    if "row" in over:
+        return over["row"]
+    if dataset == MH.MARK and sym not in FROZEN_MARK_SYMBOLS:
+        # Round 19: a real mark price MOVES. A series of 999 identical closes is what the loader now calls a frozen (invalid) price series, so the shared fixture's closes wiggle deterministically by
+        # candle (0.00..0.06 around 100.50: the FIRST candle's close stays exactly 100.5, which several tests pin). ``FROZEN_MARK_SYMBOLS`` keeps one symbol's closes constant on purpose.
+        close = f"{100.5 + ((ts - FIRST) // H4 % 7) * 0.01:.2f}"
+        return [str(ts), "100", "101", "99", close]
+    return [str(ts), "100", "101", "99", "100.5"]
 
 
 def envelope(dataset, sym, rows, server, **kw):
