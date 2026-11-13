@@ -202,12 +202,13 @@ def structure_capital_usd(structure: str, notional_usd: Any, leverage: Any, *, b
     if inventory_collateral_ratio is not None and structure != OWNED_INVENTORY_OVERLAY:
         raise EconomicModelError("inventory_collateral_ratio belongs to OWNED_INVENTORY_OVERLAY only: a ratio nothing reads is a mistake, not a default")
     margin = n / lev
+    # the EXACT expressions the two wrappers always used (byte-identical at every leverage, including the non-terminating 3, 7 and 9: n x (1 + 1/lev) and n / lev differ from n + n/lev in the 28th digit)
     if structure == PERP_ONLY:
-        return Quantity(margin * (Decimal(1) + buf), "derived", "usd")
+        return Quantity(n / lev * (Decimal(1) + buf), "derived", "usd")
     if structure == ACQUIRED_SPOT_PERP:
-        return Quantity((n + margin) * (Decimal(1) + buf), "derived", "usd")
+        return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "derived", "usd")
     if inventory_collateral_ratio is None:
-        return Quantity((n + margin) * (Decimal(1) + buf), "assumed", "usd")
+        return Quantity(n * (Decimal(1) + Decimal(1) / lev) * (Decimal(1) + buf), "assumed", "usd")
     ratio = to_decimal(inventory_collateral_ratio)
     if not (Decimal(0) <= ratio <= Decimal(1)):
         raise EconomicModelError("inventory_collateral_ratio must be in [0, 1]")

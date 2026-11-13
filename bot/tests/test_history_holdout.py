@@ -96,7 +96,7 @@ def _final(w):
 def _reserve_past_the_dataset_gate(monkeypatch, reg, root, uni, spot, led):
     """For tests whose subject is the LOADER's cut (a regime change or a late listing inside the reserved region). Those fixtures are partial datasets the Round 19 gate rightly refuses to
     reserve on (an unproven funding-interval change and a symbol whose data starts after its launch both read DATA_INCOMPLETE), so they reserve past the gate on purpose and only the gate."""
-    monkeypatch.setattr(HH, "dataset_problem_for_a_reservation", lambda *a, **k: None)
+    monkeypatch.setattr(HH, "dataset_problem_for_a_reservation", lambda *a, **k: (None, {}))
     return HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=led, universe_dir=uni, spot_dir=spot)
 
 
@@ -1133,10 +1133,13 @@ def test_a_window_that_carries_one_test_but_not_one_test_after_the_reserve_is_re
     assert _reserve(world)["kind"] == "reserve"
 
 
-def test_the_production_bar_refuses_a_short_history_without_any_patching(tmp_path, offline, monkeypatch):
-    """The REGISTERED 60 rows (457 days), not the module's lowered fixture bar, against the 199.7-day fixture. The reservation that used to succeed here is refused as insufficient."""
-    monkeypatch.setattr(CR, "STATE_MIN_ROWS", 60)
-    assert (CR.STATE_FORMATION_DAYS, CR.STATE_HOLD_DAYS, CR.STATE_MIN_ROWS) == (30, 7, 60)
+def test_the_registered_bar_refuses_a_short_history(tmp_path, offline, monkeypatch):
+    """The REGISTERED 60 rows (457 days), not the module's lowered fixture bar, against the 199.7-day fixture. The registered value is read from the EVALUATOR's own default (the module fixture
+    lowers ``STATE_MIN_ROWS``; test_candidate_readiness pins it equal to that default), so this does not assert a number it just set. The reservation that used to succeed here is refused."""
+    import inspect
+    registered = inspect.signature(CR.evaluate_ranked_funding).parameters["min_rows"].default
+    assert registered == 60
+    monkeypatch.setattr(CR, "STATE_MIN_ROWS", registered)
     root, uni, spot = _hist(tmp_path, complete_window=True)
     reg = str(tmp_path / "r.jsonl")
     with pytest.raises(RH.HarnessError, match="EXPLORE_WINDOW_NOT_SUFFICIENT_AFTER_THE_RESERVE"):
@@ -1181,3 +1184,23 @@ def test_a_holdout_is_not_reserved_on_a_dataset_whose_mark_prices_are_frozen(tmp
     with pytest.raises(RH.HarnessError, match="DATASET_NOT_COMPLETE_FOR_A_HOLDOUT.*DATA_INVALID.*BTCUSDT.*frozen"):
         HH.reserve(reg, root, mark_interval=MARK_IV, ledger_dir=str(tmp_path / "led"), universe_dir=uni, spot_dir=spot)
     assert not os.path.exists(reg)
+
+
+def test_the_reservation_and_the_final_read_record_which_dataset_they_judged(world):
+    """Round 19 (independent review): completeness is judged against the lifecycle-eligible set of whichever --universe-dir is passed, and the registry recorded neither the universe nor the dataset, so
+    the reserve and the one final read could be judged against different symbol sets with nothing to show it. Recorded as EVIDENCE (a later read legitimately sees more forward data, so a changed
+    identity is stated, not refused)."""
+    r = _reserve(world)
+    ev = r["dataset_at_reservation"]
+    assert ev["state"] == CR.DATA_SUFFICIENT_NOT_EVALUATED and len(ev["loaded_identity_digest"]) == 64 and len(ev["universe_manifest_sha256"]) == 64
+    series, info = _final(world)
+    fin = [x for x in _rows(world["reg"]) if x.get("purpose") == HH.FINAL][-1]
+    assert fin["dataset_at_read"]["loaded_identity_digest"] == ev["loaded_identity_digest"] and fin["dataset_at_read"]["universe_manifest_sha256"] == ev["universe_manifest_sha256"]
+    assert fin["dataset_at_read"]["identity_differs_from_reservation"] is False and info["holdout"]["dataset_at_read"]["identity_differs_from_reservation"] is False
+
+
+def test_an_existing_reservation_is_returned_without_a_universe_dir(world):
+    """The idempotent path is cheap and unchanged: UNIVERSE_DIR_REQUIRED applies when a reservation would be CREATED (independent review: it was checked before the idempotent return)."""
+    first = _reserve(world)
+    again = HH.reserve(world["reg"], world["root"], mark_interval=MARK_IV, ledger_dir=world["ldir"], universe_dir="")
+    assert again["already_reserved"] is True and again["from_ms"] == first["from_ms"]

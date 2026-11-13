@@ -201,6 +201,7 @@ jobs:
         run: |
           code="${{ steps.drill.outputs.exit }}"
           echo "preflight: ${{ steps.preflight.outcome }}  drill exit: ${code:-not run}  ensure-flat: ${{ steps.flat.outcome }}"
+          if [ "${{ steps.flat.outcome }}" = "skipped" ] && [ "$code" = "2" ]; then echo "the drill was REFUSED before any order (exit 2: another executor holds the account, or the executor guard is not configured): nothing was opened and the close-out was deliberately not run; this run FAILED on the drill's authority, it is not a finding about the account"; exit 1; fi
           if [ "${{ steps.flat.outcome }}" != "success" ]; then echo "THE VENUE COULD NOT BE VERIFIED FLAT: look at the testnet account"; exit 1; fi
           if [ "${{ steps.preflight.outcome }}" != "success" ]; then echo "preflight failed (not flat, or the venue could not be read): no drill was run"; exit 1; fi
           case "$code" in 0|5) echo "drill finished (exit $code)";; *) echo "drill exit code $code is not a clean finish"; exit 1;; esac

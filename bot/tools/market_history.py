@@ -1069,7 +1069,20 @@ def _rerun_problem(prior: Mapping[str, Any], specs: Sequence[Mapping[str, Any]],
     if isinstance(ps, int) and isinstance(pe, int) and (ps, pe) != (ns, ne):
         return (f"RERUN_REFUSED_WINDOW_CHANGED: this dataset directory was collected for the window {ps}..{pe} and this run asks for {ns}..{ne}. Its pages are only valid for their own window and a "
                 f"refreshed plan moves the end every day: use a NEW root for a new window, or re-run with the ORIGINAL window to resume. Nothing was fetched or written.")
-    listed = set((prior.get("symbols") or {})) | set((prior.get("excluded") or {})) if isinstance(prior.get("symbols"), Mapping) else set()
+    prior_syms = prior.get("symbols") if isinstance(prior.get("symbols"), Mapping) else {}
+    for x in specs:                                              # the SAME fields resume compares per symbol (_begin_row): a clamped end, another interval, another start, another limit
+        old_spec = (prior_syms.get(x["symbol"]) or {}).get("spec") if isinstance(prior_syms.get(x["symbol"]), Mapping) else None
+        if not isinstance(old_spec, Mapping):
+            continue
+        try:
+            was, now = _begin_row(old_spec), _begin_row(x)
+        except (KeyError, TypeError):
+            continue                                             # an older-schema spec cannot be compared: the per-symbol PARAMS_MISMATCH still guards the pages
+        diff = [f"{k}: {was[k]!r} -> {now[k]!r}" for k in now if was.get(k) != now[k]]
+        if diff:
+            return (f"RERUN_REFUSED_SPEC_CHANGED: {x['symbol']} was collected with different parameters ({'; '.join(diff[:3])}), typically because the universe record was refreshed (a delivery time "
+                    f"clamps a symbol's end). The pages are only valid for their own parameters: re-run with the ORIGINAL plan, or use a NEW root. Nothing was fetched or written.")
+    listed = set(prior_syms) | set((prior.get("excluded") or {})) if prior_syms else set()
     asked = {x["symbol"] for x in specs} | set(excluded)
     dropped = sorted(listed - asked)
     if dropped:
@@ -1173,7 +1186,16 @@ def run_dataset(root: str, dataset: str, interval: Optional[str], specs: Sequenc
                "note": "raw pages are the evidence; gaps/rejects/conflicts are reported, never filled; a hash shows what was read, not who produced it"}
         man["manifest_digest"] = _sha(_canon({k: v for k, v in man.items() if k != "manifest_digest"}))
         if prior_bytes is not None and isinstance(prior, dict):
-            _write_atomic(os.path.join(ddir, "manifest.superseded.json"), prior_bytes)       # a one-step undo: the manifest this run replaces (the pages are the evidence; this is the index)
+            arch = os.path.join(ddir, "manifest.superseded.json")
+            keep_old = False
+            if prior.get("dataset_status") != "COMPLETE":            # a one-step undo must not be overwritten by a WORSE manifest: an archived COMPLETE one stays until a COMPLETE one replaces it
+                try:
+                    with open(arch, "rb") as fh:
+                        keep_old = json.loads(fh.read().decode("utf-8")).get("dataset_status") == "COMPLETE"
+                except (OSError, ValueError, AttributeError):
+                    keep_old = False
+            if not keep_old:
+                _write_atomic(arch, prior_bytes)                     # the manifest this run replaces (the pages are the evidence; this is the index)
         _write_atomic(mpath, (json.dumps(man, indent=1, sort_keys=True, allow_nan=False) + "\n").encode())
     return man
 

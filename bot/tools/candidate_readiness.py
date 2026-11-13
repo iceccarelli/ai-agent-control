@@ -567,6 +567,33 @@ _EVALUATOR_NOT_ENOUGH = ("INSUFFICIENT_DATA", "UNTESTED")
 #: series is exactly zero for every hold, so the series reads as a PERFECT hedge and the squeeze or crash a short suffers is erased (a planted +0.03%/print rally in two top-funding names inflated the
 #: out-of-sample mean 12x, 4.3 -> 51.6 bps/row, with nothing flagged). Frozen BEFORE the owner's data is read; a funding rate is NOT held to the same rule (a run of the 1 bp baseline is real).
 FROZEN_MARK_MIN_HOURS = 48
+#: ... and never fewer than this many candles whatever the interval: two equal DAILY closes are a low-priced coin on a coarse tick, not a stalled feed (the registered evaluators read 240-minute marks: 12 candles).
+FROZEN_MARK_MIN_CANDLES = 12
+
+
+def frozen_mark_threshold(interval_ms: Optional[int]) -> int:
+    """How many identical consecutive closes make a mark series frozen: 48 hours of candles, never fewer than ``FROZEN_MARK_MIN_CANDLES`` (and 12 when the interval is not stated)."""
+    if not isinstance(interval_ms, int) or isinstance(interval_ms, bool) or interval_ms <= 0:
+        return FROZEN_MARK_MIN_CANDLES
+    return max(FROZEN_MARK_MIN_CANDLES, int(math.ceil(FROZEN_MARK_MIN_HOURS * 3_600_000 / interval_ms)))
+
+
+def has_stuck_window(values: Sequence[Any], window: int, max_distinct: int = 2) -> bool:
+    """True when ANY run of ``window`` consecutive values holds at most ``max_distinct`` distinct values (a feed that dithers by a tick is as stuck as one that repeats). Shorter input: False."""
+    n = len(values)
+    if window <= 0 or n < window:
+        return False
+    counts: Dict[Any, int] = {}
+    for i, v in enumerate(values):
+        counts[v] = counts.get(v, 0) + 1
+        if i >= window:
+            out = values[i - window]
+            counts[out] -= 1
+            if not counts[out]:
+                del counts[out]
+        if i >= window - 1 and len(counts) <= max_distinct:
+            return True
+    return False
 
 
 def longest_identical_run(values: Sequence[Any]) -> int:
@@ -1550,11 +1577,12 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                     raise RH.LookAheadError(f"{sym}: a mark row claims its close is knowable before the candle ended (observation_time {ot!r}, candle start {r['ts']}, interval {iv_ms!r})")
             fund = sorted((r["observation_time"], float(Decimal(r["v"]["fundingRate"]) * 10000)) for r in frows if cut_ms is None or r["observation_time"] < cut_ms)
             mark = sorted((r["observation_time"], float(Decimal(r["v"]["close"]))) for r in mrows if cut_ms is None or r["observation_time"] < cut_ms)
-            _iv = iv_ms if isinstance(iv_ms, int) and not isinstance(iv_ms, bool) and iv_ms > 0 else None
-            _need = max(2, int(math.ceil(FROZEN_MARK_MIN_HOURS * 3_600_000 / _iv))) if _iv else 12
-            _run = longest_identical_run([c for _t, c in mark])
-            if _run >= _need:
-                frozen_marks.append({"symbol": sym, "run_candles": _run, "min_candles": _need, "min_hours": FROZEN_MARK_MIN_HOURS})
+            _need = frozen_mark_threshold(iv_ms)
+            _closes = [c for _t, c in mark]
+            _run = longest_identical_run(_closes)
+            _stuck = has_stuck_window(_closes, 2 * _need)
+            if _run >= _need or _stuck:
+                frozen_marks.append({"symbol": sym, "run_candles": _run, "min_candles": _need, "min_hours": FROZEN_MARK_MIN_HOURS, "stuck_window_candles": 2 * _need if _stuck else None})
         except RH.HarnessError:
             raise
         except (KeyError, InvalidOperation, ValueError, TypeError, OSError) as exc:
@@ -1629,8 +1657,9 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
                              window_days=(w1 - w0) / MS_DAY, survivorship=survivorship)
     state_findings: Dict[str, List[str]] = {"unavailable": [], "invalid": [], **_sf}
     for _fm in frozen_marks:
-        state_findings["invalid"].append(f"{_fm['symbol']}: the mark price is frozen for {_fm['run_candles']} consecutive candles (>= {_fm['min_candles']} = {_fm['min_hours']} h): not a market price series, "
-                                         f"its price leg is zero for every hold")
+        state_findings["invalid"].append(f"{_fm['symbol']}: the mark price is frozen ({_fm['run_candles']} identical consecutive candles against a limit of {_fm['min_candles']}"
+                                         + (f"; and a window of {_fm['stuck_window_candles']} candles holds at most two distinct closes" if _fm["stuck_window_candles"] else "")
+                                         + f"): not a market price series, its price leg is near zero for every hold (confirm against the venue's public klines, then collect a NEW root without it)")
     for _nm, _man in (("funding", fman), (mark_name, mman), ("the universe capture", uinfo)):
         _st = _man.get("dataset_status")
         if _st in ("CONFLICTED", "UNVERIFIED"):

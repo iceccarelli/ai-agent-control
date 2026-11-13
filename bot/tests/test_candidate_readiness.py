@@ -1818,7 +1818,19 @@ def test_the_acquire_class_is_priced_at_the_executed_capital_and_the_overlay_gri
 def test_the_longest_identical_run_and_the_frozen_mark_threshold():
     assert CR.longest_identical_run([]) == 0 and CR.longest_identical_run([5]) == 1
     assert CR.longest_identical_run([1, 1, 2, 2, 2, 1]) == 3 and CR.longest_identical_run(["a", "a", "a"]) == 3
-    assert CR.FROZEN_MARK_MIN_HOURS == 48 and math.ceil(CR.FROZEN_MARK_MIN_HOURS * 3_600_000 / (4 * 3_600_000)) == 12, "48 hours of 4h candles"
+    h = 3_600_000
+    assert CR.FROZEN_MARK_MIN_HOURS == 48 and CR.frozen_mark_threshold(4 * h) == 12, "48 hours of 4h candles"
+    assert CR.frozen_mark_threshold(h) == 48 and CR.frozen_mark_threshold(None) == 12
+    assert CR.frozen_mark_threshold(24 * h) == 12 and CR.frozen_mark_threshold(7 * 24 * h) == 12, "independent review: two equal DAILY closes are a low-tick coin, not a frozen feed; a coarse interval needs the same 12 candles"
+
+
+def test_a_stuck_window_is_found_even_when_a_single_tick_dither_breaks_the_run():
+    """Independent review: one different close resets the run, so [1]*11 + [2] + [1]*11 (a 1-tick dither) passed. A window of twice the threshold holding at most two distinct closes is stuck."""
+    dithered = [100.0] * 11 + [100.1] + [100.0] * 11 + [100.1]                     # 24 candles: every run is at most 11 (below the 12 needed), two distinct closes in all
+    assert CR.longest_identical_run(dithered) == 11 and CR.has_stuck_window(dithered, 24) is True
+    assert CR.has_stuck_window([100.0 + (i % 7) * 0.01 for i in range(200)], 24) is False, "a moving series (seven distinct closes) is never stuck"
+    assert CR.has_stuck_window([1.0] * 8 + [2.0] * 8 + [3.0] * 8, 24) is False, "three distinct closes in the window"
+    assert CR.has_stuck_window([1.0] * 10, 24) is False, "shorter than the window: nothing to judge"
 
 
 def test_a_frozen_mark_price_series_makes_the_dataset_invalid_and_names_the_symbol(tmp_path, offline, monkeypatch):

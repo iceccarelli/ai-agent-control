@@ -182,11 +182,14 @@ def _stated_number(v: Any) -> Tuple[Optional[str], bool]:
         return None, False
     if isinstance(v, bool) or not isinstance(v, (str, int)):
         return None, True
+    text = str(v).strip()
+    if len(text) > 64:                                           # no wallet figure is this long: bounded work and bounded storage whatever the venue (or a proxy) sends
+        return None, True
     try:
-        d = D(str(v).strip())
+        d = D(text)
     except (ArithmeticError, ValueError):
         return None, True
-    if not d.is_finite():
+    if not d.is_finite() or (d != 0 and not -30 <= d.adjusted() <= 30):      # checked BEFORE the number is expanded: format(Decimal('1E+999999999'), 'f') is a ~1 GB string
         return None, True
     return format(d, "f"), False
 

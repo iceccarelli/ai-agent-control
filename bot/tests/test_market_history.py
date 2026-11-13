@@ -771,6 +771,37 @@ def test_resume_with_a_different_window_is_refused_not_mixed(root):
     assert run(root, funding_specs(), v)["dataset_status"] == "COMPLETE", "the ORIGINAL window still resumes (nothing to fetch, nothing lost)"
 
 
+def test_a_rerun_whose_symbol_spec_changed_is_refused_even_when_the_window_did_not(root):
+    """Round 19 (independent review, reproduced): a refreshed universe record that states a delivery time CLAMPS that symbol's end while the window and the symbol set stay the same; the window and
+    symbol-set checks passed, the per-symbol PARAMS_MISMATCH fired, and the manifest was rewritten UNVERIFIED. The refusal compares every symbol's own begin-row fields (the ones resume compares)."""
+    v = funding_venue()
+    run(root, funding_specs(), v)
+    mpath = os.path.join(ddir(root), "manifest.json")
+    before = open(mpath, "rb").read()
+    urls = len(v.urls)
+    delivered = MH.build_specs(MH.FUNDING, None, ["BTCUSDT"], START, END, {"BTCUSDT": {"launchTime": FIRST - 1, "fundingInterval_min": 480, "snapshot_ms": 1, "deliveryTime": END - 5 * H8}})
+    assert delivered[0]["end_ms"] != funding_specs()[0]["end_ms"] and delivered[0]["window_end_ms"] == funding_specs()[0]["window_end_ms"], "the fixture must change the symbol's end and not the window"
+    with pytest.raises(MH.HistoryError, match="RERUN_REFUSED_SPEC_CHANGED.*BTCUSDT.*end_ms"):
+        run(root, delivered, v)
+    assert open(mpath, "rb").read() == before and len(v.urls) == urls
+    assert MH.verify_dataset(ddir(root))["ok"] and run(root, funding_specs(), v)["dataset_status"] == "COMPLETE"
+
+
+def test_the_archived_manifest_is_never_replaced_by_a_worse_one(root):
+    """Round 19 (independent review): the one-step undo was overwritten on every accepted re-run, so after a run that left the dataset non-COMPLETE the next resume replaced the archived COMPLETE manifest."""
+    v = funding_venue()
+    run(root, funding_specs(), v)
+    run(root, funding_specs(), v)
+    arch = os.path.join(ddir(root), "manifest.superseded.json")
+    assert json.load(open(arch))["dataset_status"] == "COMPLETE"
+    mpath = os.path.join(ddir(root), "manifest.json")
+    worse = json.load(open(mpath))
+    worse["dataset_status"] = "PARTIAL"
+    open(mpath, "w").write(json.dumps(worse))                             # a manifest that is not COMPLETE (what a failed run leaves) ...
+    run(root, funding_specs(), v)                                          # ... must not displace the archived COMPLETE one when the next run replaces it
+    assert json.load(open(arch))["dataset_status"] == "COMPLETE"
+
+
 def test_a_rerun_that_would_drop_collected_symbols_from_the_manifest_is_refused(root):
     """Round 19 (data specialist F4): re-running with ``--symbols BTCUSDT`` over a two-symbol dataset rewrote the manifest with ONE symbol while the other directory stayed on disk, unlisted."""
     syms = ("BTCUSDT", "ETHUSDT")

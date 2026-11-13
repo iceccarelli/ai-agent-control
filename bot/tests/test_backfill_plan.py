@@ -139,9 +139,12 @@ def venue_for(syms, recs, start, end):
     return Venue(g)
 
 
-def full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.FUNDING, MH.MARK), start=W0, end=T):
+def full_history(root, uni, syms=("AAAUSDT", "BBBUSDT", "OLDUSDT"), datasets=(MH.FUNDING, MH.MARK), start=W0, end=T, drop_head=None):
+    """``drop_head`` = {(dataset, symbol): n}: the venue serves that symbol's rows starting n rows LATE over the full requested window (a real head gap, collected in one run)."""
     recs, _ = MH.load_universe_dir(str(uni), include_statuses=["Trading", "Closed"])
     v = venue_for(syms, {s: {k: str(x) if k in ("launchTime", "deliveryTime") else x for k, x in recs[s].items()} for s in syms}, start, end)
+    for key, n in (drop_head or {}).items():
+        v.grids[key] = v.grids[key][n:]
     for ds in datasets:
         collect(root, uni, ds, None if ds == MH.FUNDING else "240", list(syms), start, end, v)
     return v

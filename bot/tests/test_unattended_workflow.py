@@ -336,3 +336,13 @@ class TestEveryWorkflowActionIsPinnedToACommit:
             if not re.fullmatch(re.escape(owner_repo) + r" v?\d+(\.\d+)+", comment.strip()):
                 bad.append(f"{name}:{n}")
         assert not bad, bad
+
+
+def test_a_refused_drill_is_reported_as_refused_not_as_an_unverified_venue():
+    """Independent review: with the close-out correctly skipped after a refused drill (exit 2), the Verdict step said 'THE VENUE COULD NOT BE VERIFIED FLAT: look at the testnet account' although nothing was opened."""
+    text = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".github", "workflows", "carry-drill-testnet.yml"), encoding="utf-8").read()
+    verdict = text[text.index("- name: Verdict"):]
+    refused = verdict.index('steps.flat.outcome }}" = "skipped" ] && [ "$code" = "2"')
+    unverified = verdict.index("THE VENUE COULD NOT BE VERIFIED FLAT")
+    assert refused < unverified, "the refused-drill branch comes BEFORE the generic unverified-venue message"
+    assert "REFUSED before any order" in verdict[refused:unverified] and "nothing was opened" in verdict[refused:unverified] and "exit 1" in verdict[refused:unverified]

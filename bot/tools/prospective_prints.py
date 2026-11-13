@@ -139,8 +139,16 @@ def check_capture_manifest(paths: Sequence[str], manifest_path: Optional[str] = 
         dirs = {os.path.dirname(os.path.abspath(p)) for p in paths}
         cand = os.path.join(next(iter(dirs)), "manifest.json") if len(dirs) == 1 else None
         if cand is None or not os.path.isfile(cand):
-            return {"status": "NO_MANIFEST_HAND_SAVED_INPUTS", "note": "no manifest.json beside the inputs: the pages are operator-saved, so that they are the complete, unedited history of the window cannot be shown "
-                                                                          "(use tools/funding_capture.py and pass its directory)"}
+            return {"status": "NO_MANIFEST_HAND_SAVED_INPUTS", "note": "no manifest.json beside the inputs (or the inputs come from several directories): the pages are operator-saved, so that they are the "
+                                                                          "complete, unedited history of the window cannot be shown (use tools/funding_capture.py and pass its directory)"}
+        try:
+            _rawc, _shac = _read(cand)
+            _docc = json.loads(_rawc.decode("utf-8", "strict"))
+            _is_capture = isinstance(_docc, dict) and isinstance(_docc.get("pages"), list) and isinstance(_docc.get("request"), dict)
+        except (OSError, ValueError, PrintsError):
+            _is_capture = False
+        if not _is_capture:                                          # a manifest.json of some OTHER tool beside hand-saved pages is not this capture's: say so, do not crash the builder
+            return {"status": "NO_MANIFEST_HAND_SAVED_INPUTS", "note": "a manifest.json sits beside the inputs but is not a funding_capture manifest (no pages / request): no lineage is claimed for the pages"}
         mp = cand
     if os.path.isdir(mp):
         mp = os.path.join(mp, "manifest.json")
@@ -155,8 +163,9 @@ def check_capture_manifest(paths: Sequence[str], manifest_path: Optional[str] = 
     missing = sorted(os.path.basename(f) for f in set(expected) - given)
     extra = sorted(os.path.basename(f) for f in given - set(expected))
     if missing or extra:
+        hint = " (manifest.json is not a page: list the page*.json files, do not glob *.json)" if "manifest.json" in extra else ""
         raise PrintsError(f"PAGE_SET_DIFFERS: the inputs are not the manifest's pages (missing: {missing[:5]}; not in the manifest: {extra[:5]}): a page dropped or added after the capture changes the "
-                          f"evidence without changing a hash")
+                          f"evidence without changing a hash{hint}")
     for f, want in sorted(expected.items()):
         _data, got = _read(f)
         if got != want:
@@ -164,7 +173,7 @@ def check_capture_manifest(paths: Sequence[str], manifest_path: Optional[str] = 
     if doc.get("stopped_because") == "max_pages":
         raise PrintsError("CAPTURE_TRUNCATED: the capture stopped at its page cap, not at the start of the window: the history is incomplete; capture again with a larger cap")
     miss = doc.get("missing_on_grid")
-    return {"status": "VERIFIED", "file": os.path.basename(mp), "sha256": man_sha, "pages": len(expected), "stopped_because": doc.get("stopped_because"),
+    return {"status": "VERIFIED_WITH_GAPS" if isinstance(miss, list) and miss else "VERIFIED", "file": os.path.basename(mp), "sha256": man_sha, "pages": len(expected), "stopped_because": doc.get("stopped_because"),
             "missing_on_grid": len(miss) if isinstance(miss, list) else None, "expected_on_grid": doc.get("expected_on_grid"), "distinct_settlements": doc.get("distinct_settlements"),
             "note": "every input re-hashes to the manifest and the set equals the manifest's; the manifest itself is the capturer's word (a hash shows what was read, not who produced it)"}
 

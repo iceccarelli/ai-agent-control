@@ -1268,3 +1268,18 @@ def test_the_executor_records_the_wallet_facts_without_touching_the_trading_answ
     run.ex.account_state({}, 0)
     assert len(run.ex.wallet_facts) == n, "an unchanged answer inside the sampling interval adds nothing"
     assert len(run.ex.wallet_facts) <= TE.WALLET_FACT_SAMPLES_MAX
+
+
+@pytest.mark.parametrize("hostile", ["1E+999999999", "1E+99999999", "-1E+400", "9" * 80, "0." + "0" * 80 + "1", "1e-400"])
+def test_a_hostile_number_in_the_wallet_answer_is_unparsed_and_costs_nothing(hostile):
+    """Round 19 (independent review, reproduced): ``format(Decimal('1E+999999999'), 'f')`` built a ~1 GB string inside an observation-only path that runs before every entry and exit decision."""
+    import time
+    res = _real_wallet_result()
+    res["list"][0]["totalInitialMargin"] = hostile
+    res["list"][0]["coin"][0]["accruedInterest"] = hostile
+    t0 = time.perf_counter()
+    facts = TE.parse_wallet_facts(res)
+    assert time.perf_counter() - t0 < 0.5, "bounded work: the exponent is checked BEFORE the number is expanded"
+    assert facts["account"]["totalInitialMargin"] is None and facts["derived"]["committed_initial_margin"] is None
+    assert "account.totalInitialMargin" in facts["unparsed"] and facts["derived"]["accrued_interest_stated"] is None
+    assert len(json.dumps(facts)) < 20_000, "nothing the venue sent can make a stored sample large"
