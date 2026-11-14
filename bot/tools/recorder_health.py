@@ -122,6 +122,8 @@ def classify(status: Optional[Mapping[str, Any]], *, now_s: float, free_bytes: O
     reserve = _num(store.get("min_free_bytes"))
     retention = _num(store.get("retention_days"))
     total = _num(total_bytes)
+    if total is None:
+        total = _num(store.get("volume_total_bytes"))                       # the recorder's own statement of its volume (a fresh status: the monitor does not read the volume)
 
     # ---- freshness of the evidence
     now_ms = _num((st or {}).get("now_ms"))

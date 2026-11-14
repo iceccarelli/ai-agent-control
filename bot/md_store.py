@@ -407,6 +407,11 @@ class MarketStore:
         st = os.statvfs(self.dir)
         return int(st.f_bavail) * int(st.f_frsize)
 
+    def total_bytes(self) -> int:
+        """The size of the volume holding the store (statvfs): published in the recorder's status so the capacity model can compare the volume with the retention without the monitor reading it."""
+        st = os.statvfs(self.dir)
+        return int(st.f_blocks) * int(st.f_frsize)
+
     def _require_free_space(self) -> None:
         """Raise StoreError when the volume is below the reserve. Looked at most once a
         second (a statvfs per frame would cost more than the frame); a failed look is

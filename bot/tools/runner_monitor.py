@@ -378,11 +378,17 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None, pr
         return obs
     now_f = time.time() if now is None else now
     st, err = obs.pop("_status", None), obs.pop("_read_error", None)
-    try:
-        vfs = os.statvfs(os.path.dirname(os.path.abspath(path)))
-        free_now, total_now = int(vfs.f_bavail) * int(vfs.f_frsize), int(vfs.f_blocks) * int(vfs.f_frsize)
-    except OSError:
-        free_now = total_now = None
+    free_now = total_now = None
+    if obs.get("free_mb_source") != "recorder_status":
+        # The volume is read ONLY when the status cannot be trusted for it (stale, or no figure): a FRESH status keeps the recorder's own free-space and volume-size figures (tests/test_recorder_liveness.py pins that
+        # the monitor does not touch the volume for it).
+        try:
+            vfs = os.statvfs(os.path.dirname(os.path.abspath(path)))
+            free_now = int(vfs.f_bavail) * int(vfs.f_frsize)
+            blocks = getattr(vfs, "f_blocks", None)
+            total_now = None if blocks is None else int(blocks) * int(vfs.f_frsize)       # a volume total the platform does not state is unknown, never zero
+        except (OSError, AttributeError, TypeError, ValueError):
+            free_now = total_now = None
     try:
         obs["health"] = RH.classify(st, now_s=now_f, free_bytes=free_now, total_bytes=total_now, supervisor=_supervisor_status(path), provenance=provenance,
                                     status_read_error=err or (obs.get("detail") if obs.get("state") in ("ABSENT", "UNREADABLE") else None))
