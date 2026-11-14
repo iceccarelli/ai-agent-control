@@ -588,3 +588,51 @@ def test_a_failed_read_distrusts_the_text_that_arrived_but_never_hides_an_alert_
     assert set(both) == {"machine_unreachable", "forward_stale"}, sorted(both)                  # (2): the independent alert is NOT hidden by the failed read
     assert "the evidence file is old" in both["forward_stale"].text
     assert set(_by_key(RA.evaluate(alarm, 1_000_000.0, read_failure="timeout", forward={"state": "OK"}))) == {"machine_unreachable"}, "an OK forward status adds nothing"
+
+
+# -- Round 20: a volume that never recovers is not the same alarm as a dip that will ----------------------------
+
+def _hourly(hours, mb, *, step_h=1.0):
+    """Readings every `step_h` hours ending NOW, each `mb` (a number, or a callable of hours-ago)."""
+    n = int(hours / step_h)
+    return [row(int((n - i) * step_h * 60) - 0, recorder_state="FAULT", recorder_free_mb=(mb(int((n - i) * step_h)) if callable(mb) else mb)) for i in range(n + 1)]
+
+
+def test_a_shortfall_that_outlasts_two_utc_midnights_names_both_causes_and_the_read_only_checks():
+    """REPRODUCED (Round 20, specialist A): a 1 GB volume cannot hold one day of depth above the 512 MiB reserve, so the recorder never writes again, yet the alert was byte-identical to the one for a transient
+    dip. The live history (510.5 MiB hourly since 2026-11-11T12:28Z) crosses this line at 59 h. The alert fires on the history alone and deletes nothing."""
+    alerts = RA.evaluate(text(*_hourly(59, 510.5)), NOW)
+    assert "recorder_stall_permanent" in _keys(alerts) and "recorder_disk_low" in _keys(alerts) and "recorder_down" in _keys(alerts)
+    msg = next(a for a in alerts if a.key == "recorder_stall_permanent")
+    assert msg.severity == RA.WARNING and "UTC midnights" in msg.text and "cannot hold even ONE day" in msg.text and "predates the bounded recovery" in msg.text
+    assert "fly volumes list -a carry-drill" in msg.text and "ls -l --time-style=full-iso /data/market" in msg.text and "Nothing is deleted or resized" in msg.text
+
+
+@pytest.mark.parametrize("hours", [10, 36, 47])
+def test_a_shortfall_shorter_than_48_hours_is_never_called_permanent(hours):
+    assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*_hourly(hours, 510.5)), NOW))
+
+
+def test_a_recovery_resets_the_run_and_a_healthy_history_never_fires():
+    below = _hourly(60, 510.5)
+    recovered = [dict(r) for r in below]
+    recovered[30]["recorder_free_mb"] = 900                       # one reading at or above the reserve ends the run: only ~30 h remain after it
+    assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*recovered), NOW))
+    healthy = _hourly(80, lambda h: 5000 - (h % 24) * 100)
+    assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*healthy), NOW))
+
+
+def test_unusable_readings_are_skipped_and_a_real_reading_above_the_reserve_still_ends_the_run():
+    rows = [dict(r) for r in _hourly(59, 510.5)]
+    for k, junk in zip(range(1, len(rows) - 3, 7), [True, float("nan"), "510", None, [], 1e999, {}, False]):
+        rows[k]["recorder_free_mb"] = junk                          # not readings: skipped, neither extending nor ending the run
+    assert "recorder_stall_permanent" in _keys(RA.evaluate(text(*rows), NOW))
+    rows[-5]["recorder_free_mb"] = 5000.0                           # a REAL reading above the reserve four hours ago
+    assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*rows), NOW))
+
+
+def test_the_permanent_alert_needs_stamps_and_never_reads_the_machines_clock():
+    rows = [dict(r) for r in _hourly(59, 510.5)]
+    for r in rows:
+        r["at"] = "garbage"
+    assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*rows), NOW)), "unreadable stamps cannot establish a duration"
