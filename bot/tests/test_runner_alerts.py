@@ -636,3 +636,44 @@ def test_the_permanent_alert_needs_stamps_and_never_reads_the_machines_clock():
     for r in rows:
         r["at"] = "garbage"
     assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*rows), NOW)), "unreadable stamps cannot establish a duration"
+
+
+# -- Round 22: image provenance and the early warning in hours --------------------------------------------------
+
+def _img_rows(*statuses):
+    n = len(statuses)
+    return [row((n - i) * 60, recorder_state="RECORDING", recorder_image_status=s) for i, s in enumerate(statuses)]
+
+
+def test_a_recorder_image_whose_provenance_is_not_established_for_three_cycles_raises_recorder_image_mismatch():
+    for bad in ("MISMATCH", "MISSING"):
+        alerts = RA.evaluate(text(*_img_rows("VERIFIED", bad, bad, bad)), NOW)
+        assert "recorder_image_mismatch" in _keys(alerts) and "recorder_down" not in _keys(alerts), bad          # it is still RECORDING: this is a different fault
+        msg = next(a for a in alerts if a.key == "recorder_image_mismatch")
+        assert msg.severity == RA.WARNING and "BUILD_COMMIT" in msg.text and "Nothing is changed" in msg.text
+
+
+def test_one_or_two_bad_image_cycles_a_verified_image_or_no_field_do_not_alert():
+    for sts in (("VERIFIED", "MISMATCH", "MISMATCH"), ("MISMATCH", "MISMATCH", "VERIFIED"), ("MISMATCH", "MISSING"), ("VERIFIED", "VERIFIED", "VERIFIED"), ("NOT_CHECKED",) * 3):
+        assert "recorder_image_mismatch" not in _keys(RA.evaluate(text(*_img_rows(*sts)), NOW)), sts
+    assert "recorder_image_mismatch" not in _keys(RA.evaluate(text(row(180), row(120), row(60)), NOW))
+
+
+def _soon_rows(*hours, health="degraded"):
+    n = len(hours)
+    return [row((n - i) * 60, recorder_state="RECORDING", recorder_health=health, recorder_hours_to_reserve=h) for i, h in enumerate(hours)]
+
+
+def test_a_volume_that_reaches_the_reserve_within_a_day_warns_in_hours_before_the_headroom_is_gone():
+    alerts = RA.evaluate(text(*_soon_rows(30.0, 20.0, 15.5, 11.0)), NOW)
+    assert "recorder_reserve_soon" in _keys(alerts) and "recorder_down" not in _keys(alerts)
+    msg = next(a for a in alerts if a.key == "recorder_reserve_soon")
+    assert "11.0 h" in msg.text and "nothing is deleted or resized" in msg.text
+
+
+def test_the_hours_warning_is_quiet_when_there_is_time_when_blocked_already_or_the_estimate_is_unusable():
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(60.0, 48.0, 30.0)), NOW))
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(10.0, 9.0, 8.0, health="storage_blocked")), NOW)), "blocked is recorder_down / recorder_disk_low's case"
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(10.0, 9.0)), NOW)), "two cycles are not three"
+    junk = [row(180, recorder_hours_to_reserve=True), row(120, recorder_hours_to_reserve="5"), row(60, recorder_hours_to_reserve=-3)]
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*junk), NOW))

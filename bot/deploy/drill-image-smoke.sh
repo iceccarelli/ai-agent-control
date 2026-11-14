@@ -18,8 +18,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== build (no build args, no secrets)"
-docker build -f Dockerfile.drill -t "$IMG" .
+echo "== build (the commit is the ONLY build arg; no secrets). A build without it must REFUSE: an image that cannot say what it was built from does not exist"
+if docker build -f Dockerfile.drill -t "$IMG-noprov" . >/dev/null 2>&1; then fail "the image built WITHOUT BUILD_COMMIT: provenance is not enforced at build"; fi
+docker build -f Dockerfile.drill --build-arg BUILD_COMMIT="$(git rev-parse HEAD)" -t "$IMG" .
+
+echo "== the image states what it is (runtime manifest) and re-verifies it; a changed file is refused; the entrypoint refuses to start the recorder on a tampered image"
+docker run --rm --network none --entrypoint python3 "$IMG" tools/runtime_provenance.py verify --root /app --expect READ_ONLY_RECORDER >/dev/null || fail "the image's own provenance does not verify"
+docker run --rm --network none --entrypoint python3 "$IMG" tools/runtime_provenance.py verify --root /app --expect TESTNET_EXECUTOR >/dev/null 2>&1 && fail "a recorder image verified as an executor image"
+docker run --rm --network none --entrypoint sh "$IMG" -c 'echo "# tampered" >> /app/md_store.py && ! python3 tools/runtime_provenance.py verify --root /app --expect READ_ONLY_RECORDER >/dev/null' || fail "a changed closure file was not refused"
+docker run --rm --network none --entrypoint sh "$IMG" -c 'echo "# tampered" >> /app/md_store.py && /usr/local/bin/drill-entrypoint true; test $? -eq 78' || fail "the entrypoint did not refuse (exit 78) on a tampered image"
 
 echo "== the tools the entrypoint needs exist"
 docker run --rm --network none --entrypoint sh "$IMG" -c 'command -v setpriv && command -v python3' >/dev/null || fail "setpriv / python3 missing from the image"

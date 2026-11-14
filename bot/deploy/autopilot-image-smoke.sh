@@ -14,8 +14,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== build (no build args, no secrets)"
-docker build -f Dockerfile.autopilot -t "$IMG" .
+echo "== build (the commit is the ONLY build arg; no secrets). A build without it must REFUSE: an executor image that cannot say what it was built from does not exist"
+if docker build -f Dockerfile.autopilot -t "$IMG-noprov" . >/dev/null 2>&1; then fail "the image built WITHOUT BUILD_COMMIT: provenance is not enforced at build"; fi
+docker build -f Dockerfile.autopilot --build-arg BUILD_COMMIT="$(git rev-parse HEAD)" -t "$IMG" .
+
+echo "== the image states what it is (runtime manifest), re-verifies it, is approved only as the executor, and the entrypoint refuses to start the autopilot on a tampered image"
+docker run --rm --entrypoint python3 "$IMG" tools/runtime_provenance.py verify --root /app --expect TESTNET_EXECUTOR >/dev/null || fail "the image's own provenance does not verify"
+docker run --rm --entrypoint python3 "$IMG" tools/runtime_provenance.py verify --root /app --expect READ_ONLY_RECORDER >/dev/null 2>&1 && fail "an executor image verified as a recorder image"
+docker run --rm --entrypoint sh "$IMG" -c 'echo "# tampered" >> /app/tools/ms_edge_gate.py && ! python3 tools/runtime_provenance.py verify --root /app --expect TESTNET_EXECUTOR >/dev/null' || fail "a changed closure file was not refused"
+docker run --rm --entrypoint sh "$IMG" -c 'echo "# tampered" >> /app/tools/ms_edge_gate.py && /usr/local/bin/autopilot-entrypoint true; test $? -eq 78' || fail "the entrypoint did not refuse (exit 78) on a tampered image"
 
 echo "== the tools the entrypoint and the owner procedure need exist"
 docker run --rm --entrypoint sh "$IMG" -c 'command -v setpriv && command -v su && command -v python3' >/dev/null || fail "setpriv / su / python3 missing from the image"

@@ -226,6 +226,8 @@ class Recorder:
                       "free_bytes": free, "min_free_bytes": self.min_free_bytes,
                       "retention_days": self.retention_days,
                       "capacity_retention_days": self.capacity_retention_days,
+                      "last_commit_ms": getattr(store, "last_commit_wall_ms", None),
+                      "segment_bytes": store.segment_bytes() if hasattr(store, "segment_bytes") else None,
                       "emergency_prunes": getattr(store, "emergency_prunes", 0), "emergency_prunes_denied": getattr(store, "emergency_prunes_denied", 0),
                       "fault": self.engine.state.store_fault},
             "entry_refusals": view_refusals,

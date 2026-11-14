@@ -181,6 +181,9 @@ class EdgeVerdict:
     settlements_in_hold: int
     digest: str
     capital: Mapping[str, Any] = dataclasses.field(default_factory=dict)     # the cost-of-capital basis: state, capital committed, the stated rate with its source / time / provenance, the charge
+    #: Round 22: the provenance of every cost line and scenario input, and which MODELLED inputs nothing has measured (typed constants). NOT part of the digest body (a read-only disclosure of what the model
+    #: already holds): the durable decision record and the economics sheet carry it so no cost is shown without the basis it stands on.
+    provenance: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -274,7 +277,7 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
         borrow_apr=EM.structural_zero("fraction", "SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW"),     # spot is bought with USDT, not borrowed (declared in zero_reasons)
         opportunity_cost_apr=opportunity_cost_apr,
         hedge_ratio=EM.Quantity(hedge_ratio, "derived", "ratio"), adverse_move_bps=EM.Quantity(ADVERSE_MOVE_BPS, "modelled", "bps"),
-        margin_usd=EM.Quantity(inp.notional_usd * (D(1) + D(1) / D(inp.leverage)), "derived", "usd"), zero_reasons=zero_reasons)
+        margin_usd=committed_q, zero_reasons=zero_reasons)                  # Round 22: the registry's committed capital (2.04x at leverage 1), not notional x (1 + 1/L) without the buffer
     try:
         res = EM.evaluate_chain(scn)
     except EM.EconomicModelError as exc:
@@ -314,16 +317,23 @@ def evaluate_edge(inp: EdgeInputs) -> EdgeVerdict:
         cls = REJECTED
         reasons.append(f"NET_EDGE_{net.value:.2f}bps_BELOW_HURDLE_{MIN_NET_EDGE_BPS}bps")
     net_usd = (net.value / BPS * inp.notional_usd) if net.known else None
-    return _verdict(cls, reasons, net.value if net.known else None, expected_funding, required, comps, assumed, n_settle, inp, net_usd, capital=capital)
+    # Round 22: what each figure stands on. The typed constants below are labelled "modelled" and no measurement has calibrated them (exec_quality's feedback loop deliberately excludes impact, basis,
+    # adverse selection and hedge error), so a verdict resting on them is listed here as UNCALIBRATED: the eligibility gate does not accept that as a validated execution model.
+    modelled_inputs = {"gross_edge": ("modelled", _q(expected_funding)), "funding_haircut": ("modelled", _q(FUNDING_HAIRCUT)), "impact_bps": ("modelled", _q(IMPACT_BPS)),
+                       "basis_cost_bps": ("modelled" if basis_bps is not None else "unknown", None if basis_bps is None else _q(max(basis_bps, BASIS_STRESS_BPS))),
+                       "adverse_move_bps": ("modelled", _q(ADVERSE_MOVE_BPS))}
+    prov = {"components": {k: q.provenance for k, q in res.components.items()}, "fee_tier": {"spot": spot_tier.source, "perp": perp_tier.source}, "scenario_inputs": {k: {"provenance": v[0], "value": v[1]} for k, v in modelled_inputs.items()},
+            "uncalibrated_modelled": sorted(k for k, v in modelled_inputs.items() if v[0] == "modelled"), "calibration": None}
+    return _verdict(cls, reasons, net.value if net.known else None, expected_funding, required, comps, assumed, n_settle, inp, net_usd, capital=capital, provenance=prov)
 
 
 def _verdict(cls: str, reasons: Sequence[str], net: Optional[D], funding: Optional[D], required: Optional[D], comps: Mapping[str, Optional[D]], assumed: Sequence[str], n: int,
-             inp: EdgeInputs, net_usd: Optional[D] = None, capital: Optional[Mapping[str, Any]] = None) -> EdgeVerdict:
+             inp: EdgeInputs, net_usd: Optional[D] = None, capital: Optional[Mapping[str, Any]] = None, provenance: Optional[Mapping[str, Any]] = None) -> EdgeVerdict:
     cap = dict(capital or {})
     body = {"class": cls, "reasons": list(reasons), "net": _q(net), "funding": _q(funding), "required": _q(required), "comps": {k: _q(v) for k, v in sorted(comps.items())},
             "assumed": list(assumed), "n": n, "symbol": inp.symbol, "notional": _q(inp.notional_usd), "now_ms": inp.now_ms, "hold_s": inp.hold_s, "capital": cap}
     dg = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return EdgeVerdict(cls, tuple(reasons), _q(net), _q(funding), _q(required), _q(net_usd), {k: _q(v) for k, v in sorted(comps.items())}, tuple(assumed), n, dg, cap)
+    return EdgeVerdict(cls, tuple(reasons), _q(net), _q(funding), _q(required), _q(net_usd), {k: _q(v) for k, v in sorted(comps.items())}, tuple(assumed), n, dg, cap, dict(provenance or {}))
 
 
 # ---------------------------------------------------------------------------------------------------- reading the venue (public GETs + one optional signed GET)

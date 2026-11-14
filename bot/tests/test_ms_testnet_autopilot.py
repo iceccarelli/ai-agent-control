@@ -1401,7 +1401,7 @@ def test_every_evaluation_carries_a_decision_record_whose_id_is_reproducible_fro
     r2 = _evaluate(w, notional_usd="200")
     rec1, rec2 = r1["decision_record"], r2["decision_record"]
     assert rec1["decision_id"].startswith("dec_") and rec1 == rec2, "the same market inputs, size and code must give the same record"
-    assert rec1["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and rec1["fee_tier"] == "MEASURED" and rec1["inputs_ref"] and rec1["edge"]["edge_ref"] and rec1["data_scope"].startswith("TESTNET_DATA")
+    assert rec1["decision"] == "ELIGIBLE_FOR_OWNER_TESTNET_DECISION" and rec1["fee_tier"] == "VENUE_STATED" and rec1["inputs_ref"] and rec1["edge"]["edge_ref"] and rec1["data_scope"].startswith("TESTNET_DATA")
     assert rec1["capital_required_usd"] == "408.00" and rec1["worst_credible_loss_usd"]["basis"] == "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL" and "UNATTENDED_GRANT" in rec1["authority_gaps"]
     assert "inputs_digest" in r1 and len(r1["inputs_digest"]) == 64                                  # the full digest stays in the local result; the record carries a 16-hex reference
 

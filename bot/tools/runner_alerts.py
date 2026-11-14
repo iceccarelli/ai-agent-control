@@ -25,6 +25,10 @@ WHAT IT ALERTS ON
   recorder_disk_low the last 3 cycles that report free space found the recorder's volume within one day
                 (about 1 GiB) of its 512 MiB write reserve (WARNING: the recorder is about to stop writing and
                 cannot recover by itself)
+  recorder_image_mismatch the last 3 cycles that report the running image's provenance found it MISMATCH or MISSING
+                (WARNING: the recorder may be writing, but it is not the approved implementation; Round 22)
+  recorder_reserve_soon the last 3 cycles that report an estimate found the volume reaching the write reserve within
+                24 hours at the current write rate (WARNING: the early warning in HOURS, before recorder_disk_low's headroom is gone; Round 22)
   mainnet_stalled  the last 6 cycles that collect real-market data recorded none
                 (WARNING: the protocol's 30-day clock is not accumulating)
   shadow        the last forward-shadow step was FAULT or REFUSED (WARNING)
@@ -315,6 +319,30 @@ def _recorder_down(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+#: Round 22: cycles an image-provenance failure must persist before it alerts (the check is hourly-cached; one stale read must not page)
+RECORDER_IMAGE_CYCLES = 3
+#: Round 22: hours-to-reserve below which the early-warning alert fires
+RECORDER_RESERVE_SOON_HOURS = 24.0
+
+
+def _recorder_image_mismatch(rows: Sequence[Mapping[str, object]], n: int):
+    """The last ``n`` rows that carry ``recorder_image_status``, when every one is MISMATCH or MISSING; else None (VERIFIED, NOT_CHECKED and rows without the field count neither way)."""
+    with_img = [r for r in rows if isinstance(r.get("recorder_image_status"), str)]
+    tail = with_img[-n:]
+    if len(tail) == n and all(r["recorder_image_status"] in ("MISMATCH", "MISSING") for r in tail):
+        return tail
+    return None
+
+
+def _recorder_reserve_soon(rows: Sequence[Mapping[str, object]], n: int):
+    """The last ``n`` rows that carry ``recorder_hours_to_reserve``, when every one is below the limit and the recorder is not already blocked (that is recorder_down / recorder_disk_low's case); else None."""
+    with_h = [r for r in rows if isinstance(r.get("recorder_hours_to_reserve"), (int, float)) and not isinstance(r.get("recorder_hours_to_reserve"), bool)]
+    tail = with_h[-n:]
+    if len(tail) == n and all(0 <= float(r["recorder_hours_to_reserve"]) < RECORDER_RESERVE_SOON_HOURS and r.get("recorder_health") != "storage_blocked" for r in tail):
+        return tail
+    return None
+
+
 def _free_mib(row: Mapping[str, object]) -> Optional[float]:
     """The recorder volume's free space in MiB from a monitor history line, or None. The monitor writes it as ``recorder_free_mb`` (every recorder field is prefixed; see
     ``runner_monitor._history_line``). A bool, a string, a non-finite or an absurdly large number is not a reading."""
@@ -520,6 +548,20 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
             "(1) the volume cannot hold even ONE day of data above the reserve (the first segment is never pruned, so it stays stopped for good: extend the volume, RUNBOOKS section 14), or "
             "(2) the RUNNING image predates the bounded recovery (RUNBOOKS section 18). Read-only checks: fly volumes list -a carry-drill; "
             "fly ssh console -a carry-drill -C \"ls -l --time-style=full-iso /data/market\" (a single md-<day>.db of a fraction of a GB, and no pruned.jsonl, means cause 1). Nothing is deleted or resized by this alert."))
+    img = _recorder_image_mismatch(rows, RECORDER_IMAGE_CYCLES)
+    if img:
+        last = img[-1]
+        alerts.append(Alert(
+            "recorder_image_mismatch", WARNING,
+            f"the last {RECORDER_IMAGE_CYCLES} cycles found the running recorder image's provenance {last['recorder_image_status']}: it is not established as the approved implementation (the recorder may still be writing). "
+            "Compare the image with the commit (RUNBOOKS 'Runtime provenance': `fly image show -a carry-drill`, python3 tools/image_manifest.py compare), and redeploy an image built with --build-arg BUILD_COMMIT=<sha>. Nothing is changed by this alert."))
+    soon = _recorder_reserve_soon(rows, RECORDER_DISK_LOW_CYCLES)
+    if soon:
+        h = float(soon[-1]["recorder_hours_to_reserve"])
+        alerts.append(Alert(
+            "recorder_reserve_soon", WARNING,
+            f"at the current write rate the recorder volume reaches its write reserve in about {h:.1f} h (the last {RECORDER_DISK_LOW_CYCLES} cycles all say under {RECORDER_RESERVE_SOON_HOURS:.0f} h, before any pruning). "
+            "Extend the volume or lower --recorder-retention-days before it stops writing (RUNBOOKS section 14 and 'Recorder storage sizing'); nothing is deleted or resized by this alert."))
     rising = _recorder_restarting(rows)
     if rising:
         a, b = rising

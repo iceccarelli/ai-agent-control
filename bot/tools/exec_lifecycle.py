@@ -192,8 +192,10 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
                        "required_funding_bps": num(edge.get("required_funding_bps")), "expected_net_usd": num(edge.get("expected_net_usd")),
                        "costs_bps": {str(k)[:30]: num(v) for k, v in dict(edge.get("costs_bps", {})).items()}, "assumed_inputs": assumed[:10],
                        "settlements_in_hold": edge.get("settlements_in_hold"), "edge_ref": ref16(edge.get("digest")),
-                       "capital_basis": capital_basis(edge.get("capital"))}
-        rec["fee_tier"] = "ASSUMED" if any("fee" in a.lower() for a in assumed) else "MEASURED"
+                       "capital_basis": capital_basis(edge.get("capital")),
+                       "provenance": provenance_view(edge.get("provenance"))}
+        # Round 22: an account fee-rate READ states the tier (VENUE_STATED); it is not a measurement of our own fills (those are MEASURED in execution_quality). The published VIP-0 tier is ASSUMED and cannot PASS.
+        rec["fee_tier"] = "ASSUMED" if any("fee" in a.lower() for a in assumed) else "VENUE_STATED"
     rec["venue"] = None if venue is None else {str(k)[:20]: str(v)[:60] for k, v in dict(venue).items()}
     ms = result.get("observed_ms")
     if isinstance(ms, int) and ms > 0:
@@ -230,6 +232,16 @@ def decision_record(result: Mapping[str, Any], *, code_sha: Optional[str] = None
     if loss_cap_usd is not None:
         rec["worst_credible_loss_usd"] = {"value": num(loss_cap_usd, 2), "basis": "POLICY_PER_SESSION_LOSS_CEILING_NOT_A_MODEL"}
     return rec
+
+
+def provenance_view(p: Any) -> Optional[Dict[str, Any]]:
+    """The verdict's per-component provenance and the list of modelled inputs nothing has calibrated, in the durable record (Round 22). None when the verdict carries none (an older verdict)."""
+    if not isinstance(p, Mapping) or not p:
+        return None
+    comps = p.get("components") if isinstance(p.get("components"), Mapping) else {}
+    fees = p.get("fee_tier") if isinstance(p.get("fee_tier"), Mapping) else {}
+    return {"components": {str(k)[:30]: str(v)[:20] for k, v in comps.items()}, "fee_tier": {str(k)[:10]: str(v)[:20] for k, v in fees.items()},
+            "uncalibrated_modelled": [str(x)[:30] for x in list(p.get("uncalibrated_modelled", []))[:12]]}
 
 
 def execution_quality(doc: Optional[Mapping[str, Any]]) -> List[Event]:
