@@ -704,8 +704,51 @@ class Watchdog:
 
 # -- command line, for a watcher that is NOT on the runner ---------------------
 
+DELIVERY_OK = ("none_needed", "all_sent", "dry_run")
+
+
+def delivery_status(alerts: Sequence[Alert], results: Mapping[str, str], *, dry_run: bool = False) -> str:
+    """How the raised alerts left the building, as ONE word: ``none_needed`` (nothing raised), ``dry_run``, ``all_sent``, ``partial``, ``none_delivered`` (a send was attempted and every one failed) or
+    ``disabled`` (no usable webhook). Round 22: the watcher's exit code was ``1`` whether Slack got the alert or not, so a red job could not say if anyone had been told."""
+    if not alerts:
+        return "none_needed"
+    if dry_run:
+        return "dry_run"
+    sent = sum(1 for a in alerts if results.get(a.key) == "sent")
+    if sent == len(alerts):
+        return "all_sent"
+    if results and all(v == "disabled" for v in results.values()):
+        return "disabled"
+    return "partial" if sent else "none_delivered"
+
+
+def _publish_delivery(status: str, alerts: Sequence[Alert], results: Mapping[str, str], env: Mapping[str, str], result_file: Optional[str]) -> None:
+    """Print the delivery line, write the machine-readable result (``--result-file``), and, on GitHub Actions, an ``::error`` annotation and a step-summary table. Never raises and never prints the webhook."""
+    sent = sum(1 for a in alerts if results.get(a.key) == "sent")
+    print(f"DELIVERY: {status} ({len(alerts)} alert(s) raised, {sent} delivered)")
+    if result_file:
+        try:
+            with open(result_file, "w", encoding="utf-8") as fh:
+                json.dump({"schema": "runner_alerts_result/v1", "delivery": status, "raised": [a.key for a in alerts],
+                           "results": {k: ("sent" if v == "sent" else str(v)[:80]) for k, v in results.items()}}, fh, sort_keys=True)
+        except OSError as exc:
+            print(f"cannot write {result_file}: {type(exc).__name__}", file=sys.stderr)
+    if status not in DELIVERY_OK and env.get("GITHUB_ACTIONS") == "true":
+        print(f"::error title=monitor alerts were raised but NOT delivered::{status}: {len(alerts) - sent} of {len(alerts)} alert(s) did not reach Slack; read the alert lines above")
+    summary_path = env.get("GITHUB_STEP_SUMMARY")
+    if summary_path and alerts:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write(f"### Recorder / runner alerts ({status})\n\n| alert | severity | delivery |\n|---|---|---|\n")
+                for a in alerts:
+                    fh.write(f"| {a.key} | {a.severity} | {results.get(a.key, 'not attempted')} |\n")
+        except OSError:
+            pass
+
+
 def main(argv: Optional[Sequence[str]] = None,
-         env: Optional[Mapping[str, str]] = None) -> int:
+         env: Optional[Mapping[str, str]] = None,
+         notifier: Optional["Notifier"] = None) -> int:
     env = os.environ if env is None else env
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("history", nargs="?",
@@ -725,6 +768,8 @@ def main(argv: Optional[Sequence[str]] = None,
                          "(forward_status.py); omitted, no forward check")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the alerts; send nothing")
+    ap.add_argument("--result-file", default=None,
+                    help="write a small JSON result (the raised alert keys and how each was delivered) to this path")
     args = ap.parse_args(argv)
     if args.test:
         notifier = Notifier(env, say=lambda line: print(line, file=sys.stderr))
@@ -750,14 +795,20 @@ def main(argv: Optional[Sequence[str]] = None,
     code = max(int(summary["exit"]), 1 if alerts else 0)
     for a in alerts:
         print(f"[{a.severity}] {a.key}: {a.text}")
+    results: Dict[str, str] = {}
     if args.dry_run or not alerts:
+        _publish_delivery(delivery_status(alerts, results, dry_run=args.dry_run), alerts, results, env, args.result_file)
         return code
-    notifier = Notifier(env, say=lambda line: print(line, file=sys.stderr))
+    notifier = notifier or Notifier(env, say=lambda line: print(line, file=sys.stderr))
     if not notifier.enabled:
         print(f"ALERTS DISABLED: {notifier.disabled_reason}", file=sys.stderr)
+        results = {a.key: "disabled" for a in alerts}
+        _publish_delivery(delivery_status(alerts, results), alerts, results, env, args.result_file)
         return code
     for a in alerts:
-        print(f"alert {a.key}: {notifier.send(a)}", file=sys.stderr)
+        results[a.key] = notifier.send(a)
+        print(f"alert {a.key}: {results[a.key]}", file=sys.stderr)
+    _publish_delivery(delivery_status(alerts, results), alerts, results, env, args.result_file)
     return code
 
 

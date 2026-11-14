@@ -446,6 +446,47 @@ class TestCommandLine:
         assert RA.ENV_VAR in out.err and code == 1
 
 
+    def test_a_failing_transport_is_reported_as_not_delivered_not_as_a_quiet_red(self, tmp_path, capsys):
+        """REPRODUCED (Round 22): with Slack unreachable the watcher still exited 1 and said nothing distinct; a red job could not say whether anyone had been told."""
+        def dead(url, body, timeout):
+            raise OSError("network is unreachable " + FAKE_URL)
+        n = RA.Notifier(ENV, transport=dead, say=lambda line: None, sleep=lambda s: None)
+        path = tmp_path / "h.jsonl"
+        path.write_text(text(row(400)))
+        result = tmp_path / "result.json"
+        summary = tmp_path / "summary.md"
+        code = RA.main([str(path), "--now", str(NOW), "--result-file", str(result)], env={**ENV, "GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(summary)}, notifier=n)
+        shown = capsys.readouterr()
+        assert code == 1                                                       # still red: an alert was raised
+        assert "DELIVERY: none_delivered" in shown.out and "::error title=monitor alerts were raised but NOT delivered" in shown.out
+        got = json.loads(result.read_text())
+        assert got["delivery"] == "none_delivered" and got["raised"] and all(v.startswith("failed") for v in got["results"].values())
+        assert "none_delivered" in summary.read_text() and "stale" in summary.read_text().lower()
+        assert TOKEN not in shown.out + shown.err + result.read_text() + summary.read_text()
+
+    def test_delivered_disabled_dry_run_and_quiet_are_each_named(self, tmp_path, capsys):
+        wire = Wire()
+        ok = RA.Notifier(ENV, transport=wire, say=lambda line: None, sleep=lambda s: None)
+        path = tmp_path / "h.jsonl"
+        path.write_text(text(row(400)))
+        r = tmp_path / "r.json"
+        assert RA.main([str(path), "--now", str(NOW), "--result-file", str(r)], env=ENV, notifier=ok) == 1
+        assert json.loads(r.read_text())["delivery"] == "all_sent" and "::error" not in capsys.readouterr().out
+        RA.main([str(path), "--now", str(NOW), "--result-file", str(r)], env={})
+        assert json.loads(r.read_text())["delivery"] == "disabled"
+        RA.main([str(path), "--now", str(NOW), "--dry-run", "--result-file", str(r)], env=ENV)
+        assert json.loads(r.read_text())["delivery"] == "dry_run"
+        path.write_text(text(row(5)))
+        RA.main([str(path), "--now", str(NOW), "--result-file", str(r)], env=ENV)
+        assert json.loads(r.read_text())["delivery"] == "none_needed" and json.loads(r.read_text())["raised"] == []
+
+    def test_a_partial_delivery_is_partial(self):
+        a, b = RA.Alert("x", RA.WARNING, "t"), RA.Alert("y", RA.WARNING, "t")
+        assert RA.delivery_status([a, b], {"x": "sent", "y": "failed: HTTP 500"}) == "partial"
+        assert RA.delivery_status([a, b], {"x": "failed: OSError", "y": "failed: OSError"}) == "none_delivered"
+        assert RA.delivery_status([a], {"x": "disabled"}) == "disabled"
+
+
 # -- it can read, it cannot trade ---------------------------------------------
 
 def test_the_module_has_no_order_capable_import_and_no_credentials():
