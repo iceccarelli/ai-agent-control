@@ -1,6 +1,6 @@
 # The carry-research WORKER: PUBLIC-DATA RESEARCH ONLY. A separate app from carry-autopilot, carry-drill and carry-book; it never holds an exchange credential and cannot place an order.
-# Deploy (owner, after reading bot/RUNBOOKS.md):  fly apps create carry-research  &&  fly volumes create research_data --region fra --size 3 -a carry-research  &&
-#                                                  fly deploy -c fly.research.toml --ha=false         (never `fly launch`, which rewrites config)
+# NOT PROVISIONED, and not to be provisioned until the owner approves a data-transfer and storage plan that fits the actual data, backups, seals and growth (CLAUDE.md; the "Operating topology" block in
+# bot/RUNBOOKS.md). This file is the committed configuration for that decision, not an instruction: any creation or deploy is the owner's explicit act (never `fly launch`, which rewrites config).
 # tests/test_research_image.py pins these properties.
 #
 #   one machine, one volume     the job queue is a single sqlite file on the volume

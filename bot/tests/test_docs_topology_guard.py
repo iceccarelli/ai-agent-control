@@ -34,29 +34,40 @@ ACTIVE_FILES = [
     "docs/TESTNET_QUALIFICATION_PROPOSAL.md",
     "reports/codespaces-checklist.md",
     "Makefile",
+    # Round 21 (review): configuration and image files carry comments people copy from too
+    "bot/fly.toml", "bot/fly.autopilot.toml", "bot/fly.drill.toml", "bot/fly.research.toml",
+    "bot/Dockerfile", "bot/Dockerfile.autopilot", "bot/Dockerfile.drill", "bot/Dockerfile.research",
 ]
-#: scripts that inject a hostile environment (a Mainnet selector, a live switch, generic key names) to PROVE the image refuses it
-NEGATIVE_TEST_SCRIPTS = {"bot/deploy/autopilot-image-smoke.sh", "bot/deploy/drill-image-smoke.sh", "scripts/verify_drill_runner.sh"}
-HOSTILE_ENV_RULES = {"MAINNET_ARMING_VARIABLE", "MAINNET_HOST_OR_ARMING_FLAG", "GENERIC_KEY_AS_TESTNET_CREDENTIAL"}
-HISTORICAL_FILES = ["docs/MONEY_MISSION.md"]            # scanned only between the active markers
+#: workflows are scanned too, except the one RETIRED workflow, whose executable steps remain (gated off by a repository variable) and are pinned by their own tests below
+WORKFLOWS = sorted(os.path.relpath(p, REPO) for p in glob.glob(os.path.join(REPO, ".github", "workflows", "*.yml")) if not p.endswith("carry-drill-testnet.yml"))
+#: scripts that inject a hostile environment (a Mainnet selector, a live switch) to PROVE an image refuses it, or that must name the generic key names to warn about them: exempt from ONLY the named rules
+NEGATIVE_TEST_SCRIPTS = {
+    "bot/deploy/autopilot-image-smoke.sh": {"MAINNET_ARMING_VARIABLE", "MAINNET_HOST_OR_ARMING_FLAG", "GENERIC_KEY_AS_TESTNET_CREDENTIAL"},
+    "bot/deploy/drill-image-smoke.sh": {"MAINNET_ARMING_VARIABLE", "MAINNET_HOST_OR_ARMING_FLAG", "GENERIC_KEY_AS_TESTNET_CREDENTIAL"},
+    "scripts/verify_drill_runner.sh": {"GENERIC_KEY_AS_TESTNET_CREDENTIAL"},
+}
+HISTORICAL_FILES = ["docs/MONEY_MISSION.md"]            # scanned only between marker lines that stand alone on their line
 TOPOLOGY_FILES = ["bot/README.md", "bot/RUNBOOKS.md", "docs/MONEY_MISSION.md"]
 BEGIN, END = "<!-- topology:begin -->", "<!-- topology:end -->"
 ACTIVE_BEGIN, ACTIVE_END = "<!-- docs-scan:active -->", "<!-- docs-scan:end -->"
+REF_BEGIN, REF_END = "<!-- docs-scan:reference -->", "<!-- docs-scan:reference-end -->"
 
-#: a line that states a prohibition is prose about the rule, not an instruction
-PROHIBITION = re.compile(r"\b(never|must not|do not|don't|does not|did not|not set|is not|are not|not a|not an|not the|refus\w+|forbid\w*|retired|stays? (?:unset|stopped|off)|unset|"
-                         r"out of scope|history|historical|stale|disabled|not part|cannot|can no longer|no longer|nothing)\b", re.I)
+#: a line that states a prohibition is prose about the rule, not an instruction. Deliberately narrow (Round 21 review): "is not the default", "history" or "nothing" do not excuse a command.
+PROHIBITION = re.compile(r"\b(never|must not|do not|don't|does not|did not|is not to be|not to be invoked|refus\w+|forbid\w*|retired|not an approval|no agent runs|no longer|out of scope|stays? (?:unset|stopped|off))\b", re.I)
 
 #: (id, compiled pattern, what is wrong). Each matches a copy-paste instruction.
+_FLY = r"(?:fly|flyctl)"
 RULES = [
-    ("MAINNET_ARMING_VARIABLE", re.compile(r"(LIVE_TRADING_ACK\s*=|USE_TESTNET\s*=\s*0|PAPER_TRADING\s*=\s*0)"),
+    ("MAINNET_ARMING_VARIABLE", re.compile(r"(LIVE_TRADING_ACK\s*[=:]|USE_TESTNET\s*[=:]\s*[\"']?(?:0|false|no|off)\b|PAPER_TRADING\s*[=:]\s*[\"']?(?:0|false|no|off)\b)", re.I),
      "sets a Mainnet arming variable (CLAUDE.md: never set LIVE_TRADING_ACK, USE_TESTNET=0 or PAPER_TRADING=0)"),
-    ("MAINNET_HOST_OR_ARMING_FLAG", re.compile(r"(api\.bybit\.com|BYBIT_VENUE\s*=\s*mainnet|drill\.py\s+--arm|--live-arm)"),
-     "points a command at Mainnet or arms a drill"),
-    ("CODESPACE_ORDER_LOOP", re.compile(r"(tmux\s+new[^\n]*(auto|loop)|ms_testnet_autopilot\.py\s+loop|ms_testnet_autopilot\.py\s+grant|autopilot-ctl\s+grant\b[^\n]*Codespace)"),
+    ("MAINNET_HOST_OR_ARMING_FLAG", re.compile(r"((?:api\.bybit\.com|api\.bytick\.com|stream\.bybit\.com)[^\n]*(?:/v5/(?:order|position|account|asset|user)|/v5/private|X-BAPI|Authorization|signed)|BYBIT_VENUE\s*[=:]\s*[\"']?mainnet|drill\.py\b[^\n]*--arm\b|--live-arm)", re.I),
+     "sends an order, a signed or an account request to a Mainnet host, selects Mainnet, or arms a drill (a PUBLIC market-data read of a Mainnet host is not what this rule is about)"),
+    ("CODESPACE_ORDER_LOOP", re.compile(r"(tmux\s+new[^\n]*(auto|loop)|\bpython3?\s+(?:-m\s+)?(?:tools/)?ms_testnet_autopilot(?:\.py)?\s+(?:loop|grant)\b|autopilot-ctl\s+grant\b[^\n]*Codespace)", re.I),
      "starts the order-capable loop or types a grant in a Codespace"),
-    ("LEGACY_BOOK_COMMAND", re.compile(r"(fly\s+(deploy|apps\s+create|machine\s+start|machine\s+run|scale|volumes\s+extend)[^\n]*carry-book|carry-book[^\n]*(fly\s+deploy|machine\s+start|volumes\s+extend))"),
+    ("LEGACY_BOOK_COMMAND", re.compile(rf"({_FLY}\s+(?:deploy|apps?\s+(?:create|restart|destroy)|machines?\s+(?:start|run|restart|update)|vol(?:ume)?s?\s+(?:extend|create)|scale)\b[^\n]*carry-book|carry-book[^\n]*{_FLY}\s+(?:deploy|machines?\s+start|vol(?:ume)?s?\s+extend))", re.I),
      "starts, deploys or resizes the stopped legacy carry-book"),
+    ("ORDER_CAPABLE_COMMAND", re.compile(r"(unattended_drill\.py\s+--conformance|(?<!test_)testnet_conformance_run\.py|close_testnet_short\.py[^\n]*--arm\b|ms_testnet_session\.py\s+execute\b|\$S\s+execute\b|ms_testnet_session\.py[^\n]*\breconcile\b[^\n]*--unwind)"),
+     "an order-capable command outside a REFERENCE ONLY region (CLAUDE.md: never start the legacy conformance path; one selected executor, after the owner's approval)"),
     ("GENERIC_KEY_AS_TESTNET_CREDENTIAL", re.compile(r"\bBYBIT_API_(KEY|SECRET)\b"),
      "names a generic key as if it were a Testnet credential (only BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET are)"),
     ("PS_NOT_IN_DRILL_IMAGE", re.compile(r"ps\s+-eo"),
@@ -64,6 +75,8 @@ RULES = [
     ("TIMER_WITH_ARMING", re.compile(r"testnet_session_timer\.sh\s+\d"),
      "runs the retired order-capable timer"),
 ]
+#: rules that do not apply inside a `<!-- docs-scan:reference -->` region (which must open with a REFERENCE ONLY banner)
+REFERENCE_OK = {"ORDER_CAPABLE_COMMAND"}
 #: generic names may appear in a line that says what they are (a reference, not an instruction)
 GENERIC_OK = re.compile(r"(generic|not (?:a )?testnet|not testnet|never used|never a fallback|are ignored|names only|names that|legacy|which account)", re.I)
 
@@ -74,40 +87,71 @@ def _read(rel):
 
 
 def _active_text(rel, text):
-    """The text of a document that the scan applies to. A historical document contributes only its marked regions."""
+    """The text of a document that the scan applies to. A historical document contributes only the lines between marker LINES (each alone on its line: a marker quoted inside prose toggles nothing)."""
     if rel not in HISTORICAL_FILES:
         return text
     out, on = [], False
     for ln in text.split("\n"):
-        if ACTIVE_BEGIN in ln:
+        s = ln.strip()
+        if s == ACTIVE_BEGIN:
             on = True
+            out.append("")
             continue
-        if ACTIVE_END in ln:
+        if s == ACTIVE_END:
             on = False
+            out.append("")
             continue
         out.append(ln if on else "")
     return "\n".join(out)
 
 
+def _logical_lines(text):
+    """(line_no, text) with backslash-continued lines joined (`fly deploy \\` + `--app carry-book` is ONE command)."""
+    out, buf, start = [], "", None
+    for n, ln in enumerate(text.split("\n"), 1):
+        if start is None:
+            start = n
+        if ln.rstrip().endswith("\\"):
+            buf += ln.rstrip()[:-1] + " "
+            continue
+        out.append((start, buf + ln))
+        buf, start = "", None
+    if buf:
+        out.append((start, buf))
+    return out
+
+
 def scan(text):
     """Violations in one document's active text: [(line_no, rule_id, why, line)]."""
-    found, in_fence = [], False
-    for n, ln in enumerate(text.split("\n"), 1):
-        if ln.lstrip().startswith("```"):
+    found, in_fence, in_ref = [], False, False
+    for n, ln in _logical_lines(text):
+        s = ln.strip()
+        if s == REF_BEGIN:
+            in_ref = True
+            continue
+        if s == REF_END:
+            in_ref = False
+            continue
+        if s.startswith("```"):
             in_fence = not in_fence
             continue
         if "docs-scan:allow" in ln:
             continue
         prohib = bool(PROHIBITION.search(ln)) and not in_fence
+        hostile_smoke = "docker run" in ln and "--network none" in ln          # a CI step that feeds an image a hostile environment to prove it refuses it
         for rid, rx, why in RULES:
             if not rx.search(ln):
+                continue
+            if in_ref and rid in REFERENCE_OK:
+                continue
+            if hostile_smoke and rid in ("MAINNET_ARMING_VARIABLE", "MAINNET_HOST_OR_ARMING_FLAG", "GENERIC_KEY_AS_TESTNET_CREDENTIAL"):
                 continue
             if rid == "GENERIC_KEY_AS_TESTNET_CREDENTIAL":
                 if GENERIC_OK.search(ln) or prohib:
                     continue
             elif prohib:
                 continue
-            found.append((n, rid, why, ln.strip()[:160]))
+            found.append((n, rid, why, s[:160]))
     return found
 
 
@@ -120,7 +164,7 @@ def _scripts():
 
 # --------------------------------------------------------------------------------------- the scan itself
 
-@pytest.mark.parametrize("rel", ACTIVE_FILES + HISTORICAL_FILES)
+@pytest.mark.parametrize("rel", ACTIVE_FILES + WORKFLOWS + HISTORICAL_FILES)
 def test_no_active_document_carries_a_forbidden_instruction(rel):
     text = _active_text(rel, _read(rel))
     found = scan(text)
@@ -129,32 +173,36 @@ def test_no_active_document_carries_a_forbidden_instruction(rel):
 
 def test_the_scan_sees_the_real_files():
     """A scan that silently reads nothing proves nothing."""
-    for rel in ACTIVE_FILES + HISTORICAL_FILES:
+    for rel in ACTIVE_FILES + WORKFLOWS + HISTORICAL_FILES:
         assert os.path.exists(os.path.join(REPO, rel)), rel
     assert len(_read("bot/RUNBOOKS.md")) > 100_000
     assert _scripts(), "no shell scripts were found to scan"
+    assert len(WORKFLOWS) >= 7 and "bot/Dockerfile" in ACTIVE_FILES and "bot/fly.research.toml" in ACTIVE_FILES
 
 
-@pytest.mark.parametrize("rel", _scripts())
-def test_no_shell_script_arms_mainnet_or_starts_the_retired_paths(rel):
-    """Scripts are all code: a prohibition word on a line does not excuse it. Comments are skipped; a heredoc that prints text is code."""
+def scan_script(text, exempt=frozenset()):
+    """Scripts are all code: a prohibition word on a line does not excuse it, and a word such as REFUSED excuses nothing. Comments are skipped; a heredoc that prints text is code.
+    `exempt` names the ONLY rules a hostile-environment smoke script is excused from."""
     bad = []
-    hostile = rel in NEGATIVE_TEST_SCRIPTS
-    for n, ln in enumerate(_read(rel).split("\n"), 1):
+    for n, ln in _logical_lines(text):
         s = ln.strip()
         if not s or s.startswith("#") or "docs-scan:allow" in s:
             continue
         for rid, rx, why in RULES:
-            if rid == "PS_NOT_IN_DRILL_IMAGE":
+            if rid == "PS_NOT_IN_DRILL_IMAGE" or rid in exempt:
                 continue
-            if hostile and rid in HOSTILE_ENV_RULES:
-                continue          # these scripts feed a hostile environment ON PURPOSE to prove the image refuses it
-            if hostile and rid == "CODESPACE_ORDER_LOOP" and re.search(r"\bgrep\b", s):
+            if "CODESPACE_ORDER_LOOP" in exempt and rid == "CODESPACE_ORDER_LOOP":
+                continue
+            if rid == "CODESPACE_ORDER_LOOP" and re.search(r"\bgrep\b", s) and exempt:
                 continue          # a smoke script that GREPS the container's PID 1 for the loop is a check, not a launch
             if rx.search(s) and not (rid == "GENERIC_KEY_AS_TESTNET_CREDENTIAL" and GENERIC_OK.search(s)):
                 bad.append((n, rid, s[:140]))
-    # retired scripts print a REFUSED notice; that text is checked by name below
-    bad = [b for b in bad if "REFUSED" not in b[2]]
+    return bad
+
+
+@pytest.mark.parametrize("rel", _scripts())
+def test_no_shell_script_arms_mainnet_or_starts_the_retired_paths(rel):
+    bad = scan_script(_read(rel), NEGATIVE_TEST_SCRIPTS.get(rel, frozenset()))
     assert not bad, f"{rel}: {bad}"
 
 
@@ -169,6 +217,28 @@ PLANTED_BAD = [
     "fly ssh console -a carry-drill -C \"ps -eo pid,user,args\"",
     "python3 tools/ms_testnet_autopilot.py grant --max-sessions 2 --max-notional-usd 400",
     "BYBIT_VENUE=mainnet python3 main.py",
+    # Round 21 review: every spelling the first version of the guard let through
+    'export PAPER_TRADING="0"',
+    "PAPER_TRADING=false python3 main.py",
+    'USE_TESTNET="0"',
+    "LIVE_TRADING_ACK: I_UNDERSTAND",
+    'BYBIT_VENUE="mainnet"',
+    "BYBIT_VENUE=Mainnet python3 main.py",
+    'curl -H "X-BAPI-API-KEY: $K" https://api.bytick.com/v5/order/create',
+    "wss://stream.bybit.com/v5/private",
+    "flyctl deploy --app carry-book",
+    "fly machines start d8e8 -a carry-book",
+    "fly vol extend vol_abc -s 10 -a carry-book",
+    "fly apps restart carry-book",
+    "fly deploy \\\n    --strategy immediate \\\n    --app carry-book",
+    "python3 tools/drill.py --out x --arm",
+    "python3 -m ms_testnet_autopilot loop",
+    'fly ssh console -a carry-drill -C "python3 tools/unattended_drill.py --conformance"',
+    "python3 tools/close_testnet_short.py --symbol BTCUSDT --arm",
+    "python3 tools/ms_testnet_session.py execute --confirm-plan-digest abc",
+    "Arm it with `export PAPER_TRADING=0` (this is not the default)",
+    "History: it was fine to set PAPER_TRADING=0 back then, so do that.",
+    "Nothing stops you running fly deploy --app carry-book now.",
 ]
 PLANTED_OK = [
     "Never set `LIVE_TRADING_ACK`, `USE_TESTNET=0` or `PAPER_TRADING=0`.",
@@ -176,6 +246,9 @@ PLANTED_OK = [
     "The generic `BYBIT_API_KEY` / `BYBIT_API_SECRET` are not Testnet credentials.",
     "carry-book is stopped; do not run fly deploy against carry-book.",
     "`carry-autopilot` does not exist and is not deployed.",
+    "Never start `unattended_drill.py --conformance` on carry-drill.",
+    "GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT (a public market-data read, no credential)",
+    "`ms_testnet_session.py execute` is refused in a Codespace and is not to be invoked there.",
 ]
 
 
@@ -204,13 +277,58 @@ def test_a_mutation_of_the_real_runbook_is_caught():
     assert scan(mutated)
     mutated2 = real + "\n```bash\nfly secrets set -a carry-book PAPER_TRADING=0\n```\n"
     assert scan(mutated2)
+    mutated3 = real + "\n- Then run `python3 tools/ms_testnet_session.py execute --confirm-plan-digest X` from the Codespace.\n"
+    assert scan(mutated3), "an order-capable command outside a REFERENCE ONLY region is flagged"
 
 
-def test_history_is_exempt_only_outside_the_active_markers():
+def test_a_reference_only_region_excuses_the_order_capable_rule_and_nothing_else():
+    inside = f"{REF_BEGIN}\nrun `$S execute --confirm-plan-digest X`\nand export PAPER_TRADING=0\n{REF_END}\n"
+    found = [rid for _n, rid, _w, _l in scan(inside)]
+    assert found == ["MAINNET_ARMING_VARIABLE"], found
+    outside = "run `$S execute --confirm-plan-digest X`\n"
+    assert [rid for _n, rid, _w, _l in scan(outside)] == ["ORDER_CAPABLE_COMMAND"]
+
+
+def test_every_reference_only_region_opens_with_its_banner_and_is_closed():
+    for rel in ACTIVE_FILES + HISTORICAL_FILES:
+        text = _read(rel)
+        starts = [i for i, ln in enumerate(text.split("\n")) if ln.strip() == REF_BEGIN]
+        ends = [i for i, ln in enumerate(text.split("\n")) if ln.strip() == REF_END]
+        assert len(starts) == len(ends), rel
+        lines = text.split("\n")
+        for s, e in zip(starts, ends):
+            assert s < e, rel
+            assert "REFERENCE ONLY" in "\n".join(lines[max(0, s - 6):s]), f"{rel}: a reference region must be preceded by its REFERENCE ONLY banner"
+
+
+def test_history_is_exempt_only_between_marker_lines():
     hist = "Round 5 said: set PAPER_TRADING=0 then run drill.py --arm.\n"
     assert not scan(_active_text("docs/MONEY_MISSION.md", hist))
     marked = f"{ACTIVE_BEGIN}\nset PAPER_TRADING=0\n{ACTIVE_END}\nset PAPER_TRADING=0\n"
     assert len(scan(_active_text("docs/MONEY_MISSION.md", marked))) == 1
+    # REPRODUCED (review): prose that QUOTES the markers inline toggled the region and inverted the scan (the head of the file was skipped, the tail scanned)
+    inline = f"The guard scans only a region between `{ACTIVE_BEGIN}` and `{ACTIVE_END}`.\nset PAPER_TRADING=0 here is history\n"
+    assert scan(_active_text("docs/MONEY_MISSION.md", inline)) == [], "an inline quoted marker must not start a region"
+
+
+def test_the_real_mission_document_scans_only_its_marked_topology_block():
+    text = _read("docs/MONEY_MISSION.md")
+    active = _active_text("docs/MONEY_MISSION.md", text).split("\n")
+    scanned = [ln for ln in active if ln.strip()]
+    assert scanned, "no region of the mission document is scanned: the topology block must be inside marker lines"
+    assert BEGIN in "\n".join(scanned) and END in "\n".join(scanned)
+    assert len(scanned) < 40, f"the active region should be just the topology block, not {len(scanned)} lines of history"
+
+
+def test_a_script_line_is_not_excused_by_the_word_refused_and_a_hostile_script_is_excused_only_from_its_named_rules():
+    assert scan_script('echo REFUSED; export PAPER_TRADING=0'), "REFUSED excuses nothing"
+    assert scan_script("python3 tools/ms_testnet_session.py execute --confirm-plan-digest x")
+    assert not scan_script('echo "$ENVS" | grep -Eq "^(BYBIT_API_KEY|LIVE_TRADING_ACK)="', {"GENERIC_KEY_AS_TESTNET_CREDENTIAL", "MAINNET_ARMING_VARIABLE"})
+    # verify_drill_runner.sh is excused ONLY from the generic-name rule: a Mainnet host or an arming variable in it is still a failure
+    only_generic = NEGATIVE_TEST_SCRIPTS["scripts/verify_drill_runner.sh"]
+    assert only_generic == {"GENERIC_KEY_AS_TESTNET_CREDENTIAL"}
+    assert scan_script("export PAPER_TRADING=0", only_generic) and scan_script('curl -H "X-BAPI-API-KEY: k" https://api.bybit.com/v5/order/create', only_generic)
+    assert not scan_script('has BYBIT_API_KEY || has BYBIT_API_SECRET', only_generic)
 
 
 # --------------------------------------------------------------------------------------- one topology statement
@@ -231,7 +349,7 @@ def test_the_topology_block_is_byte_identical_everywhere():
 def test_the_topology_block_states_the_current_operating_model():
     b = _block("bot/RUNBOOKS.md")
     for needle in ("Codespace or laptop", "**No.**", "Not selected and not deployed", "`carry-autopilot` does not exist", "`carry-drill` (Fly)", "read-only market-data recorder and monitor",
-                   "`carry-book` (Fly)", "**Stopped.**", "`carry-research` (Fly)", "**Does not exist.**", "Mainnet is out of scope", "BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_SECRET",
+                   "`carry-book` (Fly)", "**Stopped** (owner-observed 2026-11-14)", "`carry-research` (Fly)", "**Does not exist** (owner-observed 2026-11-14)", "no machine setting disables it", "Mainnet is out of scope", "BYBIT_TESTNET_API_KEY", "BYBIT_TESTNET_API_SECRET",
                    "single-writer lease", "capability and a grant"):
         assert needle in b, needle
     # the statement of what is NOT done may not be softened into an invitation
@@ -250,7 +368,7 @@ def test_the_runbook_does_not_tell_a_codespace_to_run_the_loop_or_type_a_grant()
 def test_every_carry_autopilot_command_comes_after_its_not_deployed_banner():
     t = _read("bot/RUNBOOKS.md")
     early = t.index("**Status (Round 21): every `-a carry-autopilot` command from here to the end of \"Fly autopilot: owner procedure\" assumes an app that does not exist today")
-    banner = t.index("**STATUS (Round 21, owner-observed 2026-11-14): the `carry-autopilot` Fly app does NOT exist")
+    banner = t.index("**STATUS (Round 21, owner-observed 2026-11-14): REFERENCE ONLY. The `carry-autopilot` Fly app does NOT exist")
     proc = t.index("**Fly autopilot: owner procedure (laptop-free).**")
     assert early < banner < proc
     # every `fly ... -a carry-autopilot` command in the whole runbook sits after the first banner

@@ -48,6 +48,13 @@ jobs:
       - name: Every shipped CLI builds its parser and prints its help
         run: python -m pytest -q -p no:cacheprovider tests/test_cli_help_strings.py
 
+      - name: Every argparse script under bot/ prints its help (the sweep; must run, not skip)
+        env:
+          HELP_SWEEP: "1"
+        run: |
+          python -m pytest -q -p no:cacheprovider -rs tests/test_cli_help_strings.py -k every_argparse_script | tee "$RUNNER_TEMP/sweep.txt"
+          grep -Eq "(^| )1 passed" "$RUNNER_TEMP/sweep.txt"
+
       - name: The documentation guard and the recorder forensics parser
         run: python -m pytest -q -p no:cacheprovider tests/test_docs_topology_guard.py tests/test_recorder_forensics.py
 

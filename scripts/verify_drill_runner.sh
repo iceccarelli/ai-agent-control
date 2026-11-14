@@ -42,14 +42,16 @@ secrets="$($FLY secrets list -a "$APP" 2>&1)"
 has() { printf '%s\n' "$secrets" | grep -qw "$1"; }
 if has BYBIT_TESTNET_API_KEY && has BYBIT_TESTNET_API_SECRET; then
   echo "dedicated Testnet credential names: present"
+elif has BYBIT_TESTNET_API_KEY || has BYBIT_TESTNET_API_SECRET; then
+  fail "only half of the dedicated Testnet pair (BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET) is set on $APP"
+elif has BYBIT_API_KEY && has BYBIT_API_SECRET; then
+  echo "dedicated Testnet credential names (BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET): not present"
+  echo "WARNING: generic BYBIT_API_KEY / BYBIT_API_SECRET names are present. They are not Testnet credentials in this repository,"
+  echo "         and the names do not say which account they reach. Treat this app as a READ-ONLY recorder and monitor."
+elif has BYBIT_API_KEY || has BYBIT_API_SECRET; then
+  fail "only half of the generic pair (BYBIT_API_KEY / BYBIT_API_SECRET) is set on $APP"
 else
-  echo "dedicated Testnet credential names (BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET): not both present"
-  if has BYBIT_API_KEY || has BYBIT_API_SECRET; then
-    echo "WARNING: generic BYBIT_API_KEY / BYBIT_API_SECRET names are present. They are not Testnet credentials in this repository,"
-    echo "         and the names do not say which account they reach. Treat this app as a READ-ONLY recorder and monitor."
-  else
-    fail "no Bybit credential name is set on $APP (a read-only recorder needs none, but the monitor's venue reads do)"
-  fi
+  fail "no Bybit credential name is set on $APP (a read-only recorder needs none, but the monitor's venue reads do)"
 fi
 
 echo "== can the machine reach the testnet?"

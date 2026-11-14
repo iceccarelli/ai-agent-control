@@ -193,3 +193,35 @@ def test_every_shipped_parser_factory_builds_and_formats_its_help_on_this_interp
             failures.append(f"{rel}:{fn}: {type(exc).__name__}: {exc}")
     assert built >= 3, (built, factories)
     assert not failures, "\n".join(failures)
+
+
+# ----------------------------------------------------------------------------------------- the sweep: every argparse script prints its help (run on the NEWEST interpreters by the python-compat workflow)
+SWEEP_RC_OK = {"tools/runner_supervisor.py": {0, 3}}         # rc 3 is its usage convention when no `--` command follows
+
+
+def _argparse_scripts():
+    out = []
+    for p in _shipped_python():
+        rel = os.path.relpath(p, BOT)
+        if rel.startswith("tests" + os.sep):
+            continue
+        src = open(p, encoding="utf-8").read()
+        if "ArgumentParser" in src and "__main__" in src:
+            out.append(rel)
+    return out
+
+
+@pytest.mark.skipif(not os.environ.get("HELP_SWEEP"), reason="set HELP_SWEEP=1 (the python-compat workflow does): ~150 subprocesses")
+def test_every_argparse_script_prints_its_help_on_this_interpreter(tmp_path):
+    """The review's net: a help built from a variable or a call is invisible to the static scan, and a parser built inside main() is invisible to the factory test, but `--help` builds every parser."""
+    scripts = _argparse_scripts()
+    assert len(scripts) > 80, len(scripts)
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "LEDGER_DISABLED": "1",
+           "HISTORY_HOLDOUT_LEDGER": str(tmp_path / "holdout.jsonl"), "CANDIDATE_LEDGER_DIR": str(tmp_path / "cand"), "CAPITAL_ANCHOR_DIR": str(tmp_path / "anchor")}
+    bad = []
+    for rel in scripts:
+        r = subprocess.run([sys.executable, os.path.join(BOT, rel), "--help"], capture_output=True, text=True, timeout=120, cwd=BOT, env=env, stdin=subprocess.DEVNULL)
+        if r.returncode not in SWEEP_RC_OK.get(rel, {0}) or "Traceback" in r.stderr or "badly formed help string" in r.stderr:
+            bad.append((rel, r.returncode, r.stderr[-200:]))
+    assert not bad, bad
+    assert not os.path.exists(tmp_path / "holdout.jsonl") and not os.path.exists(tmp_path / "cand") and not os.path.exists(tmp_path / "anchor"), "--help must not touch any owner state"

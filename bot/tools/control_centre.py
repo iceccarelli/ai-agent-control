@@ -319,7 +319,8 @@ def _coc_basis_note(c: Mapping[str, Any]) -> str:
     if isinstance(fu, Mapping) and fu.get("min") is not None and fu.get("max") is not None:
         lo, hi = fu["min"], fu["max"]
         shown = f"{lo:.2f}x" if lo == hi else f"{lo:.2f}x to {hi:.2f}x"
-        return f"charged on {shown} committed capital per unit of notional ({c.get('capital_factor_basis') or 'the basis text is not carried'})"
+        below = " BELOW the 2.04x the executor commits for a carry: not comparable with the executor's figures." if c.get("kind") == "SPOT_PERP_CARRY" and hi < 2.0399 else ""
+        return f"charged on {shown} committed capital per unit of notional ({c.get('capital_factor_basis') or 'the basis text is not carried'});{below}"
     return ("capital basis NOT carried by this artifact: an artifact written before Round 21 charged a 1.2x research basis, which is not comparable with the 2.04x the executor commits for the same carry")
 
 

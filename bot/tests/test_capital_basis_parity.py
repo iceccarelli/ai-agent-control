@@ -60,10 +60,18 @@ def test_the_research_margin_parameter_is_gone_and_a_stale_caller_fails_closed()
         run(params={"margin_frac": 0.2})
 
 
-@pytest.mark.parametrize("bad", [0, -1, 0.5, 1.5, True, None, "1", float("nan")])
+@pytest.mark.parametrize("bad", [0, -1, 0.5, 1.5, True, None, "1", float("nan"), 101, 10**6, 10**31])
 def test_leverage_must_be_a_whole_number_of_at_least_one(bad):
     with pytest.raises(S.ScanError):
         run(params={"leverage": bad})
+
+
+def test_the_leverage_bound_keeps_a_perp_only_book_from_being_priced_at_almost_no_capital():
+    """REVIEWED (Round 21): an unbounded leverage priced a perp-only book at 1.02e-6 and inflated its rank; 10**31 raised out of the scan. 100 is the highest venue leverage; above it the scan is refused, never crashed."""
+    assert S.committed_capital_factor(SPREAD, 100) == pytest.approx(_perp(100))
+    for bad in (101, 10**6, 10**31):
+        with pytest.raises(S.ScanError):
+            S.committed_capital_factor(SPREAD, bad)
 
 
 def test_the_factor_function_refuses_a_kind_it_does_not_know():

@@ -82,9 +82,9 @@ ENV STATE_DB_PATH=/app/state/trading_state.db
 ARG BUILD_COMMIT=unknown
 ENV BUILD_COMMIT=$BUILD_COMMIT
 
-# Safe by default. Going live requires all four of USE_TESTNET=0,
-# PAPER_TRADING=0, LIVE_TRADING_ACK=I_UNDERSTAND and real credentials,
-# supplied at runtime from a secret manager — never baked in here.
+# Safe by default (Testnet and paper). This image is never configured for Mainnet: the repository's
+# mandate is paper and Bybit Testnet only, and no arming variable is set here or anywhere in the repository.
+# Credentials, where an owner supplies them, are Fly secrets at runtime, never baked in here.
 ENV USE_TESTNET=1 \
     PAPER_TRADING=1 \
     ENABLE_HEALTH_SERVER=1 \

@@ -57,6 +57,7 @@ DEFAULT_PARAMS: Dict[str, Any] = {
     "top_k": 3, "price_vol_bps_per_day": {}, "pair_corr": 0.0,
 }
 KINDS = T.OPP_KINDS
+MAX_LEVERAGE = 100                  # the highest linear-perp leverage a venue offers: an absurd leverage would price a perp-only book at almost no capital and inflate its rank
 STYLES = ("TAKER", "MAKER_FIRST")
 CAP_PROV = "MODELLED"
 
@@ -78,8 +79,8 @@ def _params(params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise ScanError(f"parameter {k} must be a positive finite number")
     lev = p["leverage"]
-    if isinstance(lev, bool) or not isinstance(lev, int) or lev < 1:
-        raise ScanError("leverage must be a whole number >= 1: the leverage the executed structure would use (the autopilot's is 1); it sets the committed capital through economic_model, never a research constant")
+    if isinstance(lev, bool) or not isinstance(lev, int) or not 1 <= lev <= MAX_LEVERAGE:
+        raise ScanError(f"leverage must be a whole number in [1, {MAX_LEVERAGE}]: the leverage the executed structure would use (the autopilot's is 1); it sets the committed capital through economic_model, never a research constant")
     if not isinstance(p["min_prints"], int) or p["min_prints"] < 1 or not isinstance(p["top_k"], int) or p["top_k"] < 1:
         raise ScanError("min_prints and top_k must be positive integers")
     if not 0.0 <= float(p["p_missed_fill"]) <= 1.0 or not -1.0 <= float(p["pair_corr"]) <= 1.0:
@@ -276,10 +277,13 @@ def committed_capital_factor(kind: str, leverage: Any = 1) -> float:
     plan's buffer); a spread or directional book is PERP_ONLY (margin + buffer). The ranking denominator, the financing charge here and the pipeline's realised cost of capital all use this one function."""
     if kind not in KINDS:
         raise ScanError(f"unknown opportunity kind {kind!r}: one of {KINDS}")
-    if isinstance(leverage, bool) or not isinstance(leverage, int) or leverage < 1:
-        raise ScanError("leverage must be a whole number >= 1")
+    if isinstance(leverage, bool) or not isinstance(leverage, int) or not 1 <= leverage <= MAX_LEVERAGE:
+        raise ScanError(f"leverage must be a whole number in [1, {MAX_LEVERAGE}]")
     structure = EM.ACQUIRED_SPOT_PERP if kind == "SPOT_PERP_CARRY" else EM.PERP_ONLY
-    return float(EM.structure_capital_usd(structure, 1, leverage).value)
+    try:
+        return float(EM.structure_capital_usd(structure, 1, leverage).value)
+    except EM.EconomicModelError as exc:                                  # never an unhandled error out of a scan
+        raise ScanError(f"the committed-capital registry refused leverage {leverage}: {exc}") from None
 
 
 def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, MarketSnapshot, str]], f_leg_day: Sequence[Dict[str, float]], candidate_id: str, spec_digest: str,

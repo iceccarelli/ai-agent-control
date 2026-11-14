@@ -45,7 +45,7 @@ RUN useradd --create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /data && chown -R bot:bot /app /data
 
 # Testnet only, stated again here; the orchestrator also forces its own env for
-# every child (PAPER_TRADING=0 only inside the order-capable child it starts,
+# every child (its own paper flag is set only inside the order-capable child it starts,
 # LIVE_TRADING_ACK removed). Credentials arrive as Fly secrets. Round 19: the
 # IMAGE default is PAPER_TRADING=1: a read-only image must not carry the order
 # arming flag for every command run in it (a `fly ssh` session, a mis-typed tool).

@@ -1382,6 +1382,8 @@ def test_the_competition_view_states_the_capital_basis_beside_the_after_cost_net
     assert old_row["capital_factor_used"] is None and "NOT carried" in CC._coc_basis_note(old_row) and "1.2x research basis" in CC._coc_basis_note(old_row)
     legacy = CC._v_competition({"candidates": [_comp_candidate(net_bps_after_cost_of_capital=-1.5, cost_of_capital={**coc, "capital_factor_used": {"min": 1.2, "max": 1.2}})]})["candidates"][0]
     assert "1.20x" in CC._coc_basis_note(legacy), "an artifact that states 1.2x is shown as 1.20x: the reader sees the basis that was used, not the one that is now correct"
+    assert "BELOW the 2.04x the executor commits for a carry" in CC._coc_basis_note(legacy), "a carry charged on less than the executor's capital is flagged as not comparable"
+    assert "BELOW" not in CC._coc_basis_note(row), "the registry basis (2.04x) carries no warning"
     span = CC._v_competition({"candidates": [_comp_candidate(cost_of_capital={**coc, "capital_factor_used": {"min": 1.02, "max": 2.04}})]})["candidates"][0]
     assert "1.02x to 2.04x" in CC._coc_basis_note(span)
 
