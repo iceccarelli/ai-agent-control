@@ -68,13 +68,9 @@ cd /workspaces/ai-agent-control/bot && python3 tools/carry_performance.py --db <
 ```
 Per cycle and in total: confirmed versus provisional net, funding, fees, financing, price leg, return on notional, drawdown, concentration, holding time. It prints "no closed cycle" and no ratios until the book has closed one. Margin committed and fill slippage are not journalled and are reported as such. Point it at a copy, never at `bot/state/trading_state.db`.
 
-## 6. Recording a human promotion approval (only when you have read the evidence)
+## 6. Promotion approvals: RETIRED as an active step (Round 21)
 
-The gate no longer trusts a flag in the repository. Approve one item at a time, writing outside the repo:
-```bash
-cd /workspaces/ai-agent-control/bot && python3 tools/promotion_approve.py --key kill_switch_drill_recorded --out ~/promotion_approvals.json
-```
-Then set `PROMOTION_APPROVALS_FILE=$HOME/promotion_approvals.json` in the process environment. Changing the item's entry afterwards voids the approval. This does not open live trading: the live-arming chain and the forward evidence are still required.
+Promotion toward live capital is outside the current mandate: this repository is paper and Bybit Testnet only and nothing in it arms Mainnet. Do not record a promotion approval, and do not set `PROMOTION_APPROVALS_FILE`, as part of any routine. The earlier instructions in this section are in git history as history. What a Codespace is for, and what may place an order, is the "Operating topology" block at the top of `bot/RUNBOOKS.md`.
 
 ## What "ready" means
 

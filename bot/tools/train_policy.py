@@ -1683,7 +1683,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--holdout-from", default=None,
         help="ISO date (UTC). Everything from here is held out entirely. "
-             f"Default: the last {DEFAULT_HOLDOUT_FRACTION:.0%} of the sample span.",
+             f"Default: the last {DEFAULT_HOLDOUT_FRACTION * 100:.0f}%% of the sample span.",
     )
     parser.add_argument(
         "--folds", type=int, default=pol.DEFAULT_N_FOLDS,

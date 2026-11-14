@@ -1,177 +1,23 @@
 #!/usr/bin/env bash
-# deploy.sh — from a clean checkout to a book running on Fly, in one command.
+# deploy.sh: RETIRED (Round 21). This script no longer deploys anything.
 #
-# Idempotent and step-wise: every step checks whether it already happened and
-# skips it, so re-running after a failure costs nothing and never duplicates an
-# app, a volume or an IP. It REFUSES rather than guessing at every point where
-# guessing could point the book at the wrong exchange.
+# It used to take a checkout to a running `carry-book` machine on Fly and printed
+# instructions to arm it. That path is not part of the current mandate: this
+# repository is paper and Bybit Testnet only, `carry-book` is stopped and stays
+# stopped, and nothing in the repository arms Mainnet. The earlier script is in
+# git history as history, not as guidance.
 #
-# It does not arm anything. What it leaves you with is a machine that can reach
-# the venue, with a book that refuses every order because PAPER_TRADING=1.
-# Arming is two deliberate commands, printed at the end.
-#
-#   ./scripts/deploy.sh                 # testnet (default)
-#   BYBIT_VENUE=demo ./scripts/deploy.sh
+# It refuses before it touches flyctl, a network, a secret or an app, so running it
+# by mistake is harmless. Where the live instructions are:
+#   - what runs where, and what may place an order: the "Operating topology" block in
+#     bot/RUNBOOKS.md (byte-identical in bot/README.md and docs/MONEY_MISSION.md);
+#   - the owner's deploy checklist for the one selected Testnet executor:
+#     bot/RUNBOOKS.md "Fly autopilot: owner procedure" (NOT deployed; not an approval);
+#   - read-only checks: bot/RUNBOOKS.md sections 14, 16 and 18.
 set -euo pipefail
-trap 'echo; echo "STOPPED at line $LINENO. Nothing was left half-done that a re-run will not fix." >&2' ERR
-
-VENUE="${BYBIT_VENUE:-testnet}"
-APP="${FLY_APP:-carry-book}"
-REGION="${FLY_REGION:-fra}"
-VOLUME="${FLY_VOLUME:-carry_state}"
-
-case "$VENUE" in
-  testnet|demo) ;;
-  mainnet)
-    echo "REFUSED: this script does not deploy to mainnet." >&2
-    echo "         Mainnet needs a signed risk memo and a recorded drill" >&2
-    echo "         first, and then it is a deliberate act, not a script." >&2
-    exit 1 ;;
-  *) echo "REFUSED: BYBIT_VENUE=$VENUE is not testnet or demo." >&2; exit 1 ;;
-esac
-
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$root/bot"
-say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-
-say "1/7  flyctl"
-# The installer lays down `flyctl`. A `fly` alias is NOT guaranteed — checking
-# only for it reinstalled flyctl on a machine that already had it and then
-# called a command that was not there. Resolve ONE name, once, and use it.
-export PATH="${FLYCTL_INSTALL:-$HOME/.fly}/bin:$PATH"
-if command -v flyctl >/dev/null 2>&1; then FLY=flyctl
-elif command -v fly >/dev/null 2>&1; then FLY=fly
-else
-  echo "installing flyctl..."
-  curl -L https://fly.io/install.sh | sh
-  export FLYCTL_INSTALL="${FLYCTL_INSTALL:-$HOME/.fly}"
-  export PATH="$FLYCTL_INSTALL/bin:$PATH"
-  command -v flyctl >/dev/null 2>&1 && FLY=flyctl || FLY=fly
-fi
-echo "using: $(command -v "$FLY")"
-"$FLY" version
-"$FLY" auth whoami >/dev/null 2>&1 || {
-  echo; echo "Not signed in. Run: $FLY auth login"; exit 1; }
-
-say "2/7  the config, checked before anything is created"
-python3 tools/fly_stack.py --check
-
-# `fly apps create`, NOT `fly launch`. launch rewrites fly.toml: it printed
-# "Wrote config file fly.toml" on the run that first deployed this app, and
-# the rewritten file then failed the checks that had passed minutes earlier
-# against a document which no longer existed. What launch adds is exactly
-# what this book cannot have — it reads the Dockerfile EXPOSE and offers an
-# [http_service], which drags in auto_stop, and a machine stopped while
-# holding a hedge leaves a client unhedged. apps create writes nothing.
-say "3/7  the app"
-if "$FLY" status --app "$APP" >/dev/null 2>&1; then
-  echo "app $APP already exists"
-else
-  "$FLY" apps create "$APP" --org "${FLY_ORG:-personal}" --yes
-fi
-
-# fly.toml is checked AGAIN here, belt and braces. `fly launch` REWRITES it —
-# the run that produced this line. The check in step 2 was therefore a check of
-# a document that no longer exists. If launch dropped `strategy = immediate`,
-# or added an [http_service] with auto_stop, the machine could run two books or
-# be stopped while holding a hedge. So the same check runs again, and this time
-# a failure stops the deploy.
-say "3b/7  the config again, belt and braces"
-if ! python3 tools/fly_stack.py --check; then
-  echo >&2
-  echo "STOP: fly.toml no longer passes the checks above. Something" >&2
-  echo "      rewrote it; fly launch is the usual culprit." >&2
-  echo "      checks above. Nothing has been deployed. Restore it with" >&2
-  echo "          python3 tools/fly_stack.py --render" >&2
-  echo "      and re-run this script." >&2
-  exit 1
-fi
-
-say "4/7  the volume (the ledger lives here; losing it means a human looks)"
-if "$FLY" volumes list --app "$APP" 2>/dev/null | grep -q "$VOLUME"; then
-  echo "volume $VOLUME already exists"
-else
-  "$FLY" volumes create "$VOLUME" --app "$APP" --region "$REGION" --size 1 --yes
-fi
-
-say "5/7  the outbound IP — this is the address you pin the API key to"
-if "$FLY" ips list --app "$APP" 2>/dev/null | grep -qi egress; then
-  echo "an egress IP is already allocated"
-else
-  if ! "$FLY" ips allocate-egress --app "$APP" --region "$REGION" --yes; then
-    cat >&2 <<'PINNING'
-
-  NO STATIC EGRESS IP. Fly disables this for trial organisations until a card
-  is on file. That is a real constraint, not a failure of this script, and it
-  has one consequence: THE API KEY CANNOT BE IP-PINNED.
-
-  For BYBIT_VENUE=demo that is an accepted risk and it is written down in
-  INVENTORY: no real money, no withdrawal rights, simulated matching, and a
-  key that is useless anywhere but the demo venue.
-
-  For MAINNET it is not acceptable and this script refuses mainnet anyway.
-  Before real money: add a card, allocate the egress IP, and pin the key to
-  it — that rule has not moved.
-
-PINNING
-  fi
-fi
-"$FLY" ips list --app "$APP" || true
-
-say "6/7  secrets"
-if "$FLY" secrets list --app "$APP" 2>/dev/null | grep -q BYBIT_API_KEY; then
-  echo "BYBIT_API_KEY is already set"
-else
-  echo "Set them now, from the key you pinned to the IPv4 above:"
-  echo "    fly secrets set --app $APP BYBIT_API_KEY=... BYBIT_API_SECRET=..."
-  echo
-  read -r -p "press enter once they are set (or ctrl-c to stop) "
-fi
-"$FLY" secrets set --app "$APP" BYBIT_VENUE="$VENUE" --stage >/dev/null
-echo "BYBIT_VENUE staged as $VENUE"
-
-say "7/7  deploy — immediate, because two machines is two hedges"
-"$FLY" deploy --app "$APP" --strategy immediate
-
-cat <<NEXT
-
-==============================================================================
-  The book is running and it will not send an order: PAPER_TRADING=1 and the
-  promotion gate is unsigned. Nothing below is armed.
-
-  see it                flyctl logs --app $APP
-  the four invariants   flyctl ssh console --app $APP -C "python3 tools/session_tail.py"
-  the preflight drill   flyctl ssh console --app $APP -C "python3 tools/drill.py"
-  owner policy inputs   flyctl ssh console --app $APP -C "python3 tools/owner_policy_check.py"
-                        (read-only; exit 0 only when the evidence inputs are set; it suggests no value)
-  execution samples     flyctl ssh console --app $APP -C "python3 tools/execution_samples_report.py --db /app/state/trading_state.db --environment <testnet|mainnet> --mode overlay --notional-usd N"
-                        (read-only; how many real fills per leg, and how many more the entry gate needs)
-NEXT
-
-if [ "$VENUE" = "demo" ]; then cat <<NEXT
-  fund the wallet       flyctl ssh console --app $APP -C "python3 tools/fund_demo.py --btc 1 --usdt 10000"
-                        (demo funds itself by API; testnet needs the web faucet)
-NEXT
-fi
-
-if ! command -v flyctl >/dev/null 2>&1; then cat <<'PATHNOTE'
-
-  NOTE: flyctl was installed into this script's PATH but not your shell's.
-  Before running anything below:
-
-      export PATH="$HOME/.fly/bin:$PATH"      # or: source ~/.bashrc
-
-PATHNOTE
-fi
-
-cat <<NEXT
-
-  ARMING, when the preflight is clean and the wallet has BTC in it. Two
-  deliberate commands, in this order, and neither is mainnet:
-
-      "$FLY" secrets set --app $APP PAPER_TRADING=0
-      "$FLY" ssh console --app $APP -C "python3 tools/drill.py --arm --out artifacts/drill.json"
-
-  The transcript that writes is the Phase D evidence.
-==============================================================================
-NEXT
+cat >&2 <<'RETIRED'
+REFUSED: scripts/deploy.sh is retired and deploys nothing.
+         carry-book is stopped and stays stopped. Mainnet is out of scope.
+         Read the "Operating topology" block at the top of bot/RUNBOOKS.md.
+RETIRED
+exit 2

@@ -2043,3 +2043,50 @@ def test_a_grant_created_in_the_future_is_refused(tmp_path):
     assert out is None and "GRANT_FROM_THE_FUTURE" in why
     out2, why2 = write(now - day, now + 29 * day)
     assert out2 is not None and not why2                                   # control: an ordinary grant is unchanged
+
+
+# ------------------------------------------------------------------------------------------------ Round 21: the read-only entry points reach no executor write method
+def _calls_in(path, func_names):
+    import ast
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    found, seen = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in func_names:
+            seen.add(node.name)
+            for c in ast.walk(node):
+                if isinstance(c, ast.Call):
+                    f = c.func
+                    found.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+    return found, seen
+
+
+EXECUTOR_WRITE_METHODS = {"send_order", "cancel_order", "set_leverage", "halt", "unhalt", "execute", "cmd_execute", "run_session", "create_order", "place_order", "amend_order", "cancel_all", "reconcile", "unwind",
+                          "exec_lease_acquire", "exec_lease_renew", "acquire", "renew", "write_grant", "cmd_grant", "save_record"}
+
+
+def test_the_read_only_decision_and_its_funding_read_reach_no_executor_write_method():
+    """REVIEWED (Round 21): `evaluate` is documented as read-only (public GETs and two signed fee-rate GETs, no lease, no authority, no state directory). This pins it structurally: the functions that make up
+    that path may not call an order, leverage, halt, lease or grant-writing method. (`status` separately creates the empty private state directory; that is documented and sends nothing.)"""
+    path = os.path.join(os.path.dirname(HERE), "tools", "ms_testnet_autopilot.py")
+    found, seen = _calls_in(path, {"evaluate_readonly", "fetch_funding", "_executor"})
+    assert seen == {"evaluate_readonly", "fetch_funding", "_executor"}, seen
+    assert not (found & EXECUTOR_WRITE_METHODS), sorted(found & EXECUTOR_WRITE_METHODS)
+
+
+def test_the_preflight_venue_reads_reach_no_executor_write_method():
+    path = os.path.join(os.path.dirname(HERE), "tools", "ms_testnet_session.py")
+    found, seen = _calls_in(path, {"_preflight_reads"})
+    assert seen == {"_preflight_reads"}, seen
+    assert not (found & EXECUTOR_WRITE_METHODS), sorted(found & EXECUTOR_WRITE_METHODS)
+
+
+def test_the_write_method_guard_can_fail():
+    """A mutant: a function that calls send_order must be caught by the same walker."""
+    import ast
+    import tempfile
+    src = "def evaluate_readonly(x):\n    return x.executor.send_order(1)\n"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.py")
+        open(p, "w").write(src)
+        found, seen = _calls_in(p, {"evaluate_readonly"})
+    assert seen == {"evaluate_readonly"} and "send_order" in found and found & EXECUTOR_WRITE_METHODS

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# READ-ONLY check of the deployed testnet drill runner (Fly app carry-drill).
+# READ-ONLY check of the deployed drill machine (Fly app carry-drill): its role is the read-only recorder and monitor.
 #
 # It deploys nothing, starts nothing, stops nothing and sends no order. It reads
 # `fly` listings, asks the machine to fetch the public testnet time endpoint,
@@ -34,10 +34,25 @@ echo "drill_runs volumes: $v"
 [ "$v" = "1" ] || fail "expected exactly 1 drill_runs volume, found $v"
 
 echo "== secrets (names only)"
+# Names only, never values, and a name never says which account a key reaches. The dedicated Testnet
+# credential names are BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET. The generic BYBIT_API_KEY /
+# BYBIT_API_SECRET on the 2026-11-05 machine are NOT Testnet credentials in this repository: they are
+# reported, with a warning, and they are never accepted as the dedicated pair.
 secrets="$($FLY secrets list -a "$APP" 2>&1)"
-for k in BYBIT_API_KEY BYBIT_API_SECRET; do
-  printf '%s\n' "$secrets" | grep -q "$k" || fail "$k is not set on $APP"
-done
+has() { printf '%s\n' "$secrets" | grep -qw "$1"; }
+if has BYBIT_TESTNET_API_KEY && has BYBIT_TESTNET_API_SECRET; then
+  echo "dedicated Testnet credential names: present"
+elif has BYBIT_TESTNET_API_KEY || has BYBIT_TESTNET_API_SECRET; then
+  fail "only half of the dedicated Testnet pair (BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET) is set on $APP"
+elif has BYBIT_API_KEY && has BYBIT_API_SECRET; then
+  echo "dedicated Testnet credential names (BYBIT_TESTNET_API_KEY / BYBIT_TESTNET_API_SECRET): not present"
+  echo "WARNING: generic BYBIT_API_KEY / BYBIT_API_SECRET names are present. They are not Testnet credentials in this repository,"
+  echo "         and the names do not say which account they reach. Treat this app as a READ-ONLY recorder and monitor."
+elif has BYBIT_API_KEY || has BYBIT_API_SECRET; then
+  fail "only half of the generic pair (BYBIT_API_KEY / BYBIT_API_SECRET) is set on $APP"
+else
+  fail "no Bybit credential name is set on $APP (a read-only recorder needs none, but the monitor's venue reads do)"
+fi
 
 echo "== can the machine reach the testnet?"
 reach="$($FLY ssh console -a "$APP" -C "python3 -c \"import urllib.request as u,urllib.error as e

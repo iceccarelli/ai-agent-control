@@ -36,7 +36,7 @@ Both are refused by `check()`, not by a comment.
 
     python3 tools/fly_stack.py --check      # the committed fly.toml
     python3 tools/fly_stack.py --render     # write bot/fly.toml
-    python3 tools/fly_stack.py --commands   # the exact deploy sequence
+    python3 tools/fly_stack.py --commands   # RETIRED: prints a notice, never a deploy command
 """
 from __future__ import annotations
 
@@ -422,53 +422,20 @@ HEADER = """\
 """
 
 COMMANDS = """\
-# ---------------------------------------------------------------- Phase D --
-# PRINTED, NEVER RUN, by this tool. Everything below is run ONCE, by a human, from
-# the repo's bot/ directory. Nothing here trades: the image ships PAPER_TRADING=1 and
-# the promotion gate is unsigned, so the carry broker refuses every order until
-# both change. Each step has a side effect on a real Fly account; read the whole
-# list before running the first.
-
-cd bot
-
-# 0. confirm the generated config is the committed one (read-only).
-python3 tools/fly_stack.py --check
-
-# 1. the app and the disk. `fly launch` is NOT used: it rewrites fly.toml (it did,
-#    once: 0050). The app is created empty and the committed fly.toml is used as is.
-fly apps create carry-book
-fly volumes create carry_state --app carry-book --region fra --size 1 --yes
-
-# 2. THE OUTBOUND IP. Bybit keys are pinned to an address. Fly's egress-IP command
-#    and its scope (app-wide or per machine) have changed between flyctl releases:
-#    read `fly ips allocate-egress --help` and the current Fly docs FIRST, confirm
-#    the scope covers a machine recreated by a deploy, and only then run it.
-#    It bills monthly. The address you pin the exchange key to must be the one
-#    `fly ips list --app carry-book` shows afterwards.
-
-# 3. credentials, encrypted, injected at runtime, never in a layer or a file. Use a
-#    key with the LEAST permission the next step needs (read-only for a qualification
-#    read) and an IP allowlist containing only the address from step 2.
-fly secrets set --app carry-book BYBIT_API_KEY=... BYBIT_API_SECRET=...
-
-# 4. deploy ONE machine. --strategy immediate is also in fly.toml; --ha=false stops
-#    Fly creating a second machine, and two machines is two books.
-fly deploy --app carry-book --strategy immediate --ha=false \
-    --build-arg BUILD_COMMIT=$(git rev-parse HEAD)   # shown in /health for drift checks
-fly logs --app carry-book
-
-# 5. CAN THIS MACHINE REACH THE VENUE? The question a drill has to answer
-#    before it can mean anything. Read-only; places nothing.
-fly ssh console --app carry-book -C "python3 tools/connector_check.py --require-bybit-testnet"
-
-# 6. the four invariants, printed from inside the running image.
-fly ssh console --app carry-book -C "python3 tools/session_tail.py"
-
-# 7. NOT HERE. This app (carry-book) stays PAPER_TRADING=1 and USE_TESTNET=1. A
-#    testnet drill that sends orders is a different app (carry-drill, fly.drill.toml)
-#    and needs the owner's explicit, separate authorisation; the printed commands
-#    for it come from tools/drill.py, not from this file. Mainnet needs live
-#    authorisation AND a signed promotion gate, and the gate is not signed.
+# RETIRED (Round 21). This tool no longer prints a deploy sequence.
+#
+# The sequence it used to print created the legacy `carry-book` app, set the generic
+# BYBIT_API_KEY / BYBIT_API_SECRET and deployed a machine. `carry-book` is stopped and
+# stays stopped: no document authorises starting, redeploying or resizing it, and the
+# generic key names are not Testnet credentials in this repository.
+#
+# What may run where, and what an owner must do first, is the "Operating topology" block
+# in bot/RUNBOOKS.md (byte-identical in bot/README.md and docs/MONEY_MISSION.md). The
+# only deploy checklist that exists is RUNBOOKS "Fly autopilot: owner procedure"; it is
+# NOT an approval, and no agent runs it.
+#
+# What this tool still does, read-only: `--check` verifies the committed bot/fly.toml and
+# the build context; `--render` regenerates bot/fly.toml (a local file).
 """
 
 

@@ -1,4 +1,4 @@
-# Proposed Testnet qualification session (Round 19, 2026-11-13) — NOT SUBMITTED, NOT AUTHORISED
+# Proposed Testnet qualification session (Round 19, 2026-11-13; prerequisites restated Round 21, 2026-11-14) — NOT SUBMITTED, NOT AUTHORISED
 
 **Status: a proposal for the owner's decision. No grant, capability, lease, credential or order was created, copied, read or placed by the agent that wrote this. No approval means no order.**
 Testnet is fake money. A Testnet result is never owner profit and never evidence of Mainnet expectancy (`CLAUDE.md`). Mainnet stays disabled.
@@ -50,13 +50,37 @@ It **cannot** establish: an edge, the owner's opportunity cost, Mainnet tiered c
 
 Each step is owner-only because it creates authority or starts an order-capable process.
 
+**Prerequisite 0 (Round 21): the executor does not exist yet.** The owner reports (2026-11-14) that the Fly apps are `carry-drill` (read-only recorder and monitor; its 2026-11-05 image predates the lease guard and must not run its conformance path) and a stopped `carry-book`; `carry-autopilot` and `carry-research` do not exist. The `fly ... -a carry-autopilot` commands in steps 2 and 4 therefore cannot run as written until the owner has created and deployed that app from the merged commit by RUNBOOKS "Fly autopilot: owner procedure" (image comparison first, `fly.autopilot.toml`, the Supabase migrations and `carry` schema exposure, the lease secrets). Creating it is itself an owner decision, separate from this session, and is not requested here.
+
+**Read-only readiness the agent can and cannot establish (Round 21).** Without a capability, `ms_testnet_session.py preflight` stops after its four local checks and makes no venue read, so the user-id basis, key permissions, account mode, one-way mode, wallet balance (at least 500 USDT), instrument filters and flat / no-open-orders facts are provable only AFTER the owner creates the capability (step 2). `ms_testnet_autopilot.py evaluate` needs only the dedicated Testnet credentials and reads the account fee tier, instrument filters and books. Both are listed with their effects in RUNBOOKS "Testnet readiness checklist (Round 21)". Until they have been run and read, the venue facts are UNKNOWN, not assumed.
+
 1. **Decide** whether to allow a mechanics session at all. It costs about $0.5 of fake money and buys the first measured fills, fees and margin facts. Not doing it leaves execution cost unmeasured and every research number modelled.
-2. **Provide the capability and grant** (typed by you; the repository never creates, copies or renews them). The capability file is RUNBOOKS autopilot step 4 (it holds your manifest, no key). The grant is step 5: `fly ssh console -a carry-autopilot`, then `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 5 --days 1 --allow-mechanics-sessions` (RUNBOOKS autopilot section, step 5). *What it changes:* writes `~/.ai-agent-control/ms_autopilot_grant.json` (0600, expiring, bound to the manifest). *Reversible:* delete the file or let it expire; `drain` before any deploy.
+2. **Provide the capability and grant** on the selected executor once prerequisite 0 is done (typed by you; the repository never creates, copies or renews them). The capability file is RUNBOOKS autopilot step 4 (it holds your manifest, no key). The grant is step 5: `fly ssh console -a carry-autopilot` (the app of prerequisite 0), then `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 5 --days 1 --allow-mechanics-sessions` (RUNBOOKS autopilot section, step 5). *What it changes:* writes `~/.ai-agent-control/ms_autopilot_grant.json` (0600, expiring, bound to the manifest). *Reversible:* delete the file or let it expire; `drain` before any deploy.
 3. **Confirm the shared lease and the single executor:** `carry-book` stays stopped and `CARRY_DRILL_ENABLED` stays unset; the deployed 2026-11-05 `carry-drill` image predates the lease guard and must not run its conformance path.
-4. **Start** the autopilot only after 2 and 3 (`fly machine start`, per RUNBOOKS). *Risk:* fake-money loss of about $5.55 or a little more (the limit is a trigger, not a cap); an unhandled fault leaves a Testnet hedge that the engine's startup recovery proves flat or alerts on.
+4. **Start** the autopilot only after 0, 2 and 3 (per RUNBOOKS; there is no machine to start until prerequisite 0 exists). *Risk:* fake-money loss of about $5.55 or a little more (the limit is a trigger, not a cap); an unhandled fault leaves a Testnet hedge that the engine's startup recovery proves flat or alerts on.
 5. Read the verification list above and send back `reconciliation.json` and the `__wallet_facts__` samples.
 
 **I am not asking for approval to place any order; I am asking whether you want this session proposed again as an explicit request. Until you say so in your own words, nothing runs.**
+
+## The exact approval request (Round 21; NOT SUBMITTED; to be put to the owner only after the readiness checklist in RUNBOOKS is proven)
+
+Prerequisites that are NOT yet true, so this request is not sent today: the autopilot app does not exist (prerequisite 0 above), the Supabase lease objects have not been read back, no capability file exists, `capital --anchor-init` has not been run, and no venue fact (fee tier, wallet, one-way mode, flat) has been read by anyone. When they have, the request below is the one to present, in these words, for the owner to answer in their own.
+
+> **Request: one bounded Bybit TESTNET mechanics session. Nothing runs unless you answer yes in your own words.**
+>
+> *What it is.* Fake Testnet money. A plumbing measurement: fills, fees by currency, maker/taker flags, committed margin, borrow and interest while hedged, funding settlement rows, a venue-confirmed flat. It is not income and not evidence of Mainnet expectancy. Mainnet stays disabled and this request does not touch it.
+>
+> *Expected result.* A small LOSS of about $0.31 to $0.50 (a 31.4 bps modelled round trip on $100 per leg, plus basis, with funding of either sign). It buys the first measured costs. It does not establish an edge, and the economic verdict stays NO WINNER.
+>
+> *Limits (from the code).* Venue: Bybit Testnet only (`venues.py` registry). Credentials: `BYBIT_TESTNET_API_KEY` and `BYBIT_TESTNET_API_SECRET` only. Instrument: BTCUSDT spot Buy + BTCUSDT linear perpetual Sell, leverage 1. Notional $100 per leg (`MECHANICS_CAP_USD`; the plan refuses below $20); committed capital about $204 (2.04x); aggregate ceiling $500; at most 4 entries per UTC day; the grant caps it at 1 session. Hold at most 1500 s in the grant (hard cap 3300 s); the hedge is held 120 s past settlement and entry needs at least 90 s before it; the session lifecycle is one hour; the grant is valid 1 day (maximum 30). Capital stops also apply: entries stop after 4 consecutive losses, a drawdown stop at $11.10 and a lifetime stop at $22.20. Mechanics sessions run only if the grant says `--allow-mechanics-sessions` and funding is not negative.
+>
+> *Loss trigger.* $5.55 (`MAX_LOSS_CEILING_USD`) is a TRIGGER, not a cap: when equity falls by that much the session ends as LOSS_LIMIT and unwinds reduce-only, so the realised loss can exceed it by the unwind's own slippage and fees. The theoretical exposure is the $100 long spot and the $100 short perp.
+>
+> *Stop conditions (any one ends it; the agent overrides none).* LOSS_LIMIT; lifecycle exceeded; lease lost or unprovable; kill switch engaged; a leg refused or unhedged beyond tolerance; NOT_FLAT at the end (a failed wallet, position or order read ends as NOT_FLAT, never inferred flat); grant or capability expired, revoked or future-dated; an ALERT marker. If the executor stops with a short open, `tools/close_testnet_short.py` (takes the single-writer guard; `--arm` is yours) or `reconcile --unwind` (yours).
+>
+> *What YOU create yourself (the agent will not, and cannot).* (a) deploy the autopilot app from the merged commit (it does not exist today), confirm `carry-book` stays stopped and `CARRY_DRILL_ENABLED` unset; (b) the owner capability file (RUNBOOKS, "Testnet execution: owner procedure" step 4; it holds your manifest, no key); (c) the dedicated Testnet credentials as secrets; (d) one interactive `capital --anchor-init`; (e) the grant, typed by you on the selected executor: `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 5 --days 1 --allow-mechanics-sessions`; (f) starting the process, and afterwards sending back `reconciliation.json` and the `__wallet_facts__` samples.
+>
+> *Reversible by* deleting the grant, letting it expire, or `drain`. If you do not answer, nothing runs.
 
 ## Not part of this proposal
 

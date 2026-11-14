@@ -49,6 +49,7 @@ def _copied_tools():
 
 
 def _tools_the_script_promises():
+    # Round 21: scripts/deploy.sh is a refusing tombstone and promises no tool; the helper stays so a revived script is held to the same rule.
     path = os.path.join(REPO, "scripts", "deploy.sh")
     text = open(path, encoding="utf-8").read()
     named = set(re.findall(r"tools/[a-z_0-9]+\.py", text))

@@ -343,7 +343,7 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                 # the headline is the EXCESS over cash on the capital tied up (the like-for-like USD-risk alternative), never the notional figure that charges no capital
                 bx = max(with_cash, key=lambda p: p["mean_excess_over_cash_bps_of_capital"])
                 net = bx["mean_excess_over_cash_bps_of_capital"]
-                net_basis = (f"{CORPUS_LABEL}: best policy {bx['policy']}: EXCESS over cash on 1.16x capital (OKX USDT lending, a lender's floor, not the owner's cost) after taker + ASSUMED spread "
+                net_basis = (f"{CORPUS_LABEL}: best policy {bx['policy']}: EXCESS over cash on {OM.CAPITAL_PER_NOTIONAL:.2f}x capital (OKX USDT lending, a lender's floor, not the owner's cost) after taker + ASSUMED spread "
                              f"(11.4 bps round trip); the nominal best is {nominal:.1f} bps of NOTIONAL at ZERO capital cost; in-sample, regime dependent")
                 extra["nominal_net_bps_zero_capital_cost"] = nominal
             else:

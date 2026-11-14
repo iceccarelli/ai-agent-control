@@ -418,3 +418,12 @@ def test_every_action_is_pinned_by_sha_and_every_workflow_is_read_only():
         assert re.search(r"^permissions:\n  contents: read\n", body, re.M), name
     for name in ("carry-verify.yml", "security.yml"):
         assert "secrets." not in open(os.path.join(wf_dir, name), encoding="utf-8").read().lower(), name
+
+
+def test_the_python_compat_workflow_covers_the_newest_interpreters_and_the_help_string_proof():
+    """Round 21: Python 3.14 refuses a literal `%` in an argparse help string when the parser is BUILT, which broke the owner's `ms_testnet_autopilot.py status` while every 3.11/3.12 job was green."""
+    body = open(os.path.join(REPO, ".github", "workflows", "python-compat.yml"), encoding="utf-8").read()
+    assert 'python: ["3.13", "3.14"]' in body
+    assert "tests/test_cli_help_strings.py" in body and "tests/test_docs_topology_guard.py" in body
+    assert "secrets." not in body.lower() and "BYBIT" not in body and "LIVE_TRADING_ACK" not in body
+    assert re.search(r"^permissions:\n  contents: read\n", body, re.M)

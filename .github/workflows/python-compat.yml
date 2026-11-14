@@ -1,0 +1,65 @@
+# Forward-compatibility smoke on the NEWEST Python interpreters.
+#
+# Production stays on Python 3.11 and carry-verify runs the whole suite on 3.11 and 3.12. This workflow exists
+# because Python 3.14 validates argparse help strings when a parser is BUILT (a literal `%` in a help string is a
+# ValueError at add_argument time; on 3.11 to 3.13 it only fails when --help is printed), so an owner on a newer
+# interpreter could not run `ms_testnet_autopilot.py status` although every CI job was green. It runs the tests that
+# prove every shipped CLI builds and prints its help, the documentation guard, and an import smoke, on 3.13 and 3.14.
+# It is NOT the full suite and does not replace carry-verify.
+#
+# NO CREDENTIALS, NO TRADING: no secret is read, no exchange is contacted, nothing can place an order.
+name: python-compat
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-compat-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  newest-python:
+    name: CLI help, docs guard and imports on Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -c constraints.txt pytest
+
+      - name: Every shipped CLI builds its parser and prints its help
+        run: python -m pytest -q -p no:cacheprovider tests/test_cli_help_strings.py
+
+      - name: Every argparse script under bot/ prints its help (the sweep; must run, not skip)
+        env:
+          HELP_SWEEP: "1"
+        run: |
+          python -m pytest -q -p no:cacheprovider -rs tests/test_cli_help_strings.py -k every_argparse_script | tee "$RUNNER_TEMP/sweep.txt"
+          grep -Eq "(^| )1 passed" "$RUNNER_TEMP/sweep.txt"
+
+      - name: The documentation guard and the recorder forensics parser
+        run: python -m pytest -q -p no:cacheprovider tests/test_docs_topology_guard.py tests/test_recorder_forensics.py
+
+      - name: The owner-facing read-only commands start
+        run: |
+          python tools/ms_testnet_autopilot.py --help > /dev/null
+          python tools/owner_ledger.py --help > /dev/null
+          python tools/recorder_forensics.py commands > /dev/null

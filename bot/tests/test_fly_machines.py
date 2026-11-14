@@ -142,10 +142,30 @@ def test_the_script_fails_when_the_testnet_is_blocked(tmp_path):
     assert r.returncode == 1 and "not reachable" in r.stdout
 
 
-def test_the_script_fails_when_a_secret_name_is_missing(tmp_path):
-    r = _run(tmp_path, machines=MACHINE_LIST, volumes=VOLUMES_ONE,
-             secrets="BYBIT_API_KEY\n")
-    assert r.returncode == 1 and "BYBIT_API_SECRET is not set" in r.stdout
+def test_the_script_fails_when_no_credential_name_is_set(tmp_path):
+    r = _run(tmp_path, machines=MACHINE_LIST, volumes=VOLUMES_ONE, secrets="SOMETHING_ELSE\n")
+    assert r.returncode == 1 and "no Bybit credential name is set" in r.stdout
+
+
+def test_half_a_pair_fails_whichever_pair_it_is(tmp_path):
+    """REPRODUCED (review): the first Round 21 version let a lone generic name through with only a warning; the original script failed unless BOTH generic names were present."""
+    for secrets, msg in (("BYBIT_API_KEY\n", "only half of the generic pair"), ("BYBIT_API_SECRET\n", "only half of the generic pair"),
+                         ("BYBIT_TESTNET_API_KEY\n", "only half of the dedicated Testnet pair"), ("BYBIT_TESTNET_API_SECRET\nBYBIT_API_KEY\n", "only half of the dedicated Testnet pair")):
+        r = _run(tmp_path, machines=MACHINE_LIST, volumes=VOLUMES_ONE, secrets=secrets)
+        assert r.returncode == 1 and msg in r.stdout, (secrets, r.stdout)
+
+
+def test_generic_bybit_names_are_warned_about_and_never_accepted_as_the_dedicated_pair(tmp_path):
+    """CLAUDE.md: generic BYBIT_API_KEY / BYBIT_API_SECRET are not Testnet credentials. The 2026-11-05 machine
+    has them; the check reports and warns, and never says the dedicated pair is present."""
+    r = _run(tmp_path, machines=MACHINE_LIST, volumes=VOLUMES_ONE)             # the fixture's default: the generic pair only
+    assert "dedicated Testnet credential names: present" not in r.stdout
+    assert "WARNING: generic BYBIT_API_KEY / BYBIT_API_SECRET names are present" in r.stdout and "not Testnet credentials" in r.stdout
+
+
+def test_the_dedicated_pair_is_recognised_without_a_warning(tmp_path):
+    r = _run(tmp_path, machines=MACHINE_LIST, volumes=VOLUMES_ONE, secrets="BYBIT_TESTNET_API_KEY\nBYBIT_TESTNET_API_SECRET\n")
+    assert "dedicated Testnet credential names: present" in r.stdout and "WARNING" not in r.stdout
 
 
 def test_the_script_is_read_only():

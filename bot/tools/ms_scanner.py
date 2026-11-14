@@ -40,6 +40,7 @@ for _p in (BOT, os.path.join(BOT, "tools")):
         sys.path.insert(0, _p)
 
 import carry_costs as CC  # noqa: E402
+import economic_model as EM  # noqa: E402
 import ms_types as T  # noqa: E402
 from ms_types import BookLevel, CostLine, Instrument, MarketSnapshot, Opportunity, dec, funding_bps_per_day, round_down_to_step, weakest  # noqa: E402
 
@@ -51,11 +52,12 @@ EXCLUSIONS = (
     "NO_SPOT_MARK", "BASIS_TOO_WIDE", "VOL_UNKNOWN", "FINANCING_UNKNOWN", "NET_BELOW_MIN", "NET_UNKNOWN", "FUNDING_NOT_POSITIVE", "NO_PAIR")
 DEFAULT_PARAMS: Dict[str, Any] = {
     "hold_days": 7.0, "formation_days": 3.0, "min_prints": 3, "notional_usd": 10_000.0, "max_book_age_ms": 5_000, "max_snapshot_age_ms": 60_000, "max_spread_bps": 10.0,
-    "min_turnover24h_usd": None, "min_open_interest_usd": None, "min_net_bps": 0.0, "persistence": 0.5, "margin_frac": 0.2, "oi_participation": 0.01, "risk_floor_bps": 1.0,
+    "min_turnover24h_usd": None, "min_open_interest_usd": None, "min_net_bps": 0.0, "persistence": 0.5, "leverage": 1, "oi_participation": 0.01, "risk_floor_bps": 1.0,
     "spot_slippage_bps_per_leg": 1.0, "basis_floor_bps": 2.0, "max_entry_basis_bps": 50.0, "opportunity_cost_apr": None, "p_missed_fill": 0.25,
     "top_k": 3, "price_vol_bps_per_day": {}, "pair_corr": 0.0,
 }
 KINDS = T.OPP_KINDS
+MAX_LEVERAGE = 100                  # the highest linear-perp leverage a venue offers: an absurd leverage would price a perp-only book at almost no capital and inflate its rank
 STYLES = ("TAKER", "MAKER_FIRST")
 CAP_PROV = "MODELLED"
 
@@ -72,10 +74,13 @@ def _params(params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         p[k] = v
     if isinstance(p["persistence"], (int, float)) and not isinstance(p["persistence"], bool) and p["persistence"] > 1.0:
         raise ScanError("persistence is a haircut in (0, 1]: trailing funding cannot be assumed to grow over the hold")
-    for k in ("hold_days", "formation_days", "notional_usd", "max_spread_bps", "margin_frac", "oi_participation", "risk_floor_bps", "persistence"):
+    for k in ("hold_days", "formation_days", "notional_usd", "max_spread_bps", "oi_participation", "risk_floor_bps", "persistence"):
         v = p[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise ScanError(f"parameter {k} must be a positive finite number")
+    lev = p["leverage"]
+    if isinstance(lev, bool) or not isinstance(lev, int) or not 1 <= lev <= MAX_LEVERAGE:
+        raise ScanError(f"leverage must be a whole number in [1, {MAX_LEVERAGE}]: the leverage the executed structure would use (the autopilot's is 1); it sets the committed capital through economic_model, never a research constant")
     if not isinstance(p["min_prints"], int) or p["min_prints"] < 1 or not isinstance(p["top_k"], int) or p["top_k"] < 1:
         raise ScanError("min_prints and top_k must be positive integers")
     if not 0.0 <= float(p["p_missed_fill"]) <= 1.0 or not -1.0 <= float(p["pair_corr"]) <= 1.0:
@@ -266,11 +271,19 @@ def _rules_exclusions(inst: Instrument, snap: MarketSnapshot, notional_usd: floa
 
 
 # ---------------------------------------------------------------- one candidate (single leg book or pair)
-def committed_capital_factor(kind: str, margin_frac: float) -> float:
-    """Capital committed per unit of position notional on the scanner's own basis: the spot leg paid in full plus perp margin for a carry, perp margin alone for a perp-only kind.
-    The ranking denominator, the financing charge here and the pipeline's realised cost of capital all use this one function, so they cannot drift apart."""
-    m = float(margin_frac)
-    return (1.0 + m) if kind == "SPOT_PERP_CARRY" else m
+def committed_capital_factor(kind: str, leverage: Any = 1) -> float:
+    """Cash committed per unit of position notional, from the ONE definition per structure in ``economic_model`` (Round 21; it was a research constant, ``margin_frac`` 0.2, which charged 1.2x for a
+    carry and 0.2x for a perp-only book while the executable structures commit 2.04x and 1.02x at leverage 1). A carry is the ACQUIRED spot + perp structure (the spot leg paid in full + the perp margin + the
+    plan's buffer); a spread or directional book is PERP_ONLY (margin + buffer). The ranking denominator, the financing charge here and the pipeline's realised cost of capital all use this one function."""
+    if kind not in KINDS:
+        raise ScanError(f"unknown opportunity kind {kind!r}: one of {KINDS}")
+    if isinstance(leverage, bool) or not isinstance(leverage, int) or not 1 <= leverage <= MAX_LEVERAGE:
+        raise ScanError(f"leverage must be a whole number in [1, {MAX_LEVERAGE}]")
+    structure = EM.ACQUIRED_SPOT_PERP if kind == "SPOT_PERP_CARRY" else EM.PERP_ONLY
+    try:
+        return float(EM.structure_capital_usd(structure, 1, leverage).value)
+    except EM.EconomicModelError as exc:                                  # never an unhandled error out of a scan
+        raise ScanError(f"the committed-capital registry refused leverage {leverage}: {exc}") from None
 
 
 def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, MarketSnapshot, str]], f_leg_day: Sequence[Dict[str, float]], candidate_id: str, spec_digest: str,
@@ -282,8 +295,7 @@ def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, Marke
     costs: List[CostLine] = []
     n_legs = len(legs_inst)
     w = 1.0 / n_legs if kind == "PERP_FUNDING_SPREAD" else 1.0
-    margin = float(p["margin_frac"])
-    capital_factor = committed_capital_factor(kind, margin)          # committed capital per unit of position notional: the SAME factor rank_score divides by
+    capital_factor = committed_capital_factor(kind, p["leverage"])    # committed capital per unit of position notional: the registry's, and the SAME factor rank_score divides by
     # --- funding (interval-normalised, per unit of position notional)
     funding_day = 0.0
     for (inst, snap, side), f in zip(legs_inst, f_leg_day):
@@ -322,8 +334,8 @@ def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, Marke
                        "not zero (state it, a stated 0 is a statement)")
     else:
         costs.append(CostLine("financing", float(apr) / 365.0 * 1e4 * hold * capital_factor, "MODELLED"))
-        reasons.append(f"financing = the STATED alternative return {float(apr):.4%}/yr on {capital_factor:.2f}x committed capital per unit of notional (the ranking's own capital factor; margin_frac "
-                       f"{margin} is a research assumption, 5x: the autopilot's executed structure commits 2.04x at leverage 1) over the {hold:g}-day hold: MODELLED (a stated parameter, not an observation)")
+        reasons.append(f"financing = the STATED alternative return {float(apr):.4%}/yr on {capital_factor:.2f}x committed capital per unit of notional (economic_model's "
+                       f"{'ACQUIRED_SPOT_PERP' if kind == 'SPOT_PERP_CARRY' else 'PERP_ONLY'} structure at leverage {int(p['leverage'])}, the ranking's own capital factor) over the {hold:g}-day hold: MODELLED (a stated parameter, not an observation)")
     # --- known-cost edge before slippage -> capacity by depth walk
     pre = [c.bps for c in costs]
     edge_pre = None if any(x is None for x in pre) else funding_h - sum(pre)

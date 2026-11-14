@@ -1432,7 +1432,7 @@ def render(rep: Mapping[str, Any]) -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Local-only owner P&L ledger (no network, no orders, writes nothing).")
     ap.add_argument("--manifest", required=True)
-    ap.add_argument("--alternative-return-pct", type=float, default=None, help="your own alternative return, %/yr (a stated owner input)")
+    ap.add_argument("--alternative-return-pct", type=float, default=None, help="your own alternative return, %%/yr (a stated owner input)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     try:
