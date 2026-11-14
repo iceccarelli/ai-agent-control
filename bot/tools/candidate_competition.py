@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -200,6 +201,21 @@ def run_cross_sectional(data_root: Optional[str], universe_dir: Optional[str], l
     return {"status": "EVALUATED", "evaluation": out}
 
 
+def _real_number(x: Any) -> bool:
+    """A finite int or float that is not a bool: the only thing a figure in the ranked table may be made of (NaN made `max` order-dependent and the sort unstable; True read as 1.0)."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+#: a family's out-of-sample mean may be PRINTED as 'positive' in the ranked table only when it is also statistically distinguishable from noise at the evaluator's own alpha, on at least the repo's minimum
+#: out-of-sample observations; otherwise it is descriptive (Round 20, specialist E: a best-of-K mean with a Holm p of 0.95 on 3 observations headed the 'positive' tier).
+SIGNIFICANCE_ALPHA = 0.05
+
+
+def _family_significant(f: Mapping[str, Any]) -> bool:
+    p, n = f.get("p_adjusted"), f.get("oos_independent_observations")
+    return f.get("status") == "WALK_FORWARD_DONE" and _real_number(p) and p <= SIGNIFICANCE_ALPHA and _real_number(n) and n >= CR.MIN_PROMISING_OOS_OBS
+
+
 def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     if res["status"] != "EVALUATED":
         return {"verdict": "UNTESTED", "net_edge": None, "reasons": [res["reason"]], "families": {}, "evaluation": None, "survivorship": None, "holdout": None}
@@ -213,6 +229,7 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     for k, f in fams.items():
         verdicts.append(f["verdict"])
         oos = f.get("oos_mean_total_bps_per_row") if f.get("status") == "WALK_FORWARD_DONE" else None
+        oos = oos if _real_number(oos) else None
         desc = None
         if f.get("status") == "TOO_FEW_HOLDING_ROWS":
             ba = (f.get("descriptive_only") or {}).get("book_analytics") or {}
@@ -229,7 +246,7 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
                                                                  "oos_mean_cash_hurdle_bps_of_gross_per_row", "oos_independent_observations", "reason")} for lbl, b in (f.get("vs_cash") or {}).items()}}
         for lbl, b in (f.get("vs_cash") or {}).items():
             x = b.get("oos_mean_excess_bps_of_capital_per_row")
-            if x is not None:
+            if _real_number(x) and b.get("status") == "WALK_FORWARD_DONE":          # a block that did not complete a walk-forward, or holds a NaN / bool, never enters the headline
                 excess_by_basis.setdefault(lbl, []).append(x)
         if oos is not None and (best is None or oos > best):
             best = oos
@@ -252,7 +269,9 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
         basis = "EXCESS_OVER_CASH_BPS_OF_CAPITAL_PER_ROW (lowest over the cash sources applied: " + ", ".join(sorted(excess_by_basis)) + ")"
         if best is not None and best > 0 and net_edge <= 0:
             reasons.append(f"VS_CASH: the nominal out-of-sample mean is +{best:.1f} bps of gross notional per row but the excess over cash on the capital committed is {net_edge:+.1f} bps of capital per row")
-    return {"verdict": verdict, "net_edge": net_edge, "net_edge_basis": basis, "reasons": reasons, "families": fam_out, "evaluation": ev, "survivorship": ev.get("survivorship"),
+    net_edge = net_edge if _real_number(net_edge) else None
+    significant = any(_family_significant(f) for f in fams.values()) if net_edge is not None else None
+    return {"verdict": verdict, "net_edge": net_edge, "net_edge_basis": basis, "net_edge_significant": significant, "reasons": reasons, "families": fam_out, "evaluation": ev, "survivorship": ev.get("survivorship"),
             "holdout": dict(ho) if isinstance(ho, Mapping) else None}
 
 
@@ -262,7 +281,7 @@ def _tier(row: Mapping[str, Any]) -> int:
     if row["readiness_level"] in ("PROMISING", "PROSPECTIVE", "EXECUTION_READY", "OWNER_PROFIT_EVIDENCED"):
         return VERDICT_TIER["PROMISING"]
     ne = row["net_edge"]["value_bps"]
-    if v == "INSUFFICIENT_DATA" and ne is not None and ne > 0:
+    if v == "INSUFFICIENT_DATA" and _real_number(ne) and ne > 0 and row["net_edge"].get("significant") is not False:      # a positive mean that is NOT significant is descriptive, never the 'positive' tier
         return VERDICT_TIER["EVALUATED_POSITIVE"]
     return VERDICT_TIER[v]
 
@@ -360,7 +379,8 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
                                   "missing": [i["name"] for i in r["required_data"]["items"] if not (i["trusted"] and i["complete"])]},
                "point_in_time": r["point_in_time"]["value"], "universe_dir": r["universe_dir"]["status"], "universe_complete_for_claim": r["universe_complete_for_claim"],
                "mechanism_present": r["economic_mechanism"]["present"],
-               "net_edge": {"value_bps": net, "basis": net_basis, "required_to_break_even": r["edge_vs_costs"].get("breakeven_requirement")},
+               "net_edge": {"value_bps": net, "basis": net_basis, "required_to_break_even": r["edge_vs_costs"].get("breakeven_requirement"),
+                            "significant": (xs.get("net_edge_significant") if name == "cross_sectional_funding" else None)},
                "price_leg_hedge_risk_measured": r["price_leg_hedge_risk_measured"]["value"], "capacity_supported_by_depth": r["capacity_supported_by_depth"]["value"],
                "multiple_testing": mt, "oos_possible": r["oos_or_prospective_possible"]["value"],
                "executable_on_qualified_venue": {"value": r["executable_on_qualified_venues"]["value"], "executable": r["executable_on_qualified_venues"]["executable"],
@@ -382,7 +402,7 @@ def run_competition(*, data_root: Optional[str] = None, universe_dir: Optional[s
         if draft:
             row["rationale"] = DRAFT_RATIONALE.get(name, "")
         rows.append(row)
-    ranked = sorted((x for x in rows if x["origin"] != "RESEARCH_ONLY"), key=lambda x: (_tier(x), -(x["net_edge"]["value_bps"] if x["net_edge"]["value_bps"] is not None else -1e18), x["name"]))
+    ranked = sorted((x for x in rows if x["origin"] != "RESEARCH_ONLY"), key=lambda x: (_tier(x), -(x["net_edge"]["value_bps"] if _real_number(x["net_edge"]["value_bps"]) else -1e18), x["name"]))
     for i, x in enumerate(ranked, 1):
         x["rank"] = i
     for x in rows:

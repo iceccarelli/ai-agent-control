@@ -405,10 +405,14 @@ def build_plan(manifest: Mapping[str, Any], pre: Mapping[str, Any], *, symbol: s
     if notional > ceiling + 1e-9:
         raise ValueError("QTY_NOTIONAL_ABOVE_CEILING")
     usdt = pre.get("usdt")
-    if isinstance(usdt, (int, float)) and not isinstance(usdt, bool):          # the spot buy (notional) plus the perp initial margin (notional / leverage) plus a 2% buffer must fit in the USDT read
-        need = float(EM.hedged_pair_capital_usd(D(repr(notional)), max(1, leverage)).value)      # ONE definition of the capital a pair commits (economic_model); the allocator's margin cap reads the same
-        if need > float(usdt) + 1e-9:
-            raise ValueError(f"INSUFFICIENT_USDT_FOR_PLAN:need {need:.2f} have {float(usdt):.2f} (spot buy + perp margin at leverage {leverage} + 2%)")
+    if not (isinstance(usdt, (int, float)) and not isinstance(usdt, bool) and math.isfinite(usdt)):
+        # Round 20 (specialist C): this cash check is what justifies pricing the spot leg's borrow at a structural zero (ms_edge_gate: SPOT_LEG_PAID_FROM_USDT_CASH_NO_BORROW). It used to run only when the
+        # read happened to be numeric, so a missing or malformed USDT read skipped the very check the zero stands on. A plan with no proven cash is refused, never assumed funded.
+        raise ValueError("USDT_BALANCE_UNREAD: the preflight carried no numeric USDT balance, so the spot leg cannot be shown to be paid from cash (no borrow)")
+    # the spot buy (notional) plus the perp initial margin (notional / leverage) plus a 2% buffer must fit in the USDT read
+    need = float(EM.hedged_pair_capital_usd(D(repr(notional)), max(1, leverage)).value)      # ONE definition of the capital a pair commits (economic_model); the allocator's margin cap reads the same
+    if need > float(usdt) + 1e-9:
+        raise ValueError(f"INSUFFICIENT_USDT_FOR_PLAN:need {need:.2f} have {float(usdt):.2f} (spot buy + perp margin at leverage {leverage} + 2%)")
     for cat, f, ref in (("linear", lin, mark), ("spot", sp, D(str(mk["spot_ask"])))):
         if D(f["min_notional"]) > 0 and D(qty) * ref < D(f["min_notional"]):
             raise ValueError(f"{cat.upper()}_NOTIONAL_BELOW_MIN")
