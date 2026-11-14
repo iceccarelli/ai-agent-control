@@ -25,7 +25,7 @@ import ms_capital_anchor as AN  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
-from test_ms_testnet_autopilot import _profit_world, write_grant  # noqa: E402,F401
+from test_ms_testnet_autopilot import _session_world, write_grant  # noqa: E402,F401
 
 
 def posts(w):
@@ -63,7 +63,7 @@ def adopt_cash(w, cash):
 
 # ---------------------------------------------------------------------------------------------- a new account needs the owner, once
 def test_an_account_with_no_lineage_is_refused_without_an_order_or_an_alert_and_the_owner_can_initialise_it(w, capsys):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     res = session(w, eng)
     assert res["result"] == "REFUSED" and res["why"] == ["CAPITAL_ANCHOR_REFUSED:ACCOUNT_NOT_INITIALISED"], res
@@ -82,7 +82,7 @@ def test_an_account_with_no_lineage_is_refused_without_an_order_or_an_alert_and_
 
 
 def test_a_session_on_a_second_account_with_the_first_ones_root_is_refused(w):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     CT.anchored(str(eng))                                      # the root belongs to account 100000001
     w.fake.user_id = 100000002                                  # the credentials now belong to another account
@@ -93,7 +93,7 @@ def test_a_session_on_a_second_account_with_the_first_ones_root_is_refused(w):
 
 
 def test_a_venue_that_states_no_account_pauses_the_loop_with_the_reason_and_never_guesses(w):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     w.fake.user_id = None
     res = session(w, eng)
@@ -102,7 +102,7 @@ def test_a_venue_that_states_no_account_pauses_the_loop_with_the_reason_and_neve
 
 
 def test_the_owner_can_choose_the_key_id_as_the_identity_and_it_is_a_different_account_from_the_user_id(w):
-    _profit_world(w)
+    _session_world(w)
     w.fake.user_id = None
     w.env["CAPITAL_ACCOUNT_IDENTITY_FALLBACK"] = "KEY_ID"
     eng = w.tmp / "eng"
@@ -116,7 +116,7 @@ def test_the_owner_can_choose_the_key_id_as_the_identity_and_it_is_a_different_a
 # ---------------------------------------------------------------------------------------------- the reset attacks, through the loop
 @pytest.fixture
 def lost(w):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     book = CT.anchored(str(eng))
     lifetime_loss(book)
@@ -150,7 +150,7 @@ def test_the_lifetime_stop_survives_a_reset_restore_or_relocation_and_no_order_i
 
 
 def test_an_account_whose_cash_fell_while_nothing_was_pending_is_refused_with_the_review_and_no_order(w, capsys):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     book = CT.anchored(str(eng))
     book.ensure_baseline("10000")
@@ -164,7 +164,7 @@ def test_an_account_whose_cash_fell_while_nothing_was_pending_is_refused_with_th
 
 def test_a_rolled_back_volume_is_caught_by_the_venues_cash_through_the_loop(w):
     """the whole state directory AND the anchor are put back to before the last session: both are valid and clean, and the venue's cash re-books the missing money"""
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     book = CT.anchored(str(eng))
     book.ensure_baseline("10000")
@@ -210,7 +210,7 @@ class Witness:
 
 
 def test_a_required_witness_that_is_down_refuses_before_any_order_without_an_alert_and_the_session_runs_when_it_is_back(w, monkeypatch):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     wit = Witness()
     monkeypatch.setattr(AN, "witness_from_env", lambda env: wit)
@@ -227,7 +227,7 @@ def test_a_required_witness_that_is_down_refuses_before_any_order_without_an_ale
 
 
 def test_the_park_placeholder_is_witnessed_before_the_first_order_leaves(w, monkeypatch):
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     wit = Witness(probe=lambda: len([r for r in w.fake.requests if r[0] == "POST" and "/v5/order/create" in r[1]]))
     monkeypatch.setattr(AN, "witness_from_env", lambda env: wit)
@@ -241,7 +241,7 @@ def test_the_park_placeholder_is_witnessed_before_the_first_order_leaves(w, monk
 
 def test_an_outage_that_starts_after_the_session_opened_is_stopped_by_the_barrier_before_the_first_order(w, monkeypatch):
     """the witness answered when the book was opened (in sync), then could not take the PARK head: the open-time check cannot see that, the barrier before the first order must"""
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     wit = Witness(publishes_before_failing=2)                    # open publishes GENESIS (1), the baseline commit (2); the PARK commit's publish and the barrier's are an outage
     monkeypatch.setattr(AN, "witness_from_env", lambda env: wit)
@@ -294,7 +294,7 @@ def test_the_witness_check_command_is_read_only_and_reports_a_rollback(tmp_path,
 # =====================================================================================================================================================================================================
 def test_a_lock_timeout_inside_the_park_is_a_transient_anchor_refusal_not_an_unreadable_book(w, monkeypatch):
     """park() used to DROP the anchor's code: a lock that did not free up in time became CAPITAL_BOOK_UNREADABLE, which is neither owner-side nor transient (three in a row would raise the repeated-refusal ALERT)."""
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng"
     CT.anchored(str(eng))
 
@@ -354,7 +354,7 @@ def test_the_decision_record_and_the_evidence_event_state_the_epoch_and_the_resu
 
 def test_a_rollback_accepted_review_is_shown_as_what_it_is_not_as_unexplained_cash(w):
     """Second red team, L1: every review was reported to the owner as ACCOUNT_CASH_UNEXPLAINED."""
-    _profit_world(w)
+    _session_world(w)
     eng = w.tmp / "eng_review"
     book = CT.anchored(str(eng))
     with book._locked():

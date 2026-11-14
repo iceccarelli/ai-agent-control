@@ -27,6 +27,7 @@ ALLOW = {  # (file, context, symbol): (values, category)
     ('backtest.py', 'default', '__init__(maker_fee)'): (('0.001',), 'MIRROR'),
     ('backtest.py', 'default', '__init__(taker_fee)'): (('0.001',), 'MIRROR'),
     ('capital_survival.py', 'dict', 'liquidation_fee_bps'): (('50.0',), 'POLICY'),
+    ('tools/mechanics_verify.py', 'assign', 'FEE_BPS_MAX'): (('25',), 'POLICY'),   # Round 22: a PLAUSIBILITY ceiling in a read-only verifier (a measured fee above 25 bps of leg notional is a wrong number, not a Bybit tier); it prices nothing
     ('carry_costs.py', 'assign', 'ASSUMED_ROUND_TRIP_SPREAD_BPS'): (('0.4',), 'AUTH'),
     ('carry_costs.py', 'assign', 'MAKER_BPS_PERP_MODELLED'): (('2.0',), 'AUTH'),
     ('carry_costs.py', 'assign', 'TAKER_BPS_PERP'): (('5.5',), 'AUTH'),

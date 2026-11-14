@@ -34,7 +34,7 @@ import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 FRAME = "frame"        # a raw WebSocket text frame
 CONN = "conn"          # a connection event: {"event": connected|disconnected|invalidate, ...}
@@ -169,6 +169,8 @@ class MarketStore:
         self._day: Optional[str] = None
         self._pending = 0
         self._last_commit = time.monotonic()
+        #: wall-clock ms of the last SUCCESSFUL commit of a non-empty batch (None until one has happened): the recorder's "last durable write" for health reporting. Never set by a failed commit.
+        self.last_commit_wall_ms: Optional[int] = None
         self.commit_every = commit_every
         self.commit_interval_s = commit_interval_s
         self._lock_fd: Optional[int] = None
@@ -204,6 +206,25 @@ class MarketStore:
 
     def segments(self) -> List[str]:
         return sorted(f for f in os.listdir(self.dir) if f.startswith("md-") and f.endswith(".db"))
+
+    def segment_bytes(self) -> Dict[str, int]:
+        """On-disk bytes per UTC day (``YYYYMMDD``): the database plus its WAL and SHM files, from ``os.stat`` only (cheap; never opens a segment). A file that vanishes between the listing and the stat is skipped."""
+        out: Dict[str, int] = {}
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return out
+        for f in names:
+            if not f.startswith("md-"):
+                continue
+            day = f[3:11]
+            if len(day) != 8 or not day.isdigit() or f[11:] not in (".db", ".db-wal", ".db-shm"):
+                continue
+            try:
+                out[day] = out.get(day, 0) + os.stat(os.path.join(self.dir, f)).st_size
+            except OSError:
+                continue
+        return dict(sorted(out.items()))
 
     def _segment_path(self, day: str) -> str:
         return os.path.join(self.dir, f"md-{day}.db")
@@ -386,6 +407,11 @@ class MarketStore:
         st = os.statvfs(self.dir)
         return int(st.f_bavail) * int(st.f_frsize)
 
+    def total_bytes(self) -> int:
+        """The size of the volume holding the store (statvfs): published in the recorder's status so the capacity model can compare the volume with the retention without the monitor reading it."""
+        st = os.statvfs(self.dir)
+        return int(st.f_blocks) * int(st.f_frsize)
+
     def _require_free_space(self) -> None:
         """Raise StoreError when the volume is below the reserve. Looked at most once a
         second (a statvfs per frame would cost more than the frame); a failed look is
@@ -502,9 +528,12 @@ class MarketStore:
                 self._next_id, self._prev_chain, self._pending = self._committed_next, self._committed_chain, 0
                 self._last_commit = time.monotonic()
                 raise
+        had_batch = self._pending > 0 and self._conn is not None
         self._committed_next, self._committed_chain = self._next_id, self._prev_chain
         self._pending = 0
         self._last_commit = time.monotonic()
+        if had_batch:
+            self.last_commit_wall_ms = int(time.time() * 1000)
 
     def flush(self) -> None:
         with self._lock:

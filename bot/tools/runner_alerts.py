@@ -25,6 +25,12 @@ WHAT IT ALERTS ON
   recorder_disk_low the last 3 cycles that report free space found the recorder's volume within one day
                 (about 1 GiB) of its 512 MiB write reserve (WARNING: the recorder is about to stop writing and
                 cannot recover by itself)
+  recorder_image_mismatch the last 3 cycles that report the running image's provenance found it MISMATCH or MISSING
+                (WARNING: the recorder may be writing, but it is not the approved implementation; Round 22)
+  recorder_resume_will_prune the last 3 cycles found the recorder NOT writing (storage_blocked/stalled/unknown) while the first write after recovery would delete retained closed days
+                (WARNING: the owner must preserve them BEFORE freeing space; Round 22)
+  recorder_reserve_soon the last 3 cycles that report an estimate found the volume reaching the write reserve within
+                24 hours at the current write rate (WARNING: the early warning in HOURS, before recorder_disk_low's headroom is gone; Round 22)
   mainnet_stalled  the last 6 cycles that collect real-market data recorded none
                 (WARNING: the protocol's 30-day clock is not accumulating)
   shadow        the last forward-shadow step was FAULT or REFUSED (WARNING)
@@ -315,6 +321,39 @@ def _recorder_down(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+#: Round 22: cycles an image-provenance failure must persist before it alerts (the check is hourly-cached; one stale read must not page)
+RECORDER_IMAGE_CYCLES = 3
+#: Round 22: hours-to-reserve below which the early-warning alert fires
+RECORDER_RESERVE_SOON_HOURS = 24.0
+
+
+def _recorder_image_mismatch(rows: Sequence[Mapping[str, object]], n: int):
+    """The last ``n`` rows that carry ``recorder_image_status``, when every one is MISMATCH or MISSING; else None (VERIFIED, NOT_CHECKED and rows without the field count neither way)."""
+    with_img = [r for r in rows if isinstance(r.get("recorder_image_status"), str)]
+    tail = with_img[-n:]
+    if len(tail) == n and all(r["recorder_image_status"] in ("MISMATCH", "MISSING") for r in tail):
+        return tail
+    return None
+
+
+def _recorder_reserve_soon(rows: Sequence[Mapping[str, object]], n: int):
+    """The last ``n`` rows that carry ``recorder_hours_to_reserve``, when every one is below the limit and the recorder is not already blocked (that is recorder_down / recorder_disk_low's case); else None."""
+    with_h = [r for r in rows if isinstance(r.get("recorder_hours_to_reserve"), (int, float)) and not isinstance(r.get("recorder_hours_to_reserve"), bool)]
+    tail = with_h[-n:]
+    if len(tail) == n and all(0 <= float(r["recorder_hours_to_reserve"]) < RECORDER_RESERVE_SOON_HOURS and r.get("recorder_health") != "storage_blocked" for r in tail):
+        return tail
+    return None
+
+
+def _reserve_mib(row: Mapping[str, object]) -> float:
+    """The write reserve IN FORCE on a history line (``recorder_reserve_bytes``, the recorder's own effective setting), else the documented 512 MiB. The alerts used to hard-code 512 MiB, so a recorder
+    configured with a different reserve alerted at the wrong level (too late when higher, noisily when lower). A bool, a non-finite or a non-positive figure is not a reading."""
+    v = row.get("recorder_reserve_bytes")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+        return float(RECORDER_RESERVE_MB)
+    return float(v) / 1048576.0
+
+
 def _free_mib(row: Mapping[str, object]) -> Optional[float]:
     """The recorder volume's free space in MiB from a monitor history line, or None. The monitor writes it as ``recorder_free_mb`` (every recorder field is prefixed; see
     ``runner_monitor._history_line``). A bool, a string, a non-finite or an absurdly large number is not a reading."""
@@ -346,7 +385,7 @@ def _recorder_stall_permanent(rows: Sequence[Mapping[str, object]]):
     readings = [r for r in rows if _free_mib(r) is not None]
     run: List[Mapping[str, object]] = []
     for r in reversed(readings):
-        if float(_free_mib(r)) < RECORDER_RESERVE_MB:               # type: ignore[arg-type]
+        if float(_free_mib(r)) < _reserve_mib(r):                   # type: ignore[arg-type]
             run.append(r)
         else:
             break
@@ -368,7 +407,21 @@ def _recorder_disk_low(rows: Sequence[Mapping[str, object]], n: int):
     (a recorder that is already down raises `recorder_down` as well, which is useful: the second says why)."""
     with_free = [r for r in rows if _free_mib(r) is not None]
     tail = with_free[-n:]
-    if len(tail) == n and all(float(_free_mib(r)) < RECORDER_FREE_WARN_MB for r in tail):   # type: ignore[arg-type]
+    if len(tail) == n and all(float(_free_mib(r)) < _reserve_mib(r) + (RECORDER_FREE_WARN_MB - RECORDER_RESERVE_MB) for r in tail):   # type: ignore[arg-type]
+        return tail
+    return None
+
+
+#: Round 22: cycles a "resuming would prune retained days" reading must persist before it alerts
+RECORDER_RESUME_PRUNE_CYCLES = 3
+
+
+def _recorder_resume_will_prune(rows: Sequence[Mapping[str, object]], n: int):
+    """The last ``n`` rows that carry ``recorder_resume_prune_days``, when every one is a positive count AND the recorder is not writing (storage_blocked, stalled or unknown): that is the window in which
+    the owner is about to free space and the first write would delete the retained days. A healthy writer's own expiry is normal and never alerts; else None."""
+    with_p = [r for r in rows if isinstance(r.get("recorder_resume_prune_days"), (int, float)) and not isinstance(r.get("recorder_resume_prune_days"), bool)]
+    tail = with_p[-n:]
+    if len(tail) == n and all(float(r["recorder_resume_prune_days"]) > 0 and r.get("recorder_health") in ("storage_blocked", "stalled", "unknown") for r in tail):
         return tail
     return None
 
@@ -503,10 +556,11 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
     low = _recorder_disk_low(rows, RECORDER_DISK_LOW_CYCLES)
     if low:
         free = float(_free_mib(low[-1]))                       # type: ignore[arg-type]
-        below = free < RECORDER_RESERVE_MB
+        reserve = _reserve_mib(low[-1])
+        below = free < reserve
         alerts.append(Alert(
             "recorder_disk_low", WARNING,
-            f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {RECORDER_RESERVE_MB} MiB write reserve). "
+            f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {reserve:.0f} MiB write reserve). "
             "At the reserve the recorder stops writing; it recovers only at the next UTC day boundary and only if the volume holds the retained days plus the reserve, otherwise it stays stopped. The RUNNING image may predate even that bounded "
             "recovery (merging it changes no running machine): check with RUNBOOKS section 18. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
             "--recorder-retention-days; see MONEY_MISSION.md (recorder size model) and RUNBOOKS section 14."))
@@ -515,11 +569,35 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
         run, hours, midnights = perm
         alerts.append(Alert(
             "recorder_stall_permanent", WARNING,
-            f"every free-space reading for the last {hours:.0f} h ({len(run)} readings, {midnights} UTC midnights; latest {float(_free_mib(run[-1])):.0f} MiB) is below the {RECORDER_RESERVE_MB} MiB write reserve. "
+            f"every free-space reading for the last {hours:.0f} h ({len(run)} readings, {midnights} UTC midnights; latest {float(_free_mib(run[-1])):.0f} MiB) is below the {_reserve_mib(run[-1]):.0f} MiB write reserve. "
             "A transient dip recovers at the next UTC day boundary; this has not, so the recorder is not coming back by itself. Two causes fit this history and only a read of the machine tells them apart: "
             "(1) the volume cannot hold even ONE day of data above the reserve (the first segment is never pruned, so it stays stopped for good: extend the volume, RUNBOOKS section 14), or "
             "(2) the RUNNING image predates the bounded recovery (RUNBOOKS section 18). Read-only checks: fly volumes list -a carry-drill; "
             "fly ssh console -a carry-drill -C \"ls -l --time-style=full-iso /data/market\" (a single md-<day>.db of a fraction of a GB, and no pruned.jsonl, means cause 1). Nothing is deleted or resized by this alert."))
+    img = _recorder_image_mismatch(rows, RECORDER_IMAGE_CYCLES)
+    if img:
+        last = img[-1]
+        alerts.append(Alert(
+            "recorder_image_mismatch", WARNING,
+            f"the last {RECORDER_IMAGE_CYCLES} cycles found the running recorder image's provenance {last['recorder_image_status']}: it is not established as the approved implementation (the recorder may still be writing). "
+            "Compare the image with the commit (RUNBOOKS 'Runtime provenance': `fly image show -a carry-drill`, python3 tools/image_manifest.py compare), and redeploy an image built with --build-arg BUILD_COMMIT=<sha>. Nothing is changed by this alert."))
+    resume = _recorder_resume_will_prune(rows, RECORDER_RESUME_PRUNE_CYCLES)
+    if resume:
+        last = resume[-1]
+        gb = float(last.get("recorder_resume_prune_bytes") or 0) / 1e9
+        alerts.append(Alert(
+            "recorder_resume_will_prune", WARNING,
+            f"the recorder is not writing and the first write after space is freed would delete {int(float(last['recorder_resume_prune_days']))} retained closed day(s) ({gb:.2f} GB): a stalled store's newest segment is old and "
+            "shields them, but writing resumes into TODAY's segment and the next retention pass removes every closed day older than the retention window. Whether those days are backed up is not known here. "
+            "Before extending the volume or redeploying, preserve them (fly volumes snapshots create / an off-machine copy; RUNBOOKS 'Recorder storage sizing', remediation Phase 1) or set --recorder-retention-days high enough to keep them, and size the "
+            "volume for that retention. Nothing is deleted or resized by this alert."))
+    soon = _recorder_reserve_soon(rows, RECORDER_DISK_LOW_CYCLES)
+    if soon:
+        h = float(soon[-1]["recorder_hours_to_reserve"])
+        alerts.append(Alert(
+            "recorder_reserve_soon", WARNING,
+            f"at the current write rate the recorder volume reaches its write reserve in about {h:.1f} h (the last {RECORDER_DISK_LOW_CYCLES} cycles all say under {RECORDER_RESERVE_SOON_HOURS:.0f} h, before any pruning). "
+            "Extend the volume or lower --recorder-retention-days before it stops writing (RUNBOOKS section 14 and 'Recorder storage sizing'); nothing is deleted or resized by this alert."))
     rising = _recorder_restarting(rows)
     if rising:
         a, b = rising
@@ -626,8 +704,51 @@ class Watchdog:
 
 # -- command line, for a watcher that is NOT on the runner ---------------------
 
+DELIVERY_OK = ("none_needed", "all_sent", "dry_run")
+
+
+def delivery_status(alerts: Sequence[Alert], results: Mapping[str, str], *, dry_run: bool = False) -> str:
+    """How the raised alerts left the building, as ONE word: ``none_needed`` (nothing raised), ``dry_run``, ``all_sent``, ``partial``, ``none_delivered`` (a send was attempted and every one failed) or
+    ``disabled`` (no usable webhook). Round 22: the watcher's exit code was ``1`` whether Slack got the alert or not, so a red job could not say if anyone had been told."""
+    if not alerts:
+        return "none_needed"
+    if dry_run:
+        return "dry_run"
+    sent = sum(1 for a in alerts if results.get(a.key) == "sent")
+    if sent == len(alerts):
+        return "all_sent"
+    if results and all(v == "disabled" for v in results.values()):
+        return "disabled"
+    return "partial" if sent else "none_delivered"
+
+
+def _publish_delivery(status: str, alerts: Sequence[Alert], results: Mapping[str, str], env: Mapping[str, str], result_file: Optional[str]) -> None:
+    """Print the delivery line, write the machine-readable result (``--result-file``), and, on GitHub Actions, an ``::error`` annotation and a step-summary table. Never raises and never prints the webhook."""
+    sent = sum(1 for a in alerts if results.get(a.key) == "sent")
+    print(f"DELIVERY: {status} ({len(alerts)} alert(s) raised, {sent} delivered)")
+    if result_file:
+        try:
+            with open(result_file, "w", encoding="utf-8") as fh:
+                json.dump({"schema": "runner_alerts_result/v1", "delivery": status, "raised": [a.key for a in alerts],
+                           "results": {k: ("sent" if v == "sent" else str(v)[:80]) for k, v in results.items()}}, fh, sort_keys=True)
+        except OSError as exc:
+            print(f"cannot write {result_file}: {type(exc).__name__}", file=sys.stderr)
+    if status not in DELIVERY_OK and env.get("GITHUB_ACTIONS") == "true":
+        print(f"::error title=monitor alerts were raised but NOT delivered::{status}: {len(alerts) - sent} of {len(alerts)} alert(s) did not reach Slack; read the alert lines above")
+    summary_path = env.get("GITHUB_STEP_SUMMARY")
+    if summary_path and alerts:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write(f"### Recorder / runner alerts ({status})\n\n| alert | severity | delivery |\n|---|---|---|\n")
+                for a in alerts:
+                    fh.write(f"| {a.key} | {a.severity} | {results.get(a.key, 'not attempted')} |\n")
+        except OSError:
+            pass
+
+
 def main(argv: Optional[Sequence[str]] = None,
-         env: Optional[Mapping[str, str]] = None) -> int:
+         env: Optional[Mapping[str, str]] = None,
+         notifier: Optional["Notifier"] = None) -> int:
     env = os.environ if env is None else env
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("history", nargs="?",
@@ -647,6 +768,8 @@ def main(argv: Optional[Sequence[str]] = None,
                          "(forward_status.py); omitted, no forward check")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the alerts; send nothing")
+    ap.add_argument("--result-file", default=None,
+                    help="write a small JSON result (the raised alert keys and how each was delivered) to this path")
     args = ap.parse_args(argv)
     if args.test:
         notifier = Notifier(env, say=lambda line: print(line, file=sys.stderr))
@@ -672,14 +795,20 @@ def main(argv: Optional[Sequence[str]] = None,
     code = max(int(summary["exit"]), 1 if alerts else 0)
     for a in alerts:
         print(f"[{a.severity}] {a.key}: {a.text}")
+    results: Dict[str, str] = {}
     if args.dry_run or not alerts:
+        _publish_delivery(delivery_status(alerts, results, dry_run=args.dry_run), alerts, results, env, args.result_file)
         return code
-    notifier = Notifier(env, say=lambda line: print(line, file=sys.stderr))
+    notifier = notifier or Notifier(env, say=lambda line: print(line, file=sys.stderr))
     if not notifier.enabled:
         print(f"ALERTS DISABLED: {notifier.disabled_reason}", file=sys.stderr)
+        results = {a.key: "disabled" for a in alerts}
+        _publish_delivery(delivery_status(alerts, results), alerts, results, env, args.result_file)
         return code
     for a in alerts:
-        print(f"alert {a.key}: {notifier.send(a)}", file=sys.stderr)
+        results[a.key] = notifier.send(a)
+        print(f"alert {a.key}: {results[a.key]}", file=sys.stderr)
+    _publish_delivery(delivery_status(alerts, results), alerts, results, env, args.result_file)
     return code
 
 

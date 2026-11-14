@@ -46,6 +46,8 @@ import exec_lifecycle as EL  # noqa: E402
 import exec_quality as EQ  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_capital_anchor as AN  # noqa: E402
+import economic_model as EM  # noqa: E402
+import eligibility_gate as EGATE  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
@@ -65,6 +67,13 @@ SETTLEMENT_ENTRY_MARGIN_S = 20          # RE-CHECKED when the first entry order 
 POLL_S = 120                            # a cheap public read between cycles
 COOLDOWN_AFTER_SESSION_S = 1800
 MAX_CONSECUTIVE_ERRORS = 3
+#: Round 22: free bytes the executor's state volume must have before it starts a session. A full volume used to be survivable by nothing: the decision record, the journal and the engine state are all written
+#: there, evidence writes were skipped silently ("never a reason to trade") and an OSError out of the loop killed the process under an always-restart policy. The owner may RAISE the floor, never lower it.
+EXECUTOR_MIN_FREE_BYTES = 256 * 1024 * 1024
+#: environment NAME PREFIXES that must never be present, with a value, in this process: ``LIVE_*`` is the family of Mainnet arming switches and ``BYBIT_API_*`` the generic, non-Testnet credentials (the Testnet
+#: ones are ``BYBIT_TESTNET_API_*``, which do not match). Prefixes, not literals: this module must stay free of the Mainnet arming names (tests/test_ms_testnet_autopilot.py pins that), and a prefix also
+#: catches a renamed switch. Finding one means the deployment is wrong, so the loop refuses.
+FORBIDDEN_ENV_PREFIXES = ("LIVE_", "BYBIT_API_")
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".ai-agent-control", "ms_autopilot")
 
 
@@ -204,6 +213,47 @@ def _executor(env: Mapping[str, str], inner: Any, clock: Callable[[], int], symb
     """A read-only TestnetExecutor view (the registry-pinned Testnet host, no redirects) for the public reads and the one signed fee-rate read."""
     client, _t = TT.build_client(TT.TestnetCredentials.from_mapping(env), inner if inner is not None else TT.NoRedirectInner())
     return TE.TestnetExecutor(client, symbols=[symbol], spot_symbols=[symbol], clock_ms=clock, kill_reader=lambda: (False, "read only"))
+
+
+def cmd_venue_snapshot(env: Mapping[str, str], clock: Callable[[], int], symbol: Optional[str] = None, out_path: Optional[str] = None, *, inner: Any = None,
+                       out: Callable[[str], None] = print) -> int:
+    """The owner's read-only end-state read: the venue's own positions (every symbol), balances and open orders (ordinary and conditional) as ``mechanics_venue_snapshot/1``. It sends no order, needs no
+    grant or lease and writes nothing but the optional ``--out`` file. Exit 0 = the snapshot is COMPLETE, 3 = it is not (then it proves nothing: ``mechanics_verify`` reports INCONCLUSIVE)."""
+    sym = symbol
+    if not sym:
+        manifest, _st = S._load_capability_manifest()
+        sym = ((manifest or {}).get("symbol_allowlist") or ["BTCUSDT"])[0]
+    p = TT.TestnetCredentials.presence(env)
+    if not (p["dedicated_key_present"] and p["dedicated_secret_present"]):
+        out(json.dumps({"schema": "mechanics_venue_snapshot/1", "complete": False, "reason": "DEDICATED_TESTNET_CREDENTIALS_MISSING"}, sort_keys=True))
+        return 3
+    try:
+        ex = _executor(env, inner, clock, sym)
+        snap = ex.venue_end_state()
+        snap["venue"] = "testnet"
+        _ok, _why, key_summary = TT.check_api_key(ex.client)                  # which account these credentials belong to, as the VENUE states it (only its hash leaves): the verifier binds the snapshot to the session's account
+        snap["account_ref"] = key_summary.get("account_ref")
+        snap["account_identity_basis"] = "USER_ID" if snap["account_ref"] else "UNAVAILABLE"
+    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, TT.TestnetCredentialsMissing, KeyError, ValueError, TypeError) as exc:
+        out(json.dumps({"schema": "mechanics_venue_snapshot/1", "complete": False, "reason": f"VENUE_UNREADABLE:{type(exc).__name__}"}, sort_keys=True))
+        return 3
+    text = json.dumps(snap, indent=2, sort_keys=True, default=str)
+    out(text)
+    if out_path:
+        # evidence, never state: the same directory refusal as `--record-to` (not the repository, not the owner's engine/authority root), a NEW file only (never an overwrite of anything, a capital view
+        # included) and owner-only permissions
+        refusal = _decision_dir_refusal(os.path.dirname(os.path.abspath(out_path)))
+        if refusal:
+            out(f"REFUSED to write {out_path}: {refusal}")
+            return 3
+        try:
+            fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            out(f"cannot write {out_path} (it must not exist yet): {type(exc).__name__}")
+            return 3
+    return 0 if snap.get("complete") else 3
 
 
 def fetch_funding(env: Mapping[str, str], inner: Any, clock: Callable[[], int], symbol: str) -> Tuple[float, int]:
@@ -432,6 +482,35 @@ def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir
         pass
 
 
+class _HeldLease:
+    """Stands for a lease the strong pre-order check JUST verified (``revocation_reason(..., strong=True)`` returned None): the gate reads ``held()`` and must not spend a second lease round trip."""
+
+    @staticmethod
+    def held() -> bool:
+        return True
+
+
+def session_gate(verdict: Any, session_class: str, manifest: Mapping[str, Any], preflight: Mapping[str, Any], alloc_notional: Any, usdt_now: Any, lease: Any, book_stops: Sequence[str] = ()) -> Dict[str, Any]:
+    """The deterministic eligibility gate (tools/eligibility_gate.py) for THIS session, from the facts the session already holds. A mechanics session is judged under the MEASUREMENT profile (fake money; it
+    measures lifecycle, fees and fills and is never an opportunity), anything else under PROFIT_SEEKING. Round 22: no qualification flow and no execution-model calibration is wired into the executor, so a
+    PROFIT_SEEKING session is NO_TRADE here until the evidence exists and the owner wires it: that is the honest state, not a defect. Never raises (a failure to build the inputs is an UNKNOWN term)."""
+    try:
+        edge = verdict.as_dict()
+        books_fresh = not any(b in str(r) for r in verdict.reasons for b in MARKET_QUALITY_BLOCKERS)
+        ident = any(isinstance(c, Mapping) and c.get("name") == "endpoint_identity" and c.get("ok") is True for c in (preflight.get("checks") or []))
+        committed = EM.hedged_pair_capital_usd(D(str(alloc_notional)), 1).value
+        lease_state = "NOT_REQUIRED" if lease is None else ("HELD" if bool(lease.held()) else "LOST")
+        inputs = {"data": {"venue_identity": ident, "books_fresh": books_fresh, "funding_observed": edge.get("expected_funding_bps") is not None, "scope": "TESTNET_FAKE_MONEY"},
+                  "edge": edge, "execution": {},
+                  "evidence": {"status": "UNTESTED", "candidate_id": manifest.get("candidate_id"), "reasons": ["NO_QUALIFICATION_FLOW_WIRED_INTO_THE_EXECUTOR"]},
+                  "risk": {"loss_cap_usd": float(AD.MAX_LOSS_CEILING_USD), "loss_limit_usd": float(manifest["bounds"]["max_loss_usd"]), "worst_case_loss_usd": None,
+                           "capital_committed_usd": float(committed), "capital_available_usd": usdt_now, "book_stops": list(book_stops)},
+                  "authority": {"capability": "VALID", "grant": "VALID", "credentials_present": True, "lease": lease_state}}
+    except Exception as exc:                                                  # noqa: BLE001 - an input that cannot be built is an unestablished fact
+        inputs = {"_build_error": type(exc).__name__}
+    return EGATE.evaluate(inputs, profile=EGATE.MEASUREMENT if session_class == "TESTNET_MECHANICS" else EGATE.PROFIT_SEEKING)
+
+
 def _annotate_decision(state_dir: str, extra: Mapping[str, Any]) -> None:
     """What the session actually did, added NEXT TO the decision record (decision.json), never into its id: the decision was evaluated at the grant's size and the book as it stood; the allocator then
     sized the session from the settled book."""
@@ -439,7 +518,7 @@ def _annotate_decision(state_dir: str, extra: Mapping[str, Any]) -> None:
         path = os.path.join(state_dir, "decision.json")
         doc = ES.read_json(path)
         if isinstance(doc, dict):
-            S._write_json(path, {**doc, "executed": dict(extra)})
+            S._write_json(path, {**doc, "executed": {**(doc.get("executed") if isinstance(doc.get("executed"), dict) else {}), **dict(extra)}})      # merged: the allocator's sizing and the eligibility gate both live here
     except Exception:                                                  # noqa: BLE001 - evidence only
         pass
 
@@ -481,6 +560,51 @@ def record_decision(directory: str, record: Mapping[str, Any], at_ms: int) -> st
                 pass
 
 
+def forbidden_environment(env: Mapping[str, str]) -> List[str]:
+    """Names (never values) of the arming switches and credentials this process must not carry: any ``LIVE_*`` or generic ``BYBIT_API_*`` variable with a value, ``USE_TESTNET`` set to a falsy value,
+    ``PAPER_TRADING`` set to a falsy value. Defence in depth: the executor's transport is Testnet-only whatever these say, but a deployment that carries one is a deployment mistake the owner must see,
+    not a machine that quietly trades. Absent ``USE_TESTNET`` / ``PAPER_TRADING`` are fine (the image and toml set the Testnet values)."""
+    bad: List[str] = []
+    for name in sorted(str(k) for k in env):
+        if name.startswith(FORBIDDEN_ENV_PREFIXES) and str(env.get(name) or "").strip():
+            bad.append(name)
+    falsy = ("0", "false", "no", "off", "")
+    if "USE_TESTNET" in env and str(env.get("USE_TESTNET")).strip().lower() in falsy:
+        bad.append("USE_TESTNET")
+    if "PAPER_TRADING" in env and str(env.get("PAPER_TRADING")).strip().lower() in falsy[:4]:
+        bad.append("PAPER_TRADING")
+    return bad
+
+
+def _free_bytes_at(path: str) -> Optional[int]:
+    """Free bytes of the volume holding ``path`` (the nearest existing ancestor when the path is not created yet); None when it cannot be read: unknown is not 'enough'."""
+    p = os.path.abspath(path)
+    for _ in range(64):
+        if os.path.exists(p):
+            try:
+                return int(shutil.disk_usage(p).free)
+            except OSError:
+                return None
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+    return None
+
+
+def disk_gate(env: Mapping[str, str], path: str) -> Optional[str]:
+    """None when the volume has the floor free; else a refusal code ``DISK_LOW:<free>B<floor>`` (or ``DISK_UNREADABLE``)."""
+    floor = EXECUTOR_MIN_FREE_BYTES
+    try:
+        floor = max(floor, int(str(env.get("EXECUTOR_MIN_FREE_BYTES") or 0)))
+    except ValueError:
+        pass
+    free = _free_bytes_at(path)
+    if free is None:
+        return "DISK_UNREADABLE"
+    return None if free >= floor else f"DISK_LOW:{free}B<{floor}B"
+
+
 def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callable[[], int]] = None, sleep: Optional[Callable[[float], None]] = None,
              out: Callable[[str], None] = print, state_root: Optional[str] = None, engine_root: Optional[str] = None, lease: Any = None,
              on_state: Callable[[str, str], None] = _noop_state, on_event: Callable[..., None] = _noop_event, dry_run: bool = False, **_ignored: Any) -> Dict[str, Any]:
@@ -491,6 +615,9 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     sleep = sleep or time.sleep
     now = int(clock())
     on_state("DATA_CHECK", "cycle_start")
+    bad_env = forbidden_environment(env)
+    if bad_env:                                                       # before ANY read or authority check: a mis-armed deployment must be visible, not quiet
+        return _res("REFUSED", ["BAD_ENVIRONMENT:" + n for n in bad_env])
     manifest, st = S._load_capability_manifest()
     if manifest is None:
         return _res("REFUSED", ["OWNER_CAPABILITY_FILE:" + ",".join(st.get("reasons", []))])
@@ -500,6 +627,9 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     p = TT.TestnetCredentials.presence(env)
     if not (p["dedicated_key_present"] and p["dedicated_secret_present"]):
         return _res("REFUSED", ["DEDICATED_TESTNET_CREDENTIALS_MISSING"])
+    low = disk_gate(env, state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control"))
+    if low:                                                           # the session's evidence lives on this volume: no room, no session (resumes by itself when space is freed)
+        return _res("REFUSED", [low])
     cap = min(int(g["max_sessions_per_day"]), int(manifest["bounds"]["max_entries_per_utc_day"]))
     if S.entries_today(now) >= cap:
         return _res("SKIPPED", ["DAILY_SESSIONS_REACHED"])
@@ -527,6 +657,14 @@ def run_once(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Calla
     did = drec["decision_id"]                                         # the SAME record shape the read-only evaluation produces: a session is traceable to the decision that preceded it
     if session_class is None:
         return _res("SKIPPED", why_not, funding_bps=rate * 1e4, edge=verdict.as_dict(), decision_id=did)
+    if session_class == "PROFIT_SEEKING":
+        # Round 22: the terms a profit session cannot pass today (cost basis, execution calibration, statistical evidence) are decided by the economics alone, so they are decided HERE, before a session directory, a
+        # preflight, a plan and a venue round trip exist: otherwise every idle cycle while the print clears the floor would create a directory and call the venue for a session that cannot happen.
+        early = EGATE.evaluate({"edge": verdict.as_dict(), "execution": {}, "evidence": {"status": "UNTESTED", "candidate_id": manifest.get("candidate_id"), "reasons": ["NO_QUALIFICATION_FLOW_WIRED_INTO_THE_EXECUTOR"]}},
+                               profile=EGATE.PROFIT_SEEKING)
+        static = ("COSTS_KNOWN", "EXECUTION_MODEL_VALID", "EDGE_POSITIVE_AFTER_COSTS", "STATISTICAL_EVIDENCE_SUFFICIENT")
+        if any(t["term"] in static and t["verdict"] in (EGATE.FAIL, EGATE.UNKNOWN) for t in early["terms"]):
+            return _res("SKIPPED", ["NO_TRADE"] + [r for r in EGATE.no_trade_reasons(early, 8) if r.split(":", 1)[0] in static], funding_bps=rate * 1e4, edge=verdict.as_dict(), decision_id=did, eligibility=early)
     root = state_root or os.path.join(os.path.expanduser("~"), ".ai-agent-control")
     d = os.path.join(root, "ms_auto_" + time.strftime("%Y%m%dT%H%M%S", time.gmtime(now / 1000.0)))
     _ACTIVE["dir"] = d
@@ -641,6 +779,18 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
+    # Round 22: the deterministic eligibility gate, at the LAST point before capital is reserved and an order can leave (the strong lease check just above is what makes ``lease`` HELD here; it is not
+    # asked a second time). NO_TRADE returns before the park: nothing is reserved, nothing is placed.
+    gate = session_gate(verdict, session_class, manifest, pf, alloc.notional, usdt_now, None if lease is None else _HeldLease())
+    _annotate_decision(d, {"eligibility_gate": gate})                  # the gate's verdict and every term sit NEXT TO the decision it gates
+    g_ = gate if isinstance(gate, dict) else {}
+    emit(("DECISION", "ELIGIBILITY_GATE", {"source": "GATE", "verdict": str(g_.get("verdict")), "profile": str(g_.get("profile")), "failed": list(g_.get("failed") or []), "unknown": list(g_.get("unknown") or []),
+                                           "waived": list(g_.get("waived") or []), "gate_id": str(g_.get("digest") or "")[:16]}))     # the 64-hex digest itself is refused by the evidence guard (a long hex token looks like a credential): the id is its first 16 characters; the full digest sits in decision.json
+    allowed = (EGATE.ELIGIBLE_MEASUREMENT_ONLY,) if session_class == "TESTNET_MECHANICS" else (EGATE.ELIGIBLE,)
+    if not (isinstance(gate, dict) and gate.get("verdict") in allowed and gate.get("profile") == (EGATE.MEASUREMENT if session_class == "TESTNET_MECHANICS" else EGATE.PROFIT_SEEKING)):
+        # an ALLOWLIST: only the outcome that matches the session class proceeds; NO_TRADE, a missing verdict or anything unexpected stops before the park
+        why = EGATE.no_trade_reasons(gate) if isinstance(gate, dict) else []
+        return _res("SKIPPED", ["NO_TRADE"] + (why or ["GATE_VERDICT_NOT_ELIGIBLE"]), state_dir=d, allocation=alloc.as_dict(), eligibility=gate if isinstance(gate, dict) else None)
     try:
         parked = book.park(os.path.basename(d), usdt_now, None, False, False, cash_read_ms=cash_read_ms)
     except CC.BookUnreadable as exc:                                  # the book went bad between the check and the park: still BEFORE any order
@@ -658,12 +808,22 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
 
     first_entry = {"pending": True}
     settlement_refusal: Dict[str, str] = {}
+    pre_abort: Dict[str, str] = {}                                    # the reason the pre-order check stopped an entry (kept so a session that sent nothing can say why)
 
     def pre_order() -> Optional[str]:
+        try:
+            return _pre_order()
+        except Exception as exc:                                                                # noqa: BLE001 - the session treats an exception here as a refusal (RT2b); the reason is kept for the result
+            pre_abort.setdefault("why", f"PRE_ORDER_CHECK_ERROR:{type(exc).__name__}")
+            raise
+
+    def _pre_order() -> Optional[str]:
         if _STOP.is_set():
+            pre_abort.setdefault("why", "STOP_SIGNAL")
             return "STOP_SIGNAL"
         why = revocation_reason(int(clock()), manifest, engine_root, lease, strong=True)       # before EVERY entry order: the server must say this holder still holds the lease
         if why is not None:
+            pre_abort.setdefault("why", str(why))
             return why
         if first_entry["pending"]:                                                              # the settlement was priced at decision time; reads, risk checks and a slow venue have used time since.
             left = (int(next_settlement_ms) - int(clock())) / 1000.0                           # Checked LAST (after the lease round trip) so it is as close to the order as it can be.
@@ -712,6 +872,13 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
         return _res("REFUSED", ["EXECUTE_REFUSED"], **summary)
     if settlement_refusal and not rec.get("orders"):                  # the first entry was refused for time and nothing was sent: that is a SKIP with its reason, not a completed session
         return _res("SKIPPED", [settlement_refusal["why"]], **summary)
+    if not rec.get("orders") and rec.get("flat_verified") is True:
+        # Round 22: no order ever left and the venue is flat. That is NOT a completed session ("DONE" starts the 30-minute cooldown, counts as the day's session and says a hedge was run): either the
+        # authority vanished or a stop arrived before the first entry (nothing was placed: a skip with the reason), or the execute ended without sending anything for a reason nobody recorded (an error).
+        abort = pre_abort.get("why") or watch.get("reason") or ("STOP_SIGNAL" if _STOP.is_set() else None)
+        if abort:
+            return _res("SKIPPED", ["EXECUTE_ABORTED_BEFORE_ANY_ORDER:" + str(abort)], **summary)
+        return _res("ERROR", ["EXECUTE_ENDED_WITHOUT_ORDERS"], **summary)
     return _res("DONE" if rec.get("flat_verified") is True else "NOT_FLAT", [], **summary)
 
 
@@ -846,6 +1013,7 @@ def recover(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callab
     baselines: Dict[str, Optional[float]] = {}
     entry_qty = None
     unresolved = False
+    traded: List[str] = list(syms)                       # the symbols the last session traded (every allowlisted one while the plan cannot be read)
     if last:
         lim = ES.read_json(os.path.join(last, "run_limits.json")) or {}
         for sym in syms:
@@ -856,12 +1024,23 @@ def recover(env: Mapping[str, str], *, inner: Any = None, clock: Optional[Callab
             entry_qty = float(plan["group"]["legs"][0]["qty"])
         except (KeyError, IndexError, TypeError, ValueError):
             entry_qty = None
+        try:
+            planned = sorted({str(l["symbol"]) for l in plan["group"]["legs"]})
+            traded = [s for s in syms if s in planned] if planned else list(syms)
+        except (KeyError, TypeError):
+            traded = list(syms)
         rec = ES.read_json(os.path.join(last, "testnet_session.json")) or {}
         jp = os.path.join(last, S.FILES["journal"])
         started = (os.path.exists(jp) and os.path.getsize(jp) > 0) or bool(rec.get("orders"))
         unresolved = bool(started and rec.get("flat_verified") is not True)
     all_why: List[str] = []
     complete_all = True
+    if unresolved:
+        # Round 22: the spot leg of an unresolved session can only be proven flat RELATIVE to the balance it started from. A session that sent orders always wrote that baseline first (run_limits.json at the first
+        # account read), so its absence is an anomaly, and the proof used to skip the spot check silently and call the account flat.
+        for sym in traded:
+            if baselines.get(sym) is None:
+                all_why.append(f"BASELINE_UNKNOWN:{sym}")
     for sym in syms:
         try:
             flat, why, complete = venue_flat_proof(_executor(env, inner, clock, sym), sym, baselines.get(sym), entry_qty)
@@ -1027,9 +1206,12 @@ def evidence_net(net: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
 
 # ---------------------------------------------------------------------------------------------------- the supervised loop: a state machine that does not exit on a marker
 IDLE_POLL_S = 30
+#: session states entered BEFORE the first order of a session. Their transitions must be durable: if the state cannot be written the session is refused (the OSError propagates); only the states after the orders
+#: (RECONCILING and later) are tolerant, because by then a session may hold exposure and must be allowed to unwind and report.
+PRE_ORDER_STATES = frozenset(("DATA_CHECK", "RESEARCHING", "PLAN_PROPOSED", "RISK_APPROVED", "EXECUTING"))
 IN_SESSION_HEARTBEAT_S = 30
 DRAINED_FRESH_MS = 300_000
-OWNER_AUTHORITY_REFUSALS = ("GRANT_", "OWNER_CAPABILITY_FILE", "DEDICATED_TESTNET_CREDENTIALS_MISSING", *("CAPITAL_ANCHOR_REFUSED:" + c for c in NO_ALERT_ANCHOR_CODES))
+OWNER_AUTHORITY_REFUSALS = ("GRANT_", "OWNER_CAPABILITY_FILE", "DEDICATED_TESTNET_CREDENTIALS_MISSING", "BAD_ENVIRONMENT:", "DISK_LOW:", "DISK_UNREADABLE", *("CAPITAL_ANCHOR_REFUSED:" + c for c in NO_ALERT_ANCHOR_CODES))
 
 
 def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[..., Dict[str, Any]] = run_once, clock: Optional[Callable[[], int]] = None,
@@ -1056,6 +1238,7 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
     seen: Dict[str, Optional[int]] = {"bybit": None, "market": None, "reconcile": None, "sync": None}
     session: Dict[str, Optional[str]] = {"id": None}
     hb = {"seq": 0, "at": 0}
+    fault = {"state_write": False}                                   # Round 22: set when the engine state could not be PERSISTED (a full or failing volume); no session starts until a write works again
 
     def emit(drain: bool = True) -> None:
         """One heartbeat with a UNIQUE seq per heartbeat (the database keys heartbeats by run and seq: a repeat would be dropped and the worker would look stale)."""
@@ -1070,9 +1253,17 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
         except TypeError:
             tel.heartbeat(beat)
 
-    def go(state: str, source: str, **extra: Any) -> Dict[str, Any]:
+    def go(state: str, source: str, *, strict: bool = False, **extra: Any) -> Dict[str, Any]:
         session["id"] = os.path.basename(_ACTIVE["dir"]) if _ACTIVE.get("dir") else None
-        st = eng.transition(state, source, **extra)
+        try:
+            st = eng.transition(state, source, **extra)
+            fault["state_write"] = False
+        except OSError as exc:                                       # a full / failing volume must not kill the loop (an always-restart policy would loop on it): say so and stay out of sessions
+            fault["state_write"] = True
+            out(f"STATE_WRITE_FAILED: {type(exc).__name__} errno={getattr(exc, 'errno', None)} while entering {state}: no session starts until the state volume is writable again")
+            if strict:
+                raise                                                # a PRE-ORDER transition is a refusal point: a session whose state cannot be recorded must not reach its first order (the error ends the session as ERROR and forces a fresh venue proof, as before Round 22)
+            return {}
         try:
             emit()
             payload: Dict[str, Any] = {"state": state, "source": source[:200]}
@@ -1096,7 +1287,11 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
 
     def alert(code: str, body: Mapping[str, Any], why: Sequence[str] = ()) -> None:
         """Set the persistent ALERT marker AND emit an INCIDENT event (the independent monitor alerts the owner on it)."""
-        eng.set("ALERT", {"code": code, **body})
+        try:
+            eng.set("ALERT", {"code": code, **body})
+        except OSError as exc:                                       # the marker could not be written: the INCIDENT event below and the forced venue proof on the next pass still stand
+            fault["state_write"] = True
+            out(f"ALERT_MARKER_WRITE_FAILED: {type(exc).__name__} errno={getattr(exc, 'errno', None)} ({code})")
         try:
             tel.event("INCIDENT", {"code": code, "severity": "CRITICAL", "detail": "; ".join(str(x) for x in list(why)[:4])[:300]}, session["id"])
         except Exception:                                            # noqa: BLE001
@@ -1137,6 +1332,12 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             go("STOPPED", "signal")
             out("stop signal: stopped")
             return 0
+        if fault["state_write"]:                                     # probe the state volume; run NOTHING while it is unwritable (a session whose state cannot be saved cannot be recovered)
+            recovered = False
+            go("PAUSED", "state_volume_unwritable")
+            if fault["state_write"]:
+                idle_sleep(IDLE_POLL_S)
+                continue
         if eng.has("ALERT"):
             idle("UNRECONCILED" if eng.load()["state"] == "UNRECONCILED" else "ALERT", "marker", detail=eng.read("ALERT"))        # the more specific cause stays visible across a restart
             continue
@@ -1175,12 +1376,16 @@ def loop(env: Mapping[str, str], *, root: str = DEFAULT_ROOT, once: Callable[...
             idle("DRAINING", "drain_requested")
             continue
         try:
-            res = once(env, clock=clock, sleep=session_sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src), on_event=on_event, **kw)
+            res = once(env, clock=clock, sleep=session_sleep, out=out, engine_root=root, lease=lease, on_state=lambda s, src: go(s, src, strict=s in PRE_ORDER_STATES), on_event=on_event, **kw)
         except Exception as exc:                                     # noqa: BLE001 - a session died with an exception: it may have legs open. Never carry on; prove the venue flat first.
             res = {"result": "ERROR", "why": [f"UNEXPECTED_EXCEPTION:{type(exc).__name__}"]}
             recovered = False
         res["at_ms"] = int(clock())
-        ES.write_json_atomic(os.path.join(root, "last_result.json"), res)
+        try:
+            ES.write_json_atomic(os.path.join(root, "last_result.json"), res)
+        except OSError as exc:                                       # evidence of the last cycle: never a reason to crash the loop
+            fault["state_write"] = True
+            out(f"LAST_RESULT_WRITE_FAILED: {type(exc).__name__} errno={getattr(exc, 'errno', None)}")
         out(json.dumps({k: res.get(k) for k in ("result", "why", "state_dir", "flat_verified", "funding_bps", "session_class")}, sort_keys=True, default=str))
         sid = os.path.basename(res["state_dir"]) if res.get("state_dir") else None
         try:
@@ -1462,6 +1667,9 @@ def _parser() -> argparse.ArgumentParser:
     cp.add_argument("--accept-older-lineage", action="store_true", help="OWNER ONLY, after ANCHOR_BEHIND_BOOK (an OLDER anchor directory was restored over a newer view or high-water mark): continue from the older lineage as a RECORDED decision (an ACK_OLDER lineage entry keeps what was discarded; a review is required before any entry). A witness that knows a newer head refuses it")
     qp = sub.add_parser("quality", help="READ-ONLY: measured execution cost vs the model's, realised funding vs expected, and the policy comparison, from the chained session log (no venue access, nothing written)")
     qp.add_argument("--root", default=DEFAULT_ROOT)
+    vs = sub.add_parser("venue-snapshot", help="READ-ONLY: the account's end state from the VENUE (positions on every symbol, spot balances, USDT, open AND conditional orders) as mechanics_venue_snapshot/1 JSON, for tools/mechanics_verify.py; places nothing, needs no grant")
+    vs.add_argument("--symbol", help="the spot symbol whose base-coin balance is read (default: the capability's first symbol, else BTCUSDT)")
+    vs.add_argument("--out", help="also write the JSON to this file (outside git); stdout always gets it")
     ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
     ev.add_argument("--symbol", help="default: the grant's / capability's first symbol, else BTCUSDT")
     ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40%% of the ceiling)")
@@ -1694,6 +1902,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
         rep["log_chain_ok"] = bool(ok)
         print(json.dumps(rep, indent=2, sort_keys=True, default=str))
         return 0 if ok else 1
+    if a.cmd == "venue-snapshot":
+        return cmd_venue_snapshot(e, clock, a.symbol, a.out)
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps, engine_root=getattr(a, "root", None))
         if a.record_to and isinstance(res.get("decision_record"), dict):

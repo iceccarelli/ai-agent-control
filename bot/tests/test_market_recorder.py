@@ -176,6 +176,27 @@ def test_the_status_publishes_the_chain_head_and_the_monitor_copies_it_into_its_
     assert line["recorder_chain_head"] == obs["chain_head"] and line["recorder_chain_n"] == 1
 
 
+def test_the_recorders_own_status_yields_a_health_state_and_the_monitor_history_carries_the_numbers(tmp_path):
+    """Round 22 end to end: the recorder's real status file -> recorder_observation (health + metrics) -> a monitor.jsonl line an external watcher can alert on. Not healthy without a verified image."""
+    import runner_monitor as RM
+    rec, store, wall = make(tmp_path)
+    rec.write_status()
+    now = wall / 1000.0 + 1
+    prov = {"status": "VERIFIED", "git_sha": "a" * 40, "recorder_fingerprint": "b" * 64, "environment_class": "READ_ONLY_RECORDER"}
+    obs = RM.recorder_observation(os.path.join(rec.dir, MR.STATUS_FILE), now=now, provenance=prov)
+    assert obs["health"]["schema"] == "recorder_health/v1" and obs["health"]["metrics"]["image"]["status"] == "VERIFIED"
+    root = str(tmp_path / "hist")
+    os.makedirs(root)
+    RM._history_line(root, {"at": "t", "outcome": "ENTRY_NOT_ELIGIBLE", "reasons": [], "recorder": obs})
+    line = json.loads(open(os.path.join(root, "monitor.jsonl")).read().splitlines()[-1])
+    assert line["recorder_health"] in ("healthy", "degraded", "stalled", "storage_blocked", "image_mismatch", "unknown")
+    assert line["recorder_image_status"] == "VERIFIED" and isinstance(line["recorder_health_codes"], list)
+    assert "recorder_reserve_bytes" in line and "recorder_retention_days" in line
+    # no provenance supplied: never healthy
+    bare = RM.recorder_observation(os.path.join(rec.dir, MR.STATUS_FILE), now=now)
+    assert bare["health"]["state"] != "healthy" and "IMAGE_NOT_CHECKED" in [r["code"] for r in bare["health"]["reasons"]]
+
+
 def test_a_crash_between_a_row_and_its_chain_entry_is_resealed_visibly_at_start(tmp_path):
     import evidence_chain as EC
     rec, store, wall = make(tmp_path)

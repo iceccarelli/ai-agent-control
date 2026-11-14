@@ -39,10 +39,20 @@ COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/profitability_report.py tools/state_backup.py tools/anchor_archive.py \
      tools/legacy_executor_guard.py tools/ms_executor_lock.py tools/executor_env.py tools/exec_evidence.py tools/supabase_sync.py tools/account_review.py tools/carry_prospective.py \
      tools/carry_teardown.py tools/deflated_sharpe.py tools/hypothesis_registry.py tools/strategy_verdict.py \
+     tools/recorder_health.py tools/runtime_provenance.py tools/image_manifest.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
+# Round 22: the image states what it is. The build REFUSES (no manifest, no image) without the 40-hex commit it is built from:
+#   fly deploy -c fly.drill.toml --ha=false --build-arg BUILD_COMMIT=$(git rev-parse HEAD)      (never without it)
+# The entrypoint re-verifies the manifest against the files and packages actually present and REFUSES to start the recorder otherwise (tools/runtime_provenance.py).
+ARG BUILD_COMMIT
+COPY Dockerfile.drill fly.drill.toml /tmp/provenance/
+RUN python3 tools/runtime_provenance.py build --git-sha "$BUILD_COMMIT" --environment-class READ_ONLY_RECORDER --root /app --extra /usr/local/bin/drill-entrypoint \
+        --config /tmp/provenance/Dockerfile.drill --config /tmp/provenance/fly.drill.toml \
+    && rm -rf /tmp/provenance
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
-    && mkdir -p /data && chown -R bot:bot /app /data
+    && mkdir -p /data && chown -R bot:bot /app /data \
+    && chown root:root /app/RUNTIME_MANIFEST.json && chmod 0444 /app/RUNTIME_MANIFEST.json
 
 # Testnet only, stated again here; the orchestrator also forces its own env for
 # every child (its own paper flag is set only inside the order-capable child it starts,

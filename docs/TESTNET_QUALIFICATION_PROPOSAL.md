@@ -55,7 +55,7 @@ Each step is owner-only because it creates authority or starts an order-capable 
 **Read-only readiness the agent can and cannot establish (Round 21).** Without a capability, `ms_testnet_session.py preflight` stops after its four local checks and makes no venue read, so the user-id basis, key permissions, account mode, one-way mode, wallet balance (at least 500 USDT), instrument filters and flat / no-open-orders facts are provable only AFTER the owner creates the capability (step 2). `ms_testnet_autopilot.py evaluate` needs only the dedicated Testnet credentials and reads the account fee tier, instrument filters and books. Both are listed with their effects in RUNBOOKS "Testnet readiness checklist (Round 21)". Until they have been run and read, the venue facts are UNKNOWN, not assumed.
 
 1. **Decide** whether to allow a mechanics session at all. It costs about $0.5 of fake money and buys the first measured fills, fees and margin facts. Not doing it leaves execution cost unmeasured and every research number modelled.
-2. **Provide the capability and grant** on the selected executor once prerequisite 0 is done (typed by you; the repository never creates, copies or renews them). The capability file is RUNBOOKS autopilot step 4 (it holds your manifest, no key). The grant is step 5: `fly ssh console -a carry-autopilot` (the app of prerequisite 0), then `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 5 --days 1 --allow-mechanics-sessions` (RUNBOOKS autopilot section, step 5). *What it changes:* writes `~/.ai-agent-control/ms_autopilot_grant.json` (0600, expiring, bound to the manifest). *Reversible:* delete the file or let it expire; `drain` before any deploy.
+2. **Provide the capability and grant** on the selected executor once prerequisite 0 is done (typed by you; the repository never creates, copies or renews them). The capability file is RUNBOOKS autopilot step 4 (it holds your manifest, no key). The grant is step 5: `fly ssh console -a carry-autopilot` (the app of prerequisite 0), then `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 0.5 --days 1 --allow-mechanics-sessions` (RUNBOOKS autopilot section, step 5). *What it changes:* writes `~/.ai-agent-control/ms_autopilot_grant.json` (0600, expiring, bound to the manifest). *Reversible:* delete the file or let it expire; `drain` before any deploy.
 3. **Confirm the shared lease and the single executor:** `carry-book` stays stopped and `CARRY_DRILL_ENABLED` stays unset; the deployed 2026-11-05 `carry-drill` image predates the lease guard and must not run its conformance path.
 4. **Start** the autopilot only after 0, 2 and 3 (per RUNBOOKS; there is no machine to start until prerequisite 0 exists). *Risk:* fake-money loss of about $5.55 or a little more (the limit is a trigger, not a cap); an unhandled fault leaves a Testnet hedge that the engine's startup recovery proves flat or alerts on.
 5. Read the verification list above and send back `reconciliation.json` and the `__wallet_facts__` samples.
@@ -78,10 +78,36 @@ Prerequisites that are NOT yet true, so this request is not sent today: the auto
 >
 > *Stop conditions (any one ends it; the agent overrides none).* LOSS_LIMIT; lifecycle exceeded; lease lost or unprovable; kill switch engaged; a leg refused or unhedged beyond tolerance; NOT_FLAT at the end (a failed wallet, position or order read ends as NOT_FLAT, never inferred flat); grant or capability expired, revoked or future-dated; an ALERT marker. If the executor stops with a short open, `tools/close_testnet_short.py` (takes the single-writer guard; `--arm` is yours) or `reconcile --unwind` (yours).
 >
-> *What YOU create yourself (the agent will not, and cannot).* (a) deploy the autopilot app from the merged commit (it does not exist today), confirm `carry-book` stays stopped and `CARRY_DRILL_ENABLED` unset; (b) the owner capability file (RUNBOOKS, "Testnet execution: owner procedure" step 4; it holds your manifest, no key); (c) the dedicated Testnet credentials as secrets; (d) one interactive `capital --anchor-init`; (e) the grant, typed by you on the selected executor: `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 5 --days 1 --allow-mechanics-sessions`; (f) starting the process, and afterwards sending back `reconciliation.json` and the `__wallet_facts__` samples.
+> *What YOU create yourself (the agent will not, and cannot).* (a) deploy the autopilot app from the merged commit (it does not exist today), confirm `carry-book` stays stopped and `CARRY_DRILL_ENABLED` unset; (b) the owner capability file (RUNBOOKS, "Testnet execution: owner procedure" step 4; it holds your manifest, no key); (c) the dedicated Testnet credentials as secrets; (d) one interactive `capital --anchor-init`; (e) the grant, typed by you on the selected executor: `autopilot-ctl grant --max-sessions 1 --max-notional-usd 100 --max-hold-s 1500 --min-funding-bps 0.5 --days 1 --allow-mechanics-sessions`; (f) starting the process, and afterwards sending back `reconciliation.json` and the `__wallet_facts__` samples.
 >
 > *Reversible by* deleting the grant, letting it expire, or `drain`. If you do not answer, nothing runs.
 
 ## Not part of this proposal
 
 Mainnet, any real-money order, the carry-book, any change to a risk limit, refusal code, lease, kill switch or reconciliation, the frozen `funding_carry_fade_v1`, the owner holdout, the capital anchor or any owner ledger.
+
+## Round 22 addendum: what "mechanics verified" means, and the one correction to the grant
+
+**Correction (REPRODUCED by running the documented grant's floor through `funding_decision`).** The grant above said `--min-funding-bps 5`. The loop starts a session only when the funding print pays at least that floor, and the usual Bybit BTCUSDT print is about 1 bp (the largest historical print in the committed corpus is 11.28 bps), so a 5 bp floor would have waited for a rare print and run nothing for days. For a MECHANICS session the floor only has to be positive: use `--min-funding-bps 0.5` (a print of 0 or less never qualifies: the loop requires funding strictly above zero). A test now runs the grant text of this document through the loop's own decision at 1 bp (runs), 0.4 bp (does not) and 0 (does not).
+
+**Plan sizing.** The plan rounds the quantity DOWN to the venue's lot step, so at the Testnet price in the committed capture one BTC lot is about $83 per leg (about $170 committed at 2.04x), not $100: the notional above is a ceiling. The refusals to expect if the sizing does not fit are `QTY_BELOW_MIN_QTY`, `LINEAR_NOTIONAL_BELOW_MIN`, `SPOT_NOTIONAL_BELOW_MIN` and `BELOW_MIN_NOTIONAL` (read at preflight; nothing is sent). These are offline figures from the committed capture and are UNVERIFIED against a live read.
+
+**What this session may be called, in a closed vocabulary** (the level is never higher than the evidence; `tools/mechanics_verify.py` produces the middle ones):
+
+| Level | Evidence required |
+|---|---|
+| NOT BUILT / BUILT | the code exists and its tests pass |
+| NOT DEPLOYED / DEPLOYED | the image built from a merged commit is running (registry digest, the in-machine provenance check) |
+| NOT AUTHORISED / AUTHORISED | the owner's capability and grant exist (the owner's act) |
+| NOT RUN / RUNNING | a session started |
+| **MECHANICS VERIFIED** | `mechanics_verify` = MECHANICS_VERIFIED on the session directory AND an independent venue snapshot taken after the last fill (positions on every symbol zero, ordinary and conditional open orders empty, spot base within dust of the baseline, cash change equal to the recomputed net) |
+| **REPEATED MECHANICS VERIFIED** | at least two distinct sessions (different group, plan digest and decision) each MECHANICS VERIFIED |
+
+Neither verified level says anything about profit: Testnet money is fake and the session's expected result is a small loss. A funding settlement that is observed but whose sign convention is not yet settled (a `QUARANTINED_SIGN` row) stays UNKNOWN, which makes a session meant to span a settlement INCONCLUSIVE rather than verified. The first session therefore resolves two measurable uncertainties: the executed cost against the 31.4 bps model (fees by currency, spread, slippage), and the sign convention of the funding row.
+
+**Read-only verification after the session** (nothing here sends an order; run on the executor or any machine with the dedicated Testnet credentials and the session directory):
+
+    autopilot-ctl venue-snapshot --out /data/snapshot_after.json          # the venue's own account-wide end state: every symbol, ordinary AND conditional open orders
+    python3 bot/tools/mechanics_verify.py <session_dir> --venue-snapshot snapshot_after.json --json
+
+Evidence to return to the engineer: the session directory (`testnet_session.json`, `plan.json`, `preflight.json`, `engine_journal.jsonl`, `execution_quality.json`, `exec_measurements.json`, `funding_settlement.json`, `reconciliation.json`, `decision.json`), the snapshot, `mechanics_verify`'s JSON, and `autopilot-ctl quality`. The request volume of a session is about 19 requests per second at peak (a measured figure from the fake venue's request log, UNVERIFIED against the venue's real rate limits).

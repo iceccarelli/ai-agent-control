@@ -400,6 +400,7 @@ class TestTheMonitorCannotTrade:
         assert names <= {"argparse", "json", "os", "sys", "time", "typing",
                          "threading", "traceback", "__future__", "run_outcomes",
                          "runner_alerts", "mainnet_public", "unattended_drill",
+                         "recorder_health", "runtime_provenance",   # Round 22: pure classification and the image's own provenance check: no client, no order, no network
                          "carry_shadow"}   # lazy: public-data shadow book, no client
 
     def test_a_full_preflight_flow_sends_no_non_get_request(self):
@@ -814,7 +815,7 @@ class TestItImportsWhatItNeedsWhenLaunchedAsAScript:
             for f in ("runner_monitor.py", "run_outcomes.py", "carry_preflight.py",
                       "unattended_drill.py", "next_settlement.py",
                       "runner_alerts.py", "monitor_summary.py",
-                      "mainnet_public.py"):
+                      "mainnet_public.py", "recorder_health.py", "runtime_provenance.py", "image_manifest.py"):
                 shutil.copy(os.path.join(BOT, "tools", f), os.path.join(root, "tools"))
             shutil.copytree(os.path.join(BOT, "signals"), os.path.join(root, "signals"))
             # `-c` puts '' (the app root) first; replace it with tools/ to mimic

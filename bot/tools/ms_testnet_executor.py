@@ -557,6 +557,56 @@ class TestnetExecutor:
         return {"orders": orders, "executions": execs, "positions": positions, "complete": complete, "read_ms": int(self.clock()),
                 "foreign_open_orders": list(self.foreign_open_orders), "unattributed": list(self._read_unattributed)}
 
+    #: the order filters the venue distinguishes: ordinary resting orders, conditional (stop) orders and TP/SL orders. A conditional order is open exposure that the ordinary list does not show.
+    ORDER_FILTERS = ("Order", "StopOrder", "tpslOrder")
+
+    def account_open_orders(self) -> Dict[str, Any]:
+        """READ-ONLY and account-wide: every OPEN order on linear (all USDT symbols) and spot, in each order filter. ``venue_state`` reads open orders only for the executor's own symbols and only the
+        ordinary filter, so a foreign order on another symbol or a conditional order was invisible to the flat proof (Round 22). ``complete`` is False when ANY read failed, was malformed or was still paging;
+        an incomplete read is never read as 'no open orders'. UNVERIFIED against the live Testnet API: whether spot accepts no symbol and whether ``orderFilter`` is honoured as documented; a refusal is
+        ``complete: False`` (the caller then proves nothing), never a pass."""
+        active: List[Dict[str, Any]] = []
+        conditional: List[Dict[str, Any]] = []
+        complete = True
+        for cat, base in (("linear", {"settleCoin": QUOTE}), ("spot", {})):
+            for flt in self.ORDER_FILTERS:
+                try:
+                    rows = self._paged("/v5/order/realtime", {"category": cat, **base, "openOnly": 0, "orderFilter": flt}, 50)
+                except (ExecutorError, KeyError, TypeError, ValueError):
+                    complete = False
+                    continue
+                for r in rows:
+                    item = {"category": cat, "filter": flt, "symbol": str(r.get("symbol")), "order_id": str(r.get("orderId")), "link": r.get("orderLinkId") or None, "status": str(r.get("orderStatus")),
+                            "side": r.get("side"), "qty": str(r.get("qty")), "reduce_only": r.get("reduceOnly")}
+                    (active if flt == "Order" else conditional).append(item)
+        return {"complete": complete, "active": active, "conditional": conditional}
+
+    def venue_end_state(self) -> Dict[str, Any]:
+        """``mechanics_venue_snapshot/1`` (named ``venue_end_state``: ``snapshot(symbol)`` is the market snapshot the engine uses): the account's end state from the VENUE, read now, for ``tools/mechanics_verify.py`` (the independent proof of what a session's own flat claim only asserts). Positions on
+        ANY linear symbol, spot base-coin balances for this executor's spot symbols, the USDT balance, and the account-wide open orders (ordinary and conditional). ``complete`` only when every read parsed. Reads only."""
+        t0 = int(self.clock())                                             # the instant BEFORE the first read: no fill can be later than a read that began after it
+        v = self.venue_state()
+        orders = self.account_open_orders()
+        positions = v.get("positions")
+        complete = bool(v.get("complete")) and positions is not None and bool(orders["complete"])
+        lin = {k[len("linear:"):]: float(q) for k, q in (positions or {}).items() if k.startswith("linear:")}
+        spot: Dict[str, str] = {}
+        usdt: Optional[str] = None
+        try:
+            coins = sorted({self.filters("spot", s).base_coin for s in self.spot_symbols} | {QUOTE})
+            _eq, have = parse_wallet(self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": ",".join(coins)}, signed=True))
+            for c in coins:
+                if c in have:
+                    spot[c] = format(have[c], "f")
+            usdt = spot.get(QUOTE)
+            if usdt is None or any(self.filters("spot", s).base_coin not in have for s in self.spot_symbols):
+                complete = False                                           # an asked-for coin the venue did not answer for is UNKNOWN, not zero
+        except (ExecutorError, KeyError, TypeError, ValueError):
+            complete = False
+        return {"schema": "mechanics_venue_snapshot/1", "read_ms": t0, "complete": bool(complete), "venue": "testnet", "linear_positions": lin, "spot_balances": spot,
+                "open_orders_active": orders["active"], "open_orders_conditional": orders["conditional"], "usdt_balance": usdt,
+                "unverified": ["spot order/realtime without a symbol and the orderFilter values StopOrder/tpslOrder are documented but not yet exercised against the live Testnet"]}
+
     def _spot_base_coin(self, symbol: str) -> Optional[str]:
         """The symbol's base coin from the instrument filters this executor already holds (None when they cannot be read: then no fee currency but the quote is trusted)."""
         try:

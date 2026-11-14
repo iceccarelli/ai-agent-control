@@ -446,6 +446,47 @@ class TestCommandLine:
         assert RA.ENV_VAR in out.err and code == 1
 
 
+    def test_a_failing_transport_is_reported_as_not_delivered_not_as_a_quiet_red(self, tmp_path, capsys):
+        """REPRODUCED (Round 22): with Slack unreachable the watcher still exited 1 and said nothing distinct; a red job could not say whether anyone had been told."""
+        def dead(url, body, timeout):
+            raise OSError("network is unreachable " + FAKE_URL)
+        n = RA.Notifier(ENV, transport=dead, say=lambda line: None, sleep=lambda s: None)
+        path = tmp_path / "h.jsonl"
+        path.write_text(text(row(400)))
+        result = tmp_path / "result.json"
+        summary = tmp_path / "summary.md"
+        code = RA.main([str(path), "--now", str(NOW), "--result-file", str(result)], env={**ENV, "GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(summary)}, notifier=n)
+        shown = capsys.readouterr()
+        assert code == 1                                                       # still red: an alert was raised
+        assert "DELIVERY: none_delivered" in shown.out and "::error title=monitor alerts were raised but NOT delivered" in shown.out
+        got = json.loads(result.read_text())
+        assert got["delivery"] == "none_delivered" and got["raised"] and all(v.startswith("failed") for v in got["results"].values())
+        assert "none_delivered" in summary.read_text() and "stale" in summary.read_text().lower()
+        assert TOKEN not in shown.out + shown.err + result.read_text() + summary.read_text()
+
+    def test_delivered_disabled_dry_run_and_quiet_are_each_named(self, tmp_path, capsys):
+        wire = Wire()
+        ok = RA.Notifier(ENV, transport=wire, say=lambda line: None, sleep=lambda s: None)
+        path = tmp_path / "h.jsonl"
+        path.write_text(text(row(400)))
+        r = tmp_path / "r.json"
+        assert RA.main([str(path), "--now", str(NOW), "--result-file", str(r)], env=ENV, notifier=ok) == 1
+        assert json.loads(r.read_text())["delivery"] == "all_sent" and "::error" not in capsys.readouterr().out
+        RA.main([str(path), "--now", str(NOW), "--result-file", str(r)], env={})
+        assert json.loads(r.read_text())["delivery"] == "disabled"
+        RA.main([str(path), "--now", str(NOW), "--dry-run", "--result-file", str(r)], env=ENV)
+        assert json.loads(r.read_text())["delivery"] == "dry_run"
+        path.write_text(text(row(5)))
+        RA.main([str(path), "--now", str(NOW), "--result-file", str(r)], env=ENV)
+        assert json.loads(r.read_text())["delivery"] == "none_needed" and json.loads(r.read_text())["raised"] == []
+
+    def test_a_partial_delivery_is_partial(self):
+        a, b = RA.Alert("x", RA.WARNING, "t"), RA.Alert("y", RA.WARNING, "t")
+        assert RA.delivery_status([a, b], {"x": "sent", "y": "failed: HTTP 500"}) == "partial"
+        assert RA.delivery_status([a, b], {"x": "failed: OSError", "y": "failed: OSError"}) == "none_delivered"
+        assert RA.delivery_status([a], {"x": "disabled"}) == "disabled"
+
+
 # -- it can read, it cannot trade ---------------------------------------------
 
 def test_the_module_has_no_order_capable_import_and_no_credentials():
@@ -636,3 +677,76 @@ def test_the_permanent_alert_needs_stamps_and_never_reads_the_machines_clock():
     for r in rows:
         r["at"] = "garbage"
     assert "recorder_stall_permanent" not in _keys(RA.evaluate(text(*rows), NOW)), "unreadable stamps cannot establish a duration"
+
+
+# -- Round 22: image provenance and the early warning in hours --------------------------------------------------
+
+def _img_rows(*statuses):
+    n = len(statuses)
+    return [row((n - i) * 60, recorder_state="RECORDING", recorder_image_status=s) for i, s in enumerate(statuses)]
+
+
+def test_a_recorder_image_whose_provenance_is_not_established_for_three_cycles_raises_recorder_image_mismatch():
+    for bad in ("MISMATCH", "MISSING"):
+        alerts = RA.evaluate(text(*_img_rows("VERIFIED", bad, bad, bad)), NOW)
+        assert "recorder_image_mismatch" in _keys(alerts) and "recorder_down" not in _keys(alerts), bad          # it is still RECORDING: this is a different fault
+        msg = next(a for a in alerts if a.key == "recorder_image_mismatch")
+        assert msg.severity == RA.WARNING and "BUILD_COMMIT" in msg.text and "Nothing is changed" in msg.text
+
+
+def test_one_or_two_bad_image_cycles_a_verified_image_or_no_field_do_not_alert():
+    for sts in (("VERIFIED", "MISMATCH", "MISMATCH"), ("MISMATCH", "MISMATCH", "VERIFIED"), ("MISMATCH", "MISSING"), ("VERIFIED", "VERIFIED", "VERIFIED"), ("NOT_CHECKED",) * 3):
+        assert "recorder_image_mismatch" not in _keys(RA.evaluate(text(*_img_rows(*sts)), NOW)), sts
+    assert "recorder_image_mismatch" not in _keys(RA.evaluate(text(row(180), row(120), row(60)), NOW))
+
+
+def _soon_rows(*hours, health="degraded"):
+    n = len(hours)
+    return [row((n - i) * 60, recorder_state="RECORDING", recorder_health=health, recorder_hours_to_reserve=h) for i, h in enumerate(hours)]
+
+
+def test_a_volume_that_reaches_the_reserve_within_a_day_warns_in_hours_before_the_headroom_is_gone():
+    alerts = RA.evaluate(text(*_soon_rows(30.0, 20.0, 15.5, 11.0)), NOW)
+    assert "recorder_reserve_soon" in _keys(alerts) and "recorder_down" not in _keys(alerts)
+    msg = next(a for a in alerts if a.key == "recorder_reserve_soon")
+    assert "11.0 h" in msg.text and "nothing is deleted or resized" in msg.text
+
+
+def test_the_hours_warning_is_quiet_when_there_is_time_when_blocked_already_or_the_estimate_is_unusable():
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(60.0, 48.0, 30.0)), NOW))
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(10.0, 9.0, 8.0, health="storage_blocked")), NOW)), "blocked is recorder_down / recorder_disk_low's case"
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(10.0, 9.0)), NOW)), "two cycles are not three"
+    junk = [row(180, recorder_hours_to_reserve=True), row(120, recorder_hours_to_reserve="5"), row(60, recorder_hours_to_reserve=-3)]
+    assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*junk), NOW))
+
+
+def _resume_rows(days, health="storage_blocked", n=3, gb=4.4e9):
+    return [row((n - i) * 60, recorder_state="STALE", recorder_health=health, recorder_resume_prune_days=days, recorder_resume_prune_bytes=gb) for i in range(n)]
+
+
+def test_a_blocked_recorder_whose_first_write_would_delete_retained_days_says_so_before_the_owner_extends_the_volume():
+    for health in ("storage_blocked", "stalled", "unknown"):
+        alerts = RA.evaluate(text(*_resume_rows(3, health)), NOW)
+        assert "recorder_resume_will_prune" in _keys(alerts), health
+    msg = next(a for a in RA.evaluate(text(*_resume_rows(3)), NOW) if a.key == "recorder_resume_will_prune")
+    assert msg.severity == RA.WARNING and "3 retained closed day(s) (4.40 GB)" in msg.text and "preserve them" in msg.text and "Nothing is deleted or resized" in msg.text
+
+
+def test_the_resume_prune_alert_is_quiet_for_a_healthy_writer_for_zero_days_for_two_cycles_or_for_junk():
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(3, health="healthy")), NOW)), "a healthy writer's own expiry is normal"
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(0)), NOW))
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(3, n=2)), NOW)), "two cycles are not three"
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(True)), NOW)) and "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows("3")), NOW))
+
+
+def test_the_disk_alerts_use_the_reserve_the_recorder_reports_not_a_hard_coded_512_mib():
+    """REPRODUCED (Round 22 fly review): runner_alerts compared against a constant 512 MiB. A recorder running with a 2 GiB reserve and 1.5 GiB free is BLOCKED; the alert must see it."""
+    blocked = [row((3 - i) * 60, recorder_state="STALE", recorder_free_mb=1536.0, recorder_reserve_bytes=2 * 1024 ** 3) for i in range(3)]
+    msg = next(a for a in RA.evaluate(text(*blocked), NOW) if a.key == "recorder_disk_low")
+    assert "BELOW the 2048 MiB write reserve" in msg.text
+    # a smaller reserve is not over-alerted: 1.2 GiB free is far above a 64 MiB reserve + 1 GiB headroom? (64 + 1024 = 1088 < 1229)
+    fine = [row((3 - i) * 60, recorder_state="RECORDING", recorder_free_mb=1229.0, recorder_reserve_bytes=64 * 1024 ** 2) for i in range(3)]
+    assert "recorder_disk_low" not in _keys(RA.evaluate(text(*fine), NOW))
+    # a row that does not say falls back to the documented 512 MiB
+    legacy = [row((3 - i) * 60, recorder_state="RECORDING", recorder_free_mb=1400.0) for i in range(3)]
+    assert "recorder_disk_low" in _keys(RA.evaluate(text(*legacy), NOW))

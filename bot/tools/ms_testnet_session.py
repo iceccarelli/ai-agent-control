@@ -774,6 +774,8 @@ class Run:
         if not view or not view.get("complete") or view.get("positions") is None:
             return False
         pos = view["positions"]
+        if any(str(k).startswith("linear:") and abs(float(q)) >= 1e-12 for k, q in pos.items()):
+            return False                                                # Round 22: a perp open on ANY symbol of this account is exposure the proof must not hide (the autopilot's recovery already reads all of them)
         for sym in sorted({l.symbol for l in self.group_plan.legs}):
             dust = max(float(self.ex.filters("spot", sym).qty_step), 0.002 * max(float(l.qty) for l in self.group_plan.legs if l.symbol == sym))
             if abs(pos.get(f"linear:{sym}", 0.0)) >= 1e-12 or abs(_minus(pos.get(f"spot:{sym}", 0.0), self.baseline.get(f"spot:{sym}", 0.0))) > dust:

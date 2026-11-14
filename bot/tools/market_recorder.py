@@ -213,6 +213,10 @@ class Recorder:
             free = store.free_bytes()
         except Exception:  # noqa: BLE001
             free = None
+        try:
+            volume_total = store.total_bytes() if hasattr(store, "total_bytes") else None
+        except Exception:  # noqa: BLE001
+            volume_total = None
         view_refusals = self._entry_refusals      # from the last capacity capture: reading the view here would wait on the engine lock the writer holds, and a heartbeat must never wait on the writer
         return {
             "schema": SCHEMA, "pid": os.getpid(), "environment": self.environment,
@@ -223,9 +227,11 @@ class Recorder:
                           "last_maintenance_error": self.last_maintenance_error, "maintenance_ok_ms": self.maintenance_ok_ms},
             "progress": self._progress(now),
             "store": {"records": self._count_cache, "records_counted_ms": self._count_ms, "segments": len(store.segments()),
-                      "free_bytes": free, "min_free_bytes": self.min_free_bytes,
+                      "free_bytes": free, "volume_total_bytes": volume_total, "min_free_bytes": self.min_free_bytes,
                       "retention_days": self.retention_days,
                       "capacity_retention_days": self.capacity_retention_days,
+                      "last_commit_ms": getattr(store, "last_commit_wall_ms", None),
+                      "segment_bytes": store.segment_bytes() if hasattr(store, "segment_bytes") else None,
                       "emergency_prunes": getattr(store, "emergency_prunes", 0), "emergency_prunes_denied": getattr(store, "emergency_prunes_denied", 0),
                       "fault": self.engine.state.store_fault},
             "entry_refusals": view_refusals,

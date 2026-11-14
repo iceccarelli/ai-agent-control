@@ -52,6 +52,8 @@ if BOT not in sys.path:
     sys.path.insert(1, BOT)
 
 import run_outcomes as RO
+import recorder_health as RH  # noqa: E402
+import runtime_provenance as RP  # noqa: E402
 import runner_alerts as RA  # noqa: E402
 import unattended_drill as UD  # noqa: E402  (probe, child runner, lock, prune)
 
@@ -199,6 +201,20 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
         # recorder's last value.
         if isinstance(recorder.get("free_mb_source"), str):
             line["recorder_free_mb_source"] = recorder["free_mb_source"]
+        health = recorder.get("health")
+        if isinstance(health, dict):
+            m = health.get("metrics") if isinstance(health.get("metrics"), dict) else {}
+            line["recorder_health"] = health.get("state")
+            line["recorder_health_codes"] = [r.get("code") for r in health.get("reasons", []) if isinstance(r, dict)][:8]
+            for src, dst in (("bytes_remaining_above_reserve", "recorder_bytes_remaining"), ("hours_to_reserve_no_prune", "recorder_hours_to_reserve"), ("last_write_age_s", "recorder_last_write_age_s"),
+                             ("last_commit_age_s", "recorder_last_commit_age_s"), ("effective_reserve_bytes", "recorder_reserve_bytes"), ("effective_retention_days", "recorder_retention_days"),
+                             ("volume_total_bytes", "recorder_volume_total_bytes"), ("closed_day_mean_bytes", "recorder_daily_rate_bytes"), ("volume_holds_retention", "recorder_volume_holds_retention"),
+                             ("prune_on_resume_days", "recorder_resume_prune_days"), ("prune_on_resume_bytes", "recorder_resume_prune_bytes")):
+                if m.get(src) is not None:
+                    line[dst] = m[src]
+            image = m.get("image") if isinstance(m.get("image"), dict) else {}
+            if image.get("status"):
+                line["recorder_image_status"] = image["status"]
         if recorder.get("fault") or recorder.get("detail"):
             # The state's OWN explanation comes first (a STALE or NOT_PERSISTING recorder says why it
             # is not reporting or not persisting), then the store's last fault. The fault used to
@@ -260,9 +276,9 @@ def _supervisor_summary(status_path: str) -> str:
         return f"supervisor status unreadable ({type(exc).__name__})"
 
 
-def recorder_observation(path: Optional[str], *, now: Optional[float] = None
-                         ) -> Optional[Dict[str, Any]]:
-    """What the market recorder says about itself, or None when no recorder is configured.
+def _recorder_core(path: Optional[str], *, now: Optional[float] = None
+                   ) -> Optional[Dict[str, Any]]:
+    """What the market recorder says about itself, or None when no recorder is configured. (Round 22: ``recorder_observation`` wraps this and adds the one health classification.)
 
     DATA COLLECTION, reported next to the cycle outcome and never folded into it: a dead
     recorder cannot fail a good cycle (the monitor's job is the read-only check), but it is
@@ -316,11 +332,69 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None
                 "chain_file": (cap.get("chain_head") or {}).get("file"),
                 "chain_n": (cap.get("chain_head") or {}).get("n"),
                 "chain_head": (cap.get("chain_head") or {}).get("head"),
-                "entry_refusals": st.get("entry_refusals")}
+                "entry_refusals": st.get("entry_refusals"), "_status": st}
     except FileNotFoundError:
-        return {"state": "ABSENT", "detail": "no status file: the recorder has not started"}
+        return {"state": "ABSENT", "detail": "no status file: the recorder has not started", "_status": None, "_read_error": "FileNotFoundError"}
     except Exception as exc:                                   # noqa: BLE001
-        return {"state": "UNREADABLE", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+        return {"state": "UNREADABLE", "detail": f"{type(exc).__name__}: {exc}"[:200], "_status": None, "_read_error": type(exc).__name__}
+
+
+_PROV_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
+PROVENANCE_TTL_S = 3600.0
+
+
+def runtime_provenance_check(now: Optional[float] = None) -> Dict[str, Any]:
+    """The running image's provenance (``runtime_provenance.verify_runtime`` over the application root, required to be a READ_ONLY_RECORDER image), re-hashed at most once an hour: the files of an
+    image do not change under a running process, and hashing ~100 files every monitor cycle is waste. A failure to establish it is MISSING or MISMATCH, never a pass. Never raises."""
+    now = time.time() if now is None else now
+    if _PROV_CACHE["result"] is not None and 0 <= now - _PROV_CACHE["at"] < PROVENANCE_TTL_S:
+        return _PROV_CACHE["result"]
+    try:
+        res = RP.verify_runtime(BOT, expect="READ_ONLY_RECORDER")
+    except Exception as exc:  # noqa: BLE001
+        res = {"status": "MISMATCH", "detail": f"the provenance check itself failed ({type(exc).__name__})"}
+    _PROV_CACHE.update(at=now, result=res)
+    return res
+
+
+def _supervisor_status(status_path: str) -> Optional[Dict[str, Any]]:
+    """The supervisor's own status (``supervisor_status.json`` beside the recorder's), or None. Never raises."""
+    sup = os.path.join(os.path.dirname(os.path.abspath(status_path)), "supervisor_status.json")
+    try:
+        with open(sup, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def recorder_observation(path: Optional[str], *, now: Optional[float] = None, provenance: Optional[Mapping[str, Any]] = None
+                         ) -> Optional[Dict[str, Any]]:
+    """The recorder's own report (``_recorder_core``) plus ONE health classification in the closed vocabulary of ``recorder_health`` (healthy / degraded / stalled / storage_blocked / image_mismatch /
+    unknown), computed from the status file, the volume read NOW, the supervisor's counters and the runtime provenance. The older ``state`` field is unchanged; ``health`` is what an alert or an owner acts on.
+    Never raises: a classifier failure is reported as ``unknown``, never as healthy."""
+    obs = _recorder_core(path, now=now)
+    if obs is None or not path:
+        return obs
+    now_f = time.time() if now is None else now
+    st, err = obs.pop("_status", None), obs.pop("_read_error", None)
+    free_now = total_now = None
+    if obs.get("free_mb_source") != "recorder_status":
+        # The volume is read ONLY when the status cannot be trusted for it (stale, or no figure): a FRESH status keeps the recorder's own free-space and volume-size figures (tests/test_recorder_liveness.py pins that
+        # the monitor does not touch the volume for it).
+        try:
+            vfs = os.statvfs(os.path.dirname(os.path.abspath(path)))
+            free_now = int(vfs.f_bavail) * int(vfs.f_frsize)
+            blocks = getattr(vfs, "f_blocks", None)
+            total_now = None if blocks is None else int(blocks) * int(vfs.f_frsize)       # a volume total the platform does not state is unknown, never zero
+        except (OSError, AttributeError, TypeError, ValueError):
+            free_now = total_now = None
+    try:
+        obs["health"] = RH.classify(st, now_s=now_f, free_bytes=free_now, total_bytes=total_now, supervisor=_supervisor_status(path), provenance=provenance,
+                                    status_read_error=err or (obs.get("detail") if obs.get("state") in ("ABSENT", "UNREADABLE") else None))
+    except Exception as exc:  # noqa: BLE001
+        obs["health"] = {"schema": RH.SCHEMA, "state": "unknown", "reasons": [{"state": "unknown", "code": "CLASSIFIER_FAILED", "detail": f"{type(exc).__name__}: {exc}"[:200]}], "metrics": {}}
+    return obs
 
 
 def monitor_once(run_dir: str, *, env: Mapping[str, str],
@@ -344,7 +418,7 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
     # Taken first and recorded whatever else happens: a day on which testnet is
     # unreachable is still a day on which the real market had a basis.
     mainnet = mainnet_observation(mainnet_db, mainnet_observer)
-    recorder = recorder_observation(recorder_status)
+    recorder = recorder_observation(recorder_status, provenance=runtime_provenance_check() if recorder_status else None)
 
     def finish(result: Dict[str, Any], code: int) -> int:
         record = {"at": stamp, "schema": "monitor/1", **result}

@@ -21,7 +21,7 @@ sys.path[:0] = [HERE, BOT, os.path.join(BOT, "tools")]
 import ms_capital as CC  # noqa: E402
 import ms_testnet_session as S  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
-from test_ms_testnet_autopilot import _cycle_eng, _profit_world  # noqa: E402
+from test_ms_testnet_autopilot import _cycle_eng, _session_world  # noqa: E402
 
 CREATE = "/v5/order/create"
 
@@ -168,7 +168,7 @@ def _pending(eng):
 
 
 def test_a_filled_order_whose_executions_are_not_listed_parks_an_unknown_net_never_a_zero(w):
-    _profit_world(w)
+    _session_world(w)
     orig = w.fake._fill
 
     def hide(o, qty, px, *, taker, dup=False):
@@ -183,7 +183,7 @@ def test_a_filled_order_whose_executions_are_not_listed_parks_an_unknown_net_nev
 
 
 def test_a_session_that_ends_with_the_venue_not_flat_is_parked_as_not_flat(w):
-    _profit_world(w)
+    _session_world(w)
     w.fake.inject(CREATE, "rate_limit", times=10_000, match=lambda d: bool(d.get("reduceOnly")))      # every reduce-only exit is refused: the hedge cannot be closed
     res, eng = _cycle_eng(w)
     assert res["result"] != "DONE", res
@@ -192,7 +192,7 @@ def test_a_session_that_ends_with_the_venue_not_flat_is_parked_as_not_flat(w):
 
 
 def test_a_session_whose_funding_was_not_recognised_is_parked_as_funding_not_read(w):
-    _profit_world(w)
+    _session_world(w)
     res, eng = _cycle_eng(w)                                                    # no settlement printed during the hold: the venue's funding rows say nothing
     rec = json.load(open(os.path.join(res["state_dir"], "testnet_session.json")))
     assert rec["net"]["funding_usd"] is None
