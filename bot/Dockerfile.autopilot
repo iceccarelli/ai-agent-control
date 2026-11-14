@@ -29,7 +29,7 @@ COPY tools/account_review.py tools/backfill_plan.py tools/candidate_competition.
      tools/ms_testnet_autopilot.py tools/ms_testnet_executor.py tools/ms_testnet_session.py tools/ms_testnet_transport.py \
      tools/ms_types.py tools/opportunity_map.py tools/provenance.py tools/research_harness.py tools/reserved_holdout.py \
      tools/strategy_verdict.py tools/supabase_sync.py tools/testnet_action_manifest.py tools/testnet_certificate.py \
-     tools/universe_capture.py tools/venue_evidence.py tools/runtime_provenance.py tools/image_manifest.py ./tools/
+     tools/universe_capture.py tools/venue_evidence.py tools/runtime_provenance.py tools/image_manifest.py tools/eligibility_gate.py ./tools/
 COPY deploy/autopilot-entrypoint.sh /usr/local/bin/autopilot-entrypoint
 COPY deploy/autopilot-ctl.sh /usr/local/bin/autopilot-ctl
 # Round 22: the image states what it is. The build REFUSES without the 40-hex commit it is built from (`--build-arg BUILD_COMMIT=$(git rev-parse HEAD)`); the entrypoint re-verifies the manifest and

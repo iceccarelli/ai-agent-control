@@ -2,6 +2,7 @@
 human memory. These tests build a manifest from the REAL repository closure, then break it in every way a deployment can go wrong and require a fail-closed answer each time."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -355,3 +356,26 @@ def test_the_default_environment_is_only_the_three_named_identity_variables(monk
     res = RP.verify_runtime(str(tmp_path))                  # no manifest: MISSING, and the result carries only identity fields
     assert res["status"] == "MISSING" and res["app"] == "carry-drill"
     assert "should-never-be-copied" not in json.dumps(res)
+
+
+def test_compare_says_what_a_machines_manifest_differs_in_from_this_checkout(tmp_path):
+    """The owner saves `cat /app/RUNTIME_MANIFEST.json` from the machine and compares it offline with a checkout: DIFFERENT files and closure files the image does not contain are named."""
+    root = tmp_path / "img"
+    root.mkdir()
+    _assemble("Dockerfile.drill", str(root))
+    man = RP.build_manifest(str(root), git_sha="a" * 40, environment_class="READ_ONLY_RECORDER")
+    same = RP.compare_manifest(man, str(root))
+    assert same["verdict"] == "IMAGE_CONTAINS_THIS_CHECKOUTS_CLOSURE" and same["different"] == [] and same["absent_on_machine"] == [] and same["match"] > 50
+    changed = next(r for r in man["files"] if r.endswith("md_store.py"))
+    with open(os.path.join(str(root), changed), "a", encoding="utf-8") as fh:
+        fh.write("\n# edited after the image was built\n")
+    d = RP.compare_manifest(man, str(root))
+    assert d["verdict"] == "IMAGE_DIFFERS_FROM_THIS_CHECKOUT" and changed in d["different"]
+    # a closure file of the checkout that the old image never shipped
+    older = copy.deepcopy(man)
+    del older["files"][changed]
+    assert changed in RP.compare_manifest(older, str(root))["absent_on_machine"]
+    f = tmp_path / "m.json"
+    f.write_text(json.dumps(man))
+    assert RP.main(["compare", "--manifest", str(f), "--root", str(root)]) == 1
+    assert RP.main(["compare", "--manifest", str(tmp_path / "nope.json")]) == 2

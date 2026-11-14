@@ -252,6 +252,33 @@ def verify_runtime(root: str, *, manifest_path: Optional[str] = None, expect: Op
     return _result("VERIFIED", f"{len(man['files'])} shipped files and {man.get('n_packages')} packages match the build of {sha[:12]} ({cls})", man, env, code="OK")
 
 
+def compare_manifest(man: Mapping[str, Any], root: str) -> Dict[str, Any]:
+    """OFFLINE, for the owner: what a machine's manifest (``cat /app/RUNTIME_MANIFEST.json`` saved to a file) says against THIS checkout. For every file the image shipped: MATCH, DIFFERENT (same path, other bytes) or
+    ABSENT_IN_CHECKOUT; and the closure files of this checkout the image does NOT contain (ABSENT_ON_MACHINE: the exact answer to "does the running image contain this code?"). Reads the manifest and the
+    checkout only. It proves what the IMAGE was built from, not what the machine runs (that is ``verify`` inside the machine plus the registry digest)."""
+    cls = man.get("environment_class")
+    files = man.get("files") if isinstance(man.get("files"), Mapping) else {}
+    different, match, absent_checkout = [], 0, []
+    for rel, sha in sorted(files.items()):
+        if str(rel).startswith("@"):
+            continue
+        p = os.path.join(root, rel)
+        if not os.path.isfile(p):
+            absent_checkout.append(rel)
+        elif IM._sha(p) == sha:
+            match += 1
+        else:
+            different.append(rel)
+    absent_machine: List[str] = []
+    if cls in ENTRY_SETS:
+        absent_machine = sorted(rel for rel in file_hashes(root, ENTRY_SETS[cls]) if rel not in files)
+    identical = not different and not absent_machine
+    return {"schema": "runtime_compare/v1", "manifest_git_sha": man.get("git_sha"), "environment_class": cls, "built_at_utc": man.get("built_at_utc"),
+            "verdict": "IMAGE_CONTAINS_THIS_CHECKOUTS_CLOSURE" if identical else "IMAGE_DIFFERS_FROM_THIS_CHECKOUT", "match": match, "different": different, "absent_on_machine": absent_machine,
+            "absent_in_checkout": absent_checkout,
+            "reading": "a statement about the image's build inputs, not about what a machine is running now; it says nothing about the economics"}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -268,7 +295,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     v.add_argument("--manifest", default=None)
     v.add_argument("--expect", default=None, choices=ENV_CLASSES)
     v.add_argument("--json", action="store_true")
+    c = sub.add_parser("compare", help="OFFLINE: compare a manifest saved from a machine with this checkout (exit 0 identical closure, 1 differs)")
+    c.add_argument("--manifest", required=True)
+    c.add_argument("--root", default=BOT)
+    c.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    if a.cmd == "compare":
+        try:
+            with open(a.manifest, encoding="utf-8") as fh:
+                man = json.load(fh)
+        except (OSError, ValueError) as exc:
+            print(f"cannot read the manifest: {type(exc).__name__}", file=sys.stderr)
+            return 2
+        if not isinstance(man, dict) or man.get("schema") != SCHEMA:
+            print("not a runtime_manifest/v1", file=sys.stderr)
+            return 2
+        res = compare_manifest(man, a.root)
+        if a.json:
+            print(json.dumps(res, indent=2, sort_keys=True))
+        else:
+            print(f"{res['verdict']}: manifest sha {str(res['manifest_git_sha'])[:12]} ({res['environment_class']}, built {res['built_at_utc']}); match {res['match']}, different {len(res['different'])}, absent on the machine {len(res['absent_on_machine'])}")
+            for k in ("different", "absent_on_machine"):
+                for rel in res[k][:30]:
+                    print(f"  {k.upper()}: {rel}")
+        return 0 if res["verdict"].startswith("IMAGE_CONTAINS") else 1
     if a.cmd == "build":
         try:
             man = build_manifest(a.root, git_sha=a.git_sha, environment_class=a.environment_class, built_at_utc=a.built_at, config_files=a.config, extra_files=a.extra)

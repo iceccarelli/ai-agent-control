@@ -322,14 +322,23 @@ def test_an_assumed_fee_tier_blocks_a_profit_session_even_with_huge_funding(w):
     assert res["result"] == "SKIPPED" and res["why"][0] == "EDGE_INCONCLUSIVE" and any("ASSUMED_INPUTS_CANNOT_PASS" in x for x in res["why"])
 
 
-def test_a_profit_candidate_session_runs_labelled_profit_seeking_with_its_edge_evidence(w):
+def test_a_profit_candidate_is_NO_TRADE_until_the_evidence_the_calibration_and_the_measured_costs_exist(w):
+    """Round 22 (Phase 6, the strategy must EARN the right to trade): an 80 bps print makes the ECONOMICS a PROFIT_CANDIDATE, but a profit session also needs QUALIFIED statistical evidence, a calibrated
+    execution model, measured (not typed-constant) costs and a modelled worst case. None exists, so the deterministic gate says NO_TRADE BEFORE the plan, the capital park and any order. (Before Round 22
+    this session ran: it was the executor being active, not the strategy being proven.)"""
     write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
     w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
     w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000                                      # 80 bps: above the derived requirement with a measured tier
     res, _ = cycle(w)
-    assert res["result"] == "DONE" and res["session_class"] == "PROFIT_SEEKING" and res["flat_verified"] is True
+    assert res["result"] == "SKIPPED" and res["why"][0] == "NO_TRADE" and not [r for r in w.fake.requests if r[0] == "POST"], res["why"]
+    gate = res["eligibility"]
+    assert gate["profile"] == "PROFIT_SEEKING" and gate["verdict"] == "NO_TRADE"
+    assert {"STATISTICAL_EVIDENCE_SUFFICIENT", "EXECUTION_MODEL_VALID", "COSTS_KNOWN", "RISK_LIMITS_ACCEPTABLE"} <= set(gate["unknown"] + gate["failed"])
+    assert not any(t["verdict"] == "FAIL" for t in gate["terms"] if t["term"] in ("EDGE_POSITIVE_AFTER_COSTS", "AUTHORITY_VALID")), "the economics and the authority DID clear: the missing evidence is what blocks"
     ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
     assert ev["session_class"] == "PROFIT_SEEKING" and ev["edge"]["session_class"] == "PROFIT_CANDIDATE" and float(ev["edge"]["net_edge_bps"]) >= EG_MIN
+    dec = json.load(open(os.path.join(res["state_dir"], "decision.json")))
+    assert dec["executed"]["eligibility_gate"]["digest"] == gate["digest"]
 
 
 def test_a_mechanics_session_needs_the_owner_to_allow_it_and_is_never_called_an_opportunity(w):
@@ -797,7 +806,9 @@ class CountingLease:
 def prepared(w, **grant_over):
     write_grant(w, **{"min_funding_bps": 0.5, "allow_mechanics_sessions": True, **grant_over})
     w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
-    w.fake.funding_rate, w.fake.funding_in_ms = "0.0008", 600_000
+    # Round 22: a TESTNET_MECHANICS session (1 bp: the economics are negative by design). It used to be 8 bps, a PROFIT_CANDIDATE on this fake tier; a profit session now needs QUALIFIED evidence and a
+    # calibrated model (eligibility gate) and is NO_TRADE here, so the lifecycle plumbing these tests exercise runs as the measurement session it really is.
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
 
 
 def run(w, root, **kw):
@@ -1020,10 +1031,12 @@ def test_the_same_state_transition_does_not_bump_the_state_seq_but_a_change_does
 
 
 # ---------------------------------------------------------------- capital allocation and realised-only compounding wired into the session path
-def _profit_world(w):
-    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
+def _session_world(w):
+    """A world in which the order-capable cycle RUNS a session. Round 22: it used to be an 80 bps 'profit' world; a profit session now needs QUALIFIED evidence and a calibrated model (the eligibility gate) and is
+    NO_TRADE, so the lifecycle, capital-settlement and evidence plumbing these tests exercise runs the TESTNET_MECHANICS session (1 bp, the owner allowed it) that is what the executor really runs."""
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
     w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
-    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
 
 
 def _cycle_eng(w):
@@ -1032,20 +1045,20 @@ def _cycle_eng(w):
 
 
 def test_the_session_is_sized_by_the_allocator_not_the_grants_full_maximum_and_is_parked_for_settlement(w):
-    _profit_world(w)
+    _session_world(w)
     res, eng = _cycle_eng(w)
     assert res["result"] == "DONE" and res["flat_verified"] is True, res
     plan = json.load(open(os.path.join(res["state_dir"], "plan.json")))
-    assert float(plan["notional_usd"]) <= 200.0 + 1e-6 < 400.0                                        # grant max is 400: day one deploys 40% of the $500 ceiling
-    assert res["allocation"]["binding_limit"] == "COMPOUNDED_SIZE"
+    assert float(plan["notional_usd"]) <= 100.0 + 1e-6 < 400.0                                        # grant max is 400: the allocator, not the grant, sizes it (Round 22: a mechanics session is bound by the $100 mechanics cap; the compounded day-one 40% of the ceiling applies to profit sessions, which the eligibility gate stops today)
+    assert res["allocation"]["binding_limit"] == "MECHANICS_ONLY"
     ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
-    assert ev["allocation"]["notional_usd"] == "200.00" and ev["capital_settlement"]["status"] == "NO_PENDING"
+    assert ev["allocation"]["notional_usd"] == "100.00" and ev["capital_settlement"]["status"] == "NO_PENDING"
     book = CT.anchored(eng).load()
     assert book["start_cash_usd"] is not None and book["pending"]["session_id"] == os.path.basename(res["state_dir"]) and book["realised_usd"] == "0"   # parked, NOT credited yet
 
 
 def test_cash_the_ledger_cannot_explain_raises_an_alert_and_places_nothing(w):
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng")
     b = CT.anchored(eng)
     b.ensure_baseline("1")
@@ -1058,7 +1071,7 @@ def test_cash_the_ledger_cannot_explain_raises_an_alert_and_places_nothing(w):
 
 
 def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng")
     b = CT.anchored(eng)
     b.ensure_baseline("10000")
@@ -1075,7 +1088,7 @@ def test_a_halted_book_keeps_the_engine_idle_until_the_owner_acknowledges(w):
 
 def test_the_lifetime_loss_stop_idles_the_engine_and_no_acknowledgement_resumes_it(w):
     """Red-team F2: the owner's acknowledgements resume the loss-streak halt and the drawdown stop; the LIFETIME stop (verified net realised <= -2 x the drawdown stop) is not theirs to lift."""
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng")
     b = CT.anchored(eng)
     b.ensure_baseline("10000")
@@ -1213,7 +1226,7 @@ def _collect(w, eng_name="eng_ev", **kw):
 
 
 def test_a_session_emits_the_whole_lifecycle_in_order_and_every_event_passes_the_evidence_guard(w):
-    _profit_world(w)
+    _session_world(w)
     res, got = _collect(w)
     assert res["result"] == "DONE", res
     stages = [g[1] for g in got]
@@ -1232,7 +1245,7 @@ def test_a_session_emits_the_whole_lifecycle_in_order_and_every_event_passes_the
 def test_the_executed_sessions_full_decision_record_and_reconciliation_outcome_are_durable_events(w):
     """Round 18 (execution): the full decision record lived only in ``<session dir>/decision.json`` on the volume, so losing it lost what was evaluated, under which limits, on which code and
     candidate; and the ledger-vs-venue reconciliation outcome was never recorded anywhere."""
-    _profit_world(w)
+    _session_world(w)
     res, got = _collect(w)
     assert res["result"] == "DONE", res
     stages = [g[1] for g in got]
@@ -1247,7 +1260,7 @@ def test_the_executed_sessions_full_decision_record_and_reconciliation_outcome_a
 
 
 def test_lifecycle_evidence_names_who_said_it_and_never_leaks_raw_venue_ids(w):
-    _profit_world(w)
+    _session_world(w)
     res, got = _collect(w)
     rec = json.load(open(os.path.join(res["state_dir"], "testnet_session.json")))
     blob = json.dumps(got, default=str)
@@ -1263,11 +1276,11 @@ def test_lifecycle_evidence_names_who_said_it_and_never_leaks_raw_venue_ids(w):
 
 
 def test_the_next_session_settles_the_previous_one_and_emits_the_settlement_and_the_capital_book(w):
-    _profit_world(w)
+    _session_world(w)
     res1, got1 = _collect(w)
     assert res1["result"] == "DONE" and not [g for g in got1 if g[1] == "CAPITAL_SETTLED"]
     w.clock.sleep(1800)                                                                                                   # a later cycle (the fake venue is flat again)
-    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
     res2, got2 = _collect(w)
     st = [g[1] for g in got2]
     if res2["result"] in ("DONE", "SKIPPED") and "CAPITAL_SETTLED" in st:
@@ -1281,7 +1294,7 @@ def test_the_next_session_settles_the_previous_one_and_emits_the_settlement_and_
 
 
 def test_an_unexplained_cash_refusal_still_leaves_evidence(w):
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng_ev2")
     b = CT.anchored(eng)
     b.ensure_baseline("1")
@@ -1401,7 +1414,7 @@ def test_the_evaluate_command_exposes_symbol_notional_and_floor_and_nothing_that
 
 def test_a_crash_between_execute_and_the_end_of_the_session_leaves_the_cash_pending_for_settlement(w, tmp_path, monkeypatch):
     """REPRODUCED by review: the capital book was only parked after execute returned; a crash after orders left nothing to settle and the loss was invisible."""
-    _profit_world(w)
+    _session_world(w)
     real_main = S.main
 
     def dying(argv, **kw):
@@ -1475,7 +1488,7 @@ def test_every_decision_class_yields_a_valid_record(tmp_path, monkeypatch):
 
 
 def test_the_order_capable_cycle_carries_the_same_decision_id_shape_into_its_result_and_event(w, tmp_path):
-    _profit_world(w)
+    _session_world(w)
     res, _eng = _cycle_eng(w)
     assert res["result"] == "DONE" and str(res["decision_id"]).startswith("dec_"), res
     w.clock.sleep(1800)
@@ -1608,12 +1621,12 @@ def test_the_order_capable_loop_places_no_profit_seeking_session_while_the_cost_
     assert not [r for r in w.fake.requests if r[0] == "POST"], "an order was placed on capital priced as free"
 
 
-def test_stating_the_cost_of_capital_is_what_opens_the_profit_seeking_session(w):
+def test_stating_the_cost_of_capital_makes_the_edge_a_profit_candidate_but_the_eligibility_gate_still_says_no_trade(w):
     write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=False)
     w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
     w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
     res, _ = cycle(w)                                                                                  # the fixture's world states 4%/yr
-    assert res["result"] == "DONE" and res["session_class"] == "PROFIT_SEEKING"
+    assert res["result"] == "SKIPPED" and res["why"][0] == "NO_TRADE" and res["eligibility"]["profile"] == "PROFIT_SEEKING"
     ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
     assert ev["edge"]["capital"]["state"] == "STATED" and ev["edge"]["capital"]["cash_alternative_apr"] == "0.04" and ev["edge"]["capital"]["opportunity_cost_bps"] is not None      # the local verdict keeps full precision
     shipped = AP.evidence_edge(ev["edge"])["capital_basis"]                                           # the evidence payload carries the rounded basis (the guard refuses long digit runs)
@@ -1713,7 +1726,7 @@ def test_a_corrupt_capital_book_stops_the_session_before_any_order_and_is_not_re
     """THE REFUSAL A SESSION REALLY GETS. The test world auto-initialises an account (the owner's one-time act), which turned this into ``BOOK_UNREADABLE``, a code only the OWNER's ``--anchor-init`` raises: production
     answers BOOK_UNANCHORED (a pre-anchor file that cannot be adopted), a PAUSE with no ALERT, and the owner's own command is what refuses to adopt it (next test)."""
     monkeypatch.setattr(AP, "_open_book", w.production_open_book)
-    _profit_world(w)
+    _session_world(w)
     root = w.tmp / "eng_corrupt"
     os.makedirs(root)
     (root / "capital.json").write_text("{corrupt")
@@ -1736,7 +1749,7 @@ def test_the_owners_anchor_init_refuses_to_adopt_a_book_it_cannot_read_and_leave
 
 def test_a_finished_session_appends_one_chained_feedback_row_and_the_quality_command_reports_it(w, capsys):
     import evidence_chain as EC
-    _profit_world(w)
+    _session_world(w)
     res, _got = _collect(w, eng_name="eng_fb")
     assert res["result"] == "DONE", res
     log = str(w.tmp / "eng_fb" / "exec_quality_log.jsonl")
@@ -1764,26 +1777,26 @@ def _collect_with_sleep(w, sleep, eng_name="eng_held"):
 def test_a_held_session_books_the_real_settlement_and_the_next_cycle_credits_exactly_what_cash_shows(w):
     """The autopilot-level proof the review found missing: funding_was_read=True end to end. Mutating `known = price - fees + fund` (the sign of funding) must fail HERE."""
     from decimal import Decimal as D
-    _profit_world(w)
+    _session_world(w)
     start, state, real_sleep = w.clock.now(), {"done": False}, w.clock.sleep
 
     def sleep(s):
         real_sleep(s)
         if not state["done"] and w.clock.now() >= start + 600_000 and any(p["size"] != 0 for p in w.fake.positions.values()):
-            w.fake.settle_funding("BTCUSDT", "0.0080", ts_ms=w.clock.now())                      # the venue pays the held short into the wallet, mid-hold
+            w.fake.settle_funding("BTCUSDT", "0.0080", ts_ms=w.clock.now())                      # the venue pays the held short into the wallet, mid-hold (an 80 bps print: a clear credit the books must reproduce exactly)
             state["done"] = True
     cash_before = w.fake.wallet["USDT"]
     res1, got1 = _collect_with_sleep(w, sleep)
     assert res1["result"] == "DONE" and state["done"], res1
     rec = json.load(open(os.path.join(res1["state_dir"], "testnet_session.json")))
     net = rec["net"]
-    assert net["funding_usd"] is not None and net["funding_usd"] > 1.0 and rec["flat_verified"] is True
+    assert net["funding_usd"] is not None and net["funding_usd"] > 0.3 and rec["flat_verified"] is True        # a clear credit (an 80 bps print on one mechanics lot is about $0.5; it was > $1 when this session was sized at $200)
     f = [g for g in got1 if g[1] == "FUNDING_SETTLEMENT"]
     assert len(f) == 1 and f[0][2]["status"] == "BOOKED_WALLET_CONFIRMED"
     known = D(str(net["price_pnl_usd"])) - D(str(net["fees_usd"])) + D(str(net["funding_usd"]))
     assert abs((w.fake.wallet["USDT"] - cash_before) - known) < D("1e-6")                         # the wallet agrees with the ledger to the 6th decimal
     w.clock.sleep(1800)
-    w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
     res2, got2 = _collect(w, "eng_held")
     ev = next(g for g in got2 if g[1] == "CAPITAL_SETTLED")
     assert ev[2]["status"] == "SETTLED" and abs(D(ev[2]["credited_usd"]) - known) < D("0.0002") and abs(D(ev[2]["cash_change_usd"]) - known) < D("0.0002")
@@ -1838,7 +1851,7 @@ def test_the_book_age_in_the_record_is_signed_never_clamped_to_look_fresh():
 
 
 def test_the_executed_session_records_what_the_allocator_actually_sized_next_to_the_decision(w):
-    _profit_world(w)
+    _session_world(w)
     res, _got = _collect(w, "eng_exec")
     dec = json.load(open(os.path.join(res["state_dir"], "decision.json")))
     assert dec["decision_id"].startswith("dec_") and dec["executed"]["allocator_notional_usd"] and dec["executed"]["portfolio_after_settle"]["status"] in ("BOOK", "NO_CAPITAL_BOOK")
@@ -1848,7 +1861,7 @@ def test_the_executed_session_records_what_the_allocator_actually_sized_next_to_
 def test_a_book_that_goes_bad_after_the_orders_still_emits_every_event_and_stops_all_future_entries(w, monkeypatch):
     import ms_capital as CC
     import ms_engine_state as ESS
-    _profit_world(w)
+    _session_world(w)
 
     def bad(self, *a, **k):
         raise CC.BookUnreadable("capital book went bad mid-session")
@@ -1862,7 +1875,7 @@ def test_a_book_that_goes_bad_after_the_orders_still_emits_every_event_and_stops
 def test_a_book_that_goes_bad_at_the_park_refuses_before_any_order_and_alerts(w, monkeypatch):
     import ms_capital as CC
     import ms_engine_state as ESS
-    _profit_world(w)
+    _session_world(w)
 
     def bad(self, *a, **k):
         raise CC.BookUnreadable("capital book went bad at the park")
@@ -1988,7 +2001,7 @@ def test_a_session_with_time_to_spare_still_enters_across_the_settlement(w, tmp_
 @pytest.mark.parametrize("field,bad", [("realised_usd", "abc"), ("realised_usd", "NaN"), ("peak_basis_usd", "abc"), ("loss_streak", "x"), ("halted", "false")])
 def test_a_capital_book_with_a_nonsense_figure_stops_the_session_before_any_order_and_is_not_rewritten(w, field, bad):
     """REPRODUCED (specialist E N1): a parsable book with realised_usd='abc' made the allocator size 200.00 where the honest book said LIFETIME_LOSS_STOP."""
-    _profit_world(w)
+    _session_world(w)
     root = w.tmp / "eng_semantic"
     b = CT.anchored(str(root))
     b.ensure_baseline("10000")
@@ -2206,3 +2219,42 @@ def test_a_session_whose_first_entry_is_aborted_before_any_order_is_a_skip_with_
     assert res["result"] == "SKIPPED" and res["why"] and res["why"][0].startswith("EXECUTE_ABORTED_BEFORE_ANY_ORDER:"), res
     log = os.path.join(str(tmp_path / "ap"), "exec_quality_log.jsonl")
     assert not os.path.exists(log) or not open(log).read().strip()
+
+
+def test_a_mechanics_session_records_its_measurement_only_gate_next_to_the_decision_and_still_runs(w, tmp_path):
+    write_grant(w, min_funding_bps=0.5, allow_mechanics_sessions=True)
+    w.fake.fee_rates = {"spot": ("0.001", "0.001"), "linear": ("0.0002", "0.00055")}
+    w.fake.funding_rate, w.fake.funding_in_ms = "0.0001", 600_000
+    res, _ = cycle(w)
+    assert res["result"] == "DONE" and res["session_class"] == "TESTNET_MECHANICS"
+    dec = json.load(open(os.path.join(res["state_dir"], "decision.json")))
+    gate = dec["executed"]["eligibility_gate"]
+    assert gate["verdict"] == "ELIGIBLE_MEASUREMENT_ONLY" and gate["profile"] == "MEASUREMENT"
+    assert gate["waived"] == ["EDGE_POSITIVE_AFTER_COSTS", "STATISTICAL_EVIDENCE_SUFFICIENT"] and "NOT eligibility to trade for profit" in gate["claim"]
+    assert next(t for t in gate["terms"] if t["term"] == "AUTHORITY_VALID")["facts"]["lease"] == "NOT_REQUIRED"
+
+
+def test_the_gate_cannot_be_bypassed_from_the_command_line_or_the_loop():
+    src = open(AP.__file__, encoding="utf-8").read()
+    for loose in ("skip_gate", "no_gate", "bypass", "qualification="):
+        assert loose not in src, loose
+    assert src.count("session_gate(") >= 2
+
+
+def test_the_documented_mechanics_grant_floor_lets_an_ordinary_print_start_a_session(w):
+    """REPRODUCED (Round 22): the qualification proposal's grant said --min-funding-bps 5, and the loop starts NO session (mechanics included) unless the print pays that much; the usual BTCUSDT print is about 1 bp.
+    The proposal's own grant text is run through the loop's own decision."""
+    import re
+    doc = open(os.path.join(os.path.dirname(os.path.dirname(HERE)), "docs", "TESTNET_QUALIFICATION_PROPOSAL.md"), encoding="utf-8").read()
+    cmds = re.findall(r"autopilot-ctl grant([^`]*)`", doc)
+    mech = [c for c in cmds if "--allow-mechanics-sessions" in c]
+    assert mech, "the proposal must carry the mechanics grant command"
+    floor = float(re.search(r"--min-funding-bps ([0-9.]+)", mech[0]).group(1))
+    hold = int(re.search(r"--max-hold-s ([0-9]+)", mech[0]).group(1))
+    grant = {"min_funding_bps": floor, "max_hold_s": hold, "allow_mechanics_sessions": True}
+    now = w.clock.now()
+    go, _hold, why = AP.funding_decision(0.0001, now + 600_000, now, grant)             # 1 bp, settlement in 10 minutes
+    assert go, (floor, why)
+    assert not AP.funding_decision(0.00004, now + 600_000, now, grant)[0]                # 0.4 bp is below the 0.5 floor
+    assert not AP.funding_decision(0.0, now + 600_000, now, grant)[0] and not AP.funding_decision(-0.0001, now + 600_000, now, grant)[0]   # funding must be strictly positive
+    assert floor <= 1.0, "a mechanics-only grant floor above one ordinary print would wait for a rare one"

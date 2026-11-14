@@ -46,6 +46,8 @@ import exec_lifecycle as EL  # noqa: E402
 import exec_quality as EQ  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_capital_anchor as AN  # noqa: E402
+import economic_model as EM  # noqa: E402
+import eligibility_gate as EGATE  # noqa: E402
 import ms_edge_gate as EG  # noqa: E402
 import ms_engine_state as ES  # noqa: E402
 import ms_testnet_adapter as AD  # noqa: E402
@@ -211,6 +213,35 @@ def _executor(env: Mapping[str, str], inner: Any, clock: Callable[[], int], symb
     """A read-only TestnetExecutor view (the registry-pinned Testnet host, no redirects) for the public reads and the one signed fee-rate read."""
     client, _t = TT.build_client(TT.TestnetCredentials.from_mapping(env), inner if inner is not None else TT.NoRedirectInner())
     return TE.TestnetExecutor(client, symbols=[symbol], spot_symbols=[symbol], clock_ms=clock, kill_reader=lambda: (False, "read only"))
+
+
+def cmd_venue_snapshot(env: Mapping[str, str], clock: Callable[[], int], symbol: Optional[str] = None, out_path: Optional[str] = None, *, inner: Any = None,
+                       out: Callable[[str], None] = print) -> int:
+    """The owner's read-only end-state read: the venue's own positions (every symbol), balances and open orders (ordinary and conditional) as ``mechanics_venue_snapshot/1``. It sends no order, needs no
+    grant or lease and writes nothing but the optional ``--out`` file. Exit 0 = the snapshot is COMPLETE, 3 = it is not (then it proves nothing: ``mechanics_verify`` reports INCONCLUSIVE)."""
+    sym = symbol
+    if not sym:
+        manifest, _st = S._load_capability_manifest()
+        sym = ((manifest or {}).get("symbol_allowlist") or ["BTCUSDT"])[0]
+    p = TT.TestnetCredentials.presence(env)
+    if not (p["dedicated_key_present"] and p["dedicated_secret_present"]):
+        out(json.dumps({"schema": "mechanics_venue_snapshot/1", "complete": False, "reason": "DEDICATED_TESTNET_CREDENTIALS_MISSING"}, sort_keys=True))
+        return 3
+    try:
+        snap = _executor(env, inner, clock, sym).venue_end_state()
+    except (TE.ExecutorError, bc.BybitAPIError, TT.TestnetTransportRefused, TT.TestnetCredentialsMissing, KeyError, ValueError, TypeError) as exc:
+        out(json.dumps({"schema": "mechanics_venue_snapshot/1", "complete": False, "reason": f"VENUE_UNREADABLE:{type(exc).__name__}"}, sort_keys=True))
+        return 3
+    text = json.dumps(snap, indent=2, sort_keys=True, default=str)
+    out(text)
+    if out_path:
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            out(f"cannot write {out_path}: {type(exc).__name__}")
+            return 3
+    return 0 if snap.get("complete") else 3
 
 
 def fetch_funding(env: Mapping[str, str], inner: Any, clock: Callable[[], int], symbol: str) -> Tuple[float, int]:
@@ -439,6 +470,35 @@ def _alert_book_unreadable(engine_root: str, clock: Callable[[], int], state_dir
         pass
 
 
+class _HeldLease:
+    """Stands for a lease the strong pre-order check JUST verified (``revocation_reason(..., strong=True)`` returned None): the gate reads ``held()`` and must not spend a second lease round trip."""
+
+    @staticmethod
+    def held() -> bool:
+        return True
+
+
+def session_gate(verdict: Any, session_class: str, manifest: Mapping[str, Any], preflight: Mapping[str, Any], alloc_notional: Any, usdt_now: Any, lease: Any, book_stops: Sequence[str] = ()) -> Dict[str, Any]:
+    """The deterministic eligibility gate (tools/eligibility_gate.py) for THIS session, from the facts the session already holds. A mechanics session is judged under the MEASUREMENT profile (fake money; it
+    measures lifecycle, fees and fills and is never an opportunity), anything else under PROFIT_SEEKING. Round 22: no qualification flow and no execution-model calibration is wired into the executor, so a
+    PROFIT_SEEKING session is NO_TRADE here until the evidence exists and the owner wires it: that is the honest state, not a defect. Never raises (a failure to build the inputs is an UNKNOWN term)."""
+    try:
+        edge = verdict.as_dict()
+        books_fresh = not any(b in str(r) for r in verdict.reasons for b in MARKET_QUALITY_BLOCKERS)
+        ident = any(isinstance(c, Mapping) and c.get("name") == "endpoint_identity" and c.get("ok") is True for c in (preflight.get("checks") or []))
+        committed = EM.hedged_pair_capital_usd(D(str(alloc_notional)), 1).value
+        lease_state = "NOT_REQUIRED" if lease is None else ("HELD" if bool(lease.held()) else "LOST")
+        inputs = {"data": {"venue_identity": ident, "books_fresh": books_fresh, "funding_observed": edge.get("expected_funding_bps") is not None, "scope": "TESTNET_FAKE_MONEY"},
+                  "edge": edge, "execution": {},
+                  "evidence": {"status": "UNTESTED", "candidate_id": manifest.get("candidate_id"), "reasons": ["NO_QUALIFICATION_FLOW_WIRED_INTO_THE_EXECUTOR"]},
+                  "risk": {"loss_cap_usd": float(AD.MAX_LOSS_CEILING_USD), "loss_limit_usd": float(manifest["bounds"]["max_loss_usd"]), "worst_case_loss_usd": None,
+                           "capital_committed_usd": float(committed), "capital_available_usd": usdt_now, "book_stops": list(book_stops)},
+                  "authority": {"capability": "VALID", "grant": "VALID", "credentials_present": True, "lease": lease_state}}
+    except Exception as exc:                                                  # noqa: BLE001 - an input that cannot be built is an unestablished fact
+        inputs = {"_build_error": type(exc).__name__}
+    return EGATE.evaluate(inputs, profile=EGATE.MEASUREMENT if session_class == "TESTNET_MECHANICS" else EGATE.PROFIT_SEEKING)
+
+
 def _annotate_decision(state_dir: str, extra: Mapping[str, Any]) -> None:
     """What the session actually did, added NEXT TO the decision record (decision.json), never into its id: the decision was evaluated at the grant's size and the book as it stood; the allocator then
     sized the session from the settled book."""
@@ -446,7 +506,7 @@ def _annotate_decision(state_dir: str, extra: Mapping[str, Any]) -> None:
         path = os.path.join(state_dir, "decision.json")
         doc = ES.read_json(path)
         if isinstance(doc, dict):
-            S._write_json(path, {**doc, "executed": dict(extra)})
+            S._write_json(path, {**doc, "executed": {**(doc.get("executed") if isinstance(doc.get("executed"), dict) else {}), **dict(extra)}})      # merged: the allocator's sizing and the eligibility gate both live here
     except Exception:                                                  # noqa: BLE001 - evidence only
         pass
 
@@ -699,6 +759,13 @@ def _run_session(env: Mapping[str, str], inner: Any, clock: Callable[[], int], s
     if why_now is not None:                                          # authority vanished between the gates and the order: nothing is placed, no entry is counted
         return _res("SKIPPED", ["REVOKED_BEFORE_ORDER:" + why_now], state_dir=d)
     emit(EL.lease_verified(getattr(lease, "token", None), strong=lease is not None))
+    # Round 22: the deterministic eligibility gate, at the LAST point before capital is reserved and an order can leave (the strong lease check just above is what makes ``lease`` HELD here; it is not
+    # asked a second time). NO_TRADE returns before the park: nothing is reserved, nothing is placed.
+    gate = session_gate(verdict, session_class, manifest, pf, alloc.notional, usdt_now, None if lease is None else _HeldLease())
+    _annotate_decision(d, {"eligibility_gate": gate})                  # the gate's verdict and every term sit NEXT TO the decision it gates
+    emit(("DECISION", "ELIGIBILITY_GATE", {"source": "GATE", "verdict": gate["verdict"], "profile": gate["profile"], "failed": gate["failed"], "unknown": gate["unknown"], "waived": gate["waived"], "gate_id": gate["digest"][:16]}))     # the 64-hex digest itself is refused by the evidence guard (a long hex token looks like a credential): the id is its first 16 characters; the full digest sits in decision.json
+    if gate["verdict"] == EGATE.NO_TRADE:
+        return _res("SKIPPED", ["NO_TRADE"] + EGATE.no_trade_reasons(gate), state_dir=d, allocation=alloc.as_dict(), eligibility=gate)
     try:
         parked = book.park(os.path.basename(d), usdt_now, None, False, False, cash_read_ms=cash_read_ms)
     except CC.BookUnreadable as exc:                                  # the book went bad between the check and the park: still BEFORE any order
@@ -1570,6 +1637,9 @@ def _parser() -> argparse.ArgumentParser:
     cp.add_argument("--accept-older-lineage", action="store_true", help="OWNER ONLY, after ANCHOR_BEHIND_BOOK (an OLDER anchor directory was restored over a newer view or high-water mark): continue from the older lineage as a RECORDED decision (an ACK_OLDER lineage entry keeps what was discarded; a review is required before any entry). A witness that knows a newer head refuses it")
     qp = sub.add_parser("quality", help="READ-ONLY: measured execution cost vs the model's, realised funding vs expected, and the policy comparison, from the chained session log (no venue access, nothing written)")
     qp.add_argument("--root", default=DEFAULT_ROOT)
+    vs = sub.add_parser("venue-snapshot", help="READ-ONLY: the account's end state from the VENUE (positions on every symbol, spot balances, USDT, open AND conditional orders) as mechanics_venue_snapshot/1 JSON, for tools/mechanics_verify.py; places nothing, needs no grant")
+    vs.add_argument("--symbol", help="the spot symbol whose base-coin balance is read (default: the capability's first symbol, else BTCUSDT)")
+    vs.add_argument("--out", help="also write the JSON to this file (outside git); stdout always gets it")
     ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
     ev.add_argument("--symbol", help="default: the grant's / capability's first symbol, else BTCUSDT")
     ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40%% of the ceiling)")
@@ -1802,6 +1872,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Mapping[str, str], isatty
         rep["log_chain_ok"] = bool(ok)
         print(json.dumps(rep, indent=2, sort_keys=True, default=str))
         return 0 if ok else 1
+    if a.cmd == "venue-snapshot":
+        return cmd_venue_snapshot(e, clock, a.symbol, a.out)
     if a.cmd == "evaluate":
         res = run_once(e, dry_run=True, symbol=a.symbol, notional_usd=a.notional_usd, min_funding_bps=a.min_funding_bps, engine_root=getattr(a, "root", None))
         if a.record_to and isinstance(res.get("decision_record"), dict):

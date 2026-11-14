@@ -142,3 +142,13 @@ def test_the_owner_control_wrapper_passes_the_cost_of_capital_variables_the_deci
         assert name in line, name
     for forbidden in ("LIVE_", "BYBIT_API_KEY", "BYBIT_API_SECRET"):
         assert forbidden not in line, forbidden                    # the wrapper must never copy an arming switch or a generic credential
+
+
+def test_safe_deploy_builds_from_a_clean_merged_commit_and_labels_the_image_with_it():
+    """Round 22: the image says which commit it was built from (RUNTIME_MANIFEST.json) and the entrypoint refuses an image whose provenance does not verify. The owner's deploy must therefore pass the commit,
+    and only a clean tree that is contained in origin/main may be labelled as a commit."""
+    sh = _read("deploy/safe-deploy.sh")
+    deploy = next(ln for ln in sh.splitlines() if ln.startswith("fly deploy -c fly.autopilot.toml --ha=false"))
+    assert '--build-arg BUILD_COMMIT="$(git rev-parse HEAD)"' in deploy and "--env GIT_SHA" in deploy
+    assert sh.index("git status --porcelain --untracked-files=all") < sh.index("git merge-base --is-ancestor HEAD origin/main") < sh.index(deploy)
+    assert "never fly launch" in sh and "REFUSING" in sh
