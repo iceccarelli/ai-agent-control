@@ -1464,7 +1464,7 @@ def _parser() -> argparse.ArgumentParser:
     qp.add_argument("--root", default=DEFAULT_ROOT)
     ev = sub.add_parser("evaluate", help="READ-ONLY: the moment-of-decision economics, with NO grant, capability or lease needed (never starts a session; the only order path is `loop`)")
     ev.add_argument("--symbol", help="default: the grant's / capability's first symbol, else BTCUSDT")
-    ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40% of the ceiling)")
+    ev.add_argument("--notional-usd", help="proposed notional; default: the grant's maximum, else the allocator's day-one size (40%% of the ceiling)")
     ev.add_argument("--min-funding-bps", help="the owner's extra funding floor; default: the grant's, else none (the economics gate derives the real requirement)")
     ev.add_argument("--record-to", help="OPT-IN: append the decision record (no authority, no order) to the durable evidence outbox in this directory (outside git); the same decision is never stored twice")
     lp = sub.add_parser("loop", help="the engine: runs until a stop signal; ALERT/PAUSED/STOP/DRAIN are states it reports, never reasons to exit")
