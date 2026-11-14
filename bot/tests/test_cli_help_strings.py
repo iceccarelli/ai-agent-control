@@ -193,4 +193,3 @@ def test_every_shipped_parser_factory_builds_and_formats_its_help_on_this_interp
             failures.append(f"{rel}:{fn}: {type(exc).__name__}: {exc}")
     assert built >= 3, (built, factories)
     assert not failures, "\n".join(failures)
-
