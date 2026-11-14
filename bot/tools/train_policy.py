@@ -1605,6 +1605,9 @@ def render_report(run: TrainingRun, write: WriteResult) -> str:
         add(f"  - {reason}")
     if run.holdout_ok:
         add("  (no objections)")
+    for reason in run.all_reasons:
+        if reason not in run.wf_reasons and reason not in run.holdout_reasons:
+            add(f"  - {reason}")
     add("")
     add("thresholds (policy.PromotionCriteria — change them in code, in a "
         "reviewable diff):")
