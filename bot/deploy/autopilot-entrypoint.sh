@@ -3,7 +3,7 @@
 # Fly reaches the autopilot itself (the exec'd process): it engages the active session's kill switch, the session unwinds reduce-only and verifies flat, then the process ends.
 set -eu
 # Round 22: fail closed. An executor image that cannot prove what it is (git sha, closure, dependencies, role) does not start: it must be the TESTNET_EXECUTOR build of a known commit.
-python3 /app/tools/runtime_provenance.py verify --root /app --expect TESTNET_EXECUTOR || { echo "REFUSED: this image's provenance is not established; the autopilot does not start (RUNBOOKS: Runtime provenance)" >&2; exit 78; }
+python3 /app/tools/runtime_provenance.py verify --root /app --expect TESTNET_EXECUTOR >&2 || { echo "REFUSED: this image's provenance is not established; the autopilot does not start (RUNBOOKS: Runtime provenance)" >&2; exit 78; }
 mkdir -p /data/.ai-agent-control/ms_autopilot
 chown -R bot:bot /data
 chmod 700 /data/.ai-agent-control /data/.ai-agent-control/ms_autopilot

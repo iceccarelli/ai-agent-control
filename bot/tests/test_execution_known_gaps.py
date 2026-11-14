@@ -36,7 +36,7 @@ import ms_capital as CC
 import ms_testnet_autopilot as AP
 import ms_testnet_session as S
 from ms_testnet_world import World
-from test_ms_testnet_autopilot import _profit_world
+from test_ms_testnet_autopilot import _session_world
 
 
 @pytest.fixture
@@ -85,7 +85,7 @@ def venue_truth(w):
 
 # R1 ------------------------------------------------------------------------------------------------------------------------------------------------
 def test_R1_a_filled_order_whose_executions_the_venue_list_omits_must_not_publish_a_known_net_or_cost_complete(w, monkeypatch):
-    _profit_world(w)
+    _session_world(w)
     orig = w.fake._fill
 
     def hide(o, qty, px, *, taker, dup=False):
@@ -112,7 +112,7 @@ def test_R1_a_filled_order_whose_executions_the_venue_list_omits_must_not_publis
 
 # R2 / R3 ------------------------------------------------------------------------------------------------------------------------------------------
 def test_R2_a_partial_perp_entry_fill_must_unwind_to_flat_in_the_session_and_in_ONE_owner_unwind(w):
-    _profit_world(w)
+    _session_world(w)
     limit_first(w, "linear", "Sell", False, "0.0015")                   # the perp short fills 0.001 of 0.003 (IOC), the spot buy fills in full
     res, _ = cycle(w, sleep=held_funding(w))
     perp, spot = venue_truth(w)
@@ -120,7 +120,7 @@ def test_R2_a_partial_perp_entry_fill_must_unwind_to_flat_in_the_session_and_in_
 
 
 def test_R2b_the_owner_unwind_after_a_partial_perp_entry_sends_an_exit(w):
-    _profit_world(w)
+    _session_world(w)
     limit_first(w, "linear", "Sell", False, "0.0015")
     res, _ = cycle(w, sleep=held_funding(w))
     d = res["state_dir"]
@@ -134,7 +134,7 @@ def test_R2b_the_owner_unwind_after_a_partial_perp_entry_sends_an_exit(w):
 
 
 def test_R3_a_partial_perp_exit_fill_must_not_halt_the_group_with_an_open_hedge(w):
-    _profit_world(w)
+    _session_world(w)
     limit_first(w, "linear", "Buy", True, "0.001")                      # the first reduce-only perp exit fills 0.001 of 0.003
     res, _ = cycle(w, sleep=held_funding(w))
     perp, spot = venue_truth(w)
@@ -181,7 +181,7 @@ def test_the_owner_unwind_of_a_group_still_in_unwind_mode_exits_the_balanced_rem
 def test_R5_a_timed_out_first_leg_must_not_leave_a_one_legged_group_HEDGED_and_held_across_the_settlement(w):
     """the perp create times out once BEFORE reaching the venue: submit_group stops its sequence (the spot buy is never sent), the idempotent resend later fills the perp alone and the engine
     derives HEDGED from the one leg it knows. The session then HOLDS A NAKED PERP SHORT across the settlement and books the funding as the carry's realised result."""
-    _profit_world(w)
+    _session_world(w)
     w.fake.inject("/v5/order/create", "timeout", times=1, match=lambda d: d.get("category") == "linear" and d.get("side") == "Sell")
     res, got = cycle(w, sleep=held_funding(w))
     spot_orders = [r for r in w.fake.requests if r[0] == "POST" and r[1] == "/v5/order/create" and json.loads(r[3]).get("category") == "spot"]
@@ -191,7 +191,7 @@ def test_R5_a_timed_out_first_leg_must_not_leave_a_one_legged_group_HEDGED_and_h
 
 
 def test_R6_two_failed_creates_of_the_second_leg_must_not_leave_a_naked_perp_short(w):
-    _profit_world(w)
+    _session_world(w)
     w.fake.inject("/v5/order/create", "rate_limit", times=2, match=lambda d: d.get("category") == "spot" and d.get("side") == "Buy")
     res, _ = cycle(w, sleep=held_funding(w))
     perp, spot = venue_truth(w)

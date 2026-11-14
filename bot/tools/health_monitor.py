@@ -205,6 +205,10 @@ def evaluate(heartbeats: Sequence[dict], incidents: Sequence[dict], now_ms: int,
             findings.append(Finding("NOT_FLAT", "CRITICAL", wid, "worker reports NOT_FLAT"))
         elif state == "STOPPED":
             findings.append(Finding("WORKER_STOPPED", "WARNING", wid, "worker reports STOPPED"))
+        elif state == "PAUSED":
+            # Round 22: a PAUSED executor is not trading, and the reasons it pauses for (a mis-armed environment, a full state volume, a lost or unreachable lease, no grant) never raise an ALERT. It used to be
+            # silent here, so a worker that had been refusing to run for days looked healthy. The reason is in the engine state on the machine (autopilot-ctl status), not in the heartbeat.
+            findings.append(Finding("WORKER_PAUSED", "WARNING", wid, "worker reports PAUSED: it is not trading (read `autopilot-ctl status` for why)"))
         # --- freshness of the data the worker last saw (skipped when the heartbeat itself is stale)
         if age_s <= heartbeat_stale_s:
             for code, f, lim in (("BYBIT_READ_STALE", "last_bybit_read_ms", bybit_read_stale_s),

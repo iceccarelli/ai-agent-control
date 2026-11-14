@@ -76,6 +76,7 @@ def test_every_engine_state_is_recognised():
     ("OUTBOX_BACKLOG", [hb(outbox_pending=501)], []),
     ("LEASE_LOST", [hb(state="EXECUTING", lease_token=None)], []),
     ("DISK_LOW", [hb(disk_free_bytes=1000)], []),
+    ("WORKER_PAUSED", [hb(state="PAUSED")], []),
     ("MULTIPLE_WORKERS", [hb(), hb(worker_id="w2", machine_id="m2")], []),
     ("INCIDENT", [hb()], [ev("SOMETHING_ELSE")]),
 ])

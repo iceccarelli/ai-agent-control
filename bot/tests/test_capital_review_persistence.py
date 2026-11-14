@@ -24,7 +24,7 @@ for _p in (HERE, BOT, os.path.join(BOT, "tools")):
 import capital_testkit as CT  # noqa: E402
 import ms_capital as CC  # noqa: E402
 import ms_testnet_autopilot as AP  # noqa: E402
-from test_ms_testnet_autopilot import _cycle_eng, _profit_world, w  # noqa: E402,F401  (the fake venue world the autopilot tests already own)
+from test_ms_testnet_autopilot import _cycle_eng, _session_world, w  # noqa: E402,F401  (the fake venue world the autopilot tests already own)
 
 
 def _unexplained(book):
@@ -91,7 +91,7 @@ def test_acknowledging_the_review_clears_only_the_review_and_changes_no_money(tm
 # ------------------------------------------------------------------ the autopilot
 def test_a_crash_between_the_settlement_save_and_the_alert_cannot_lose_the_stop(w):
     """The window: settle() has saved, the ALERT write never happened. The next session must still refuse, and must re-raise the ALERT itself."""
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng")
     book = CT.anchored(eng)
     _unexplained(book)
@@ -105,7 +105,7 @@ def test_a_crash_between_the_settlement_save_and_the_alert_cannot_lose_the_stop(
 
 
 def test_clearing_the_alert_alone_does_not_resume_trading(w):
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng")
     book = CT.anchored(eng)
     _unexplained(book)
@@ -121,7 +121,7 @@ def test_clearing_the_alert_alone_does_not_resume_trading(w):
 
 
 def test_after_the_owners_acknowledgement_the_normal_gates_decide_again(w):
-    _profit_world(w)
+    _session_world(w)
     eng = str(w.tmp / "eng")
     book = CT.anchored(eng)
     _unexplained(book)
