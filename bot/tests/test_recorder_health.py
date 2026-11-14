@@ -164,7 +164,9 @@ def test_a_crafted_status_cannot_make_the_classifier_raise_or_report_healthy():
 
 def test_every_state_name_is_in_the_closed_vocabulary_and_healthy_helper_matches():
     assert set(RH.STATES) == {"healthy", "degraded", "stalled", "storage_blocked", "image_mismatch", "unknown"}
-    assert RH.is_healthy(RH.classify(status(segment_bytes=None, free=8 * GB), **healthy_kw())) is True
+    ok_days = seg({"20261112": 1.0 * GB, "20261113": 1.0 * GB, "20261114": 0.4 * GB})
+    assert RH.is_healthy(RH.classify(status(segment_bytes=ok_days, free=8 * GB), **healthy_kw())) is True
+    assert RH.is_healthy(RH.classify(status(segment_bytes=None, free=8 * GB), **healthy_kw())) is False        # no capacity evidence: not healthy (Round 22 review)
     assert RH.is_healthy({"state": "unknown"}) is False
 
 
@@ -192,3 +194,19 @@ def test_retention_1_with_two_days_on_disk_still_has_a_labelled_daily_rate():
     assert m["closed_day_mean_bytes"] == pytest.approx(1.9 * GB) and m["closed_day_basis"] == "single_closed_day_lower_bound"
     assert m["volume_holds_retention"] is True          # (1+1) * 1.9 GB * 1.042 + 0.5 GiB < 5 GB
     assert RH.classify(status(segment_bytes=seg({"20261114": 0.7 * GB})), **healthy_kw())["metrics"]["closed_day_basis"] is None
+
+
+def test_a_status_that_cannot_establish_headroom_or_capacity_is_never_healthy():
+    """REPRODUCED (review): a fresh status with growth but no store block, an unreadable volume and a VERIFIED image was `healthy` with no reasons; free known but reserve unknown was healthy too."""
+    ok_days = seg({"20261112": 1.0 * GB, "20261113": 1.0 * GB, "20261114": 0.4 * GB})
+    bare = status(segment_bytes=ok_days)
+    bare["store"] = {}
+    res = RH.classify(bare, now_s=NOW, free_bytes=None, total_bytes=None, supervisor=None, provenance=VERIFIED)
+    assert res["state"] != "healthy" and "HEADROOM_UNKNOWN" in codes(res)
+    no_reserve = status(segment_bytes=ok_days, free=8 * GB)
+    no_reserve["store"].pop("min_free_bytes")
+    res2 = RH.classify(no_reserve, **healthy_kw())
+    assert res2["state"] != "healthy" and "HEADROOM_UNKNOWN" in codes(res2)
+    no_retention = status(segment_bytes=ok_days, free=8 * GB, retention=None)
+    res3 = RH.classify(no_retention, **healthy_kw())
+    assert res3["state"] != "healthy" and "CAPACITY_NOT_REPORTED" in codes(res3)

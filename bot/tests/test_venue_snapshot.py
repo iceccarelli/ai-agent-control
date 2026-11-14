@@ -101,3 +101,20 @@ def test_the_executors_account_wide_order_read_covers_every_filter_and_both_cate
     seen = {(q["category"], q.get("orderFilter")) for _m, _p, q, _b in reads}
     assert {(c, f) for c in ("linear", "spot") for f in TE_.ORDER_FILTERS} <= seen
     assert all(q.get("settleCoin") == "USDT" for _m, _p, q, _b in reads if q["category"] == "linear" and q.get("orderFilter"))      # the account-wide linear reads (not the per-symbol ones venue_state also makes)
+
+
+def test_the_output_file_is_new_owner_only_and_never_inside_state_or_the_repository(w, tmp_path, monkeypatch):
+    """Review P3-5: --out opened the path with "w": an owner typo could overwrite capital.json."""
+    out = tmp_path / "snap.json"
+    assert take(w, out_path=str(out))[0] == 0 and (out.stat().st_mode & 0o777) == 0o600
+    code, lines = take(w, out_path=str(out))                                           # exists: refused, not overwritten
+    assert code == 3 and any("must not exist yet" in line for line in lines) and json.loads(out.read_text())["complete"] is True
+    home = tmp_path / "home"
+    (home / ".ai-agent-control").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    victim = home / ".ai-agent-control" / "capital.json"
+    victim.write_text('{"keep": true}')
+    code2, lines2 = take(w, out_path=str(victim))
+    assert code2 == 3 and any("REFUSED" in line for line in lines2) and victim.read_text() == '{"keep": true}'
+    assert take(w, out_path=os.path.join(os.path.dirname(AP.__file__), "snap.json"))[0] == 3         # inside the repository
+    assert not os.path.exists(os.path.join(os.path.dirname(AP.__file__), "snap.json"))

@@ -31,13 +31,14 @@ BPS_LINES = ("fee", "spread", "slippage", "impact", "basis", "hedge", "adverse",
 
 
 def _is_num(x: Any) -> bool:
+    """A finite number (as a number or a decimal string). NaN, inf, a word and None are not."""
     if isinstance(x, bool) or x is None:
         return False
     try:
-        float(str(x))
-        return True
+        v = float(str(x))
     except (TypeError, ValueError):
         return False
+    return v == v and abs(v) != float("inf")
 
 
 def _line(value: Any, unit: str, basis: Optional[str], note: Optional[str] = None) -> Dict[str, Any]:
@@ -95,10 +96,11 @@ def build(edge: Mapping[str, Any], *, structure: str = EM.ACQUIRED_SPOT_PERP, no
         "other_cost_lines": _group(costs, prov, other_names),
         "capital": cap_def,
         "holding_period": {"hold_s": hold_s if _is_num(hold_s) else UNKNOWN, "settlements_in_hold": e.get("settlements_in_hold") if isinstance(e.get("settlements_in_hold"), int) else UNKNOWN},
-        "operational_costs": _line(operating_cost_usd_per_day, "USD per day", "measured" if _is_num(operating_cost_usd_per_day) else None,
-                                   "infrastructure and operator costs are not modelled in the edge verdict; the owner's real figure belongs here" if not _is_num(operating_cost_usd_per_day) else None),
+        "operational_costs": _line(operating_cost_usd_per_day, "USD per day", "stated" if _is_num(operating_cost_usd_per_day) else None,
+                                   "infrastructure and operator costs are not modelled in the edge verdict; the owner's real figure belongs here" if not _is_num(operating_cost_usd_per_day)
+                                   else "a figure the CALLER supplied: this sheet cannot verify it"),
         "net": {"net_edge_bps": _line(net, "bps", "derived"), "expected_net_usd": _line(e.get("expected_net_usd"), "USD", "derived"),
-                "net_positive": None if not net_known or unknown_lines else (float(str(net)) > 0),
+                "net_positive": None if (not net_known or unknown_lines or not costs) else (float(str(net)) > 0),
                 "unknown_cost_lines": unknown_lines},
         "break_even": {"required_funding_bps_per_settlement": _line(e.get("required_funding_bps"), "bps", "derived", "the funding at which the net equals the hurdle")},
         "worst_case_loss": {"modelled_usd": _line(worst_case_loss_usd, "USD", "modelled" if _is_num(worst_case_loss_usd) else None, "no modelled worst case exists unless one is supplied" if not _is_num(worst_case_loss_usd) else None),

@@ -40,6 +40,12 @@ CAPITAL_STRUCTURE = {"cash_and_carry": EM.ACQUIRED_SPOT_PERP, "spot_perp_basis":
                      "cross_sectional_funding": EM.PERP_ONLY, "cross_interval_funding_dispersion": EM.PERP_ONLY, "market_neutral_relative_value": EM.PERP_ONLY}
 _LADDER_PROMISING = ("PROMISING", "PROSPECTIVE")
 _LADDER_QUALIFIED = ("EXECUTION_READY", "OWNER_PROFIT_EVIDENCED")
+#: the dataset states that say the data are valid AND sufficient (candidate_readiness: SUFFICIENT_DATA_STATES); anything else, or no state at all, can never be QUALIFIED
+SUFFICIENT_DATASET_STATES = ("DATA_SUFFICIENT_NOT_EVALUATED", "DATA_SUFFICIENT_CANDIDATE_REJECTED", "DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW")
+#: independent observations below which no claim is carried (the repository's holdout floor)
+MIN_INDEPENDENT_OBSERVATIONS = 50
+#: worst first: a duplicate row for one family is judged by its WORST status (fail closed)
+_BADNESS = (NEGATIVE, DATA_INVALID, INSUFFICIENT, UNTESTED, PROMISING, QUALIFIED)
 
 
 def load_specs(specs_dir: str) -> Dict[str, Dict[str, Any]]:
@@ -84,12 +90,29 @@ def status_of(row: Mapping[str, Any]) -> Tuple[str, List[str]]:
     if verdict == "REJECTED":
         return NEGATIVE, ["COMPETITION_VERDICT_REJECTED"] + [str(r) for r in (row.get("rejection_reasons") or [])[:2]]
     if level in _LADDER_QUALIFIED and net is not None and net > 0 and sig is True:
-        return QUALIFIED, [f"LADDER_{level}", "NET_EDGE_POSITIVE_AND_SIGNIFICANT"]
+        missing = _qualification_gaps(row, ds_state)
+        if not missing:
+            return QUALIFIED, [f"LADDER_{level}", "NET_EDGE_POSITIVE_AND_SIGNIFICANT"]
+        return PROMISING, [f"LADDER_{level}", "NOT_QUALIFIED: " + "; ".join(missing)]
     if level in _LADDER_PROMISING or level in _LADDER_QUALIFIED:
         return PROMISING, [f"LADDER_{level}"] + ([] if level in _LADDER_PROMISING else ["NOT_QUALIFIED: positive significant net edge not shown"])
     if verdict == "INSUFFICIENT_DATA":
         return INSUFFICIENT, ["COMPETITION_VERDICT_INSUFFICIENT_DATA"] + [str(r) for r in (row.get("rejection_reasons") or [])[:2]]
     return UNTESTED, [str(c) for c in [(row.get("evaluator") or {}).get("code")] if c] or ["NO_TEST_RUN"]
+
+
+def _qualification_gaps(row: Mapping[str, Any], ds_state: str) -> List[str]:
+    """What a QUALIFIED claim still needs that the row does not state. A missing fact is a gap, never a pass (Round 22 review: a row with only a ladder level, a positive edge and significant=True was QUALIFIED)."""
+    gaps: List[str] = []
+    if ds_state not in SUFFICIENT_DATASET_STATES:
+        gaps.append(f"dataset_state {ds_state or 'NOT_STATED'} is not valid-and-sufficient")
+    mt = row.get("multiple_testing")
+    if not isinstance(mt, Mapping) or _num(mt.get("n_variants_counted")) is None:
+        gaps.append("no multiple-testing count (the number of variants tried is not stated)")
+    n = _sample(row).get("independent_observations")
+    if _num(n) is None or float(n) < MIN_INDEPENDENT_OBSERVATIONS:
+        gaps.append(f"independent observations {n} below the floor of {MIN_INDEPENDENT_OBSERVATIONS}")
+    return gaps
 
 
 def _capital_model(family: str) -> Dict[str, Any]:
@@ -144,7 +167,12 @@ def candidate_view(row: Mapping[str, Any], spec: Optional[Mapping[str, Any]]) ->
 def view(report: Mapping[str, Any], specs: Optional[Mapping[str, Mapping[str, Any]]] = None) -> Dict[str, Any]:
     """The common evaluation of every candidate in ``report`` (a ``candidate_competition/v1`` report). Families absent from the report are listed as UNTESTED with the reason, so the opportunity set is always complete."""
     specs = specs or {}
-    rows = {str(r.get("name")): r for r in (report.get("results") or []) if isinstance(r, Mapping)}
+    by_name: Dict[str, List[Mapping[str, Any]]] = {}
+    for r in (report.get("results") or []):
+        if isinstance(r, Mapping):
+            by_name.setdefault(str(r.get("name")), []).append(r)
+    # one row per family: if the report carries several, the WORST status decides (a later positive row can never overwrite an earlier rejection)
+    rows = {name: min(rs, key=lambda x: _BADNESS.index(status_of(x)[0])) for name, rs in by_name.items()}
     cands: List[Dict[str, Any]] = []
     for fam in FAMILIES:
         if fam in rows:
@@ -165,7 +193,10 @@ def view(report: Mapping[str, Any], specs: Optional[Mapping[str, Mapping[str, An
 def evidence_for(view_doc: Mapping[str, Any], candidate_id: Optional[str]) -> Dict[str, Any]:
     """The ``evidence`` input of ``eligibility_gate.evaluate`` for the candidate the owner's capability names (matched by id or family); UNTESTED when it is not found."""
     for c in view_doc.get("candidates", []):
-        if candidate_id and (c.get("candidate_id") == candidate_id or c.get("family") == str(candidate_id).split("@")[0]):
+        # an id with a spec revision (name@spec-N) must match EXACTLY: a different revision of the same family is a different specification. A bare family name matches the family.
+        exact = bool(candidate_id) and c.get("candidate_id") == candidate_id
+        bare = bool(candidate_id) and "@" not in str(candidate_id) and c.get("family") == candidate_id
+        if exact or bare:
             return {"status": c["status"], "candidate_id": c["candidate_id"], "reasons": c.get("status_reasons", [])}
     return {"status": UNTESTED, "candidate_id": candidate_id, "reasons": ["CANDIDATE_NOT_FOUND_IN_THE_EVALUATION"]}
 

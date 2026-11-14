@@ -247,3 +247,19 @@ def test_a_measurement_session_is_held_to_its_enforced_limit_and_its_worst_case_
     prof = good_inputs()
     prof["risk"] = measurement_inputs()["risk"]
     assert next(x for x in EG.evaluate(prof)["terms"] if x["term"] == "RISK_LIMITS_ACCEPTABLE")["verdict"] == EG.UNKNOWN
+
+
+def test_book_stops_must_be_stated_and_a_non_numeric_cost_is_not_known():
+    """Review P3-2: a missing book_stops was read as 'no stop' and a cost of 'NaN' or 'abc' counted as known."""
+    inp = good_inputs()
+    del inp["risk"]["book_stops"]
+    t = next(x for x in EG.evaluate(inp)["terms"] if x["term"] == "RISK_LIMITS_ACCEPTABLE")
+    assert t["verdict"] == EG.UNKNOWN and t["reasons"] == ["BOOK_STOPS_NOT_STATED"]
+    inp = good_inputs()
+    inp["risk"]["book_stops"] = None
+    assert next(x for x in EG.evaluate(inp)["terms"] if x["term"] == "RISK_LIMITS_ACCEPTABLE")["verdict"] == EG.UNKNOWN
+    for bad in ("NaN", "inf", "abc", "", [], {}):
+        inp = measurement_inputs()
+        inp["edge"]["costs_bps"]["spread"] = bad
+        res = EG.evaluate(inp, profile=EG.MEASUREMENT)
+        assert next(x for x in res["terms"] if x["term"] == "COSTS_KNOWN")["verdict"] == EG.UNKNOWN and res["verdict"] == EG.NO_TRADE, bad

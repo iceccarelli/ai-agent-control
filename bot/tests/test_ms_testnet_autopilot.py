@@ -333,12 +333,12 @@ def test_a_profit_candidate_is_NO_TRADE_until_the_evidence_the_calibration_and_t
     assert res["result"] == "SKIPPED" and res["why"][0] == "NO_TRADE" and not [r for r in w.fake.requests if r[0] == "POST"], res["why"]
     gate = res["eligibility"]
     assert gate["profile"] == "PROFIT_SEEKING" and gate["verdict"] == "NO_TRADE"
-    assert {"STATISTICAL_EVIDENCE_SUFFICIENT", "EXECUTION_MODEL_VALID", "COSTS_KNOWN", "RISK_LIMITS_ACCEPTABLE"} <= set(gate["unknown"] + gate["failed"])
-    assert not any(t["verdict"] == "FAIL" for t in gate["terms"] if t["term"] in ("EDGE_POSITIVE_AFTER_COSTS", "AUTHORITY_VALID")), "the economics and the authority DID clear: the missing evidence is what blocks"
-    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
-    assert ev["session_class"] == "PROFIT_SEEKING" and ev["edge"]["session_class"] == "PROFIT_CANDIDATE" and float(ev["edge"]["net_edge_bps"]) >= EG_MIN
-    dec = json.load(open(os.path.join(res["state_dir"], "decision.json")))
-    assert dec["executed"]["eligibility_gate"]["digest"] == gate["digest"]
+    assert {"STATISTICAL_EVIDENCE_SUFFICIENT", "EXECUTION_MODEL_VALID", "COSTS_KNOWN"} <= set(gate["unknown"] + gate["failed"])
+    assert not any(t["verdict"] == "FAIL" for t in gate["terms"] if t["term"] == "EDGE_POSITIVE_AFTER_COSTS"), "the economics DID clear: the missing evidence is what blocks"
+    assert res["edge"]["session_class"] == "PROFIT_CANDIDATE" and float(res["edge"]["net_edge_bps"]) >= EG_MIN and res["decision_id"]
+    # decided BEFORE a session directory, a preflight or any venue write exists (an idle loop would otherwise create one per cycle)
+    assert not [d for d in (os.listdir(w.tmp / "auto") if (w.tmp / "auto").exists() else []) if d.startswith("ms_auto_")]
+    assert not [r for r in w.fake.requests if r[1] in ("/v5/account/wallet-balance", "/v5/position/list")], "no preflight account read happened"
 
 
 def test_a_mechanics_session_needs_the_owner_to_allow_it_and_is_never_called_an_opportunity(w):
@@ -1627,7 +1627,7 @@ def test_stating_the_cost_of_capital_makes_the_edge_a_profit_candidate_but_the_e
     w.fake.funding_rate, w.fake.funding_in_ms = "0.0080", 600_000
     res, _ = cycle(w)                                                                                  # the fixture's world states 4%/yr
     assert res["result"] == "SKIPPED" and res["why"][0] == "NO_TRADE" and res["eligibility"]["profile"] == "PROFIT_SEEKING"
-    ev = json.load(open(os.path.join(res["state_dir"], "edge_verdict.json")))
+    ev = {"edge": res["edge"]}
     assert ev["edge"]["capital"]["state"] == "STATED" and ev["edge"]["capital"]["cash_alternative_apr"] == "0.04" and ev["edge"]["capital"]["opportunity_cost_bps"] is not None      # the local verdict keeps full precision
     shipped = AP.evidence_edge(ev["edge"])["capital_basis"]                                           # the evidence payload carries the rounded basis (the guard refuses long digit runs)
     assert shipped["state"] == "STATED" and shipped["cash_alternative_apr"] == "0.040000" and shipped["cash_alternative_provenance"] == "modelled" and shipped["committed_usd"] is not None
@@ -2111,6 +2111,18 @@ def test_the_read_only_decision_and_its_funding_read_reach_no_executor_write_met
     assert not (found & EXECUTOR_WRITE_METHODS), sorted(found & EXECUTOR_WRITE_METHODS)
 
 
+def test_the_venue_snapshot_command_and_the_executors_end_state_reads_reach_no_write_method():
+    """Review P3-5 (Round 22): the account-wide end-state read is structurally read-only, not only observed to send no POST."""
+    path = os.path.join(os.path.dirname(HERE), "tools", "ms_testnet_autopilot.py")
+    found, seen = _calls_in(path, {"cmd_venue_snapshot"})
+    assert seen == {"cmd_venue_snapshot"}, seen
+    assert not (found & EXECUTOR_WRITE_METHODS), sorted(found & EXECUTOR_WRITE_METHODS)
+    epath = os.path.join(os.path.dirname(HERE), "tools", "ms_testnet_executor.py")
+    found2, seen2 = _calls_in(epath, {"venue_end_state", "account_open_orders"})
+    assert seen2 == {"venue_end_state", "account_open_orders"}, seen2
+    assert not (found2 & EXECUTOR_WRITE_METHODS), sorted(found2 & EXECUTOR_WRITE_METHODS)
+
+
 def test_the_preflight_venue_reads_reach_no_executor_write_method():
     path = os.path.join(os.path.dirname(HERE), "tools", "ms_testnet_session.py")
     found, seen = _calls_in(path, {"_preflight_reads"})
@@ -2258,3 +2270,35 @@ def test_the_documented_mechanics_grant_floor_lets_an_ordinary_print_start_a_ses
     assert not AP.funding_decision(0.00004, now + 600_000, now, grant)[0]                # 0.4 bp is below the 0.5 floor
     assert not AP.funding_decision(0.0, now + 600_000, now, grant)[0] and not AP.funding_decision(-0.0001, now + 600_000, now, grant)[0]   # funding must be strictly positive
     assert floor <= 1.0, "a mechanics-only grant floor above one ordinary print would wait for a rare one"
+
+
+@pytest.mark.parametrize("state", ["EXECUTING", "RISK_APPROVED", "PLAN_PROPOSED"])
+def test_a_state_volume_that_fills_before_the_first_order_refuses_the_session_and_places_no_order(w, tmp_path, monkeypatch, state):
+    """REPRODUCED (Round 22 review): the new tolerant state write let a session reach its first order after `EXECUTING` could not be recorded (4 orders sent; on main the OSError ended the session before any order).
+    The transitions BEFORE the first order are strict; only the ones after it are tolerant."""
+    import errno
+    prepared(w)
+    real = ES.write_json_atomic
+
+    def writer(path, obj):
+        if isinstance(obj, dict) and obj.get("state") == state:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(path, obj)
+    monkeypatch.setattr(ES, "write_json_atomic", writer)
+    rc, out = run_loop(w, tmp_path / "ap", AP.run_once, n=1, recover_fn=OK_RECOVERY, sleep=w.clock.sleep)
+    assert rc == 0 and creates(w) == [], "no order may leave while a pre-order state cannot be recorded"
+    res = json.load(open(tmp_path / "ap" / "last_result.json")) if (tmp_path / "ap" / "last_result.json").exists() else {"result": "ERROR"}
+    assert res["result"] != "DONE"
+    assert any("STATE_WRITE_FAILED" in line for line in out)
+
+
+def test_the_gate_verdict_is_an_allowlist_so_junk_never_proceeds(w, tmp_path, monkeypatch):
+    """P3-1 (review): the check used to be `== NO_TRADE`, a denylist. Any verdict that is not the one outcome matching the session class stops before the park."""
+    prepared(w)
+    for junk in ({"verdict": None, "profile": "MEASUREMENT"}, {"verdict": "MAYBE", "profile": "MEASUREMENT"}, {"verdict": "ELIGIBLE", "profile": "MEASUREMENT"},
+                 {"verdict": "ELIGIBLE_MEASUREMENT_ONLY", "profile": "PROFIT_SEEKING"}, {}, None):
+        monkeypatch.setattr(AP, "session_gate", lambda *a, _j=junk, **k: _j)
+        w.fake.requests.clear()
+        res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(tmp_path / ("ap%d" % id(junk))))
+        assert res["result"] == "SKIPPED" and res["why"][0] == "NO_TRADE", (junk, res["why"])
+        assert creates(w) == [] and not [r for r in w.fake.requests if r[0] == "POST"], junk

@@ -110,3 +110,13 @@ def test_it_is_deterministic_pure_and_never_raises_on_garbage():
     for banned in ("os.environ", "getenv", "time.time", "urllib", "socket", "requests", "subprocess", "open("):
         assert banned not in src, banned
     json.dumps(copy.deepcopy(a))
+
+
+def test_net_positive_needs_cost_lines_and_a_finite_net_and_a_supplied_operating_cost_is_not_called_measured():
+    """Review P3-3: net_positive was True with no cost lines at all or with a net of 'inf'; any supplied operating cost was labelled measured."""
+    assert ES.build({"net_edge_bps": "5.0", "costs_bps": {}})["net"]["net_positive"] is None
+    assert ES.build({"net_edge_bps": "inf", "costs_bps": {"fee": "1"}})["net"]["net_positive"] is None
+    assert ES.build({"net_edge_bps": "NaN", "costs_bps": {"fee": "1"}})["net"]["net_positive"] is None
+    assert ES.build({"net_edge_bps": "5.0", "costs_bps": {"fee": "1"}})["net"]["net_positive"] is True
+    op = ES.build({"costs_bps": {}}, operating_cost_usd_per_day=3.0)["operational_costs"]
+    assert op["provenance"] == "stated" and "cannot verify" in op["note"]

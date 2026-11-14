@@ -42,7 +42,7 @@ FEE_BPS_MAX = D("25")           # a measured fee above 25 bps of leg notional is
 CASH_TOL_ABS = D("0.02")        # the funding module's own wallet tolerance
 HEDGE_QTY_TOL = D("1e-9")
 #: a snapshot older than the last fill, or from before the session ended, proves nothing about the end state
-SNAPSHOT_KEYS = ("schema", "read_ms", "complete", "linear_positions", "spot_balances", "open_orders_active", "open_orders_conditional")
+SNAPSHOT_KEYS = ("schema", "read_ms", "complete", "venue", "linear_positions", "spot_balances", "usdt_balance", "open_orders_active", "open_orders_conditional")
 
 
 def _json(path: str) -> Any:
@@ -100,6 +100,12 @@ def snapshot_problems(snap: Any) -> List[str]:
         why.append("SNAPSHOT_SCHEMA")
     if snap.get("complete") is not True:
         why.append("SNAPSHOT_INCOMPLETE")
+    if snap.get("venue") != "testnet" or V.get("testnet").is_live:
+        why.append("SNAPSHOT_VENUE_NOT_TESTNET")                                 # a snapshot of any other venue (or none stated) is not this session's end state
+    if not isinstance(snap.get("spot_balances"), dict) or not isinstance(snap.get("linear_positions"), dict):
+        why.append("SNAPSHOT_TYPE:balances_or_positions")
+    if _d(snap.get("usdt_balance")) is None:
+        why.append("SNAPSHOT_USDT_BALANCE_MISSING")                              # the cash identity needs it: an absent figure is unknown, not zero
     if not isinstance(snap.get("read_ms"), int) or isinstance(snap.get("read_ms"), bool):
         why.append("SNAPSHOT_READ_MS")
     for k in ("open_orders_active", "open_orders_conditional"):
@@ -235,7 +241,9 @@ def verify(dirpath: str, snapshot: Optional[Dict[str, Any]] = None, *, require_f
         if not st:
             r.add("C13_FUNDING", "UNKNOWN" if need_funding else "PASS", f"no settlement inside the held window (flags={fr.get('flags')}); only a COMPLETE public history may say 'none'", required=need_funding)
         elif all(s.startswith("BOOKED") for s in st) and not (fund or {}).get("suppressed"):
-            r.add("C13_FUNDING", "PASS", f"settlements booked: {st}; booked_usd={fr.get('booked_usd')}; flags={fr.get('flags')}", required=need_funding)
+            booked, in_record = _d(fr.get("booked_usd")), _d(rec["net"]["funding_usd"])
+            agree = booked is not None and in_record is not None and abs(booked - in_record) <= ABS_TOL
+            r.add("C13_FUNDING", "PASS" if agree else "FAIL", f"settlements booked: {st}; booked_usd={fr.get('booked_usd')} record.net.funding_usd={rec['net']['funding_usd']} agree={agree}; flags={fr.get('flags')}", required=need_funding)
         else:
             r.add("C13_FUNDING", "FAIL" if any(s in ("CONFLICT", "WALLET_MISMATCH") for s in st) else "UNKNOWN",
                   f"statuses={st} suppressed={(fund or {}).get('suppressed')} (a QUARANTINED_SIGN row is the evidence that settles the sign convention, and stays UNKNOWN)", required=need_funding)
@@ -259,8 +267,16 @@ def verify(dirpath: str, snapshot: Optional[Dict[str, Any]] = None, *, require_f
                   f"the session claims flat_verified={rec['flat_verified']} but carries no read timestamp and no raw open-order list: the read cannot be shown to follow the last fill ({last_fill}); take `ms_testnet_autopilot.py venue-snapshot` and pass --venue-snapshot")
         else:
             bad_snap = snapshot_problems(snapshot)
+            ref_pre, ref_snap = pre.get("account_ref"), snapshot.get("account_ref") if isinstance(snapshot, dict) else None
+            base_coin = flt["spot"]["base"]
             if bad_snap:
                 r.add("C15_FINAL_VENUE_STATE", "UNKNOWN", f"the venue snapshot cannot be used: {bad_snap}")
+            elif base_coin not in snapshot["spot_balances"]:
+                r.add("C15_FINAL_VENUE_STATE", "UNKNOWN", f"the snapshot carries no {base_coin} balance: a base balance the venue did not state is UNKNOWN, never zero")
+            elif ref_pre and ref_snap is None:
+                r.add("C15_FINAL_VENUE_STATE", "UNKNOWN", "the session's account is known but the snapshot does not say which account it was read for: it cannot be bound to this session")
+            elif ref_pre and ref_snap != ref_pre:
+                r.add("C15_FINAL_VENUE_STATE", "FAIL", f"the snapshot is of another account ({ref_snap}) than this session's ({ref_pre})")
             else:
                 snap_ok = (snapshot["read_ms"] > last_fill and all(abs(D(str(v))) == 0 for v in snapshot["linear_positions"].values())
                            and snapshot["open_orders_active"] == [] and snapshot["open_orders_conditional"] == []
@@ -297,7 +313,7 @@ def verify(dirpath: str, snapshot: Optional[Dict[str, Any]] = None, *, require_f
               f"samples={len(samples)} readable={len(der)} borrow/interest>0={len(borrowed)} venue stated borrow+IM in {len(stated)} samples; a sample WITH the hedge open and IM stated={hedge_sample}; None = not stated = UNKNOWN, never zero", required=False)
     r.add("C00_MECHANICS_EXERCISED", "PASS" if exercised else "UNKNOWN", f"both entry legs filled and both exits filled: {exercised} (a session that sent orders but filled nothing verifies NOTHING)")
     return _result(dirpath, r, group_id=gid, plan_digest=plan.get("plan_digest"), decision_id=(dec or {}).get("decision_id") if isinstance(dec, dict) else None,
-                   net_usd=None if net_total is None else str(net_total))
+                   net_usd=None if net_total is None else str(net_total), exec_ids=sorted(str(x.get("exec_id")) for x in (rec.get("executions") or []) if isinstance(x, dict) and x.get("exec_id")))
 
 
 def _result(dirpath: str, r: _Rows, **ident: Any) -> Dict[str, Any]:
@@ -310,8 +326,10 @@ def _result(dirpath: str, r: _Rows, **ident: Any) -> Dict[str, Any]:
 def verify_repeated(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """REPEATED_MECHANICS_VERIFIED: at least two sessions, each MECHANICS_VERIFIED, with DISTINCT group id, plan digest and decision id (a copied directory is one session, not two)."""
     ok = [x for x in results if x.get("overall") == VERIFIED]
-    keys = {(x.get("group_id"), x.get("plan_digest"), x.get("decision_id")) for x in ok}
-    distinct = len(keys) == len(ok) and all(None not in k[:2] for k in keys)
+    groups, digests = [x.get("group_id") for x in ok], [x.get("plan_digest") for x in ok]
+    ids = [e for x in ok for e in (x.get("exec_ids") or [])]
+    # PAIRWISE distinct group ids and plan digests, and no execution id shared between sessions. The decision id is NOT a discriminator: a copied directory with an edited decision.json is one session.
+    distinct = (None not in groups and None not in digests and len(set(groups)) == len(ok) and len(set(digests)) == len(ok) and len(ids) == len(set(ids)))
     level = "REPEATED_MECHANICS_VERIFIED" if len(ok) >= 2 and distinct else ("MECHANICS_VERIFIED" if ok else "NOT_VERIFIED")
     return {"schema": "mechanics_repeated/v1", "level": level, "sessions": len(results), "verified": len(ok), "distinct": distinct,
             "claim": "mechanics only; no profit, no Mainnet expectancy"}

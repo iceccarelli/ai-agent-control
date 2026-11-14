@@ -83,7 +83,7 @@ def _costs_known(inputs: Mapping[str, Any], profile: str) -> Dict[str, Any]:
     costs = e.get("costs_bps")
     if not isinstance(costs, Mapping) or not costs:
         return _term("COSTS_KNOWN", UNKNOWN, ["NO_COST_LINES"])
-    unknown = sorted(k for k, v in costs.items() if v is None)
+    unknown = sorted(k for k, v in costs.items() if _num(v) is None)             # None, NaN, inf, a word: none of them is a known cost
     if unknown:
         return _term("COSTS_KNOWN", UNKNOWN, [f"COST_UNKNOWN:{k}" for k in unknown[:4]], unknown_lines=unknown)
     assumed = [str(a) for a in (e.get("assumed_inputs") or [])]
@@ -165,7 +165,10 @@ def _risk(inputs: Mapping[str, Any], profile: str) -> Dict[str, Any]:
     r = inputs.get("risk") if isinstance(inputs.get("risk"), Mapping) else {}
     cap, worst, limit = _num(r.get("loss_cap_usd")), _num(r.get("worst_case_loss_usd")), _num(r.get("loss_limit_usd"))
     committed, available = _num(r.get("capital_committed_usd")), _num(r.get("capital_available_usd"))
-    stops = [str(s) for s in (r.get("book_stops") or [])]
+    raw_stops = r.get("book_stops")
+    if not isinstance(raw_stops, (list, tuple)):
+        return _term("RISK_LIMITS_ACCEPTABLE", UNKNOWN, ["BOOK_STOPS_NOT_STATED"])      # whether the capital book holds a stop is a fact the caller must state; absent is not "none"
+    stops = [str(s) for s in raw_stops]
     if stops:
         return _term("RISK_LIMITS_ACCEPTABLE", FAIL, [f"BOOK_STOP:{s}" for s in stops[:4]])
     bound_name, bound = ("loss_limit_usd", limit) if profile == MEASUREMENT else ("worst_case_loss_usd", worst)

@@ -65,13 +65,21 @@ def row(**kw):
     return base
 
 
+def full(**kw):
+    """A row that states EVERYTHING a QUALIFIED claim needs (dataset state, multiple-testing count, independent observations)."""
+    base = dict(dataset_state={"state": "DATA_SUFFICIENT_ELIGIBLE_FOR_FURTHER_REVIEW", "reasons": []}, multiple_testing={"family": "f", "n_variants_counted": 3, "persisted_variants": 3},
+                families={"F": {"n_rows": 120}})
+    base.update(kw)
+    return row(**base)
+
+
 @pytest.mark.parametrize("r,expect", [
     (row(), "UNTESTED"),
     (row(verdict="INSUFFICIENT_DATA"), "INSUFFICIENT"),
     (row(verdict="REJECTED"), "NEGATIVE"),
     (row(verdict="INSUFFICIENT_DATA", readiness_level="PROMISING", net_edge={"value_bps": 4.0, "significant": True}), "PROMISING"),
     (row(verdict="INSUFFICIENT_DATA", readiness_level="PROSPECTIVE", net_edge={"value_bps": 4.0, "significant": True}), "PROMISING"),
-    (row(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 4.0, "significant": True}), "QUALIFIED"),
+    (full(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 4.0, "significant": True}), "QUALIFIED"),
     (row(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 4.0, "significant": False}), "PROMISING"),
     (row(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 4.0, "significant": None}), "PROMISING"),
     (row(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": -1.0, "significant": True}), "PROMISING"),
@@ -101,7 +109,7 @@ def test_missing_families_are_listed_untested_and_the_set_is_always_complete():
 
 
 def test_a_qualified_candidate_is_named_but_the_statement_keeps_the_owner_and_bounded_session_in_the_loop():
-    v = CE.view({"results": [row(name="cash_and_carry", verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 3.0, "significant": True})]})
+    v = CE.view({"results": [full(name="cash_and_carry", verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 3.0, "significant": True})]})
     assert v["qualified"] == ["x@spec-1"] and "owner's attestation" in v["statement"]
 
 
@@ -130,3 +138,32 @@ def test_the_module_reads_no_ledger_clock_network_or_environment():
     src = open(os.path.join(os.path.dirname(HERE), "tools", "candidate_evaluation.py"), encoding="utf-8").read()
     for banned in ("history_holdout", "candidate_ledger", "capital_anchor", "os.environ", "getenv", "time.time", "urllib", "socket", "requests", "subprocess", "unreserved_exploratory"):
         assert banned not in src, banned
+
+
+@pytest.mark.parametrize("drop", ["dataset_state", "multiple_testing", "families"])
+def test_a_row_missing_what_a_qualification_needs_is_at_most_promising(drop):
+    """REPRODUCED (review): {ladder EXECUTION_READY, net +5, significant} with no dataset_state / multiple-testing / sample was QUALIFIED."""
+    r = full(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 5.0, "significant": True})
+    r.pop(drop)
+    s, why = CE.status_of(r)
+    assert s == "PROMISING" and "NOT_QUALIFIED" in " ".join(why)
+    assert CE.status_of(row(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 5.0, "significant": True}))[0] == "PROMISING"
+    thin = full(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 5.0, "significant": True}, families={"F": {"n_rows": 49}})
+    assert CE.status_of(thin)[0] == "PROMISING"
+    bad_ds = full(verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 5.0, "significant": True}, dataset_state={"state": "DATA_VALID_BUT_INSUFFICIENT", "reasons": []})
+    assert CE.status_of(bad_ds)[0] == "PROMISING"
+
+
+def test_a_duplicate_family_row_is_judged_by_its_worst_status_and_evidence_matches_the_exact_spec():
+    rejected = row(name="cash_and_carry", verdict="REJECTED")
+    qualified = full(name="cash_and_carry", verdict="INSUFFICIENT_DATA", readiness_level="EXECUTION_READY", net_edge={"value_bps": 5.0, "significant": True})
+    for rows in ([rejected, qualified], [qualified, rejected]):
+        v = CE.view({"results": rows})
+        assert v["winner"] is None and {c["family"]: c["status"] for c in v["candidates"]}["cash_and_carry"] == "NEGATIVE"
+    v = CE.view({"results": [qualified]})
+    assert CE.evidence_for(v, "no_such_family@spec-9")["status"] == "UNTESTED"          # no such candidate
+    q2 = dict(qualified, candidate="cash_and_carry@spec-1")
+    v2 = CE.view({"results": [q2]})
+    assert CE.evidence_for(v2, "cash_and_carry@spec-1")["status"] == "QUALIFIED"
+    assert CE.evidence_for(v2, "cash_and_carry@other-digest")["status"] == "UNTESTED", "a different specification revision is not this candidate"
+    assert CE.evidence_for(v2, "cash_and_carry")["status"] == "QUALIFIED"

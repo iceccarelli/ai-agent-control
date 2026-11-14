@@ -98,8 +98,10 @@ def file_hashes(root: str, entries: Sequence[str]) -> Dict[str, str]:
 
 
 def shipped_files(root: str) -> List[str]:
-    """EVERY file the image ships under the application root, relative and sorted, except the manifest and interpreter caches. A script the supervisor spawns by path, a candidate signal and a file dropped
-    onto the volume's /app by sftp are all in this set: the manifest does not trust the import closure to be the whole image."""
+    """EVERY regular source/data file the image ships under the application root, relative and sorted, except the manifest and interpreter caches (``__pycache__``, ``*.pyc``). A script the supervisor spawns by
+    path, a candidate signal and a plain file dropped under /app are in this set: the manifest does not trust the import closure to be the whole image. NOT covered (a detector of deploy mistakes, not a
+    defence against someone with a shell on the machine): a planted bytecode file in ``__pycache__`` or a stray ``*.pyc`` (the interpreter writes caches at run time, so they cannot be pinned), a symlinked
+    directory (``os.walk`` does not follow it), and the manifest's own ``git_sha`` field (self-attested)."""
     out: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)

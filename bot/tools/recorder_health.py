@@ -145,6 +145,10 @@ def classify(status: Optional[Mapping[str, Any]], *, now_s: float, free_bytes: O
         blocked = True
         add("storage_blocked", "STORE_REPORTS_RESERVE_FAULT", str(store.get("fault"))[:200])
 
+    # ---- what cannot be established is never healthy (Round 22 review: a status with no store block and an unreadable volume was `healthy`)
+    if st is not None and not blocked and (free is None or reserve is None):
+        add("unknown", "HEADROOM_UNKNOWN", f"free space ({free_src}) or the write reserve is not known: the headroom above the reserve cannot be established")
+
     # ---- is it persisting? (only a FRESH status can say)
     fresh = st is not None and not stale and not future
     if fresh and not blocked:
@@ -185,6 +189,8 @@ def classify(status: Optional[Mapping[str, Any]], *, now_s: float, free_bytes: O
     if rate_day is not None and retention is not None and reserve is not None and total is not None:
         needed = (retention + 1) * rate_day * HOURLY_PASS_FACTOR + reserve
         fits = total >= needed
+    if st is not None and (retention is None or not isinstance(store.get("segment_bytes"), Mapping) or not store.get("segment_bytes")):
+        add("degraded", "CAPACITY_NOT_REPORTED", "the status carries no retention or per-day segment sizes (an older recorder, or an empty store): the daily rate, the time to the reserve and whether the volume holds the retention cannot be computed")
     if not blocked:
         if remaining is not None and reserve is not None and remaining < HEADROOM_BYTES:
             add("degraded", "WITHIN_HEADROOM_OF_RESERVE", f"{remaining / 1048576.0:.0f} MiB above the reserve (headroom {HEADROOM_BYTES / 1048576.0:.0f} MiB)")

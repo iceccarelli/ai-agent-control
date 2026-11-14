@@ -22,6 +22,11 @@ import mechanics_verify as MV  # noqa: E402
 from ms_testnet_world import World  # noqa: E402
 
 
+def rec_pre_ref(w):
+    with open(os.path.join(w.state_dir, "preflight.json"), encoding="utf-8") as fh:
+        return json.load(fh).get("account_ref")
+
+
 @pytest.fixture(scope="module")
 def session(tmp_path_factory):
     """ONE real session (perp short + spot buy, a 150 s hold across a simulated funding settlement, both legs closed) on the fake venue, and the independent end-of-session venue snapshot."""
@@ -46,7 +51,7 @@ def session(tmp_path_factory):
         assert w.execute(digest) == 0, w.text()
         rec = w.record()
         assert rec["flat_verified"] is True and rec["orders"]
-        snap = {"schema": MV.SNAPSHOT_SCHEMA, "read_ms": w.clock.now() + 1000, "complete": True,
+        snap = {"schema": MV.SNAPSHOT_SCHEMA, "read_ms": w.clock.now() + 1000, "complete": True, "venue": "testnet", "account_ref": rec_pre_ref(w),
                 "linear_positions": {s: float(p["size"]) for s, p in w.fake.positions.items()}, "spot_balances": {k: str(v) for k, v in w.fake.wallet.items()},
                 "open_orders_active": [], "open_orders_conditional": [], "usdt_balance": str(w.fake.wallet["USDT"])}
         yield {"dir": w.state_dir, "snap": snap, "tmp": tmp}
@@ -176,7 +181,7 @@ def test_repeated_needs_two_distinct_verified_sessions_not_a_copied_directory(se
     one = MV.verify(session["dir"], session["snap"], require_funding=True)
     assert MV.verify_repeated([one])["level"] == "MECHANICS_VERIFIED"
     assert MV.verify_repeated([one, one])["level"] == "MECHANICS_VERIFIED", "the same session twice is one session"
-    other = dict(one, group_id="another-group", plan_digest="f" * 64, decision_id="d2")
+    other = dict(one, group_id="another-group", plan_digest="f" * 64, decision_id="d2", exec_ids=["another-session-exec-1"])
     assert MV.verify_repeated([one, other])["level"] == "REPEATED_MECHANICS_VERIFIED"
     assert MV.verify_repeated([one, dict(other, overall=MV.FAILED)])["level"] == "MECHANICS_VERIFIED"
     assert MV.verify_repeated([])["level"] == "NOT_VERIFIED"
@@ -205,3 +210,85 @@ def test_the_verifier_has_no_network_clock_or_order_path():
     src = open(os.path.join(os.path.dirname(HERE), "tools", "mechanics_verify.py"), encoding="utf-8").read()
     for banned in ("requests", "urllib", "socket", "http.client", "time.time", "datetime", "place_order", "create_order", "os.environ", "getenv", "open(path, \"w\"", "write_json", "BYBIT_TESTNET_API", "SECRET"):
         assert banned not in src, banned
+
+
+# ---- Round 22 review: the snapshot is the INDEPENDENT proof, so it must be bound to this venue and account and must state every figure the verifier reads
+@pytest.mark.parametrize("name,snap", [
+    ("fabricated_minimal", {"schema": MV.SNAPSHOT_SCHEMA, "read_ms": 10 ** 15, "complete": True, "linear_positions": {}, "spot_balances": {}, "open_orders_active": [], "open_orders_conditional": []}),
+    ("minimal_with_venue_only", {"schema": MV.SNAPSHOT_SCHEMA, "read_ms": 10 ** 15, "complete": True, "venue": "testnet", "linear_positions": {}, "spot_balances": {}, "usdt_balance": "1", "open_orders_active": [], "open_orders_conditional": []}),
+])
+def test_a_hand_written_minimal_snapshot_cannot_verify_a_session(session, name, snap):
+    res = MV.verify(session["dir"], snap, require_funding=True)
+    assert res["overall"] != MV.VERIFIED and _non_pass(res).get("C15_FINAL_VENUE_STATE") in ("UNKNOWN", "FAIL"), (name, _non_pass(res))
+
+
+@pytest.mark.parametrize("name,change,expect", [
+    ("other_venue", lambda s: s.update(venue="mainnet"), "UNKNOWN"),
+    ("no_venue", lambda s: s.pop("venue"), "UNKNOWN"),
+    ("base_coin_absent", lambda s: s["spot_balances"].pop("BTC", None), "UNKNOWN"),
+    ("usdt_balance_absent", lambda s: s.pop("usdt_balance"), "UNKNOWN"),
+    ("other_account", lambda s: s.update(account_ref="acct_deadbeefdeadbeefdeadbeef"), "FAIL"),
+    ("account_not_stated", lambda s: s.pop("account_ref"), "UNKNOWN"),
+])
+def test_a_snapshot_must_be_this_venue_this_account_and_state_the_balances_it_is_read_for(session, name, change, expect):
+    snap = copy.deepcopy(session["snap"])
+    assert snap.get("account_ref"), "the fixture's session states its account"
+    change(snap)
+    res = MV.verify(session["dir"], snap, require_funding=True)
+    assert res["overall"] != MV.VERIFIED and _non_pass(res).get("C15_FINAL_VENUE_STATE") == expect, (name, _non_pass(res))
+
+
+def test_repeated_is_not_fooled_by_a_copied_session_with_an_edited_decision_id(session, tmp_path):
+    """REPRODUCED (review): copying a session directory and changing only decision.json's decision_id gave a second 'distinct' session and REPEATED_MECHANICS_VERIFIED."""
+    d = _copy(session, tmp_path)
+    p = os.path.join(d, "decision.json")
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"decision_id": "fabricated-decision-0002"}, fh)
+    a = MV.verify(session["dir"], session["snap"], require_funding=True)
+    b = MV.verify(d, session["snap"], require_funding=True)
+    assert a["overall"] == MV.VERIFIED and b["group_id"] == a["group_id"] and b["plan_digest"] == a["plan_digest"]
+    assert MV.verify_repeated([a, dict(b, decision_id="fabricated-decision-0002")])["level"] == "MECHANICS_VERIFIED"
+    # shared execution ids are one session as well, whatever else is changed
+    other = dict(a, group_id="g2", plan_digest="e" * 64, decision_id="d2")
+    assert MV.verify_repeated([a, other])["level"] == "MECHANICS_VERIFIED", "the same executions under another group id are the same session"
+    assert MV.verify_repeated([a, dict(other, exec_ids=["x-1"])])["level"] == "REPEATED_MECHANICS_VERIFIED"
+
+
+def test_the_funding_booked_by_the_settlement_module_must_equal_the_record(session, tmp_path):
+    d = _copy(session, tmp_path)
+    _edit(os.path.join(d, "funding_settlement.json"), lambda f: f["recognitions"][0].__setitem__("booked_usd", "5.0"))
+    res = MV.verify(d, session["snap"], require_funding=True)
+    assert res["overall"] == MV.FAILED and _non_pass(res).get("C13_FUNDING") == "FAIL"
+
+
+def _halve_the_perp_entry_fill(r):
+    for x in r["executions"]:
+        if x["side"] == "Sell":
+            x["qty"] = float(x["qty"]) / 2
+            break
+
+
+@pytest.mark.parametrize("name,fn,check", [
+    ("perp_entry_fill_halved", _halve_the_perp_entry_fill, "C10_HEDGE"),
+    ("flat_verified_false", lambda r: r.__setitem__("flat_verified", False), "C16_LOCAL_STATE"),
+])
+def test_a_hedge_that_does_not_match_and_a_session_that_does_not_claim_flat_are_not_verified(session, tmp_path, name, fn, check):
+    """The failure-mode register cites mechanics_verify for 'hedge mismatch' and 'incorrect fees': these are the tampers that back that claim."""
+    d = _copy(session, tmp_path)
+    _edit(os.path.join(d, "testnet_session.json"), fn)
+    res = MV.verify(d, session["snap"], require_funding=True)
+    assert res["overall"] in (MV.FAILED, MV.INCONCLUSIVE) and res["overall"] != MV.VERIFIED, (name, _non_pass(res))
+    assert _non_pass(res), name
+
+
+def test_a_spot_exit_that_precedes_the_perp_exit_fills_fails_the_close_order_check(session, tmp_path):
+    d = _copy(session, tmp_path)
+
+    def swap(r):
+        sells = [x for x in r["executions"] if x["side"] == "Buy" and x["link_id"] != r["executions"][0]["link_id"]]
+        for x in r["executions"]:
+            x["ts_ms"] = 1 if x["side"] == "Sell" and x["link_id"].endswith("-xs") else x["ts_ms"]
+        return sells
+    _edit(os.path.join(d, "testnet_session.json"), lambda r: [x.__setitem__("ts_ms", 10 ** 15) for x in r["executions"] if x["side"] == "Buy"])      # every Buy fill (perp exit) after every Sell
+    res = MV.verify(d, session["snap"], require_funding=True)
+    assert res["overall"] != MV.VERIFIED and "C14_CLOSE" in _non_pass(res)
