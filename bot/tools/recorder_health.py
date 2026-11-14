@@ -52,13 +52,20 @@ def _num(x: Any) -> Optional[float]:
 def _daily_rate_bytes(segment_bytes: Optional[Mapping[str, Any]], now_s: float) -> Dict[str, Optional[float]]:
     """The measured daily write rate from the segment sizes: the mean of the fully CLOSED days (oldest and newest excluded when there are at least three: the oldest may be partial and the newest is
     open), and today's rate in bytes per second from the open day's size over the seconds elapsed in the UTC day. Any of them is None when the evidence does not support it."""
-    out: Dict[str, Optional[float]] = {"closed_day_mean_bytes": None, "today_bytes": None, "today_bytes_per_s": None}
+    out: Dict[str, Any] = {"closed_day_mean_bytes": None, "today_bytes": None, "today_bytes_per_s": None, "closed_day_basis": None}
     if not isinstance(segment_bytes, Mapping) or not segment_bytes:
         return out
     days = sorted(d for d in segment_bytes if isinstance(d, str) and len(d) == 8 and d.isdigit() and _num(segment_bytes[d]) is not None)
     if not days:
         return out
-    closed = days[1:-1] if len(days) >= 3 else []
+    # With retention 1 the store holds exactly two days (one closed, one open), so "oldest and newest excluded" would leave NO closed day and the capacity model would say nothing at the very
+    # setting that fits the smallest volume. A single older day is then used as a LOWER BOUND on the daily rate (it may be a partial day) and labelled so: never presented as a mean of full days.
+    if len(days) >= 3:
+        closed, out["closed_day_basis"] = days[1:-1], "mean_of_closed_days"
+    elif len(days) == 2:
+        closed, out["closed_day_basis"] = days[:1], "single_closed_day_lower_bound"
+    else:
+        closed = []
     if closed:
         out["closed_day_mean_bytes"] = sum(float(segment_bytes[d]) for d in closed) / len(closed)
     import datetime as dt
@@ -68,6 +75,22 @@ def _daily_rate_bytes(segment_bytes: Optional[Mapping[str, Any]], now_s: float) 
         out["today_bytes"] = float(segment_bytes[today])
         if elapsed >= 1800.0:                                      # under half an hour into the day the ratio is noise
             out["today_bytes_per_s"] = float(segment_bytes[today]) / elapsed
+    return out
+
+
+def prune_on_resume(segment_bytes: Optional[Mapping[str, Any]], retention_days: Optional[float], now_s: float) -> Dict[str, Any]:
+    """What the FIRST write after the volume recovers would delete. The store prunes whole closed days older than ``retention_days`` against the wall clock, bounded by its newest segment; a stalled
+    store never opened today's segment, so its newest segment is old and shields every retained day. The first successful write opens today's segment, the bound jumps to the wall clock and every closed
+    day before (today - retention) goes at the next retention pass, however valuable it is as evidence (REPRODUCED Round 22: R=2 on a stalled store whose newest day is 5 days old). Pure and read-only:
+    ``days``/``bytes`` are what would be removed, ``None`` when the sizes or the retention are unknown."""
+    out: Dict[str, Any] = {"days": None, "bytes": None, "day_list": None}
+    r = _num(retention_days)
+    if r is None or r <= 0 or not isinstance(segment_bytes, Mapping):
+        return out
+    import datetime as dt
+    cutoff = dt.datetime.fromtimestamp(now_s - r * DAY_S, dt.timezone.utc).strftime("%Y%m%d")
+    gone = sorted(d for d in segment_bytes if isinstance(d, str) and len(d) == 8 and d.isdigit() and d < cutoff and _num(segment_bytes[d]) is not None)
+    out["day_list"], out["days"], out["bytes"] = gone, len(gone), int(sum(float(segment_bytes[d]) for d in gone))
     return out
 
 
@@ -148,6 +171,7 @@ def classify(status: Optional[Mapping[str, Any]], *, now_s: float, free_bytes: O
 
     # ---- projections and capacity (need the sizes)
     rates = _daily_rate_bytes(store.get("segment_bytes"), now_s)
+    resume = prune_on_resume(store.get("segment_bytes"), retention, now_s)
     rate_day = rates["closed_day_mean_bytes"]
     rate_s = rates["today_bytes_per_s"]
     if rate_s is None and rate_day is not None:
@@ -171,6 +195,9 @@ def classify(status: Optional[Mapping[str, Any]], *, now_s: float, free_bytes: O
     else:
         if fits is False:
             reasons.append({"state": "storage_blocked", "code": "VOLUME_BELOW_RETENTION_NEED", "detail": f"the volume ({total / 1e9:.2f} GB) is below what retention {retention:.0f} needs at the measured rate ({needed / 1e9:.2f} GB incl. the reserve): freeing a day does not fix it"})
+    if resume["days"] and (blocked or "stalled" in states or (st is not None and (stale or future))):
+        add("storage_blocked" if blocked else ("stalled" if "stalled" in states else "unknown"), "RESUME_WILL_PRUNE_RETAINED_DAYS",
+            f"when writing resumes the store opens today's segment and its retention pass removes {resume['days']} closed day(s) ({resume['bytes'] / 1e9:.2f} GB: {', '.join(resume['day_list'])}) older than retention {retention:.0f} d: preserve or back them up BEFORE freeing space")
     restarts = _num(sup.get("recorder_restarts")) if sup else None
     kills = _num(sup.get("recorder_watchdog_kills")) if sup else None
     if (restarts or 0) > 0 or (kills or 0) > 0:
@@ -194,7 +221,8 @@ def classify(status: Optional[Mapping[str, Any]], *, now_s: float, free_bytes: O
         "market_inputs": _num(progress.get("market_inputs")), "growth_age_s": growth_age,
         "effective_reserve_bytes": reserve, "effective_retention_days": retention,
         "volume_total_bytes": total, "free_bytes": free, "free_source": free_src, "bytes_remaining_above_reserve": remaining,
-        "closed_day_mean_bytes": rate_day, "today_bytes": rates["today_bytes"], "write_rate_bytes_per_s": None if rate_s is None else round(rate_s, 3),
+        "closed_day_mean_bytes": rate_day, "closed_day_basis": rates["closed_day_basis"], "today_bytes": rates["today_bytes"],
+        "prune_on_resume_days": resume["days"], "prune_on_resume_bytes": resume["bytes"], "prune_on_resume_day_list": resume["day_list"], "write_rate_bytes_per_s": None if rate_s is None else round(rate_s, 3),
         "hours_to_reserve_no_prune": hours_to_reserve, "volume_needed_for_retention_bytes": None if needed is None else int(needed), "volume_holds_retention": fits,
         "process": {"pid": (st or {}).get("pid"), "started_ms": (st or {}).get("started_ms"), "uptime_s": (st or {}).get("uptime_s"),
                     "supervisor_recorder_pid": sup.get("recorder_pid") if sup else None, "restarts": restarts, "watchdog_kills": kills},

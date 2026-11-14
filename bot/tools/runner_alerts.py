@@ -27,6 +27,8 @@ WHAT IT ALERTS ON
                 cannot recover by itself)
   recorder_image_mismatch the last 3 cycles that report the running image's provenance found it MISMATCH or MISSING
                 (WARNING: the recorder may be writing, but it is not the approved implementation; Round 22)
+  recorder_resume_will_prune the last 3 cycles found the recorder NOT writing (storage_blocked/stalled/unknown) while the first write after recovery would delete retained closed days
+                (WARNING: the owner must preserve them BEFORE freeing space; Round 22)
   recorder_reserve_soon the last 3 cycles that report an estimate found the volume reaching the write reserve within
                 24 hours at the current write rate (WARNING: the early warning in HOURS, before recorder_disk_low's headroom is gone; Round 22)
   mainnet_stalled  the last 6 cycles that collect real-market data recorded none
@@ -343,6 +345,15 @@ def _recorder_reserve_soon(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+def _reserve_mib(row: Mapping[str, object]) -> float:
+    """The write reserve IN FORCE on a history line (``recorder_reserve_bytes``, the recorder's own effective setting), else the documented 512 MiB. The alerts used to hard-code 512 MiB, so a recorder
+    configured with a different reserve alerted at the wrong level (too late when higher, noisily when lower). A bool, a non-finite or a non-positive figure is not a reading."""
+    v = row.get("recorder_reserve_bytes")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+        return float(RECORDER_RESERVE_MB)
+    return float(v) / 1048576.0
+
+
 def _free_mib(row: Mapping[str, object]) -> Optional[float]:
     """The recorder volume's free space in MiB from a monitor history line, or None. The monitor writes it as ``recorder_free_mb`` (every recorder field is prefixed; see
     ``runner_monitor._history_line``). A bool, a string, a non-finite or an absurdly large number is not a reading."""
@@ -374,7 +385,7 @@ def _recorder_stall_permanent(rows: Sequence[Mapping[str, object]]):
     readings = [r for r in rows if _free_mib(r) is not None]
     run: List[Mapping[str, object]] = []
     for r in reversed(readings):
-        if float(_free_mib(r)) < RECORDER_RESERVE_MB:               # type: ignore[arg-type]
+        if float(_free_mib(r)) < _reserve_mib(r):                   # type: ignore[arg-type]
             run.append(r)
         else:
             break
@@ -396,7 +407,21 @@ def _recorder_disk_low(rows: Sequence[Mapping[str, object]], n: int):
     (a recorder that is already down raises `recorder_down` as well, which is useful: the second says why)."""
     with_free = [r for r in rows if _free_mib(r) is not None]
     tail = with_free[-n:]
-    if len(tail) == n and all(float(_free_mib(r)) < RECORDER_FREE_WARN_MB for r in tail):   # type: ignore[arg-type]
+    if len(tail) == n and all(float(_free_mib(r)) < _reserve_mib(r) + (RECORDER_FREE_WARN_MB - RECORDER_RESERVE_MB) for r in tail):   # type: ignore[arg-type]
+        return tail
+    return None
+
+
+#: Round 22: cycles a "resuming would prune retained days" reading must persist before it alerts
+RECORDER_RESUME_PRUNE_CYCLES = 3
+
+
+def _recorder_resume_will_prune(rows: Sequence[Mapping[str, object]], n: int):
+    """The last ``n`` rows that carry ``recorder_resume_prune_days``, when every one is a positive count AND the recorder is not writing (storage_blocked, stalled or unknown): that is the window in which
+    the owner is about to free space and the first write would delete the retained days. A healthy writer's own expiry is normal and never alerts; else None."""
+    with_p = [r for r in rows if isinstance(r.get("recorder_resume_prune_days"), (int, float)) and not isinstance(r.get("recorder_resume_prune_days"), bool)]
+    tail = with_p[-n:]
+    if len(tail) == n and all(float(r["recorder_resume_prune_days"]) > 0 and r.get("recorder_health") in ("storage_blocked", "stalled", "unknown") for r in tail):
         return tail
     return None
 
@@ -531,10 +556,11 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
     low = _recorder_disk_low(rows, RECORDER_DISK_LOW_CYCLES)
     if low:
         free = float(_free_mib(low[-1]))                       # type: ignore[arg-type]
-        below = free < RECORDER_RESERVE_MB
+        reserve = _reserve_mib(low[-1])
+        below = free < reserve
         alerts.append(Alert(
             "recorder_disk_low", WARNING,
-            f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {RECORDER_RESERVE_MB} MiB write reserve). "
+            f"the market-data volume has {free:.0f} MiB free for the last {RECORDER_DISK_LOW_CYCLES} cycles ({'BELOW' if below else 'within about 1 GiB of'} the {reserve:.0f} MiB write reserve). "
             "At the reserve the recorder stops writing; it recovers only at the next UTC day boundary and only if the volume holds the retained days plus the reserve, otherwise it stays stopped. The RUNNING image may predate even that bounded "
             "recovery (merging it changes no running machine): check with RUNBOOKS section 18. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
             "--recorder-retention-days; see MONEY_MISSION.md (recorder size model) and RUNBOOKS section 14."))
@@ -543,7 +569,7 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
         run, hours, midnights = perm
         alerts.append(Alert(
             "recorder_stall_permanent", WARNING,
-            f"every free-space reading for the last {hours:.0f} h ({len(run)} readings, {midnights} UTC midnights; latest {float(_free_mib(run[-1])):.0f} MiB) is below the {RECORDER_RESERVE_MB} MiB write reserve. "
+            f"every free-space reading for the last {hours:.0f} h ({len(run)} readings, {midnights} UTC midnights; latest {float(_free_mib(run[-1])):.0f} MiB) is below the {_reserve_mib(run[-1]):.0f} MiB write reserve. "
             "A transient dip recovers at the next UTC day boundary; this has not, so the recorder is not coming back by itself. Two causes fit this history and only a read of the machine tells them apart: "
             "(1) the volume cannot hold even ONE day of data above the reserve (the first segment is never pruned, so it stays stopped for good: extend the volume, RUNBOOKS section 14), or "
             "(2) the RUNNING image predates the bounded recovery (RUNBOOKS section 18). Read-only checks: fly volumes list -a carry-drill; "
@@ -555,6 +581,16 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
             "recorder_image_mismatch", WARNING,
             f"the last {RECORDER_IMAGE_CYCLES} cycles found the running recorder image's provenance {last['recorder_image_status']}: it is not established as the approved implementation (the recorder may still be writing). "
             "Compare the image with the commit (RUNBOOKS 'Runtime provenance': `fly image show -a carry-drill`, python3 tools/image_manifest.py compare), and redeploy an image built with --build-arg BUILD_COMMIT=<sha>. Nothing is changed by this alert."))
+    resume = _recorder_resume_will_prune(rows, RECORDER_RESUME_PRUNE_CYCLES)
+    if resume:
+        last = resume[-1]
+        gb = float(last.get("recorder_resume_prune_bytes") or 0) / 1e9
+        alerts.append(Alert(
+            "recorder_resume_will_prune", WARNING,
+            f"the recorder is not writing and the first write after space is freed would delete {int(float(last['recorder_resume_prune_days']))} retained closed day(s) ({gb:.2f} GB): a stalled store's newest segment is old and "
+            "shields them, but writing resumes into TODAY's segment and the next retention pass removes every closed day older than the retention window. Whether those days are backed up is not known here. "
+            "Before extending the volume or redeploying, preserve them (fly volumes snapshots create / an off-machine copy; RUNBOOKS 'Recorder storage sizing', remediation Phase 1) or set --recorder-retention-days high enough to keep them, and size the "
+            "volume for that retention. Nothing is deleted or resized by this alert."))
     soon = _recorder_reserve_soon(rows, RECORDER_DISK_LOW_CYCLES)
     if soon:
         h = float(soon[-1]["recorder_hours_to_reserve"])

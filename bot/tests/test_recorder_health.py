@@ -166,3 +166,29 @@ def test_every_state_name_is_in_the_closed_vocabulary_and_healthy_helper_matches
     assert set(RH.STATES) == {"healthy", "degraded", "stalled", "storage_blocked", "image_mismatch", "unknown"}
     assert RH.is_healthy(RH.classify(status(segment_bytes=None, free=8 * GB), **healthy_kw())) is True
     assert RH.is_healthy({"state": "unknown"}) is False
+
+
+def test_a_stalled_store_warns_that_resuming_will_prune_the_retained_evidence_days():
+    """REPRODUCED (Round 22): the newest segment of a stalled store is old, so it shields every retained day; the first write opens today's segment and the retention pass then removes every closed day
+    before today - retention. The owner must be told the bytes and days BEFORE extending the volume."""
+    days = seg({"20261107": 1.9 * GB, "20261108": 1.9 * GB, "20261109": 0.6 * GB})
+    res = RH.classify(status(segment_bytes=days, free=509 * MIB, retention=2), **healthy_kw(free_bytes=509 * MIB, total_bytes=5 * GB))
+    m = res["metrics"]
+    assert m["prune_on_resume_days"] == 3 and m["prune_on_resume_day_list"] == ["20261107", "20261108", "20261109"]
+    assert m["prune_on_resume_bytes"] == pytest.approx(4.4 * GB)
+    assert "RESUME_WILL_PRUNE_RETAINED_DAYS" in codes(res) and res["state"] == "storage_blocked"
+    # a healthy writer whose newest day is today has nothing to warn about: the pass only ever drops what is past retention
+    live = seg({"20261112": 1.9 * GB, "20261113": 1.9 * GB, "20261114": 0.7 * GB})
+    ok = RH.classify(status(segment_bytes=live, free=6 * GB, retention=2), **healthy_kw(free_bytes=6 * GB, total_bytes=10 * GB))
+    assert ok["metrics"]["prune_on_resume_days"] == 0 and "RESUME_WILL_PRUNE_RETAINED_DAYS" not in codes(ok)
+    # unknown retention / sizes: nothing is claimed
+    assert RH.prune_on_resume(None, 2, NOW)["days"] is None and RH.prune_on_resume(days, 0, NOW)["days"] is None
+
+
+def test_retention_1_with_two_days_on_disk_still_has_a_labelled_daily_rate():
+    days = seg({"20261113": 1.9 * GB, "20261114": 0.7 * GB})
+    res = RH.classify(status(segment_bytes=days, free=2 * GB, retention=1), **healthy_kw(free_bytes=2 * GB, total_bytes=5 * GB))
+    m = res["metrics"]
+    assert m["closed_day_mean_bytes"] == pytest.approx(1.9 * GB) and m["closed_day_basis"] == "single_closed_day_lower_bound"
+    assert m["volume_holds_retention"] is True          # (1+1) * 1.9 GB * 1.042 + 0.5 GiB < 5 GB
+    assert RH.classify(status(segment_bytes=seg({"20261114": 0.7 * GB})), **healthy_kw())["metrics"]["closed_day_basis"] is None

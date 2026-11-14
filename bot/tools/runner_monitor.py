@@ -208,7 +208,8 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
             line["recorder_health_codes"] = [r.get("code") for r in health.get("reasons", []) if isinstance(r, dict)][:8]
             for src, dst in (("bytes_remaining_above_reserve", "recorder_bytes_remaining"), ("hours_to_reserve_no_prune", "recorder_hours_to_reserve"), ("last_write_age_s", "recorder_last_write_age_s"),
                              ("last_commit_age_s", "recorder_last_commit_age_s"), ("effective_reserve_bytes", "recorder_reserve_bytes"), ("effective_retention_days", "recorder_retention_days"),
-                             ("volume_total_bytes", "recorder_volume_total_bytes"), ("closed_day_mean_bytes", "recorder_daily_rate_bytes"), ("volume_holds_retention", "recorder_volume_holds_retention")):
+                             ("volume_total_bytes", "recorder_volume_total_bytes"), ("closed_day_mean_bytes", "recorder_daily_rate_bytes"), ("volume_holds_retention", "recorder_volume_holds_retention"),
+                             ("prune_on_resume_days", "recorder_resume_prune_days"), ("prune_on_resume_bytes", "recorder_resume_prune_bytes")):
                 if m.get(src) is not None:
                     line[dst] = m[src]
             image = m.get("image") if isinstance(m.get("image"), dict) else {}

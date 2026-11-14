@@ -677,3 +677,35 @@ def test_the_hours_warning_is_quiet_when_there_is_time_when_blocked_already_or_t
     assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*_soon_rows(10.0, 9.0)), NOW)), "two cycles are not three"
     junk = [row(180, recorder_hours_to_reserve=True), row(120, recorder_hours_to_reserve="5"), row(60, recorder_hours_to_reserve=-3)]
     assert "recorder_reserve_soon" not in _keys(RA.evaluate(text(*junk), NOW))
+
+
+def _resume_rows(days, health="storage_blocked", n=3, gb=4.4e9):
+    return [row((n - i) * 60, recorder_state="STALE", recorder_health=health, recorder_resume_prune_days=days, recorder_resume_prune_bytes=gb) for i in range(n)]
+
+
+def test_a_blocked_recorder_whose_first_write_would_delete_retained_days_says_so_before_the_owner_extends_the_volume():
+    for health in ("storage_blocked", "stalled", "unknown"):
+        alerts = RA.evaluate(text(*_resume_rows(3, health)), NOW)
+        assert "recorder_resume_will_prune" in _keys(alerts), health
+    msg = next(a for a in RA.evaluate(text(*_resume_rows(3)), NOW) if a.key == "recorder_resume_will_prune")
+    assert msg.severity == RA.WARNING and "3 retained closed day(s) (4.40 GB)" in msg.text and "preserve them" in msg.text and "Nothing is deleted or resized" in msg.text
+
+
+def test_the_resume_prune_alert_is_quiet_for_a_healthy_writer_for_zero_days_for_two_cycles_or_for_junk():
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(3, health="healthy")), NOW)), "a healthy writer's own expiry is normal"
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(0)), NOW))
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(3, n=2)), NOW)), "two cycles are not three"
+    assert "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows(True)), NOW)) and "recorder_resume_will_prune" not in _keys(RA.evaluate(text(*_resume_rows("3")), NOW))
+
+
+def test_the_disk_alerts_use_the_reserve_the_recorder_reports_not_a_hard_coded_512_mib():
+    """REPRODUCED (Round 22 fly review): runner_alerts compared against a constant 512 MiB. A recorder running with a 2 GiB reserve and 1.5 GiB free is BLOCKED; the alert must see it."""
+    blocked = [row((3 - i) * 60, recorder_state="STALE", recorder_free_mb=1536.0, recorder_reserve_bytes=2 * 1024 ** 3) for i in range(3)]
+    msg = next(a for a in RA.evaluate(text(*blocked), NOW) if a.key == "recorder_disk_low")
+    assert "BELOW the 2048 MiB write reserve" in msg.text
+    # a smaller reserve is not over-alerted: 1.2 GiB free is far above a 64 MiB reserve + 1 GiB headroom? (64 + 1024 = 1088 < 1229)
+    fine = [row((3 - i) * 60, recorder_state="RECORDING", recorder_free_mb=1229.0, recorder_reserve_bytes=64 * 1024 ** 2) for i in range(3)]
+    assert "recorder_disk_low" not in _keys(RA.evaluate(text(*fine), NOW))
+    # a row that does not say falls back to the documented 512 MiB
+    legacy = [row((3 - i) * 60, recorder_state="RECORDING", recorder_free_mb=1400.0) for i in range(3)]
+    assert "recorder_disk_low" in _keys(RA.evaluate(text(*legacy), NOW))
