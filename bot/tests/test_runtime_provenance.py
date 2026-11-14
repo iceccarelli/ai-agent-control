@@ -117,19 +117,21 @@ def test_a_changed_or_missing_closure_file_is_MISMATCH_and_named(app):
     assert "md_store.py (missing)" in verify(app)["differing"]
 
 
-def test_a_file_the_entry_points_now_import_but_the_manifest_does_not_list_is_MISMATCH(app):
+def test_a_file_under_the_root_that_the_manifest_does_not_list_is_FILE_EXTRA(app):
+    """A file the manifest does not list (dropped by sftp, or an import the build never saw) is refused, whether or not an entry point imports it."""
     def drop(m):
-        m["files"].pop("md_seal.py", None) if "md_seal.py" in m["files"] else m["files"].pop(sorted(m["files"])[-1])
-        m["closure_fingerprint"] = RP._digest(sorted(m["files"].items()))
+        m["files"].pop("md_seal.py") if "md_seal.py" in m["files"] else m["files"].pop(sorted(m["files"])[-1])
+        m["files_fingerprint"] = RP._digest(sorted(m["files"].items()))
     edit_manifest(app, drop)
     res = verify(app)
-    assert res["status"] == "MISMATCH" and "not in the manifest" in res["detail"] and any("(unlisted)" in d for d in res["differing"]), res
+    assert res["status"] == "MISMATCH" and res["code"] == "FILE_EXTRA" and any("(unlisted)" in d for d in res["differing"]), res
+    assert "not in the manifest" in res["detail"]
 
 
 def test_a_tampered_manifest_whose_own_fingerprint_disagrees_is_MISMATCH(app):
     edit_manifest(app, lambda m: m.update(closure_fingerprint="0" * 64))
     res = verify(app)
-    assert res["status"] == "MISMATCH" and "closure fingerprint" in res["detail"]
+    assert res["status"] == "MISMATCH" and res["code"] == "FINGERPRINT_INCONSISTENT" and "closure fingerprint" in res["detail"]
 
 
 def test_a_different_python_or_dependency_set_is_MISMATCH(app):
@@ -149,9 +151,12 @@ def test_an_image_is_approved_only_for_the_app_of_its_class(app):
 
 
 def test_the_executor_class_is_built_from_the_executor_closure(tmp_path):
-    man = RP.build_manifest(BOT, git_sha=SHA, environment_class="TESTNET_EXECUTOR", packages=PKGS)
+    root = str(tmp_path / "app")                       # what the autopilot image ships (assembled from its COPY lines), not the whole repository with its tests
+    os.makedirs(root)
+    _assemble("Dockerfile.autopilot", root)
+    man = RP.build_manifest(root, git_sha=SHA, environment_class="TESTNET_EXECUTOR", packages=PKGS)
     assert man["entry_points"] == ["tools/ms_testnet_autopilot.py"] and "tools/ms_testnet_autopilot.py" in man["files"] and "economic_model.py" in man["files"]
-    assert man["recorder_fingerprint"] is not None and man["closure_fingerprint"] != man["recorder_fingerprint"]
+    assert man["recorder_fingerprint"] is None, "the executor image holds no recorder: no recorder fingerprint is claimed for it"
 
 
 def test_the_cli_builds_and_verifies_and_refuses(tree, tmp_path, capsys):
@@ -205,7 +210,9 @@ def _assemble(dockerfile, root):
 
 
 @pytest.mark.parametrize("dockerfile,env_class,entrypoint", [("Dockerfile.drill", "READ_ONLY_RECORDER", "deploy/drill-entrypoint.sh"), ("Dockerfile.autopilot", "TESTNET_EXECUTOR", "deploy/autopilot-entrypoint.sh")])
-def test_the_dockerfile_build_step_would_produce_a_manifest_that_verifies_and_the_entrypoint_gates_on_it(dockerfile, env_class, entrypoint, tmp_path):
+def test_the_dockerfile_build_step_would_produce_a_manifest_that_verifies_and_the_entrypoint_gates_on_it(dockerfile, env_class, entrypoint, tmp_path, monkeypatch):
+    if env_class == "TESTNET_EXECUTOR":
+        monkeypatch.setenv("FLY_APP_NAME", "carry-autopilot")                 # Fly sets it on the real machine; an executor image refuses to verify without it
     text = open(os.path.join(BOT, dockerfile), encoding="utf-8").read()
     # build-time: the commit is a REQUIRED build argument (no default: an unset one makes the build REFUSE), the manifest is built for this image's class, and the configuration is fingerprinted
     assert "\nARG BUILD_COMMIT\n" in text and "ARG BUILD_COMMIT=" not in text
@@ -234,3 +241,107 @@ def test_the_smoke_scripts_require_the_build_to_refuse_without_a_commit_and_to_r
         assert "-noprov" in t and "built WITHOUT BUILD_COMMIT" in t, script
         assert '--build-arg BUILD_COMMIT="$(git rev-parse HEAD)"' in t, script
         assert "runtime_provenance.py verify" in t and tamper in t and "-eq 78" in t, script
+
+
+# ---------------------------------------------------------------------------------------- Round 22 review: the manifest covers EVERYTHING the image ships, and a missing closure file refuses the build
+EXTRAS = ["tools/drill.py", "tools/close_testnet_short.py", "tools/evidence_reconcile.py", "tools/recon_summary.py", "signals/__init__.py"]
+
+
+@pytest.fixture
+def full_app(app):
+    """The recorder closure PLUS shipped files the entry points do not import: two order-capable scripts the supervisor stack spawns by path, report tools and a signal package."""
+    for rel in EXTRAS:
+        src = os.path.join(BOT, rel)
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(os.path.join(app, rel)), exist_ok=True)
+            shutil.copy2(src, os.path.join(app, rel))
+    man = RP.build_manifest(app, git_sha=SHA, environment_class="READ_ONLY_RECORDER", packages=PKGS)
+    open(os.path.join(app, RP.MANIFEST_NAME), "w").write(json.dumps(man))
+    return app
+
+
+def test_the_manifest_lists_every_shipped_file_not_only_the_import_closure(full_app):
+    man = json.load(open(os.path.join(full_app, RP.MANIFEST_NAME)))
+    for rel in EXTRAS:
+        if os.path.isfile(os.path.join(BOT, rel)):
+            assert rel in man["files"], rel
+    assert set(man["files"]) == set(RP.shipped_files(full_app))
+    assert verify(full_app)["status"] == "VERIFIED"
+
+
+@pytest.mark.parametrize("rel", [r for r in EXTRAS if os.path.isfile(os.path.join(BOT, r))])
+def test_a_changed_file_that_no_entry_point_imports_is_still_refused(full_app, rel):
+    """REPRODUCED (Round 22 review): editing tools/drill.py or tools/close_testnet_short.py (order-capable, path-spawned) left the manifest VERIFIED."""
+    with open(os.path.join(full_app, rel), "a") as fh:
+        fh.write("\n# edited after the build\n")
+    res = verify(full_app)
+    assert res["status"] == "MISMATCH" and res["code"] == "FILE_CHANGED" and f"{rel} (changed)" in res["differing"], res
+
+
+def test_a_file_dropped_into_the_image_after_the_build_is_refused(full_app):
+    with open(os.path.join(full_app, "tools", "dropped_by_sftp.py"), "w") as fh:
+        fh.write("print('hi')\n")
+    res = verify(full_app)
+    assert res["status"] == "MISMATCH" and res["code"] == "FILE_EXTRA" and "tools/dropped_by_sftp.py (unlisted)" in res["differing"]
+    os.remove(os.path.join(full_app, "tools", "dropped_by_sftp.py"))
+    assert verify(full_app)["status"] == "VERIFIED"
+
+
+def test_a_deleted_shipped_file_is_FILE_MISSING(full_app):
+    os.remove(os.path.join(full_app, "tools", "recon_summary.py")) if os.path.isfile(os.path.join(full_app, "tools", "recon_summary.py")) else os.remove(os.path.join(full_app, "tools", "drill.py"))
+    res = verify(full_app)
+    assert res["status"] == "MISMATCH" and res["code"] == "FILE_MISSING"
+
+
+def test_a_closure_file_absent_at_BUILD_time_refuses_the_build_instead_of_being_dropped(tree, tmp_path):
+    """REPRODUCED (Round 22 review): image_manifest.closure() skips a module whose file is absent, so an image missing md_wire.py built a manifest listing one file fewer and verified. The owner found exactly this by hand
+    ('current recorder dependencies ABSENT on the machine')."""
+    root = str(tmp_path / "app")
+    shutil.copytree(tree, root)
+    os.remove(os.path.join(root, "md_wire.py"))
+    with pytest.raises(ValueError, match="resolve to nothing") as ei:
+        RP.build_manifest(root, git_sha=SHA, environment_class="READ_ONLY_RECORDER", packages=PKGS)
+    assert "md_wire" in str(ei.value)
+    assert RP.main(["build", "--git-sha", SHA, "--environment-class", "READ_ONLY_RECORDER", "--root", root]) == 2
+
+
+def test_the_one_pinned_unresolved_import_is_the_frozen_signals_lazy_research_path(tree):
+    gaps = RP.unresolved_imports(tree, RP.shipped_files(tree))
+    assert gaps == [], gaps
+    assert RP.UNRESOLVED_ALLOWED == {"sweep_geometry"}
+
+
+def test_a_closed_vocabulary_of_codes_covers_every_failure(app):
+    seen = set()
+    seen.add(verify(app)["code"])
+    seen.add(verify(os.path.join(app, "nowhere"))["code"])
+    edit_manifest(app, lambda m: m.update(git_sha="unknown"))
+    seen.add(verify(app)["code"])
+    edit_manifest(app, lambda m: m.update(git_sha=SHA, python_minor="2.7"))
+    seen.add(verify(app)["code"])
+    seen.add(verify(app, expect="TESTNET_EXECUTOR")["code"])
+    assert seen <= set(RP.CODES) and {"OK", "MANIFEST_MISSING", "SHA_UNKNOWN", "PYTHON_MISMATCH", "CLASS_MISMATCH"} <= seen, seen
+
+
+def test_an_executor_image_runs_only_in_its_fly_app_and_a_missing_app_name_is_refused(tmp_path):
+    """The class/app check is a DEPLOY-MISTAKE detector (the environment is set by whoever controls the machine). For an executor image the app name is REQUIRED."""
+    root = str(tmp_path / "app")
+    os.makedirs(root)
+    _assemble("Dockerfile.autopilot", root)
+    extras = [os.path.join(BOT, "deploy", "autopilot-entrypoint.sh"), os.path.join(BOT, "deploy", "autopilot-ctl.sh")]
+    man = RP.build_manifest(root, git_sha=SHA, environment_class="TESTNET_EXECUTOR", packages=PKGS, extra_files=extras)
+    open(os.path.join(root, RP.MANIFEST_NAME), "w").write(json.dumps(man))
+    assert verify(root, expect="TESTNET_EXECUTOR", env={})["code"] == "APP_NOT_SET"
+    assert verify(root, expect="TESTNET_EXECUTOR", env={"FLY_APP_NAME": "carry-autopilot"})["status"] == "VERIFIED"
+    assert verify(root, env={"FLY_APP_NAME": "carry-drill"})["code"] == "APP_MISMATCH"
+    assert any(k.startswith("@") and k.endswith("autopilot-entrypoint.sh") for k in man["files"]), "the entrypoint scripts are part of the image's behaviour and are listed"
+    # an entrypoint script edited after the build is refused
+    with open(extras[0], "rb") as fh:
+        original = fh.read()
+    mutated = tmp_path / "mutated-entrypoint.sh"
+    mutated.write_bytes(original + b"\n# edited\n")
+    man["files"]["@" + str(mutated)] = man["files"].pop("@" + extras[0])
+    man["files_fingerprint"] = RP._digest(sorted(man["files"].items()))
+    open(os.path.join(root, RP.MANIFEST_NAME), "w").write(json.dumps(man))
+    res = verify(root, expect="TESTNET_EXECUTOR", env={"FLY_APP_NAME": "carry-autopilot"})
+    assert res["status"] == "MISMATCH" and res["code"] == "FILE_CHANGED"

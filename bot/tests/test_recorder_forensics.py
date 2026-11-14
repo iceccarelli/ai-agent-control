@@ -288,3 +288,13 @@ def test_a_crafted_prune_timestamp_is_unknown_not_a_crash(tmp_path):
     pr = json.dumps({"segment": "md-20261105.db", "records": 5, "last_chain": "a" * 64, "pruned_at_ms": 10 ** 30}) + "\n"
     res = RF.analyse(evidence(tmp_path, pruned=pr), now_ms=NOW)
     assert res["observed"]["pruned_segments"]["rows"][0]["pruned_at_utc"] is None
+
+
+def test_rows_copied_from_a_stale_status_file_are_not_observed_progress_or_the_lack_of_it(tmp_path):
+    """REPRODUCED (Round 22 fly review): three STALE rows with recorder_age_s 400000 and a constant count gave 'NOT_WRITING ... (60 min) (OBSERVED)': a count copied from a 4.6-day-old status file."""
+    rows = "".join(json.dumps({"at": f"2026-11-14T22:{i * 15:02d}:00Z", "recorder_state": "STALE", "recorder_records": 21_837_668, "recorder_age_s": 400_000.0}) + "\n" for i in range(4))
+    w = RF.analyse(evidence(tmp_path, monitor=rows), now_ms=NOW)["observed"]["writing"]
+    assert w["status"] == "UNKNOWN", w
+    # a row with a FRESH age is still read
+    fresh = "".join(json.dumps({"at": f"2026-11-14T22:{i * 15:02d}:00Z", "recorder_state": "FAULT", "recorder_records": 7, "recorder_age_s": 12.0}) + "\n" for i in range(4))
+    assert RF.analyse(evidence(tmp_path, name="e2", monitor=fresh), now_ms=NOW)["observed"]["writing"]["status"] == "NOT_WRITING"

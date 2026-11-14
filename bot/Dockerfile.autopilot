@@ -37,10 +37,12 @@ COPY deploy/autopilot-ctl.sh /usr/local/bin/autopilot-ctl
 ARG BUILD_COMMIT
 COPY Dockerfile.autopilot fly.autopilot.toml /tmp/provenance/
 RUN python3 tools/runtime_provenance.py build --git-sha "$BUILD_COMMIT" --environment-class TESTNET_EXECUTOR --root /app \
+        --extra /usr/local/bin/autopilot-entrypoint --extra /usr/local/bin/autopilot-ctl \
         --config /tmp/provenance/Dockerfile.autopilot --config /tmp/provenance/fly.autopilot.toml \
     && rm -rf /tmp/provenance
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
-    && mkdir -p /data && chown -R bot:bot /app /data
+    && mkdir -p /data && chown -R bot:bot /app /data \
+    && chown root:root /app/RUNTIME_MANIFEST.json && chmod 0444 /app/RUNTIME_MANIFEST.json
 
 # Testnet only, stated again here. HOME=/data puts the capability file, the grant, the entries counter, every state dir and the autopilot root on the volume.
 ENV USE_TESTNET=1 BYBIT_VENUE=testnet HOME=/data

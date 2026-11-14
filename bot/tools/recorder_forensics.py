@@ -158,8 +158,22 @@ def _int(x: Any) -> Optional[int]:
     return int(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
 
 
+#: a history row whose recorder status was older than this (seconds) carries a record count COPIED from a dead recorder's last status file: it says nothing about the present
+STALE_ROW_AGE_S = 300.0
+
+
 def records_series(history: Sequence[Dict[str, Any]]) -> List[Tuple[str, int, Optional[str]]]:
-    return [(str(r.get("at")), _int(r.get("recorder_records")), r.get("recorder_state")) for r in history if _int(r.get("recorder_records")) is not None]  # type: ignore[misc]
+    """(at, records, state) for the rows whose count is a FRESH reading. A STALE row, or one whose ``recorder_age_s`` exceeds ``STALE_ROW_AGE_S``, repeats a frozen count from an old status file (Round 22: three such
+    rows with a constant count used to be reported as an OBSERVED NOT_WRITING over 60 minutes of what was really a 4.6-day-old reading)."""
+    out = []
+    for r in history:
+        if _int(r.get("recorder_records")) is None:
+            continue
+        age = r.get("recorder_age_s")
+        if r.get("recorder_state") == "STALE" or (isinstance(age, (int, float)) and not isinstance(age, bool) and age > STALE_ROW_AGE_S):
+            continue
+        out.append((str(r.get("at")), _int(r.get("recorder_records")), r.get("recorder_state")))
+    return out  # type: ignore[return-value]
 
 
 def _utc_text(ms: Any) -> Optional[str]:

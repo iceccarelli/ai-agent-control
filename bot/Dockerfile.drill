@@ -47,11 +47,12 @@ COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 # The entrypoint re-verifies the manifest against the files and packages actually present and REFUSES to start the recorder otherwise (tools/runtime_provenance.py).
 ARG BUILD_COMMIT
 COPY Dockerfile.drill fly.drill.toml /tmp/provenance/
-RUN python3 tools/runtime_provenance.py build --git-sha "$BUILD_COMMIT" --environment-class READ_ONLY_RECORDER --root /app \
+RUN python3 tools/runtime_provenance.py build --git-sha "$BUILD_COMMIT" --environment-class READ_ONLY_RECORDER --root /app --extra /usr/local/bin/drill-entrypoint \
         --config /tmp/provenance/Dockerfile.drill --config /tmp/provenance/fly.drill.toml \
     && rm -rf /tmp/provenance
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
-    && mkdir -p /data && chown -R bot:bot /app /data
+    && mkdir -p /data && chown -R bot:bot /app /data \
+    && chown root:root /app/RUNTIME_MANIFEST.json && chmod 0444 /app/RUNTIME_MANIFEST.json
 
 # Testnet only, stated again here; the orchestrator also forces its own env for
 # every child (its own paper flag is set only inside the order-capable child it starts,
