@@ -291,8 +291,36 @@ def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
                     "net_bps_horizon": _num(r, "net_bps_horizon"), "n_observations": _int(r, "n_observations", null=True), "prov": _enum(r, "prov", MST.PROVS),
                     # Round 20: the producer's net is BEFORE the owner's cost of capital; the after-figure and the state of that input travel with it (absent in an older artifact: unknown, never zero)
                     "net_bps_after_cost_of_capital": _num(r, "net_bps_after_cost_of_capital") if "net_bps_after_cost_of_capital" in r else None,
-                    "cost_of_capital_state": (r.get("cost_of_capital") or {}).get("state") if isinstance(r.get("cost_of_capital"), Mapping) and (r.get("cost_of_capital") or {}).get("state") in ("STATED", "UNSTATED") else None})
+                    "cost_of_capital_state": (r.get("cost_of_capital") or {}).get("state") if isinstance(r.get("cost_of_capital"), Mapping) and (r.get("cost_of_capital") or {}).get("state") in ("STATED", "UNSTATED") else None,
+                    # Round 21: the CAPITAL the cost was charged on travels with it (an after-cost figure without its capital basis cannot be compared with the executor's); absent in an older artifact: not carried, never assumed
+                    "capital_factor_used": _factor_range((r.get("cost_of_capital") or {}).get("capital_factor_used")) if isinstance(r.get("cost_of_capital"), Mapping) else None,
+                    "capital_factor_basis": _short_text((r.get("cost_of_capital") or {}).get("capital_factor_basis")) if isinstance(r.get("cost_of_capital"), Mapping) else None})
     return {"candidates": out}
+
+
+def _factor_range(x: Any) -> Optional[Dict[str, float]]:
+    """A {min, max} pair of finite positive multiples of notional, or None (not carried / not a number: never coerced)."""
+    if not isinstance(x, Mapping):
+        return None
+    lo, hi = x.get("min"), x.get("max")
+    for v in (lo, hi):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            return None
+    return {"min": float(lo), "max": float(hi)} if lo <= hi else None
+
+
+def _short_text(x: Any, limit: int = 400) -> Optional[str]:
+    return x[:limit] if isinstance(x, str) and x.strip() else None
+
+
+def _coc_basis_note(c: Mapping[str, Any]) -> str:
+    """What capital the cost of capital was charged on, stated beside every after-cost figure (Round 21)."""
+    fu = c.get("capital_factor_used")
+    if isinstance(fu, Mapping) and fu.get("min") is not None and fu.get("max") is not None:
+        lo, hi = fu["min"], fu["max"]
+        shown = f"{lo:.2f}x" if lo == hi else f"{lo:.2f}x to {hi:.2f}x"
+        return f"charged on {shown} committed capital per unit of notional ({c.get('capital_factor_basis') or 'the basis text is not carried'})"
+    return ("capital basis NOT carried by this artifact: an artifact written before Round 21 charged a 1.2x research basis, which is not comparable with the 2.04x the executor commits for the same carry")
 
 
 def _v_opps(o: Mapping[str, Any]) -> Dict[str, Any]:
@@ -651,7 +679,7 @@ def _research(cand_rows: Sequence[Mapping[str, Any]], comp: Dict[str, Any], opps
                            "note": "Sufficient evidence is not authorisation: authorisation is the owner's act (config.is_live_authorized AND the signed promotion gate)."
                                    + ("" if econ_loaded else " In-sample corpus economics are not loaded (slow); start with --with-economics to include rejection reasons from them.")}
     out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps", "per closed group, BEFORE the owner's cost of capital (" + ("stated: see net_after_cost_of_capital" if c.get("cost_of_capital_state") == "STATED" else "UNSTATED or not carried by this artifact: no after-cost figure exists") + "); the multi-symbol pipeline uses the ledger's net (after fees, taker slippage and adverse selection)"),
-                                                                       "net_after_cost_of_capital": val(c.get("net_bps_after_cost_of_capital"), PROV_TO_BASIS[c["prov"]], "bps", "per closed group, after the stated cost of capital on the scanner's committed-capital basis; unknown when the rate is unstated"),
+                                                                       "net_after_cost_of_capital": val(c.get("net_bps_after_cost_of_capital"), PROV_TO_BASIS[c["prov"]], "bps", "per closed group, after the stated cost of capital, " + _coc_basis_note(c) + "; unknown when the rate is unstated"),
                                                                        }
                                                                       for c in d["candidates"]]},
                                       empty="No competition result yet. Run the candidate competition CLI to write competition.json into the artifacts directory.")
@@ -675,7 +703,7 @@ def _opp_view(d: Mapping[str, Any]) -> Dict[str, Any]:
     pos = [i for i in elig if i["net"]["v"] > 0]
     return {"items": items, "n_items": len(items), "n_eligible": len(elig), "n_positive_net": len(pos),
             "best_net": val(max((i["net"]["v"] for i in elig), default=None), "ESTIMATED", "bps", "best eligible item; an upper bound, not a forecast"),
-            "est_net_usd_per_day": val(d["est_net_usd_per_day"], "ESTIMATED", "USD/day", "as stated by the scanner; a model output")}
+            "est_net_usd_per_day": val(d["est_net_usd_per_day"], "ESTIMATED", "USD/day", "as stated by the scanner; a model output; its financing is charged on the scanner's committed-capital factor (the registry's: 2.04x for a carry at leverage 1) when a rate was stated, and an opportunities.json written before Round 21 used a 1.2x research basis")}
 
 
 def _artifact_view(a: Dict[str, Any], view: Callable[[Dict[str, Any]], Dict[str, Any]], *, empty: str) -> Dict[str, Any]:

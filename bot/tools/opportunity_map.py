@@ -65,6 +65,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, ROOT)
 
 import carry_costs as costs  # noqa: E402  (pure arithmetic; the production gate)
+import economic_model as _EM  # noqa: E402  (the one capital definition per structure)
 import strategy_evidence as se  # noqa: E402
 
 HISTORICAL = "HISTORICAL_SIMULATION"
@@ -325,15 +326,18 @@ def breakeven_table(tier: Dict[str, Any], *, slippage_bps_per_leg: float,
                     ) -> List[Dict[str, Any]]:
     out = []
     for mode in ("overlay", "acquire"):
+        # Round 21: the capital cost is charged on the capital the structure COMMITS per unit of notional, not on the notional itself. An ACQUIRED pair commits the registry's 2.04x at leverage 1
+        # (economic_model); the owned-BTC overlay keeps the research 1.16x (favourable, assumed: BTC already held + ~15% perp margin + 1%), labelled as such.
+        cap = float(_EM.structure_capital_usd(_EM.ACQUIRED_SPOT_PERP, 1, 1).value) if mode == "acquire" else CAPITAL_PER_NOTIONAL
         for style in ("taker", "maker"):
             rt = round_trip_bps(mode=mode, style=style, tier=tier,
                                 slippage_bps_per_leg=slippage_bps_per_leg)
             for hold in holds:
                 for apr in capital_aprs:
-                    f = breakeven_funding(rt["total_bps"], hold, apr)
+                    f = breakeven_funding(rt["total_bps"], hold, apr * cap)
                     out.append({
                         "mode": mode, "style": style, "hold_days": hold,
-                        "capital_cost_apr": apr, **rt,
+                        "capital_cost_apr": apr, "capital_per_notional": cap, **rt,
                         "breakeven_funding_bps_per_8h": f,
                         "breakeven_funding_annualised_pct":
                             f * PRINTS_PER_DAY * 365.0 / 100.0})

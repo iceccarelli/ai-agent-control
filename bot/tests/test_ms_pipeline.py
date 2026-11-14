@@ -1324,7 +1324,8 @@ def test_the_realised_net_deducts_a_stated_cost_of_capital_as_its_own_component(
     comp = art(pr, "competition.json")["candidates"][0]
     closed = [g for g in pr.result.groups.values() if g.closed and g.notional_usd > 0]
     assert closed, "control: the scenario must close a group"
-    factor = MP.SC.committed_capital_factor("SPOT_PERP_CARRY", MP.SC.DEFAULT_PARAMS["margin_frac"])
+    factor = MP.SC.committed_capital_factor("SPOT_PERP_CARRY", MP.SC.DEFAULT_PARAMS["leverage"])
+    assert factor == pytest.approx(2.04), "Round 21: the pipeline charges the registry basis (the structure the autopilot executes), not the 1.2x research constant"
     expected = [apr / 365.0 * 1e4 * ((g.exit_ts - g.entry_ts) / D) * factor for g in closed]
     assert comp["cost_of_capital"]["mean_charge_bps"] == pytest.approx(sum(expected) / len(expected))
     assert comp["cost_of_capital"]["mean_charge_bps"] > 0
@@ -1332,7 +1333,8 @@ def test_the_realised_net_deducts_a_stated_cost_of_capital_as_its_own_component(
     assert "BEFORE cost of capital" in comp["net_definition"]
     coc = comp["cost_of_capital"]                                                    # independent review (Round 20): the basis of the charge is stated beside it, and how far it is from the executed structure
     assert coc["capital_factor_used"] == {"min": pytest.approx(factor), "max": pytest.approx(factor)}
-    assert "RESEARCH basis" in coc["capital_factor_basis"] and "2.04x" in coc["capital_factor_basis"] and "UNDERSTATES" in coc["capital_factor_basis"]
+    assert "economic_model.structure_capital_usd" in coc["capital_factor_basis"] and "2.04x" in coc["capital_factor_basis"]
+    assert "RESEARCH basis" not in coc["capital_factor_basis"] and "UNDERSTATES" not in coc["capital_factor_basis"] and "CANNOT execute" in coc["capital_factor_basis"]
     # the ledger identity is untouched: financing is a separate component, not a ledger line
     lp = art(pr, "ledger_pnl.json")
     assert lp["realised_gross_usd"] + lp["funding_usd"] - lp["fees_usd"] - lp["taker_slippage_usd"] - lp["adverse_selection_usd"] == pytest.approx(lp["realised_net_usd"], rel=1e-9, abs=1e-6)

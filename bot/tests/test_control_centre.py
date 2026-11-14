@@ -1366,3 +1366,27 @@ def test_the_competition_view_carries_the_after_cost_of_capital_net_and_its_stat
     assert old["net_bps_after_cost_of_capital"] is None and old["cost_of_capital_state"] is None
     forged = CC._v_competition({"candidates": [_comp_candidate(cost_of_capital={"state": "FREE"})]})["candidates"][0]
     assert forged["cost_of_capital_state"] is None, "only the two real states are carried"
+
+
+# ------------------------------------------------------------------------------------------------ Round 21: the capital the cost of capital was charged on travels with the after-cost figure
+
+def test_the_competition_view_states_the_capital_basis_beside_the_after_cost_net_and_never_stays_silent():
+    """REPRODUCED (Round 21): the view kept only the cost-of-capital STATE; the producer's capital factor and its basis text were dropped, so 'net after cost of capital' and the $/day read as comparable
+    with the executor's although they were charged on 0.6x of the capital the executor commits. The factor travels with the figure; an artifact that does not carry it says so."""
+    coc = {"state": "STATED", "apr": 0.05, "capital_factor_used": {"min": 2.04, "max": 2.04}, "capital_factor_basis": "economic_model.structure_capital_usd at leverage 1"}
+    row = CC._v_competition({"candidates": [_comp_candidate(net_bps_after_cost_of_capital=-1.5, cost_of_capital=coc)]})["candidates"][0]
+    assert row["capital_factor_used"] == {"min": 2.04, "max": 2.04} and "structure_capital_usd" in row["capital_factor_basis"]
+    note = CC._coc_basis_note(row)
+    assert "2.04x" in note and "structure_capital_usd" in note
+    old_row = CC._v_competition({"candidates": [_comp_candidate(net_bps_after_cost_of_capital=-1.5, cost_of_capital={"state": "STATED", "apr": 0.05})]})["candidates"][0]
+    assert old_row["capital_factor_used"] is None and "NOT carried" in CC._coc_basis_note(old_row) and "1.2x research basis" in CC._coc_basis_note(old_row)
+    legacy = CC._v_competition({"candidates": [_comp_candidate(net_bps_after_cost_of_capital=-1.5, cost_of_capital={**coc, "capital_factor_used": {"min": 1.2, "max": 1.2}})]})["candidates"][0]
+    assert "1.20x" in CC._coc_basis_note(legacy), "an artifact that states 1.2x is shown as 1.20x: the reader sees the basis that was used, not the one that is now correct"
+    span = CC._v_competition({"candidates": [_comp_candidate(cost_of_capital={**coc, "capital_factor_used": {"min": 1.02, "max": 2.04}})]})["candidates"][0]
+    assert "1.02x to 2.04x" in CC._coc_basis_note(span)
+
+
+@pytest.mark.parametrize("bad", [{"min": True, "max": 2.0}, {"min": 0, "max": 2.0}, {"min": -1.0, "max": 2.0}, {"min": float("nan"), "max": 2.0}, {"min": 3.0, "max": 2.0}, {"min": "2", "max": 2.0}, [2.04], "2.04", None])
+def test_a_forged_capital_factor_is_not_carried(bad):
+    row = CC._v_competition({"candidates": [_comp_candidate(cost_of_capital={"state": "STATED", "apr": 0.05, "capital_factor_used": bad})]})["candidates"][0]
+    assert row["capital_factor_used"] is None

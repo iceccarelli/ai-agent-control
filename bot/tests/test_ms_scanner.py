@@ -65,7 +65,7 @@ def test_carry_golden_numbers_every_cost_has_a_provenance_and_net_is_hand_comput
     assert o.net_bps_horizon == pytest.approx(84.0 - 31.0 - 1.0 - 2.0)
     basis = (100.0 - 99.98) / 99.98 * 1e4
     assert o.risk_score == pytest.approx(basis + 2.0)                                           # zero funding sigma (flat prints) + |basis| + ASSUMED floor
-    assert o.rank_score == pytest.approx((o.net_bps_horizon / 1.2) / o.risk_score)
+    assert o.rank_score == pytest.approx((o.net_bps_horizon / 2.04) / o.risk_score)                                  # Round 21: the registry's ACQUIRED_SPOT_PERP capital (2.04x at leverage 1), not the research 1.2x
     assert o.prov == "ASSUMED"                                                                   # weakest input, never better than the assumed hedge slippage / spread
 
 
@@ -212,7 +212,7 @@ def test_capacity_is_the_size_where_slippage_equals_the_remaining_edge():
     levels_b = (BookLevel(99.995, 20.0),) + tuple(BookLevel(99.995 - 0.05 * k, 20.0) for k in range(1, 60))
     levels_a = (BookLevel(100.005, 20.0),) + tuple(BookLevel(100.005 + 0.05 * k, 20.0) for k in range(1, 60))
     s_ = MarketSnapshot("AAAUSDT", NOW, 100.0, 100.0, levels_b, levels_a, 100, 4.0, (4.0,) * 9, 480, NOW + 3_600_000, None, 1e9, 99.98, trailing_funding_intervals_min=(480,) * 9)
-    o = run(s=[s_], params={"notional_usd": 1e9, "margin_frac": 0.2})[0]
+    o = run(s=[s_], params={"notional_usd": 1e9, "leverage": 1})[0]
     edge_pre = o.expected_funding_bps_horizon - sum(c.bps for c in o.costs if c.name != "slippage")
     assert o.capacity_usd > 0
     mid = 100.0
@@ -504,15 +504,15 @@ def test_an_unstated_financing_input_is_unknown_and_the_row_cannot_be_ranked_or_
 
 
 def test_a_stated_financing_rate_is_charged_on_the_capital_the_ranking_divides_by():
-    # 3.65%/yr = 1 bp/day of capital; 7 days; the carry commits 1 + margin_frac = 1.2x per unit of notional (the factor rank_score already divides by)
+    # 3.65%/yr = 1 bp/day of capital; 7 days; the carry commits 2.04x per unit of notional (Round 21: economic_model's ACQUIRED_SPOT_PERP at leverage 1, the factor rank_score divides by; it was the research 1.2x)
     o = run(params={"opportunity_cost_apr": 0.0365})[0]
     f = cost(o, "financing")
-    assert (f.bps, f.prov) == (pytest.approx(1.0 * 7 * 1.2), "MODELLED")
+    assert (f.bps, f.prov) == (pytest.approx(1.0 * 7 * 2.04), "MODELLED")
     base = run()[0]
-    assert o.net_bps_horizon == pytest.approx(base.net_bps_horizon - 8.4) and o.exclusions == ()
-    assert o.rank_score == pytest.approx((o.net_bps_horizon / 1.2) / max(o.risk_score, 1.0)) and o.rank_score < base.rank_score
-    harsh = run(params={"opportunity_cost_apr": 0.365})[0]                                        # 10 bps/day x 7 x 1.2 = 84 bps: the whole 84 bps of funding is gone before any fee
-    assert cost(harsh, "financing").bps == pytest.approx(84.0) and harsh.rank_score is None
+    assert o.net_bps_horizon == pytest.approx(base.net_bps_horizon - 14.28) and o.exclusions == ()
+    assert o.rank_score == pytest.approx((o.net_bps_horizon / 2.04) / max(o.risk_score, 1.0)) and o.rank_score < base.rank_score
+    harsh = run(params={"opportunity_cost_apr": 0.365})[0]                                        # 10 bps/day x 7 x 2.04 = 142.8 bps: more than the whole 84 bps of funding, before any fee
+    assert cost(harsh, "financing").bps == pytest.approx(142.8) and harsh.rank_score is None
     assert harsh.exclusions and "FINANCING_UNKNOWN" not in harsh.exclusions, "PRICED and refused (the capacity rule fires first: no edge is left to trade), not 'unknown'"
 
 
@@ -535,7 +535,7 @@ def test_the_perp_only_spread_is_unpriced_without_the_rate_too():
     assert pairs and all("FINANCING_UNKNOWN" in o.exclusions and o.rank_score is None and o.net_bps_horizon is None for o in pairs)
     priced = run(ins, sn, kind="PERP_FUNDING_SPREAD", params={"price_vol_bps_per_day": vol, "top_k": 2, "opportunity_cost_apr": 0.0365})
     best = priced[0]
-    assert (cost(best, "financing").bps, cost(best, "financing").prov) == (pytest.approx(1.0 * 7 * 0.2), "MODELLED")           # 20% margin per unit of gross notional
+    assert (cost(best, "financing").bps, cost(best, "financing").prov) == (pytest.approx(1.0 * 7 * 1.02), "MODELLED")          # Round 21: economic_model's PERP_ONLY margin + buffer (1.02x at leverage 1), not a fifth of it
     assert best.exclusions == () and best.rank_score is not None
 
 
