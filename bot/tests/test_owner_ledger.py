@@ -1511,3 +1511,24 @@ def test_the_withholding_is_exactly_the_non_reconciled_verdicts():
     # a status that is already withheld or never computed is left as it is
     unpriced = {"status": "WITHHELD_UNPRICED_BTC_FLOW", "why": "x"}
     assert OL.withhold_unreconciled_returns(dict(unpriced), {"status": "NOT_COMPUTED"}, "INCOMPLETE")[0] == unpriced
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a USDT deficit with no interest evidence is an unknown cost, not a reconciled zero
+
+def test_a_usdt_deficit_with_no_interest_line_is_incomplete_and_states_no_return(tmp_path):
+    """REPRODUCED (Round 20, specialist C): usdt0 = -$30,000 over four days with no INTEREST statement line gave RECONCILED_NOT_AUTHENTICATED, interest booked as exactly 0.0 (about $33 at 10%/yr)
+    and a Dietz return on a base shrunk by the unstated principal. Interest on a loan the statement does not evidence is unknown: the verdict is INCOMPLETE and the return keys are withheld."""
+    w = World(usdt0=-30_000.0)
+    w.lines = _statement(w)
+    rep = ledger(w, tmp_path)
+    codes = {f["code"] for f in rep["flags"] if f["severity"] == "GAP"}
+    assert "BORROW_INTEREST_NOT_EVIDENCED" in codes, codes
+    assert rep["verdict"] == "INCOMPLETE"
+    assert rep["returns"]["status"] == "WITHHELD_UNRECONCILED_LEDGER", "no rate is stated on a base shrunk by an unevidenced loan"
+
+
+def test_a_positive_usdt_balance_is_unaffected_by_the_deficit_rule(tmp_path):
+    w = World(usdt0=10_000.0)
+    w.lines = _statement(w)
+    rep = ledger(w, tmp_path)
+    assert "BORROW_INTEREST_NOT_EVIDENCED" not in {f["code"] for f in rep["flags"]}

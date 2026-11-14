@@ -359,6 +359,7 @@ def _wallet(obj: Mapping[str, Any], label: str) -> Dict[str, Any]:
         raise ImportRefused("SCHEMA", f"{label}: result.list[0].coin is missing")
     bal: Dict[str, float] = {}
     borrow: Dict[str, float] = {}
+    deficit_unevidenced: Dict[str, float] = {}            # a NEGATIVE balance with no stated non-zero borrowAmount: on a unified account that is a loan whose principal the file does not state
     for j, c in enumerate(coins):
         if not isinstance(c, dict) or "coin" not in c or "walletBalance" not in c:
             raise ImportRefused("SCHEMA", f"{label}: coin entry {j + 1} lacks coin / walletBalance")
@@ -369,7 +370,9 @@ def _wallet(obj: Mapping[str, Any], label: str) -> Dict[str, Any]:
         b = c.get("borrowAmount")
         if b not in (None, "") and _num(b, "borrowAmount", f"{label} coin {name}") != 0:
             borrow[name] = _num(b, "borrowAmount", f"{label} coin {name}")
-    return {"ts_ms": ts, "balances": bal, "borrow": borrow}
+        elif bal[name] < 0:
+            deficit_unevidenced[name] = bal[name]
+    return {"ts_ms": ts, "balances": bal, "borrow": borrow, "deficit_unevidenced": deficit_unevidenced}
 
 
 # ---------------------------------------------------------------- the import
@@ -496,6 +499,10 @@ def run_import(inputs: Sequence[Tuple[str, str]], *, marks: Optional[Sequence[Ma
     # ---- valuation inputs: wallet balances + EXPLICIT marks (a missing mark is UNVALUED, never zero)
     w0, w1 = wallets.get("wallet_opening"), wallets.get("wallet_closing")
     for w in (w0, w1):
+        if w and w.get("deficit_unevidenced"):
+            _flag(flags, "BORROW_PRINCIPAL_UNSTATED", "GAP", f"{w['label']}: walletBalance {w['deficit_unevidenced']} is negative and borrowAmount is absent, empty or zero: a negative balance on a unified "
+                  "account is a loan, so its principal, accrued interest and collateral treatment are UNKNOWN here (export the wallet with borrowAmount, accruedInterest and totalInitialMargin populated); "
+                  "no profit is stated until they are", list(w["deficit_unevidenced"]))
         if w and w["borrow"]:
             _flag(flags, "BORROWED_COIN", "GAP", f"{w['label']}: borrowAmount {w['borrow']}: walletBalance is not owned inventory while a coin is borrowed", list(w["borrow"]))
     if w0 and w1 and w1["ts_ms"] <= w0["ts_ms"]:
