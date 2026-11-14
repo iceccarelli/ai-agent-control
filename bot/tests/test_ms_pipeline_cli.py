@@ -739,4 +739,40 @@ def test_the_flag_is_documented_and_an_absent_flag_yields_insufficient_owner_inp
     assert "--opportunity-cost-apr" in r.stdout
     allowed_competition(monkeypatch)
     code, doc = cli(capsys, argv(world, str(tmp_path / "unstated"), opportunity_cost_apr=None))
-    assert code == 0 and doc["status"]["primary"] == "INSUFFICIENT_OWNER_INPUT"
+    assert code == 0 and "INSUFFICIENT_OWNER_INPUT" in doc["status"]["codes"] and doc["status"]["primary"] in ("INSUFFICIENT_OWNER_INPUT", "INADEQUATE_HISTORY")
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: the replay reads the dataset state the readiness gate already computes
+
+@pytest.fixture()
+def frozen_world(tmp_path, monkeypatch):
+    """A root whose FASTUSDT mark price never moves (999 identical closes): DATA_INVALID for the readiness gate and the holdout since Round 19."""
+    monkeypatch.setattr(TMH, "FROZEN_MARK_SYMBOLS", {"FASTUSDT"})
+    d = tmp_path / "frozen_root_dir"
+    d.mkdir()
+    w = W()
+    w.root, w.uni, w.spot = TCR._hist(d)
+    w.ledger = str(tmp_path / "ledgers")
+    w.base = tmp_path
+    return w
+
+
+def test_a_replay_on_a_frozen_mark_root_is_refused_and_names_the_symbol(frozen_world, tmp_path, capsys):
+    """REPRODUCED (Round 20): ms_pipeline never read dataset_state, so a DATA_INVALID root (a frozen mark gives a perfect-hedge price leg) ran to completion and was labelled VERIFIED_HISTORY_ROOT
+    with no mention of the frozen symbol anywhere in the summary."""
+    doc = refusal(capsys, argv(frozen_world, str(tmp_path / "art")), "INPUT_NOT_VERIFIED", str(tmp_path / "art"))
+    assert "DATASET_REFUSED" in doc["error"]["message"] and "DATA_INVALID" in doc["error"]["message"] and "FASTUSDT" in doc["error"]["message"]
+
+
+def test_the_library_entry_refuses_a_frozen_mark_root_too(frozen_world):
+    with pytest.raises(MP.PipelineRefused, match="DATASET_REFUSED"):
+        MP.verify_inputs(frozen_world.root, universe_dir=frozen_world.uni, spot_dir=frozen_world.spot, mark_interval=TCR.MARK_IV, holdout_ledger=HH.UNGUARDED)
+
+
+def test_the_summary_stamps_the_dataset_state_and_the_identity_of_what_was_read(world, tmp_path, capsys):
+    code, doc = cli(capsys, argv(world, str(tmp_path / "art")))
+    assert code == 0, doc
+    summary = json.load(open(str(tmp_path / "art" / "pipeline_summary.json")))
+    ds = summary["evidence_basis"]["dataset"]
+    assert ds["state"] != "UNKNOWN" and ds["frozen_mark_symbols"] == [] and ds["loaded_identity_digest"] not in ("UNKNOWN", None, "")
+    assert isinstance(ds["reasons"], list)

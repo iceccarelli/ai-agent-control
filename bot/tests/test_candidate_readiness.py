@@ -1852,3 +1852,31 @@ def test_a_frozen_mark_price_series_makes_the_dataset_invalid_and_names_the_symb
     assert [f["symbol"] for f in info2["frozen_mark_symbols"]] == ["FASTUSDT"] and info2["frozen_mark_symbols"][0]["run_candles"] >= 12
     assert any("FASTUSDT" in r and "frozen" in r for r in st["reasons"]), st["reasons"]
     assert info2["loaded_identity"]["digest"] is not None, "the bytes verify: the identity names exactly the data that was refused as a price series"
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a frozen mark is named per symbol, never silently dropped, and never reads as complete
+
+def test_a_frozen_symbol_is_named_in_the_evaluation_and_a_hand_filtered_series_is_refused(tmp_path, monkeypatch):
+    """REPRODUCED (Round 20): dropping the frozen symbol from the series list by hand gave a REJECTED verdict (OOS -8.4 vs -5.4 bps) that still reported history_coverage 4/4, the root's identity
+    digest and no frozen_mark_symbols key. The evaluator now compares its series with what the loader returned, carries the frozen symbols into its output, and the root stays DATA_INVALID."""
+    monkeypatch.setattr(TMH, "FROZEN_MARK_SYMBOLS", {"FASTUSDT"})
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    series, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    assert "FASTUSDT" in [s.symbol for s in series], "nothing is removed from the series by the loader"
+    assert info["symbols_loaded_names"] == sorted(s.symbol for s in series)
+    assert any("FROZEN_MARK_PRICE:FASTUSDT" in w for w in info["warning"].split("; "))
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert [f["symbol"] for f in out["frozen_mark_symbols"]] == ["FASTUSDT"] and out["dataset_state"]["state"] == CR.DATA_INVALID
+    filtered = [s for s in series if s.symbol != "FASTUSDT"]
+    with pytest.raises(CR.RH.HarnessError, match="SERIES_DISAGREES_WITH_LOADED_INFO"):
+        CR.evaluate_ranked_funding(filtered, universe_info=info)
+
+
+def test_the_frozen_mark_remedy_no_longer_advises_a_path_that_leads_to_data_incomplete(tmp_path, monkeypatch):
+    """REPRODUCED (Round 20, specialist E): 'collect a NEW root without it' gives DATA_INCOMPLETE (the universe capture still lists the symbol as eligible), so the advice led from one refusal to
+    another. The text now says so and names the owner decision that is actually needed; nothing drops a symbol."""
+    monkeypatch.setattr(TMH, "FROZEN_MARK_SYMBOLS", {"FASTUSDT"})
+    root, uni, spot = _hist(tmp_path, complete_window=True)
+    _s, info = CR.load_history_root(root, universe_dir=uni, spot_dir=spot, mark_interval=MARK_IV)
+    why = " ".join(info["dataset_state"]["reasons"])
+    assert "DATA_INCOMPLETE" in why and "D7" in why and "nothing here drops a symbol" in why

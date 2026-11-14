@@ -204,6 +204,27 @@ def input_parts(info: Mapping[str, Any], spot_dir: Optional[str], collector_dige
             "spot": "ABSENT" if spot_dir is None else (_manifest_digest(spot_dir) or "UNKNOWN"), "collector": collector_digest or "ABSENT", "holdout": holdout}
 
 
+def _refuse_invalid_dataset(info: Mapping[str, Any]) -> None:
+    """Round 19 made a frozen mark price (and any CONFLICTED / UNVERIFIED part) DATA_INVALID for the readiness gate and the holdout, but this pipeline never read that state: a DATA_INVALID root
+    still ran and was labelled VERIFIED_HISTORY_ROOT, with a perfect-hedge price leg. INVALID and UNAVAILABLE are refused here. INCOMPLETE / INSUFFICIENT are not refused (an exploratory replay
+    on a partial cross-section is a legitimate question) but are STAMPED into the summary, so a result can never read as complete."""
+    ds = info.get("dataset_state") if isinstance(info.get("dataset_state"), Mapping) else None
+    state = ds.get("state") if ds else None
+    if state in ("DATA_INVALID", "DATA_UNAVAILABLE"):
+        why = "; ".join(str(r)[:160] for r in (ds.get("reasons") or [])[:3]) or "no reason recorded"
+        frozen = [f.get("symbol") for f in (info.get("frozen_mark_symbols") or []) if isinstance(f, Mapping)]
+        raise PipelineRefused(f"DATASET_REFUSED: the history root is {state} ({why})" + (f"; frozen mark price: {', '.join(map(str, frozen))}" if frozen else ""))
+
+
+def _dataset_stamp(info: Mapping[str, Any]) -> Dict[str, Any]:
+    """What the summary says about the dataset the replay actually read (never absent, so a reader cannot mistake 'not stated' for 'complete')."""
+    ds = info.get("dataset_state") if isinstance(info.get("dataset_state"), Mapping) else {}
+    ident = info.get("loaded_identity") if isinstance(info.get("loaded_identity"), Mapping) else {}
+    return {"state": ds.get("state", "UNKNOWN"), "reasons": [str(r)[:200] for r in (ds.get("reasons") or [])[:5]],
+            "frozen_mark_symbols": [f.get("symbol") for f in (info.get("frozen_mark_symbols") or []) if isinstance(f, Mapping)],
+            "loaded_identity_digest": ident.get("digest") or "UNKNOWN"}
+
+
 def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[str], mark_interval: Optional[str], holdout_ledger: Any = None,
                   unreserved_exploratory: bool = False) -> LoadedHistory:
     """The ONLY way a history root enters the pipeline: ``history_holdout.load`` over ``candidate_readiness.load_history_root`` (re-verifies every dataset, the universe capture and the
@@ -211,6 +232,7 @@ def verify_inputs(history_root: str, *, universe_dir: str, spot_dir: Optional[st
     series, label, info = load_series(history_root, universe_dir=universe_dir, spot_dir=spot_dir, mark_interval=mark_interval, holdout_ledger=holdout_ledger,
                                       unreserved_exploratory=unreserved_exploratory)
     assert label == DATA_HISTORY
+    _refuse_invalid_dataset(info)
     return LoadedHistory(tuple(series), info, input_parts(info, spot_dir, None))
 
 
@@ -1065,6 +1087,8 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
         parts = input_parts(info, spot_dir, None)
     else:
         parts = {"injected": "UNKNOWN"}
+    if label == DATA_HISTORY:
+        _refuse_invalid_dataset(info)
     series = _to_replay_series(raw_series, replay_cfg)
     cut_ms = holdout_cut_of(info) if label == DATA_HISTORY else None
     past = _window_past_boundary(replay_cfg.end_ms, cut_ms)
@@ -1134,7 +1158,8 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
     first_ms, last_ms = _series_span(series)
     history = history_requirement(formation_days=float(params.get("formation_days", SC.DEFAULT_PARAMS["formation_days"])), hold_days=replay_cfg.hold_ms / DAY_MS,
                                   min_rows=min_holding_rows, first_ms=first_ms, last_ms=last_ms, end_ms=replay_cfg.end_ms)
-    evidence = {"data": label, "data_parts": dict(sorted(parts.items())), "holdout": (info.get("holdout") if label == DATA_HISTORY else None), "execution": "MODELLED",
+    evidence = {"data": label, "data_parts": dict(sorted(parts.items())), "holdout": (info.get("holdout") if label == DATA_HISTORY else None),
+                "dataset": (_dataset_stamp(info) if label == DATA_HISTORY else None), "execution": "MODELLED",
                 "books": "SYNTHETIC_ASSUMED_BOOK_FROM_MARKS (no collector: no measured depth or trades)" if micro_info is None else "MEASURED_BOOK_TAPE (PERP leg only; the spot leg uses the synthetic book; fills MODELLED)",
                 "microstructure": micro_info,
                 "fills": f"bar_policy={replay_cfg.fill.bar_policy}: a touch is never a fill; maker fills need a strict trade-through", "claim": "SIMULATED; never MEASURED execution"}
