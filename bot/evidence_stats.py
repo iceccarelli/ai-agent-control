@@ -45,12 +45,20 @@ def autocorr(xs: Sequence[float], k: int) -> Optional[float]:
     return sum((xs[i] - m) * (xs[i + k] - m) for i in range(n - k)) / den
 
 
+def _all_real(xs: Sequence[Any]) -> bool:
+    """Every element a finite int or float that is not a bool. A NaN made ``min(float(n), nan)`` read as maximal independence and sorted the bootstrap's draws arbitrarily (Round 20, reproduced:
+    a 12-point series with one NaN returned ESS 12.0 and an OK interval)."""
+    return all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in xs)
+
+
 def effective_sample_size(xs: Sequence[float]) -> Optional[float]:
     """n / (1 + 2 * sum_k (1 - k/n) rho_k), summed over leading positive autocorrelations only.
-    Clamped to [1, n]. A constant series carries one independent value."""
+    Clamped to [1, n]. A constant series carries one independent value. A series holding a non-finite or bool element has no stated ESS (None)."""
     n = len(xs)
     if n < 2:
         return float(n) if n else None
+    if not _all_real(xs):
+        return None
     mean_ = sum(xs) / n
     if len(set(xs)) == 1 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(mean_)):
         return 1.0
@@ -192,6 +200,8 @@ def batch_means_ess(xs: Sequence[float]) -> Optional[float]:
 def conservative_ess(xs: Sequence[float]) -> Optional[float]:
     """The LOWER of the autocorrelation-sum ESS and the batch-means ESS. Used wherever an ESS gates a
     claim or sizes an interval."""
+    if not _all_real(xs):
+        return None                                   # callers take `or 1.0`: one independent observation, the conservative reading
     a = effective_sample_size(xs)
     b = batch_means_ess(xs)
     if a is None:
@@ -222,6 +232,8 @@ def block_bootstrap_ci(xs: Sequence[float], stat: Optional[Callable[[Sequence[fl
     n = len(xs)
     if n < MIN_FOR_CI:
         return {"status": "INSUFFICIENT", "n": n, "reason": f"fewer than {MIN_FOR_CI} settlement-level points"}
+    if not _all_real(xs):
+        return {"status": "NONFINITE_INPUT", "n": n, "reason": "a point is NaN, infinite or a bool: an interval from sorted NaN draws is undefined, so none is stated"}
     m = _mean(xs)
     var = sum((x - m) ** 2 for x in xs) / (n - 1)
     if var <= 0 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(m)):      # constant to float precision
