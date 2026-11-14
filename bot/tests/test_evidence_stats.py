@@ -248,3 +248,28 @@ def test_the_ess_adjusted_t_interval_uses_the_exact_t_of_its_own_degrees_of_free
         var = sum((x - m) ** 2 for x in xs) / (n - 1)
         half = SP.student_t_isf(0.05, ci["ess"] - 1.0) * math.sqrt(var / ci["ess"])
         assert (ci["ess_t_hi"] - ci["ess_t_lo"]) / 2.0 == pytest.approx(half, rel=1e-9)
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a non-finite point is never read as independence or as an interval
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True])
+def test_a_non_finite_or_bool_point_gives_no_ess_and_no_interval(bad):
+    """REPRODUCED (Round 20, specialist E): a 12-point series with one NaN returned ESS 12.0 (min(float(n), nan) is n) and a bootstrap interval with status OK built from sorted NaN draws."""
+    xs = [1.0, 2.0, 1.5, 2.5, 1.2, 2.2, 1.8, 2.8, 1.1, 2.1, 1.6, 2.6]
+    poisoned = xs[:-1] + [bad]
+    assert ES.effective_sample_size(poisoned) is None and ES.conservative_ess(poisoned) is None
+    out = ES.block_bootstrap_ci(poisoned)
+    assert out["status"] == "NONFINITE_INPUT" and "lo" not in out and "hi" not in out
+    assert ES.block_bootstrap_ci(xs)["status"] == "OK", "control: the clean series still gets its interval"
+    assert ES.effective_sample_size(xs) is not None
+
+
+def test_significance_makes_no_claim_on_a_non_finite_or_overflowing_series():
+    import research_harness as RH
+    base = [0.5 + 0.01 * i for i in range(30)]
+    for bad in (float("nan"), float("inf")):
+        out = RH.significance(base[:-1] + [bad])
+        assert out["status"] == "NONFINITE_INPUT" and out["p_one_sided"] == 1.0 and out["independent_observations"] == 0
+    huge = RH.significance([1e300 * (1 if i % 2 else -1) for i in range(30)])
+    assert huge["p_one_sided"] == 1.0 and huge.get("status") == "NONFINITE_INPUT"
+    assert RH.significance(base)["p_one_sided"] < 1.0, "control: a clean positive series still yields a finite p"

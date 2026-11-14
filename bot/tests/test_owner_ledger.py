@@ -1511,3 +1511,38 @@ def test_the_withholding_is_exactly_the_non_reconciled_verdicts():
     # a status that is already withheld or never computed is left as it is
     unpriced = {"status": "WITHHELD_UNPRICED_BTC_FLOW", "why": "x"}
     assert OL.withhold_unreconciled_returns(dict(unpriced), {"status": "NOT_COMPUTED"}, "INCOMPLETE")[0] == unpriced
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a USDT deficit with no interest evidence is an unknown cost, not a reconciled zero
+
+def test_a_usdt_deficit_with_no_interest_line_is_incomplete_and_states_no_return(tmp_path):
+    """REPRODUCED (Round 20, specialist C): usdt0 = -$30,000 over four days with no INTEREST statement line gave RECONCILED_NOT_AUTHENTICATED, interest booked as exactly 0.0 (about $33 at 10%/yr)
+    and a Dietz return on a base shrunk by the unstated principal. Interest on a loan the statement does not evidence is unknown: the verdict is INCOMPLETE and the return keys are withheld."""
+    w = World(usdt0=-30_000.0)
+    w.lines = _statement(w)
+    rep = ledger(w, tmp_path)
+    codes = {f["code"] for f in rep["flags"] if f["severity"] == "GAP"}
+    assert "BORROW_INTEREST_NOT_EVIDENCED" in codes, codes
+    assert rep["verdict"] == "INCOMPLETE"
+    assert rep["returns"]["status"] == "WITHHELD_UNRECONCILED_LEDGER", "no rate is stated on a base shrunk by an unevidenced loan"
+
+
+def test_a_positive_usdt_balance_is_unaffected_by_the_deficit_rule(tmp_path):
+    w = World(usdt0=10_000.0)
+    w.lines = _statement(w)
+    rep = ledger(w, tmp_path)
+    assert "BORROW_INTEREST_NOT_EVIDENCED" not in {f["code"] for f in rep["flags"]}
+
+
+def test_only_a_usd_coin_interest_line_counts_as_interest_evidence_for_a_usdt_deficit(tmp_path):
+    """Independent review (Round 20): ANY interest line of any coin suppressed the flag. A BTC-only INTEREST line is no evidence about the interest on a USDT loan."""
+    w = World(usdt0=-30_000.0)
+    rows = _statement(w)
+    last = max(r["ts_ms"] for r in rows)
+    btc_only = rows + [{"line_id": "LB1", "ts_ms": last, "coin": "BTC", "category": "INTEREST", "change": -0.0001, "cash_balance": None, "ref_id": None}]
+    w.lines = btc_only
+    codes = {f["code"] for f in ledger(w, tmp_path)["flags"] if f["severity"] == "GAP"}
+    assert "BORROW_INTEREST_NOT_EVIDENCED" in codes, "a BTC interest line does not evidence USDT interest"
+    w.lines = rows + [{"line_id": "LU1", "ts_ms": last, "coin": "USDT", "category": "INTEREST", "change": -0.5, "cash_balance": None, "ref_id": None}]
+    codes_usd = {f["code"] for f in ledger(w, tmp_path)["flags"] if f["severity"] == "GAP"}
+    assert "BORROW_INTEREST_NOT_EVIDENCED" not in codes_usd, "a USD-coin INTEREST line clears the presence check (its amount is a stated residual, not checked)"

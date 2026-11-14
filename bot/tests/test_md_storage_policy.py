@@ -294,7 +294,14 @@ def _simulate_volume(tmp_path, *, label, stalled_aware, vol=5.0, daily=1.5, days
     ratio = len(ST._compress(probe.encode())) / len(probe)                             # the compressed size of random hex: calibrate the on-disk bytes per row to the target
     pay_len = max(1, int((per_row - 90) / ratio))
     written_per_day = {}
+    # Round 20 (specialist A): the stall slack in apply_retention grows by one day per full MONOTONIC day of stall. This harness runs nine simulated days in real seconds, so the clock never aged and a
+    # 3 GB volume read as "stalled for good" where production, whose monotonic clock does advance, recovers one day at a time. The clock now advances one hour per simulated hour.
+    import unittest.mock as _mock
+    clock = {"t": 10_000.0}
+    patcher = _mock.patch.object(ST.time, "monotonic", lambda: clock["t"])
+    patcher.start()
     for h in range(days * 24):
+        clock["t"] = 10_000.0 + h * 3600.0
         now = base + h * 3_600_000
         for k in range(20):
             store._free_checked_at = float("-inf")
@@ -308,6 +315,7 @@ def _simulate_volume(tmp_path, *, label, stalled_aware, vol=5.0, daily=1.5, days
         if store._conn:
             store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         store.apply_retention(now + 3_599_000, retention)
+    patcher.stop()
     store.close()
     return written_per_day
 
@@ -336,11 +344,15 @@ def test_a_volume_that_holds_the_retained_days_plus_the_reserve_recovers_instead
     assert sum(ok.values()) > sum(stuck.values()) and min(ok[d] for d in (5, 8)) < 480                    # but a volume below the size model's figure still loses most of some days
 
 
-def test_below_the_retained_days_plus_the_reserve_the_stall_is_still_permanent_and_the_owner_must_extend_the_volume(tmp_path):
-    """The limit, stated by a test: the fix frees at most one segment per day boundary and never the newest, so a volume that cannot hold the retained days plus the reserve still stalls for good."""
-    for vol in (1.0, 3.0):
-        got = _simulate_volume(tmp_path, label=f"small{vol}", stalled_aware=True, vol=vol)
-        assert all(got.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), (vol, got)
+def test_a_stall_is_permanent_only_when_the_volume_cannot_hold_one_realised_day_above_the_reserve(tmp_path):
+    """The limit, stated by a test with a clock that ages as production's does (Round 20, specialist A; the previous version froze the clock and so pinned 'a 3 GB volume stalls for good', which production
+    does not do). A 1 GB volume cannot hold one realised day (about 1.9 units here) above the 0.537 reserve: the first segment is never pruned and a refused write never opens the next day, so every later day
+    writes NOTHING and a restart does not help. A 3 GB volume holds one day but not the retained days: it recovers one day at a time and loses part of every cycle."""
+    tiny = _simulate_volume(tmp_path, label="small1.0", stalled_aware=True, vol=1.0)
+    assert all(tiny.get(day, 0) == 0 for day in (3, 4, 5, 6, 7, 8)), tiny
+    mid = _simulate_volume(tmp_path, label="small3.0", stalled_aware=True, vol=3.0)
+    assert any(mid.get(day, 0) > 0 for day in (3, 4, 5, 6, 7, 8)), mid
+    assert sum(mid.values()) > sum(tiny.values()) and min(mid.get(d, 0) for d in (3, 4, 5, 6, 7, 8)) < 480, "a volume below the size model's figure still loses part of its days"
 
 
 # ---------------------------------------------------------------- a recorder that died while CREATING a segment must restart (an independent review: it looped until a human deleted the file)

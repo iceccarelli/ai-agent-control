@@ -34,6 +34,7 @@ skipped, because ``tests/test_features.py`` already owns that.
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import gzip
 import hashlib
 import json
@@ -59,6 +60,17 @@ pytestmark = pytest.mark.skipif(
     not pol.sklearn_available(),
     reason=f"scikit-learn is unavailable: {pol.unavailability_reason()}",
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _the_synthetic_fixtures_are_the_subject_here():
+    """Round 20: market_data.load_corpus refuses a synthetic corpus unless the caller names market_data.SYNTHETIC_FIXTURE_OK, and no shipped tool may name it (tests/test_market_data.py pins that).
+    These tests exercise the TRAINER's mechanics on a generated corpus on purpose, so the opt-in is applied here, in the test, for this module only."""
+    mp = pytest.MonkeyPatch()
+    real = md.load_corpus
+    mp.setattr(md, "load_corpus", lambda *a, **k: real(*a, **{"synthetic_ok": md.SYNTHETIC_FIXTURE_OK, **k}))
+    yield
+    mp.undo()
 
 _OHLCV_COLUMNS = (
     "time_period_start", "time_period_end", "time_open", "time_close",
@@ -236,12 +248,23 @@ def write_corpus(root: str, n_bars: int = 900, *, seed: int = 5,
 
 @pytest.fixture(scope="module")
 def learnable_run() -> tp.TrainingRun:
-    """A run on a signal a calibrated model can actually find. Should promote."""
+    """A learnable signal on generated data, which must never be promoted."""
     return tp.train_policy(
         make_dataset(8000, seed=0, signal=1.3),
         make_corpus_info(),
         holdout_from=None, n_folds=4, embargo=30, seed=7,
     )
+
+
+@pytest.fixture(scope="module")
+def eligible_run(learnable_run) -> tp.TrainingRun:
+    """Exercise the eligible-provenance write path without claiming market data.
+
+    The data remains fabricated; only the provenance flag is changed to isolate
+    the downstream promotion and artifact mechanics from corpus loading.
+    """
+    corpus = replace(learnable_run.corpus, synthetic=False)
+    return tp.TrainingRun(**{**learnable_run.__dict__, "corpus": corpus})
 
 
 @pytest.fixture(scope="module")
@@ -612,23 +635,31 @@ class TestPromotion:
         assert noise_run.promoted is False
         assert noise_run.all_reasons
 
-    def test_a_learnable_signal_is_promoted(self, learnable_run):
-        assert learnable_run.promoted is True, learnable_run.all_reasons
-        assert learnable_run.all_reasons == ()
+    def test_a_learnable_signal_with_eligible_provenance_is_promoted(self, eligible_run):
+        assert eligible_run.promoted is True, eligible_run.all_reasons
+        assert eligible_run.all_reasons == ()
 
-    def test_promotion_needs_both_halves(self, learnable_run):
+    def test_a_synthetic_corpus_is_never_promoted(self, learnable_run):
         assert learnable_run.wf_ok and learnable_run.holdout_ok
+        assert learnable_run.promoted is False
+        assert learnable_run.all_reasons == (
+            "SYNTHETIC_CORPUS: the corpus is a generated fixture "
+            "(manifest synthetic=true); a model fitted on it is never promoted",
+        )
 
-    def test_a_failing_holdout_alone_refuses(self, learnable_run):
+    def test_promotion_needs_both_halves(self, eligible_run):
+        assert eligible_run.wf_ok and eligible_run.holdout_ok
+
+    def test_a_failing_holdout_alone_refuses(self, eligible_run):
         """Constructed directly: good folds, bad holdout, no promotion."""
-        run = tp.TrainingRun(**{**learnable_run.__dict__,
+        run = tp.TrainingRun(**{**eligible_run.__dict__,
                                 "holdout_ok": False,
                                 "holdout_reasons": ("HOLDOUT_AUC_TOO_LOW: x",)})
         assert run.promoted is False
         assert "HOLDOUT_AUC_TOO_LOW: x" in run.all_reasons
 
-    def test_a_failing_fold_alone_refuses(self, learnable_run):
-        run = tp.TrainingRun(**{**learnable_run.__dict__,
+    def test_a_failing_fold_alone_refuses(self, eligible_run):
+        run = tp.TrainingRun(**{**eligible_run.__dict__,
                                 "wf_ok": False, "wf_reasons": ("NO_AUC",)})
         assert run.promoted is False
 
@@ -723,11 +754,11 @@ class TestPromotion:
 
 class TestWriting:
     def test_a_promoted_run_writes_the_versioned_artefact_and_the_live_path(
-        self, learnable_run, tmp_path
+        self, eligible_run, tmp_path
     ):
         out = str(tmp_path / "models")
-        result = tp.write_artefacts(learnable_run, out, dry_run=False)
-        assert result.artefact_path == os.path.join(out, learnable_run.run_id)
+        result = tp.write_artefacts(eligible_run, out, dry_run=False)
+        assert result.artefact_path == os.path.join(out, eligible_run.run_id)
         assert result.live_path == os.path.join(out, tp.LIVE_DIRNAME)
         for path in (result.artefact_path, result.live_path):
             assert os.path.exists(os.path.join(path, pol.ESTIMATOR_FILENAME))
@@ -753,10 +784,10 @@ class TestWriting:
         )
 
     def test_a_refused_run_does_not_delete_a_previously_promoted_model(
-        self, learnable_run, noise_run, tmp_path
+        self, eligible_run, noise_run, tmp_path
     ):
         out = str(tmp_path / "models")
-        tp.write_artefacts(learnable_run, out, dry_run=False)
+        tp.write_artefacts(eligible_run, out, dry_run=False)
         live = os.path.join(out, tp.LIVE_DIRNAME)
         before = open(os.path.join(live, pol.METADATA_FILENAME), "rb").read()
         result = tp.write_artefacts(noise_run, out, dry_run=False)
@@ -794,10 +825,10 @@ class TestWriting:
 
 
 @pytest.fixture(scope="module")
-def written(learnable_run, tmp_path_factory):
+def written(eligible_run, tmp_path_factory):
     """A promoted artefact on disk, with its manifest parsed."""
     out = str(tmp_path_factory.mktemp("written"))
-    result = tp.write_artefacts(learnable_run, out, dry_run=False)
+    result = tp.write_artefacts(eligible_run, out, dry_run=False)
     manifest = json.load(
         open(os.path.join(result.artefact_path, tp.MANIFEST_FILENAME), encoding="utf-8")
     )
@@ -1112,8 +1143,15 @@ class TestArtefactLoading:
 
 
 @pytest.fixture(scope="module")
-def promoted_report(learnable_run, tmp_path_factory) -> str:
+def promoted_report(eligible_run, tmp_path_factory) -> str:
     out = str(tmp_path_factory.mktemp("report"))
+    write = tp.write_artefacts(eligible_run, out, dry_run=False)
+    return tp.render_report(eligible_run, write)
+
+
+@pytest.fixture(scope="module")
+def synthetic_report(learnable_run, tmp_path_factory) -> str:
+    out = str(tmp_path_factory.mktemp("synthetic-report"))
     write = tp.write_artefacts(learnable_run, out, dry_run=False)
     return tp.render_report(learnable_run, write)
 
@@ -1155,8 +1193,10 @@ class TestReport:
         assert "SINGLE USE" in promoted_report
         assert "burned it" in promoted_report
 
-    def test_a_synthetic_corpus_is_called_out_as_not_a_market(self, promoted_report):
-        assert "NOT A MARKET" in promoted_report
+    def test_a_synthetic_corpus_is_called_out_as_not_a_market(self, synthetic_report):
+        assert "NOT A MARKET" in synthetic_report
+        assert "REFUSED" in synthetic_report
+        assert "SYNTHETIC_CORPUS:" in synthetic_report
 
     def test_a_refusal_says_refused_and_lists_every_reason(
         self, refused_report, noise_run

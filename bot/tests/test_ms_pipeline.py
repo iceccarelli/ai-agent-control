@@ -86,6 +86,7 @@ def go(tmp_path, series=None, c=None, name="art", spec=SPEC, **kw):
     params = dict(kw.pop("scan_params", None) or {})
     if "persistence" in MP.SC.DEFAULT_PARAMS:                    # the scanner's modelled funding-persistence haircut is a separate knob: these proofs plant EXACT funding and check the arithmetic, so it is off (1.0)
         params.setdefault("persistence", 1.0)
+    params.setdefault("opportunity_cost_apr", 0.0)                     # a STATED 0% (an unstated rate is INSUFFICIENT_OWNER_INPUT: test_ms_pipeline_cost_of_capital); these proofs are about the stack's arithmetic
     kw["scan_params"] = params
     kw.setdefault("competition_row", PROMOTED_ROW)                  # these proofs are about the stack, not the gate: the candidate is promoted (test_ms_pipeline_cli covers the gate)
     return MP.run(series if series is not None else world(), spec=spec, candidate_id=CAND, spec_digest=DIGEST, replay_cfg=c or cfg(), artifacts_dir=str(tmp_path / name), **kw)
@@ -726,7 +727,7 @@ def test_a_replay_gate_that_refuses_a_plan_leaves_it_failed_and_never_submitted(
 
     series = [replace(s, instrument=MP._instrument_for(s, cfg())) for s in world()]
     g = Refuse()
-    rec = MP.ScanRecorder(SPEC, CAND, DIGEST, {"hold_days": 4.0})
+    rec = MP.ScanRecorder(SPEC, CAND, DIGEST, {"hold_days": 4.0, "opportunity_cost_apr": 0.0})
     res = RP.run_replay(series, cfg(end_ms=T0 + 3 * D), scan_fn=rec, risk_assess=MR.risk_assess,
                         risk_policy=MP.derive_risk_policy([s.symbol for s in series], candidate_id=CAND, spec_digest=DIGEST, portfolio=cfg().portfolio, equity_usd=100_000.0), gates=g)
     assert res.states and set(svals(res)) == {"FAILED"} and g.orders == 0 and res.fills == [] and res.venue.orders == {}
@@ -1274,3 +1275,73 @@ def test_the_run_summary_publishes_no_ledger_net_when_the_ledger_is_incomplete_a
     ok = go(tmp_path, [ser("AAAUSDT", 480, 6.0)], cfg(end_ms=T0 + 6 * D), name="complete")
     assert ok.ledger.pnl()["net_complete"] is True, "control: a clean run has a complete ledger"
     assert ok.summary["ledger"]["net"] == pytest.approx(ok.ledger.pnl()["net"]) and ok.summary["ledger"]["net_complete"] is True
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: an unstated cost of capital is UNKNOWN, never zero
+
+def _coc_scans(pr):
+    return [o for _ms, ops in pr.recorder.scans for o in ops]
+
+
+def test_an_unstated_cost_of_capital_is_a_missing_owner_input_not_a_zero_net_and_nothing_trades(tmp_path):
+    """REPRODUCED (Round 20): with no stated alternative return the scanner priced financing 0.0 'ASSUMED', ranked, allocated and published a positive net (competition +3.2 bps/group,
+    est_net_usd_per_day $1.75). A cost the owner has not stated is unknown: no row has a net or a rank, nothing is allocated, and the status says WHY (INSUFFICIENT_OWNER_INPUT), not 'the market
+    offered nothing'."""
+    pr = go(tmp_path, scan_params={"opportunity_cost_apr": None}, name="unstated")
+    rows = _coc_scans(pr)
+    assert rows and all(o.net_bps_horizon is None and o.rank_score is None for o in rows)          # no row has a net or a rank (a row excluded earlier for another reason never reaches the financing line)
+    assert any("FINANCING_UNKNOWN" in o.exclusions for o in rows), "control: a row that WAS priceable is excluded for the unknown cost, not for lack of edge"
+    st = pr.summary["status"]
+    assert "INSUFFICIENT_OWNER_INPUT" in st["codes"] and st["codes"].index("INSUFFICIENT_OWNER_INPUT") < st["codes"].index("NO_OPPORTUNITY")      # named before the consequence it causes
+    assert st["primary"] in ("INSUFFICIENT_OWNER_INPUT", "INADEQUATE_HISTORY") and st["n_groups"] == 0 and st["n_fills"] == 0   # history is the more fundamental gap when both apply
+    assert "INSUFFICIENT_OWNER_INPUT" in st["reasons"] and "--opportunity-cost-apr" in st["reasons"]["INSUFFICIENT_OWNER_INPUT"]
+    assert st["positive_opportunity_scans"] == 0
+    assert art(pr, "opportunities.json")["est_net_usd_per_day"] is None
+    comp = art(pr, "competition.json")["candidates"][0]
+    assert comp["status"] == "INSUFFICIENT_EVIDENCE" and comp["reason"].startswith("INSUFFICIENT_OWNER_INPUT") and "REJECTED" not in comp["status"]
+    assert comp["net_bps_horizon"] is None and comp["net_bps_after_cost_of_capital"] is None
+    assert comp["cost_of_capital"]["state"] == "UNSTATED" and comp["cost_of_capital"]["prov"] == "UNKNOWN" and comp["cost_of_capital"]["apr"] is None
+    assert pr.summary["cost_of_capital"] == {"state": "UNSTATED", "apr": None, "prov": "UNKNOWN"}
+    assert "COST_OF_CAPITAL_UNSTATED" in pr.summary["assumed_inputs"]
+    assert pr.summary["promotion_eligible"] is False
+
+
+def test_a_stated_zero_is_a_legitimate_statement_and_is_distinguishable_from_unstated(tmp_path):
+    stated, unstated = go(tmp_path, scan_params={"opportunity_cost_apr": 0.0}, name="stated0"), go(tmp_path, scan_params={"opportunity_cost_apr": None}, name="unst")
+    assert stated.summary["status"]["primary"] != "INSUFFICIENT_OWNER_INPUT" and stated.summary["status"]["n_groups"] > 0
+    assert stated.summary["cost_of_capital"] == {"state": "STATED", "apr": 0.0, "prov": "MODELLED"}
+    assert "COST_OF_CAPITAL_UNSTATED" not in stated.summary["assumed_inputs"]
+    assert unstated.summary["status"]["n_groups"] == 0 and stated.summary["status"]["positive_opportunity_scans"] > unstated.summary["status"]["positive_opportunity_scans"] == 0
+    comp = art(stated, "competition.json")["candidates"][0]
+    assert comp["cost_of_capital"]["complete"] is True and comp["net_bps_after_cost_of_capital"] == pytest.approx(comp["net_bps_horizon"])
+
+
+def test_the_realised_net_deducts_a_stated_cost_of_capital_as_its_own_component(tmp_path):
+    """REPRODUCED (Round 20): the scan net carried the stated financing but the replay's REALISED net per closed group never did, so the published competition net was more optimistic than the
+    scan that selected the trade by exactly the cost of capital. The component is deducted from the same stated rate on the same capital factor (the scanner's own), per group holding time."""
+    apr = 0.10
+    pr = go(tmp_path, scan_params={"opportunity_cost_apr": apr}, name="stated10")
+    comp = art(pr, "competition.json")["candidates"][0]
+    closed = [g for g in pr.result.groups.values() if g.closed and g.notional_usd > 0]
+    assert closed, "control: the scenario must close a group"
+    factor = MP.SC.committed_capital_factor("SPOT_PERP_CARRY", MP.SC.DEFAULT_PARAMS["margin_frac"])
+    expected = [apr / 365.0 * 1e4 * ((g.exit_ts - g.entry_ts) / D) * factor for g in closed]
+    assert comp["cost_of_capital"]["mean_charge_bps"] == pytest.approx(sum(expected) / len(expected))
+    assert comp["cost_of_capital"]["mean_charge_bps"] > 0
+    assert comp["net_bps_after_cost_of_capital"] == pytest.approx(comp["net_bps_horizon"] - comp["cost_of_capital"]["mean_charge_bps"])
+    assert "BEFORE cost of capital" in comp["net_definition"]
+    coc = comp["cost_of_capital"]                                                    # independent review (Round 20): the basis of the charge is stated beside it, and how far it is from the executed structure
+    assert coc["capital_factor_used"] == {"min": pytest.approx(factor), "max": pytest.approx(factor)}
+    assert "RESEARCH basis" in coc["capital_factor_basis"] and "2.04x" in coc["capital_factor_basis"] and "UNDERSTATES" in coc["capital_factor_basis"]
+    # the ledger identity is untouched: financing is a separate component, not a ledger line
+    lp = art(pr, "ledger_pnl.json")
+    assert lp["realised_gross_usd"] + lp["funding_usd"] - lp["fees_usd"] - lp["taker_slippage_usd"] - lp["adverse_selection_usd"] == pytest.approx(lp["realised_net_usd"], rel=1e-9, abs=1e-6)
+
+
+def test_the_cost_of_capital_can_only_remove_opportunities_never_add_them(tmp_path):
+    """Monotone: raising the stated rate can only shrink the eligible set; an unstated rate leaves none. (The pre-Round-20 default priced it as zero and so admitted the most.)"""
+    counts = []
+    for i, apr in enumerate((None, 0.0, 0.05, 0.30)):
+        pr = go(tmp_path, scan_params={"opportunity_cost_apr": apr}, name=f"mono{i}")
+        counts.append(pr.summary["status"]["positive_opportunity_scans"])
+    assert counts[0] == 0 and counts[1] >= counts[2] >= counts[3], counts

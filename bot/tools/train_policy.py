@@ -857,12 +857,14 @@ class TrainingRun:
 
     @property
     def promoted(self) -> bool:
-        """The only promotion answer in this file. Both halves must agree."""
-        return bool(self.wf_ok and self.holdout_ok)
+        """The only promotion answer in this file. Both halves must agree, and a model fitted on a generated fixture is never promoted: it learned a generator, not a market
+        (Round 20: market_data.load_corpus now refuses a synthetic corpus before a run can exist; this is the second layer, for a CorpusInfo built by hand)."""
+        return bool(self.wf_ok and self.holdout_ok and not self.corpus.synthetic)
 
     @property
     def all_reasons(self) -> Tuple[str, ...]:
-        return tuple(self.wf_reasons) + tuple(self.holdout_reasons)
+        extra = ("SYNTHETIC_CORPUS: the corpus is a generated fixture (manifest synthetic=true); a model fitted on it is never promoted",) if self.corpus.synthetic else ()
+        return tuple(self.wf_reasons) + tuple(self.holdout_reasons) + extra
 
 
 def compute_run_id(
@@ -1605,6 +1607,9 @@ def render_report(run: TrainingRun, write: WriteResult) -> str:
         add(f"  - {reason}")
     if run.holdout_ok:
         add("  (no objections)")
+    for reason in run.all_reasons:
+        if reason not in run.wf_reasons and reason not in run.holdout_reasons:
+            add(f"  - {reason}")
     add("")
     add("thresholds (policy.PromotionCriteria — change them in code, in a "
         "reviewable diff):")

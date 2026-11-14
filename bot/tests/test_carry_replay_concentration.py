@@ -206,3 +206,140 @@ def test_the_real_replay_reports_the_bases_and_the_headline_is_untouched():
     assert d["funding_recomputed_at_mark_usd"] == pytest.approx(report["funding_usd"], abs=1e-6)
     assert d["marked_over_entry_ratio"] > 1.0                # the synthetic corpus rises 0.02 % a print
     assert d["drift_neutral_pct"] < d["on_entry_notional_pct"]
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: the console report states what each figure is and is not
+
+import ast  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+
+_PRESENTATION = {"main", "capital_lines", "denominator_lines", "usdt_financing_lines", "owner_capital_lines", "concentration_lines"}
+#: sha256 of the exact source text of every OTHER top-level definition of tools/carry_replay.py, taken from the 56f9da6 / 413175f file (byte-identical between them) that the registered forward
+#: kill test (E1, docs/MONEY_MISSION.md) names as its engine. The console section may change; the computation may not.
+_COMPUTATION_DIGEST = "e239af91e29c70fdd4809615a01a36b468565aafb6d06d1c70a7cbfea372f545"
+_MAIN_HEAD_DIGEST = "e02229601f338f8bc0d135363504fbd79c75422e6a29940661fb19ea03c04c7e"       # source text of main()'s statements up to and including the replay(...) assignment (argparse defaults, corpus, haircut, cost-of-capital fallback)
+_REPLAY_CALL_DIGEST = "fe7f673b8efccf746468e4186ddc9560c38a721a138f487cbb1a213f07cc0103"       # ast.unparse of the replay(...) call in main(): the arguments the registered command reaches it with
+
+
+def _computation_digest(src):
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    parts = []
+    for n in tree.body:
+        name = getattr(n, "name", None) or ""
+        if name in _PRESENTATION or name.startswith("present_"):
+            continue
+        start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+        parts.append("\n".join(lines[start - 1:n.end_lineno]))
+    return hashlib.sha256("\n\x00\n".join(parts).encode()).hexdigest(), len(parts)
+
+
+def _replay_call_digest(src):
+    for n in ast.parse(src).body:
+        if getattr(n, "name", None) == "main":
+            for sub in ast.walk(n):
+                if isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call) and getattr(sub.value.func, "id", None) == "replay":
+                    return hashlib.sha256(ast.unparse(sub.value).encode()).hexdigest()
+    return None
+
+
+def _main_head_digest(src):
+    lines = src.splitlines()
+    for n in ast.parse(src).body:
+        if getattr(n, "name", None) == "main":
+            parts = []
+            for st in n.body:
+                parts.append("\n".join(lines[st.lineno - 1:st.end_lineno]))
+                if isinstance(st, ast.Assign) and isinstance(st.value, ast.Call) and getattr(st.value.func, "id", None) == "replay":
+                    return hashlib.sha256("\n\x00\n".join(parts).encode()).hexdigest()
+    return None
+
+
+def test_the_part_of_main_that_decides_what_the_registered_command_runs_is_pinned_too():
+    """REPRODUCED (independent review, Round 20): excluding ALL of main() let `impact = (0.0 if True else ...)` and `stated_cost = 0.05` pass the pin while changing what the registered command runs."""
+    src = open(rp.__file__, encoding="utf-8").read()
+    assert _main_head_digest(src) == _MAIN_HEAD_DIGEST
+    for before, after in (("impact = (0.0 if args.no_impact", "impact = (0.0 if True"), ("stated_cost = (0.0 if args.opportunity_cost_apr is None", "stated_cost = (0.05 if args.opportunity_cost_apr is None")):
+        assert before in src, before
+        assert _main_head_digest(src.replace(before, after, 1)) != _MAIN_HEAD_DIGEST, after
+    console = src.replace('print(f"  driver     {r[\'driver\']}")', 'print(f"  driver     {r[\'driver\']} (console edit)")', 1)
+    assert console != src and _main_head_digest(console) == _MAIN_HEAD_DIGEST, "the printing section stays free to change"
+
+
+def test_the_replay_computation_is_byte_identical_to_the_engine_the_forward_test_registers():
+    """E1 registers the engine at 56f9da6. Round 20 changed only the console section of this file: every other definition, and the arguments main() hands to replay(), must still hash to the pinned
+    values. If this fails the registered experiment's engine moved: revert the computation change or re-register the experiment with the owner."""
+    src = open(rp.__file__, encoding="utf-8").read()
+    digest, n = _computation_digest(src)
+    assert n >= 40 and digest == _COMPUTATION_DIGEST, "a computation definition of carry_replay.py changed"
+    assert _replay_call_digest(src) == _REPLAY_CALL_DIGEST, "main() now reaches replay() with different arguments"
+
+
+def _acquire_r():
+    return {"execution_mode": "acquire", "ledger": {"realised_usd": 428.34}}
+
+
+def test_acquire_mode_never_prints_a_hedge_failure_for_a_leg_the_journal_books_elsewhere():
+    """REPRODUCED (Round 20): 'residual -$93,425 = -100.000% of a leg' was printed for an ACQUIRE run whose hedge is fine: the revaluation entries it sums exist only for a held coin."""
+    eff = {"perp_realised_usd": -93425.0, "inventory_change_usd": 0.0, "residual_usd": -93425.0, "residual_fraction_of_leg": -1.0}
+    text = "\n".join(rp.present_hedge_lines(_acquire_r(), eff))
+    assert "% of a leg" not in text and "-100" not in text and "NOT a hedge failure" in text and "not measured in ACQUIRE mode" in text
+    over = dict(_acquire_r(), execution_mode="overlay")
+    assert "residual" in "\n".join(rp.present_hedge_lines(over, dict(eff, inventory_change_usd=93017.0, residual_usd=-408.0, residual_fraction_of_leg=-0.00437)))
+
+
+def test_both_break_even_bases_are_printed_with_the_assumption_that_makes_each_one_right():
+    """REPRODUCED (Round 20): only the whole-window figure (3.42% overlay / 1.46% acquire) was printed as 'the break-even'. Against a flat 4.4% alternative that says acquire LOSES while on the
+    held-capital basis (9.50%) it beats it. Both bases are printed, named, with the capital-time each assumes."""
+    v = {"available": True, "break_even_cost_of_capital_pct": 1.46}
+    text = "\n".join(rp.present_break_even_lines(v, 15.3))
+    assert "whole-window" in text and "1.46%/yr" in text and "idle between trades earns NOTHING" in text
+    assert "held-capital" in text and f"{1.46 / 0.153:.2f}%/yr" in text and "earns the alternative while idle" in text and "REDEPLOYED WHEN FLAT" in text
+    assert rp.present_break_even_lines({"available": False}, 15.3) == [] and rp.present_break_even_lines(v, 0.0) == []
+    # independent review (Round 20): in an OVERLAY half the committed capital is the owner's held coin, which is not redeployed when flat; and both figures are upper bounds while the USDT interest is unstated
+    over = "\n".join(rp.present_break_even_lines(dict(v, break_even_status="UPPER_BOUND_USDT_FINANCING_UNSTATED"), 79.3, "overlay"))
+    assert "HELD COIN" in over and "margin-cash component only" in over and "BOTH figures are UPPER BOUNDS" in over and "REDEPLOYED WHEN FLAT" not in over
+
+
+def test_the_overlay_ledger_block_does_not_sit_a_cash_net_under_a_headline_it_does_not_equal():
+    """REPRODUCED (Round 20): 'NET realised -$135,485.61 ... agrees with the run above: True' under a +$33,049.51 headline. The cash legs, the inventory mark and the pair net are now one traceable sum."""
+    st = {"funding_usd": 38885.91, "fees_usd": 5425.82, "borrow_usd": 0.0, "realised_usd": -168945.71, "net_usd": -135485.61, "inventory_mark_usd": 168537.45, "pair_net_usd": 33051.84, "fees_unknown": 0}
+    r = {"execution_mode": "overlay", "ledger": st, "ledger_entries": 194, "unrealised_usd": -2.33, "net_usd": 33049.51, "ledger_agrees": True}
+    text = "\n".join(rp.present_ledger_lines(r))
+    assert "NOT the headline NET" in text and "inventory mark" in text and "= PAIR net" in text and "33,051.84" in text and "agrees True" in text
+    withheld = dict(r, ledger=dict(st, pair_net_usd=None), ledger_agrees=None)
+    wtext = "\n".join(rp.present_ledger_lines(withheld))
+    assert "WITHHELD" in wtext and "UNKNOWN" in wtext and "agrees True" not in wtext
+
+
+def test_an_unstated_cost_of_capital_is_never_printed_as_a_priced_zero():
+    """REPRODUCED (Round 20): 'opportunity cost -$0.00 -> net after it $33,049.51' read as a priced result when no rate was stated."""
+    r = {"owner_capital": {"cost_of_capital": {"state": "UNSTATED"}}, "opportunity_cost_usd": -0.0, "net_after_opportunity_cost_usd": 33049.51}
+    text = "\n".join(rp.present_opportunity_cost_lines(r))
+    assert "NOT PRICED" in text and "-0.00" not in text and "33,049.51" not in text
+    stated = dict(r, owner_capital={"cost_of_capital": {"state": "STATED"}}, opportunity_cost_usd=1000.0, net_after_opportunity_cost_usd=32049.51)
+    assert "32,049.51" in "\n".join(rp.present_opportunity_cost_lines(stated))
+
+
+def test_the_real_report_states_its_structure_capital_costs_and_that_it_is_partial(capsys, tmp_path):
+    """End to end on the committed corpus: the P&L is untouched (the pinned headline), and the report says what it is."""
+    out = tmp_path / "overlay.json"
+    assert rp.main(["--mode", "overlay", "--style", "taker", "--exit-policy", "funding_streak", "--notional", "100000", "--json", str(out)]) == 0
+    text = capsys.readouterr().out
+    r = json.load(open(out))
+    assert r["net_usd"] == pytest.approx(33049.51, abs=0.01), "the underlying P&L must not move"
+    for needle in ("WHAT THIS REPORT IS", "OWNED_INVENTORY_OVERLAY", "BREAK-EVEN BASES", "whole-window", "held-capital", "NOT PRICED", "PAIR net", "NOT the headline NET", "PARTIAL"):
+        assert needle in text, needle
+    eb = r["evidence_basis"]
+    assert eb["cost_complete"] is False and eb["execution"].startswith("MODELLED") and eb["financing"]["cost_of_capital"] == "UNSTATED"
+    assert eb["impact_provenance"]["floor"].startswith("ASSUMED") and eb["impact_provenance"]["latency"].startswith("NOT_MODELLED") and eb["costs_not_included"]
+    assert "% of a leg" not in text.split("DID THE HEDGE HEDGE")[0]
+
+
+def test_the_real_acquire_report_prints_no_false_hedge_failure_and_the_held_capital_break_even(capsys):
+    assert rp.main(["--mode", "acquire", "--style", "taker", "--exit-policy", "funding_streak", "--notional", "100000"]) == 0
+    text = capsys.readouterr().out
+    assert "-100.000% of a leg" not in text and "NOT a hedge failure" in text
+    assert "9.50%/yr" in text and "1.46%/yr" in text, "both break-even bases of the committed acquire replay"
+    assert "16,398.79" in text, "the underlying P&L must not move"

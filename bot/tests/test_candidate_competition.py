@@ -456,3 +456,73 @@ def test_the_process_wide_high_water_mark_does_not_make_a_family_tried(tmp_path)
     assert r["verdict"] == "UNTESTED" and any("no test has been run" in x for x in r["rejection_reasons"])
     assert fam in {h["name"] for h in rep["next_hypotheses"]}
     _reset()
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a noise row never heads the ranked table, and NaN never reaches it
+
+def _fam(*, status="WALK_FORWARD_DONE", p=0.95, nobs=3, oos=12.0, vs=None, verdict="INSUFFICIENT_DATA"):
+    return {"verdict": verdict, "status": status, "is_carry": False, "independent_holding_rows": 5, "oos_mean_total_bps_per_row": oos, "p_adjusted": p, "oos_independent_observations": nobs,
+            "n_variants_counted": 4, "n_variants_used_for_nominal_p": 4, "survivorship": "SURVIVORS_ONLY", "vs_cash": vs or {}}
+
+
+def _xs(families):
+    return CC_._xs_summary({"status": "EVALUATED", "evaluation": {"families": families, "survivorship": "SURVIVORS_ONLY", "history_coverage": {}, "input": {}}})
+
+
+def _block(x, status="WALK_FORWARD_DONE"):
+    return {"verdict": "INSUFFICIENT_DATA", "status": status, "oos_mean_excess_bps_of_capital_per_row": x}
+
+
+def test_a_positive_but_insignificant_best_of_k_mean_is_descriptive_not_the_positive_tier():
+    """REPRODUCED (Round 20, specialist E): +40 bps with Holm p 0.95 on 3 independent observations became the row's net edge and ranked in the EVALUATED_POSITIVE tier, above every INSUFFICIENT_DATA row."""
+    weak = _xs({"A": _fam(vs={"okx": _block(40.0)})})
+    assert weak["net_edge"] == 40.0 and weak["net_edge_significant"] is False
+    row = {"verdict": "INSUFFICIENT_DATA", "readiness_level": "RESEARCH_READY", "net_edge": {"value_bps": 40.0, "significant": False}}
+    assert CC_._tier(row) == CC_.VERDICT_TIER["INSUFFICIENT_DATA"]
+    strong = _xs({"A": _fam(p=0.01, nobs=CR.MIN_PROMISING_OOS_OBS, vs={"okx": _cash_block(40.0, p=0.01, nobs=CR.MIN_PROMISING_OOS_OBS)})})
+    assert strong["net_edge_significant"] is True
+    assert CC_._tier(dict(row, net_edge={"value_bps": 40.0, "significant": True})) == CC_.VERDICT_TIER["EVALUATED_POSITIVE"]
+    assert CC_._tier(dict(row, net_edge={"value_bps": 40.0, "significant": None})) == CC_.VERDICT_TIER["EVALUATED_POSITIVE"], "rows with no assessment keep their prior behaviour"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "7", None])
+def test_a_non_real_number_never_enters_the_headline_or_the_best_of(bad):
+    s = _xs({"A": _fam(oos=bad, vs={"okx": _block(bad)}), "B": _fam(oos=3.0, vs={"okx": _block(5.0)})})
+    assert s["net_edge"] == 5.0, "the real figure is used whatever order the families come in"
+    s2 = _xs({"B": _fam(oos=3.0, vs={"okx": _block(5.0)}), "A": _fam(oos=bad, vs={"okx": _block(bad)})})
+    assert s2["net_edge"] == 5.0
+    only = _xs({"A": _fam(oos=bad, vs={"okx": _block(bad)})})
+    assert only["net_edge"] is None, "nothing real to report is None, never NaN or a bool"
+
+
+def test_a_block_that_did_not_finish_its_walk_forward_cannot_set_the_headline():
+    s = _xs({"A": _fam(vs={"okx": _block(99.0, status="TOO_FEW_HOLDING_ROWS")})})
+    assert s["net_edge"] != 99.0
+
+
+def test_real_number_is_finite_numeric_and_not_a_bool():
+    assert CC_._real_number(1) and CC_._real_number(-2.5) and not any(CC_._real_number(v) for v in (True, False, float("nan"), float("inf"), "1", None, [], {}))
+
+
+def _cash_block(x, *, p, nobs, status="WALK_FORWARD_DONE"):
+    return {"verdict": "INSUFFICIENT_DATA", "status": status, "oos_mean_excess_bps_of_capital_per_row": x, "p_adjusted": p, "oos_independent_observations": nobs}
+
+
+def test_the_significance_flag_tests_the_quantity_the_headline_is_not_the_nominal_mean():
+    """REPRODUCED (Round 20, independent review): a family with a significant NOMINAL gross mean (+30 bps, p 0.01, 60 observations) and an excess over cash of +0.5 bps with p 0.93 had the excess as the headline
+    and `significant = True` from the nominal test, so noise was ranked in the positive tier. The headline's own block decides."""
+    many = CR.MIN_PROMISING_OOS_OBS + 30
+    noisy = _xs({"A": _fam(oos=30.0, p=0.01, nobs=many, vs={"okx": _cash_block(0.5, p=0.93, nobs=many)})})
+    assert noisy["net_edge"] == 0.5 and noisy["net_edge_significant"] is False
+    row = {"verdict": "INSUFFICIENT_DATA", "readiness_level": "RESEARCH_READY", "net_edge": {"value_bps": 0.5, "significant": noisy["net_edge_significant"]}}
+    assert CC_._tier(row) == CC_.VERDICT_TIER["INSUFFICIENT_DATA"]
+    real = _xs({"A": _fam(oos=30.0, p=0.5, nobs=3, vs={"okx": _cash_block(7.0, p=0.01, nobs=many)})})
+    assert real["net_edge"] == 7.0 and real["net_edge_significant"] is True, "the excess over cash is what is significant here, whatever the nominal mean's p is"
+    # two cash sources: the headline is the LOWEST of each source's best block, so that block's significance decides
+    two = _xs({"A": _fam(vs={"okx": _cash_block(7.0, p=0.01, nobs=many), "flat": _cash_block(2.0, p=0.9, nobs=many)})})
+    assert two["net_edge"] == 2.0 and two["net_edge_significant"] is False
+    # no cash source: the best family's own nominal test decides
+    nominal = _xs({"A": _fam(oos=12.0, p=0.01, nobs=many), "B": _fam(oos=3.0, p=0.9, nobs=3)})
+    assert nominal["net_edge"] == 12.0 and nominal["net_edge_significant"] is True
+    weak = _xs({"A": _fam(oos=12.0, p=0.9, nobs=3), "B": _fam(oos=3.0, p=0.01, nobs=many)})
+    assert weak["net_edge"] == 12.0 and weak["net_edge_significant"] is False, "a different family's significance never transfers to the best mean"

@@ -1354,3 +1354,101 @@ class TestProvenanceAndStructure:
         flipped = [bar._replace(open=bar.close, close=bar.open) for bar in bars]
         with pytest.raises(make_dataset.RegimeMismatch):
             make_dataset.assert_regimes_are_what_they_claim(spec.symbol_id, flipped)
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a synthetic fixture is refused by the loader, whatever the caller passes
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, symbol, first_ms, last_ms):
+        self.calls.append((symbol, first_ms, last_ms))
+
+
+@pytest.fixture()
+def observer(monkeypatch):
+    rec = _Recorder()
+    monkeypatch.setattr(md, "READ_OBSERVER", rec)
+    return rec
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_load_corpus_refuses_the_synthetic_fixtures_and_verify_false_does_not_bypass_it(verify, observer):
+    """REPRODUCED (Round 20): data/ohlcv|orderbook|quotes are generated (MANIFEST synthetic=true) but carry names like BYBIT_SPOT_BTC_USDT_1H. md.load_corpus('data', verify=False) returned 5,000 BTCUSDT
+    bars with notes == [], and eight shipped tools pass verify=False. One synthetic load also recorded a real BTCUSDT window as READ in the holdout ledger."""
+    with pytest.raises(md.SyntheticCorpusRefused, match="SYNTHETIC_CORPUS_REFUSED"):
+        md.load_corpus(md.DATA_ROOT, symbols=["SOLUSDT"], verify=verify)
+    assert observer.calls == [], "a refused load reads nothing and records nothing"
+    assert issubclass(md.SyntheticCorpusRefused, md.ManifestError)
+
+
+@pytest.mark.parametrize("manifest", [None, "{}", '{"synthetic": "false"}', '{"synthetic": 0}', "not json", '{"synthetic": null}'])
+def test_a_manifest_that_does_not_say_synthetic_false_is_refused(tmp_path, manifest, observer):
+    """Fail closed: only an explicit boolean false proves a real corpus. No manifest, an empty one, a string 'false', 0, null or garbage is unproven provenance."""
+    (tmp_path / "ohlcv").mkdir()
+    if manifest is not None:
+        (tmp_path / "MANIFEST.json").write_text(manifest)
+    with pytest.raises(md.SyntheticCorpusRefused, match="unproven provenance"):
+        md.load_corpus(str(tmp_path), verify=False)
+    assert observer.calls == []
+
+
+def test_a_real_corpus_still_loads_and_is_recorded_by_the_holdout_observer(observer):
+    real = os.path.join(md.DATA_ROOT, "real_1d")
+    assert md.corpus_is_synthetic(real) is False
+    bars, _books, _notes = md.load_corpus(real, verify=False)
+    assert bars and observer.calls, "a real corpus is observed exactly as before"
+
+
+def test_the_named_switch_reads_a_fixture_but_never_burns_a_real_symbols_window(observer):
+    assert md.corpus_is_synthetic(md.DATA_ROOT) is True
+    bars, _books, notes = md.load_corpus(md.DATA_ROOT, symbols=["SOLUSDT"], synthetic_ok=md.SYNTHETIC_FIXTURE_OK)
+    assert bars["SOLUSDT"], "the harness's own tests can still exercise the fixtures"
+    assert observer.calls == [], "a generated fixture must never mark a real symbol's window as read"
+    for truthy in (True, 1, "yes", object()):
+        with pytest.raises(md.SyntheticCorpusRefused):
+            md.load_corpus(md.DATA_ROOT, symbols=["SOLUSDT"], synthetic_ok=truthy)
+
+
+def _switch_references(tree):
+    return sorted({node.lineno for node in ast.walk(tree)
+                   if (isinstance(node, ast.Name) and node.id == "SYNTHETIC_FIXTURE_OK") or (isinstance(node, ast.Attribute) and node.attr == "SYNTHETIC_FIXTURE_OK")
+                   or (isinstance(node, ast.alias) and node.name == "SYNTHETIC_FIXTURE_OK") or (isinstance(node, ast.Constant) and node.value == "SYNTHETIC_FIXTURE_OK")})
+
+
+def test_the_synthetic_switch_is_detected_in_every_spelling_and_ignores_prose():
+    for kind, src in {"name": "SYNTHETIC_FIXTURE_OK", "attribute": "import market_data as m\nx = m.SYNTHETIC_FIXTURE_OK", "from_import": "from market_data import SYNTHETIC_FIXTURE_OK",
+                      "aliased": "from market_data import SYNTHETIC_FIXTURE_OK as _S\nuse(_S)", "getattr": "import market_data as m\nx = getattr(m, 'SYNTHETIC_FIXTURE_OK')"}.items():
+        assert _switch_references(ast.parse(src)), f"missed the {kind} spelling"
+    assert _switch_references(ast.parse('def f():\n    """pass market_data.SYNTHETIC_FIXTURE_OK to read a fixture"""\n    raise ValueError("or the SYNTHETIC_FIXTURE_OK switch")')) == []
+
+
+def test_the_synthetic_switch_never_appears_in_shipped_code():
+    """Tools cannot opt in: only market_data.py defines it. (Tests may, and do.) Every shipped .py under bot/, recursively, outside tests. THIS IS A TRIPWIRE, NOT A BOUNDARY (independent review, Round 20):
+    a computed spelling (``md.__dict__["SYNTHETIC_" + "FIXTURE_OK"]``) is not detected, and the refusal covers ``load_corpus`` only: ``load_ohlcv`` and a direct read of data/ohlcv are not refused. The
+    boundary that matters is the default: a tool that calls ``load_corpus`` without naming the switch cannot read a fixture."""
+    offenders, seen = [], 0
+    for root, dirs, files in os.walk(REPO):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("tests", "site-packages", "node_modules", "__pycache__") and not os.path.exists(os.path.join(root, d, "pyvenv.cfg")))
+        for name in sorted(files):
+            if not name.endswith(".py"):
+                continue
+            seen += 1
+            if name == "market_data.py" and root == REPO:
+                continue
+            path = os.path.join(root, name)
+            offenders += [f"{os.path.relpath(path, REPO)}:{line}" for line in _switch_references(ast.parse(open(path, encoding="utf-8").read()))]
+    assert seen > 100, "the walker found no shipped code: the tripwire would pass vacuously"
+    assert not offenders, f"SYNTHETIC_FIXTURE_OK is for the harness's own tests: {offenders}"
+
+
+def test_the_documented_evaluation_command_refuses_the_synthetic_default_with_guidance_not_a_traceback():
+    """REPRODUCED (independent review, Round 20): `python3 tools/run_evaluation.py` (the documented command, whose --data-dir defaults to the generated fixture corpus) ended in an uncaught
+    SyntheticCorpusRefused traceback. It refuses (correct) and now says what to do instead."""
+    import subprocess
+    r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "run_evaluation.py")], capture_output=True, text=True, timeout=300, cwd=REPO,
+                       env={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"), "PYTHONDONTWRITEBYTECODE": "1", "LEDGER_DISABLED": "1"})
+    assert r.returncode == 2, (r.returncode, r.stderr[-400:])
+    assert "REFUSED" in r.stderr and "SYNTHETIC_CORPUS_REFUSED" in r.stderr and "--data-dir data/real_1d" in r.stderr and "--synthetic" in r.stderr
+    assert "Traceback" not in r.stderr and "Traceback" not in r.stdout

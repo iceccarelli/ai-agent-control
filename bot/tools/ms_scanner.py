@@ -15,7 +15,8 @@ Rules that hold for every row
   * Microstructure: no book / crossed book / book older than ``max_book_age_ms`` / unknown age / spread above ``max_spread_bps`` are excluded. Slippage is a depth WALK of the real book at
     the evaluated size (entry on one side, exit on the opposite side), never a constant.
   * Costs come from carry_costs' authoritative names, each with provenance: fees VENUE_STATED (base tier), the round-trip spread is the larger of the MEASURED book spread and
-    the ASSUMED 0.4 bps, maker rebates / adverse selection / missed fills are MODELLED, spot-leg slippage (no spot book in a snapshot) is ASSUMED, financing is an ASSUMED operator input.
+    the ASSUMED 0.4 bps, maker rebates / adverse selection / missed fills are MODELLED, spot-leg slippage (no spot book in a snapshot) is ASSUMED, financing is the owner's STATED alternative
+    return on the capital the position commits (MODELLED once stated, the label the executor's edge gate gives an owner's own figure) and is UNKNOWN until it is stated: an unstated rate is ``FINANCING_UNKNOWN``, never a default of 0.0 (Round 20).
   * Unknown input => ``net_bps_horizon`` None and unrankable (``rank_score`` None). Never zero, never defaulted.
   * Capacity: the largest per-leg notional at which the round-trip slippage still fits inside the edge that remains after every other cost (bounded by visible depth, the
     venue's max market quantity and a participation cap of open interest).
@@ -47,11 +48,11 @@ EXCLUSIONS = (
     "NO_INSTRUMENT", "NO_SNAPSHOT", "SNAPSHOT_FROM_FUTURE", "STALE_SNAPSHOT", "NEXT_FUNDING_IN_PAST", "NOT_TRADING", "NOT_LAUNCHED", "DELIVERY_WITHIN_HOLD",
     "NO_SPOT_HEDGE", "HEDGE_UNKNOWN", "NO_MARK", "FUNDING_INTERVAL_UNKNOWN", "FUNDING_INTERVAL_PER_PRINT_UNKNOWN", "INSUFFICIENT_FUNDING_HISTORY", "NO_BOOK", "BOOK_CROSSED", "BOOK_AGE_UNKNOWN", "BOOK_STALE",
     "SPREAD_TOO_WIDE", "LOW_TURNOVER", "LOW_OPEN_INTEREST", "RULES_UNKNOWN", "BELOW_MIN_ORDER_QTY", "BELOW_MIN_NOTIONAL", "DEPTH_INSUFFICIENT", "CAPACITY_BELOW_MIN",
-    "NO_SPOT_MARK", "BASIS_TOO_WIDE", "VOL_UNKNOWN", "NET_BELOW_MIN", "NET_UNKNOWN", "FUNDING_NOT_POSITIVE", "NO_PAIR")
+    "NO_SPOT_MARK", "BASIS_TOO_WIDE", "VOL_UNKNOWN", "FINANCING_UNKNOWN", "NET_BELOW_MIN", "NET_UNKNOWN", "FUNDING_NOT_POSITIVE", "NO_PAIR")
 DEFAULT_PARAMS: Dict[str, Any] = {
     "hold_days": 7.0, "formation_days": 3.0, "min_prints": 3, "notional_usd": 10_000.0, "max_book_age_ms": 5_000, "max_snapshot_age_ms": 60_000, "max_spread_bps": 10.0,
     "min_turnover24h_usd": None, "min_open_interest_usd": None, "min_net_bps": 0.0, "persistence": 0.5, "margin_frac": 0.2, "oi_participation": 0.01, "risk_floor_bps": 1.0,
-    "spot_slippage_bps_per_leg": 1.0, "basis_floor_bps": 2.0, "max_entry_basis_bps": 50.0, "opportunity_cost_apr": CC.DEFAULT_OPPORTUNITY_COST_APR, "p_missed_fill": 0.25,
+    "spot_slippage_bps_per_leg": 1.0, "basis_floor_bps": 2.0, "max_entry_basis_bps": 50.0, "opportunity_cost_apr": None, "p_missed_fill": 0.25,
     "top_k": 3, "price_vol_bps_per_day": {}, "pair_corr": 0.0,
 }
 KINDS = T.OPP_KINDS
@@ -79,6 +80,11 @@ def _params(params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         raise ScanError("min_prints and top_k must be positive integers")
     if not 0.0 <= float(p["p_missed_fill"]) <= 1.0 or not -1.0 <= float(p["pair_corr"]) <= 1.0:
         raise ScanError("p_missed_fill must be in [0,1] and pair_corr in [-1,1]")
+    apr = p["opportunity_cost_apr"]
+    # Round 20: None = the owner has NOT stated an alternative return (UNKNOWN, never 0.0); anything else must be a finite non-negative real number (a bool, a string, NaN, inf or a negative is refused,
+    # never coerced: float("0.05") or float(True) would turn a mistake into a price)
+    if apr is not None and (isinstance(apr, bool) or not isinstance(apr, (int, float)) or not math.isfinite(apr) or apr < 0):
+        raise ScanError("opportunity_cost_apr must be None (unstated) or a finite non-negative number: the owner's alternative return per year on the capital the position commits")
     return p
 
 
@@ -260,6 +266,13 @@ def _rules_exclusions(inst: Instrument, snap: MarketSnapshot, notional_usd: floa
 
 
 # ---------------------------------------------------------------- one candidate (single leg book or pair)
+def committed_capital_factor(kind: str, margin_frac: float) -> float:
+    """Capital committed per unit of position notional on the scanner's own basis: the spot leg paid in full plus perp margin for a carry, perp margin alone for a perp-only kind.
+    The ranking denominator, the financing charge here and the pipeline's realised cost of capital all use this one function, so they cannot drift apart."""
+    m = float(margin_frac)
+    return (1.0 + m) if kind == "SPOT_PERP_CARRY" else m
+
+
 def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, MarketSnapshot, str]], f_leg_day: Sequence[Dict[str, float]], candidate_id: str, spec_digest: str,
               decision_ms: int, p: Mapping[str, Any], base_exclusions: Sequence[str], legs: Tuple[Tuple[str, str], ...]) -> Opportunity:
     """Economics of one opportunity. ``legs_inst`` = the PERP legs (instrument, snapshot, side); carry has one perp leg plus the implicit spot leg."""
@@ -269,6 +282,8 @@ def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, Marke
     costs: List[CostLine] = []
     n_legs = len(legs_inst)
     w = 1.0 / n_legs if kind == "PERP_FUNDING_SPREAD" else 1.0
+    margin = float(p["margin_frac"])
+    capital_factor = committed_capital_factor(kind, margin)          # committed capital per unit of position notional: the SAME factor rank_score divides by
     # --- funding (interval-normalised, per unit of position notional)
     funding_day = 0.0
     for (inst, snap, side), f in zip(legs_inst, f_leg_day):
@@ -298,7 +313,17 @@ def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, Marke
     if kind == "SPOT_PERP_CARRY":
         costs.append(CostLine("hedge", 2.0 * float(p["spot_slippage_bps_per_leg"]), "ASSUMED"))
         reasons.append("SPOT_DEPTH_UNKNOWN: a snapshot carries no spot book; spot-leg slippage is the ASSUMED parameter and capacity is bounded by the perp book only")
-        costs.append(CostLine("financing", float(p["opportunity_cost_apr"]) / 365.0 * 1e4 * hold, "ASSUMED"))
+    # --- financing: the owner's alternative return on the capital this position COMMITS (carry: spot + margin; perp-only: margin). UNKNOWN until stated: an unstated rate is not a free loan.
+    apr = p["opportunity_cost_apr"]
+    if apr is None:
+        costs.append(CostLine("financing", None, "UNKNOWN"))
+        ex.append("FINANCING_UNKNOWN")
+        reasons.append("FINANCING_UNKNOWN: the owner's alternative return on the committed capital is not stated (opportunity_cost_apr), so no net, rank or capacity is stated: an unpriced cost of capital is "
+                       "not zero (state it, a stated 0 is a statement)")
+    else:
+        costs.append(CostLine("financing", float(apr) / 365.0 * 1e4 * hold * capital_factor, "MODELLED"))
+        reasons.append(f"financing = the STATED alternative return {float(apr):.4%}/yr on {capital_factor:.2f}x committed capital per unit of notional (the ranking's own capital factor; margin_frac "
+                       f"{margin} is a research assumption, 5x: the autopilot's executed structure commits 2.04x at leverage 1) over the {hold:g}-day hold: MODELLED (a stated parameter, not an observation)")
     # --- known-cost edge before slippage -> capacity by depth walk
     pre = [c.bps for c in costs]
     edge_pre = None if any(x is None for x in pre) else funding_h - sum(pre)
@@ -404,8 +429,6 @@ def _evaluate(kind: str, style: str, legs_inst: Sequence[Tuple[Instrument, Marke
     if net is not None and net < float(p["min_net_bps"]):
         ex.append("NET_BELOW_MIN")
     ex = sorted(set(ex))
-    margin = float(p["margin_frac"])
-    capital_factor = (1.0 + margin) if kind == "SPOT_PERP_CARRY" else margin
     rank = None
     if net is not None and risk is not None and not ex:
         rank = (net / capital_factor) / max(risk, float(p["risk_floor_bps"]))

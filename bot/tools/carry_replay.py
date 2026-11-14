@@ -1004,8 +1004,9 @@ def owner_capital_lines(v: Dict[str, Any]) -> List[str]:
         f"  owner capital (the repo's own commit rule: the hedged coin + perp margin at {v['leverage_assumed']:g}x + buffer "
         f"= {v['capital_multiple_of_marked_notional']:.2f}x the marked notional, ${v['avg_committed_capital_usd']:,.0f} on average): "
         f"{v['net_return_on_committed_capital_pct_per_year']:+.2f}%/yr",
-        f"    = the BREAK-EVEN cost of capital: an alternative that earns more than "
-        f"{v['break_even_cost_of_capital_pct']:.2f}%/yr on the same capital beats this book (margin assumed separate cash)"]
+        f"    = the WHOLE-WINDOW break-even cost of capital: an alternative that earns more than "
+        f"{v['break_even_cost_of_capital_pct']:.2f}%/yr on the same capital, held for the WHOLE window (the capital idle and earning nothing between this book's trades), beats this book "
+        f"(margin assumed separate cash; the held-capital basis is printed below)"]
     if v.get("break_even_status") == "UPPER_BOUND_USDT_FINANCING_UNSTATED":
         lines.append("    UPPER BOUND: the interest on the USDT deficit is not charged (no --usdt-borrow-apr), so the break-even above is "
                      "the best case, not the owner's")
@@ -1557,6 +1558,118 @@ def diff(engine_report: Dict[str, Any],
     return out
 
 
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# PRESENTATION ONLY (Round 20). Nothing below changes a number the replay computed; it states what each printed figure is and is not. tests/test_carry_replay_truth.py pins every other
+# top-level definition of this file by AST digest, so the registered forward test's engine (E1) cannot drift through this section.
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+def present_evidence_basis(r: Dict[str, Any], *, impact_bps: float, no_impact: bool) -> Dict[str, Any]:
+    """The machine-readable twin of the console's "WHAT THIS REPORT IS" block: structure, capital, costs in and out, financing, and an explicit completeness verdict."""
+    oc = r.get("owner_capital") or {}
+    fin = r.get("usdt_financing") or {}
+    floor = float(cb.IMPACT_FLOOR_BPS_PER_LEG)
+    coc = (oc.get("cost_of_capital") or {}).get("state", "UNSTATED")
+    return {
+        "structure": ("ACQUIRED_SPOT_PERP (buy spot + short perp; both legs traded)" if r["execution_mode"] == "acquire"
+                      else "OWNED_INVENTORY_OVERLAY (the owner's held BTC + short perp; the held coin is not bought or sold)"),
+        "headline_basis": "fixed ENTRY notional per pair (not committed capital)",
+        "notional_usd": r["notional_usd"],
+        "committed_capital": ({"multiple_of_marked_notional": oc.get("capital_multiple_of_marked_notional"), "average_usd": oc.get("avg_committed_capital_usd"),
+                               "margin_structure": oc.get("margin_structure")} if oc.get("available") else {"available": False, "why": oc.get("why")}),
+        "costs_included": ["funding (settled prints)", "taker/maker fees as modelled by the cost tables", "basis (bar prices)", "borrow at the stated --borrow-apr",
+                           ("declared impact haircut %.4f bps/leg" % float(impact_bps)) if not no_impact else "NO impact haircut (--no-impact): costs are understated"],
+        "costs_not_included": list(r.get("not_modelled") or []),
+        "financing": {"usdt_deficit_interest": fin.get("state", "UNKNOWN"), "cost_of_capital": coc,
+                      "statement": ("a STATED rate is applied" if coc == "STATED" else "UNSTATED: no figure here is an excess over any alternative; zero is not assumed")},
+        "impact_provenance": {"floor_bps_per_leg": floor, "floor": "ASSUMED (a constant with no measurement behind it)",
+                              "walk_bps_per_leg": (None if no_impact else max(0.0, float(impact_bps) - floor)),
+                              "walk": "OTHER_VENUE (a Binance USDT-M depth study, a few days; Bybit's own book is not measured)", "latency": "NOT_MODELLED (a fill is at the decision bar's price)"},
+        "data": "MEASURED settled funding prints and bar prices",
+        "execution": "MODELLED (every fill at the bar price plus the declared haircut; no measured fill, no partial fill, no queue)",
+        "cost_complete": False,
+        "completeness": "PARTIAL: this net omits the costs listed under costs_not_included and its sign of error is not established; it is an upper-bound style figure, not a total",
+    }
+
+
+def present_truth_lines(r: Dict[str, Any], basis: Dict[str, Any]) -> List[str]:
+    cc = basis["committed_capital"]
+    cap = (f"{cc['multiple_of_marked_notional']:.2f}x the marked notional = ${cc['average_usd']:,.0f} on average while held (margin assumed SEPARATE cash)"
+           if cc.get("average_usd") is not None else "not available")
+    return ["", "  WHAT THIS REPORT IS (read before quoting any figure above)",
+            f"    structure        {basis['structure']}",
+            f"    notional         ${basis['notional_usd']:,.0f} fixed entry notional per pair: the headline %/yr is on THIS, not on committed capital",
+            f"    capital          {cap}",
+            f"    costs included   {'; '.join(basis['costs_included'])}",
+            f"    costs NOT in     {len(basis['costs_not_included'])} named under not_modelled (latency, spread, impact beyond the haircut, fill probability, ...)",
+            f"    impact           floor {basis['impact_provenance']['floor_bps_per_leg']:g} bps/leg is ASSUMED; the walk is from another venue's depth study; latency is not modelled",
+            f"    financing        USDT deficit interest {basis['financing']['usdt_deficit_interest']}; cost of capital {basis['financing']['cost_of_capital']}",
+            f"    evidence         data MEASURED; execution MODELLED; cost_complete = {basis['cost_complete']}",
+            f"    => {basis['completeness']}"]
+
+
+def present_opportunity_cost_lines(r: Dict[str, Any]) -> List[str]:
+    coc = ((r.get("owner_capital") or {}).get("cost_of_capital") or {}).get("state", "UNSTATED")
+    if coc == "STATED":
+        return [f"    opportunity cost of the capital  ${r['opportunity_cost_usd']:12,.2f}   -> net after it ${r['net_after_opportunity_cost_usd']:12,.2f}   "
+                "(the entry gate's own base: 1.0x hedged notional, held prints only; the owner-capital lines below use the committed capital)"]
+    return ["    opportunity cost of the capital  NOT PRICED: no --opportunity-cost-apr was stated, so there is NO 'net after cost of capital' (the entry gate ran with 0.0 as its "
+            "unchanged behaviour; that zero is not the owner's rate)"]
+
+
+def present_break_even_lines(v: Dict[str, Any], market_exposure_pct: float, execution_mode: str = "acquire") -> List[str]:
+    """Both break-even bases, each with the assumption that makes it the right one. The whole-window figure treats the committed capital as dedicated (idle and earning nothing) between trades; the
+    held-capital figure is the same net over the capital-time actually in market, i.e. it assumes the capital earns the alternative while idle (the basis the cash path compares on)."""
+    if not v.get("available") or not (isinstance(market_exposure_pct, (int, float)) and market_exposure_pct > 0):
+        return []
+    whole = float(v["break_even_cost_of_capital_pct"])
+    held = whole / (market_exposure_pct / 100.0)
+    lines = [f"    BREAK-EVEN BASES (the same net over two capital-times; compare an alternative on the SAME basis, never across them):",
+             f"      whole-window, capital dedicated and idle between trades earns NOTHING: {whole:.2f}%/yr  (the printed 'break-even' above)",
+             f"      held-capital, capital earns the alternative while idle (in market {market_exposure_pct:.1f}% of the window): {held:.2f}%/yr"
+             + ("  <- the basis a flat cash alternative is compared on, FOR CAPITAL THAT CAN BE REDEPLOYED WHEN FLAT" if execution_mode != "overlay" else "")]
+    if execution_mode == "overlay":
+        lines.append("      OVERLAY: about half of the committed capital is the owner's HELD COIN, which stays held between trades and is not redeployed to cash, so the held-capital figure applies to the margin-cash "
+                     "component only and OVERSTATES the break-even against a cash alternative for the whole commitment; the whole-window figure is the conservative one")
+    if v.get("break_even_status") == "UPPER_BOUND_USDT_FINANCING_UNSTATED":
+        lines.append("      BOTH figures are UPPER BOUNDS: the interest on the USDT deficit is not charged (no --usdt-borrow-apr)")
+    return lines
+
+
+def present_ledger_lines(r: Dict[str, Any]) -> List[str]:
+    st = r["ledger"]
+    overlay = r["execution_mode"] == "overlay"
+    pair = st.get("pair_net_usd")
+    lines = ["", f"  THE LEDGER — built from {r['ledger_entries']:,} double-entry postings, each balanced to zero (CASH LEGS: the journal holds realised money only)",
+             f"    funding          ${st['funding_usd']:>12,.2f}", f"    fees             ${-st['fees_usd']:>12,.2f}", f"    borrow           ${-st['borrow_usd']:>12,.2f}",
+             f"    realised         ${st['realised_usd']:>12,.2f}   " + ("the SHORT's cash result only: the held coin's price result is the inventory mark below, not here" if overlay
+                                                                   else "both legs were traded: the spot leg's result is inside this figure"),
+             f"    = NET realised (cash legs only)  ${st['net_usd']:>12,.2f}" + ("   <- NOT the headline NET: an overlay's cash net omits the held coin's mark" if overlay else "")]
+    if pair is None:
+        lines.append("    PAIR net WITHHELD: an inventory leg was not valued, so the journal cannot state the hedged result and agreement is UNKNOWN (never 'True')")
+        lines.append(f"    agrees with the headline NET: {r['ledger_agrees']}")
+    else:
+        lines.append(f"    + inventory mark ${st['inventory_mark_usd']:>12,.2f}   marked, not cash: the held coin valued between two spot prices, never sold")
+        lines.append(f"    = PAIR net       ${pair:>12,.2f}")
+        lines.append(f"    + open position  ${r['unrealised_usd']:>12,.2f}   an ESTIMATE; deliberately not in the journal")
+        lines.append(f"    = ${pair + r['unrealised_usd']:,.2f} against the headline NET ${r['net_usd']:,.2f}: agrees {r['ledger_agrees']}")
+    if st["fees_unknown"]:
+        lines.append(f"    {st['fees_unknown']} fill(s) whose fee the venue never stated — counted, never booked as $0.00")
+    return lines
+
+
+def present_hedge_lines(r: Dict[str, Any], eff: Dict[str, Any]) -> List[str]:
+    if r["execution_mode"] != "overlay":
+        return ["", "  DID THE HEDGE HEDGE?  not measured in ACQUIRE mode",
+                "    The residual below is only meaningful for an overlay (the held coin's revaluation against the short). In ACQUIRE mode the spot leg is bought and sold, its result is booked in",
+                f"    'realised' ({r['ledger']['realised_usd']:,.2f} above) and no revaluation entry exists, so 'perp realised ${eff['perp_realised_usd']:,.0f} against inventory $0' is NOT a hedge failure.",
+                "    The pair's net above is the evidence."]
+    return ["", "  DID THE HEDGE HEDGE?  (overlay: the short's realised cash result against the held coin's revaluation over the closed cycles)",
+            f"    perp realised    ${eff['perp_realised_usd']:>12,.0f}", f"    inventory moved  ${eff['inventory_change_usd']:>12,.0f}",
+            f"    residual         ${eff['residual_usd']:>12,.0f}   {eff['residual_fraction_of_leg']:+.3%} of the larger leg",
+            "    That residual is the realised basis between the legs over closed cycles, plus whatever the inventory mark above holds for an open one. Not expected to be zero."]
+
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -1688,10 +1801,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"    borrow     ${r['borrow_usd']:12,.2f}")
     print(f"    = NET      ${r['net_usd']:12,.2f}   "
           f"{r['net_annualised_pct']:+.2f}%/yr   (modelled; omits the costs under not_modelled, not a total)")
-    print(f"    opportunity cost of the capital  ${r['opportunity_cost_usd']:12,.2f}   "
-          f"-> net after it ${r['net_after_opportunity_cost_usd']:12,.2f}   "
-          "(the entry gate's own base: 1.0x hedged notional, held prints only; "
-          "the owner-capital lines below use the committed capital)")
+    for line in present_opportunity_cost_lines(r):
+        print(line)
     if r.get("execution_cost_warning"):
         print(f"  !! {r['execution_cost_warning']}")
     print(f"  trades {r['trades']}, orders {r['orders']} "
@@ -1705,6 +1816,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(line)
     for line in owner_capital_lines(r["owner_capital"]):
         print(line)
+    for line in present_break_even_lines(r["owner_capital"], r["market_exposure_pct"], r["execution_mode"]):
+        print(line)
+    r["evidence_basis"] = present_evidence_basis(r, impact_bps=impact, no_impact=bool(args.no_impact))
+    for line in present_truth_lines(r, r["evidence_basis"]):
+        print(line)
     for line in concentration_lines(r["concentration"], years=r["years"],
                                     notional=r["notional_usd"],
                                     borrow_apr=r["borrow_apr"]):
@@ -1714,31 +1830,11 @@ def main(argv: Optional[List[str]] = None) -> int:
               "stopped there, as the process would")
     import ledger as _L
     st = r["ledger"]
-    print("\n  THE LEDGER — built from " f"{r['ledger_entries']:,} "
-          "double-entry postings, each balanced to zero")
-    print(f"    funding          ${st['funding_usd']:>12,.2f}")
-    print(f"    fees             ${-st['fees_usd']:>12,.2f}")
-    print(f"    borrow           ${-st['borrow_usd']:>12,.2f}")
-    print(f"    realised         ${st['realised_usd']:>12,.2f}")
-    print(f"    = NET realised   ${st['net_usd']:>12,.2f}")
-    print(f"    + open position  ${r['unrealised_usd']:>12,.2f}   "
-          "an ESTIMATE; deliberately not in the journal")
-    print(f"    ------------------------------   agrees with the run above: "
-          f"{r['ledger_agrees']}")
-    if st["fees_unknown"]:
-        print(f"    {st['fees_unknown']} fill(s) whose fee the venue never "
-              "stated — counted, never booked as $0.00")
+    for line in present_ledger_lines(r):
+        print(line)
     eff = _L.hedge_effectiveness(**r["hedge"])
-    print("\n  DID THE HEDGE HEDGE?")
-    print(f"    perp realised    ${eff['perp_realised_usd']:>12,.0f}")
-    print(f"    inventory moved  ${eff['inventory_change_usd']:>12,.0f}")
-    print(f"    residual         ${eff['residual_usd']:>12,.0f}   "
-          f"{eff['residual_fraction_of_leg']:+.3%} of a leg")
-    print("    That residual IS the basis — the only price exposure a "
-          "delta-neutral")
-    print("    overlay runs. Not expected to be zero. Expected to be small, "
-          "and now")
-    print("    measured out of a journal rather than asserted.")
+    for line in present_hedge_lines(r, eff):
+        print(line)
 
     print("\n  WHAT THE ENGINE DID, tick by tick")
     for action, count in sorted(r["actions"].items(), key=lambda kv: -kv[1]):

@@ -942,3 +942,21 @@ def test_the_shadow_net_names_every_cost_class_and_does_not_claim_a_bound_it_can
     assert "neither an upper nor a lower bound" in cc["reading"] and "OMITS" in cc["reading"]
     assert "above UNKNOWN" not in cc["reading"]                                  # the garbled sentence is gone
     assert e["label"].startswith("MODELLED") and "NOT REAL ACCOUNT P&L" in e["label"]
+
+
+class TestRound20ColdStartIdentifiesItsVenue:
+    def test_a_resumed_shadow_book_says_its_venue_is_simulated_and_not_an_account_read(self, tmp_path, caplog):
+        """Round 20: the engine logs 'carry cold start: RESUMED ...' for a real account, and the forward shadow feeds that same planner the holdings it has just read from its OWN database, so it can
+        only agree. A log line alone read as 'a pair is held on the venue'. The shadow now says beside it that the venue is simulated."""
+        import logging
+        observations = series()
+        path = str(tmp_path / "resume.db")
+        first = cs.ShadowRuntime(path, config())
+        run_all(first, observations[:5])
+        assert first.engine.position is not None
+        first.close()
+        with caplog.at_level(logging.WARNING):
+            second = cs.ShadowRuntime(path, config())
+        assert second.engine.position is not None
+        ours = [r.getMessage() for r in caplog.records if r.name == "carry_shadow"]
+        assert ours and "SIMULATED venue" in ours[0] and "NOT a read of any exchange account" in ours[0] and "RESUME" in ours[0]

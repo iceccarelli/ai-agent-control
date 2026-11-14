@@ -1074,8 +1074,15 @@ def significance(returns: Sequence[float], *, alpha: float = 0.05, ci: bool = Tr
     out: Dict[str, Any] = {"n": n, "mean": None, "sd": None, "ess": None, "independent_observations": 0, "t": None, "p_one_sided": 1.0, "ci": None}
     if n < ES.MIN_FOR_CI:
         return out
-    m = sum(xs) / n
-    sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1))
+    if not all(math.isfinite(x) for x in xs):                 # Round 20: a NaN gave p = NaN and independent_observations 30; no claim is made on a series with a non-finite point
+        out["status"] = "NONFINITE_INPUT"
+        return out
+    try:
+        m = sum(xs) / n
+        sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1))
+    except OverflowError:                                     # 1e300-scale points overflow the variance: no claim
+        out["status"] = "NONFINITE_INPUT"
+        return out
     ess = ES.conservative_ess(xs) or 1.0
     out.update({"mean": m, "sd": sd, "ess": ess, "independent_observations": int(math.floor(min(float(n), ess)))})
     if sd <= 0 or ess < 3.0:

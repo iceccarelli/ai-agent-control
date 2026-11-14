@@ -43,7 +43,8 @@ def run(i=None, s=None, *, kind="SPOT_PERP_CARRY", style="TAKER", params=None, d
     i = i if i is not None else [inst()]
     s = s if s is not None else [snap()]
     return S.scan(i, s, spec={"kind": kind, "style": style}, candidate_id="c@1", spec_digest="d" * 8, decision_ms=decision_ms,
-                  params={"persistence": 1.0, **(params or {})})        # the economics tests pin persistence 1.0 (the default 0.5 is tested on its own)
+                  params={"persistence": 1.0, "opportunity_cost_apr": 0.0, **(params or {})})        # the economics tests pin persistence 1.0 (the default 0.5 is tested on its own) and STATE a 0% alternative
+                                                                                                   # return (Round 20: the DEFAULT is UNKNOWN, tested on its own below; a stated zero is a statement)
 
 
 def cost(o, name):
@@ -59,7 +60,7 @@ def test_carry_golden_numbers_every_cost_has_a_provenance_and_net_is_hand_comput
     assert (cost(o, "exit_fee").bps, cost(o, "exit_fee").prov) == (pytest.approx(15.5), "VENUE_STATED")
     assert (cost(o, "spread").bps, cost(o, "spread").prov) == (pytest.approx(1.0), "MEASURED")                       # 0.01 / 100 = 1.0 bps > ASSUMED 0.4
     assert (cost(o, "hedge").bps, cost(o, "hedge").prov) == (pytest.approx(2.0), "ASSUMED")
-    assert cost(o, "financing").bps == 0.0 and cost(o, "financing").prov == "ASSUMED"
+    assert cost(o, "financing").bps == 0.0 and cost(o, "financing").prov == "MODELLED"                  # a STATED 0% (the helper states it): a statement, labelled like the edge gate labels an owner's figure
     assert cost(o, "slippage").bps == pytest.approx(0.0) and cost(o, "slippage").prov == "DERIVED"
     assert o.net_bps_horizon == pytest.approx(84.0 - 31.0 - 1.0 - 2.0)
     basis = (100.0 - 99.98) / 99.98 * 1e4
@@ -79,7 +80,7 @@ def test_fee_constants_are_carry_costs_names():
     assert cost(o, "entry_fee").bps + cost(o, "exit_fee").bps == pytest.approx(CC.ROUND_TRIP_FEE_BPS_SPOT_PERP) == 31.0
     d = run(kind="PERP_DIRECTIONAL_FUNDING", params={"price_vol_bps_per_day": {"AAAUSDT": 100.0}})[0]
     assert cost(d, "entry_fee").bps + cost(d, "exit_fee").bps == pytest.approx(CC.ROUND_TRIP_FEE_BPS_PERP_OVERLAY) == 11.0
-    assert not any(c.name in ("hedge", "financing") for c in d.costs)                              # a perp-only book has no spot leg
+    assert not any(c.name == "hedge" for c in d.costs)                                              # a perp-only book has no spot leg (its committed margin still has a financing line: Round 20)
 
 
 def test_maker_first_is_modelled_and_the_spot_leg_stays_taker():
@@ -257,7 +258,7 @@ def test_spread_pairs_short_high_long_low_with_perp_only_costs():
     # funding per gross notional: 0.5 x short receives 18 bps/day + 0.5 x long receives 12 bps/day = 15 bps/day over 7 days
     assert best.expected_funding_bps_horizon == pytest.approx(0.5 * 18 * 7 + 0.5 * 12 * 7)
     assert cost(best, "entry_fee").bps + cost(best, "exit_fee").bps == pytest.approx(11.0)           # two perp legs, gross-notional weights
-    assert not any(c.name in ("hedge", "financing") for c in best.costs) and best.expected_price_leg_bps == 0.0
+    assert not any(c.name == "hedge" for c in best.costs) and best.expected_price_leg_bps == 0.0      # no spot leg; the committed margin still has an opportunity cost (Round 20: a financing line)
     assert best.risk_score == pytest.approx((0.5 ** 2 * (200 * 7 ** 0.5) ** 2 * 2) ** 0.5)           # independent-legs price sigma (pair_corr 0)
     assert any("NOT" in r or "dollar-neutral" in r for r in best.reasons)
     mid = [o for o in rows if o.legs == (("MIDUSDT", "Sell"),)]
@@ -356,7 +357,7 @@ def _mutant(old, new):
 
 
 def _mrun(m, i=None, s=None, **kw):
-    return m.scan(i or [inst()], s or [snap()], spec={"kind": kw.pop("kind", "SPOT_PERP_CARRY"), "style": kw.pop("style", "TAKER")}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": 1.0, **(kw.pop("params", None) or {})})
+    return m.scan(i or [inst()], s or [snap()], spec={"kind": kw.pop("kind", "SPOT_PERP_CARRY"), "style": kw.pop("style", "TAKER")}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": 1.0, "opportunity_cost_apr": 0.0, **(kw.pop("params", None) or {})})
 
 
 def test_mutation_trading_status_check_removed():
@@ -451,7 +452,7 @@ def test_a_higher_persistence_assumption_cannot_rank_an_assumed_result_above_a_m
     sn = [snap("AAAUSDT", bid=99.95, ask=100.05, fund=(5.0,) * 9, iv=480), snap("BBBUSDT", bid=99.999, ask=100.001, fund=(20.0,) * 9, iv=480)]
     vol = {"AAAUSDT": 50.0, "BBBUSDT": 50.0}
     for pers in (0.5, 1.0):
-        rows = S.scan(ins, sn, spec={"kind": "PERP_DIRECTIONAL_FUNDING", "style": "TAKER"}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": pers, "price_vol_bps_per_day": vol})
+        rows = S.scan(ins, sn, spec={"kind": "PERP_DIRECTIONAL_FUNDING", "style": "TAKER"}, candidate_id="c", spec_digest="d", decision_ms=NOW, params={"persistence": pers, "price_vol_bps_per_day": vol, "opportunity_cost_apr": 0.0})
         by = {o.legs[0][0]: o for o in rows}
         assert by["AAAUSDT"].prov == "MODELLED" and by["BBBUSDT"].prov == "ASSUMED" and by["BBBUSDT"].rank_score > by["AAAUSDT"].rank_score
         assert [o.legs[0][0] for o in rows[:2]] == ["AAAUSDT", "BBBUSDT"]
@@ -474,7 +475,77 @@ def test_mutation_provenance_ranking_removed_is_caught():
     m = _mutant("key=lambda o: (T.PROVS.index(o.prov) if o.prov in T.PROVS else len(T.PROVS), -o.rank_score, o.legs))", "key=lambda o: (0, -o.rank_score, o.legs))")
     ins = [inst("AAAUSDT", spot_hedge="PERP_ONLY"), inst("BBBUSDT", spot_hedge="PERP_ONLY")]
     sn = [snap("AAAUSDT", bid=99.95, ask=100.05, fund=(5.0,) * 9, iv=480), snap("BBBUSDT", bid=99.999, ask=100.001, fund=(20.0,) * 9, iv=480)]
-    params = {"persistence": 1.0, "price_vol_bps_per_day": {"AAAUSDT": 50.0, "BBBUSDT": 50.0}}
+    params = {"persistence": 1.0, "opportunity_cost_apr": 0.0, "price_vol_bps_per_day": {"AAAUSDT": 50.0, "BBBUSDT": 50.0}}
     sp = {"kind": "PERP_DIRECTIONAL_FUNDING", "style": "TAKER"}
     assert m.scan(ins, sn, spec=sp, candidate_id="c", spec_digest="d", decision_ms=NOW, params=params)[0].legs[0][0] == "BBBUSDT"
     assert S.scan(ins, sn, spec=sp, candidate_id="c", spec_digest="d", decision_ms=NOW, params=params)[0].legs[0][0] == "AAAUSDT"
+
+
+# ------------------------------------------------------------------ Round 20: unknown financing is UNKNOWN, never a numeric 0.0
+def _unscored(**kw):
+    """A scan that does NOT state the owner's alternative return: the scanner's own default."""
+    i, sn = kw.pop("i", [inst()]), kw.pop("s", [snap()])
+    return S.scan(i, sn, spec={"kind": kw.pop("kind", "SPOT_PERP_CARRY"), "style": "TAKER"}, candidate_id="c@1", spec_digest="d" * 8, decision_ms=NOW,
+                  params={"persistence": 1.0, **kw.pop("params", {})})
+
+
+def test_an_unstated_financing_input_is_unknown_and_the_row_cannot_be_ranked_or_traded():
+    """Round 20 (P0): ``opportunity_cost_apr`` defaulted to carry_costs.DEFAULT_OPPORTUNITY_COST_APR = 0.0, so EVERY unpriced carry candidate got `financing = 0.0 (ASSUMED)`, a computed net and a rank
+    (the module's own docstring says 'Unknown input => net None and unrankable. Never zero, never defaulted'). An unpriced cost of capital is not zero."""
+    o = _unscored()[0]
+    f = cost(o, "financing")
+    assert f.bps is None and f.prov == "UNKNOWN", f
+    assert o.net_bps_horizon is None and o.rank_score is None and o.prov == "UNKNOWN"
+    assert "FINANCING_UNKNOWN" in o.exclusions and "FINANCING_UNKNOWN" in S.EXCLUSIONS
+    assert any("FINANCING_UNKNOWN" in r for r in o.reasons)
+    # the same row with the rate STATED is priced and ranked: the ONLY difference is the owner's statement
+    stated = run()[0]
+    assert stated.exclusions == () and stated.net_bps_horizon is not None and stated.rank_score is not None
+
+
+def test_a_stated_financing_rate_is_charged_on_the_capital_the_ranking_divides_by():
+    # 3.65%/yr = 1 bp/day of capital; 7 days; the carry commits 1 + margin_frac = 1.2x per unit of notional (the factor rank_score already divides by)
+    o = run(params={"opportunity_cost_apr": 0.0365})[0]
+    f = cost(o, "financing")
+    assert (f.bps, f.prov) == (pytest.approx(1.0 * 7 * 1.2), "MODELLED")
+    base = run()[0]
+    assert o.net_bps_horizon == pytest.approx(base.net_bps_horizon - 8.4) and o.exclusions == ()
+    assert o.rank_score == pytest.approx((o.net_bps_horizon / 1.2) / max(o.risk_score, 1.0)) and o.rank_score < base.rank_score
+    harsh = run(params={"opportunity_cost_apr": 0.365})[0]                                        # 10 bps/day x 7 x 1.2 = 84 bps: the whole 84 bps of funding is gone before any fee
+    assert cost(harsh, "financing").bps == pytest.approx(84.0) and harsh.rank_score is None
+    assert harsh.exclusions and "FINANCING_UNKNOWN" not in harsh.exclusions, "PRICED and refused (the capacity rule fires first: no edge is left to trade), not 'unknown'"
+
+
+def test_a_stated_zero_is_a_statement_not_an_unknown():
+    o = run(params={"opportunity_cost_apr": 0.0})[0]
+    assert (cost(o, "financing").bps, cost(o, "financing").prov) == (0.0, "MODELLED") and "FINANCING_UNKNOWN" not in o.exclusions and o.net_bps_horizon is not None
+
+
+@pytest.mark.parametrize("bad", [True, False, float("nan"), float("inf"), float("-inf"), -0.01, "0.05", [0.05], {"a": 1}])
+def test_a_malformed_financing_input_is_refused_never_coerced_to_a_number(bad):
+    with pytest.raises(S.ScanError, match="opportunity_cost_apr"):
+        _unscored(params={"opportunity_cost_apr": bad})
+
+
+def test_the_perp_only_spread_is_unpriced_without_the_rate_too():
+    """The committed margin of a perp-only book has an opportunity cost as well (it had no financing line at all)."""
+    ins, sn, vol = _spread_world()
+    unpriced = _unscored(i=ins, s=sn, kind="PERP_FUNDING_SPREAD", params={"price_vol_bps_per_day": vol, "top_k": 2})
+    pairs = [o for o in unpriced if len(o.legs) == 2]
+    assert pairs and all("FINANCING_UNKNOWN" in o.exclusions and o.rank_score is None and o.net_bps_horizon is None for o in pairs)
+    priced = run(ins, sn, kind="PERP_FUNDING_SPREAD", params={"price_vol_bps_per_day": vol, "top_k": 2, "opportunity_cost_apr": 0.0365})
+    best = priced[0]
+    assert (cost(best, "financing").bps, cost(best, "financing").prov) == (pytest.approx(1.0 * 7 * 0.2), "MODELLED")           # 20% margin per unit of gross notional
+    assert best.exclusions == () and best.rank_score is not None
+
+
+def test_an_unknown_cost_can_never_make_a_candidate_pass_the_profitability_gate_or_outrank_a_priced_one():
+    """Two symbols; the richer one would win with a free cost of capital. With the rate UNSTATED neither is eligible (no ranking exists); with it STATED both are ranked by their priced net."""
+    ins = [inst("AAAUSDT"), inst("BBBUSDT")]
+    sn = [snap("AAAUSDT", fund=(6.0,) * 9), snap("BBBUSDT", fund=(4.0,) * 9)]
+    unpriced = _unscored(i=ins, s=sn)
+    assert all(o.rank_score is None and o.net_bps_horizon is None for o in unpriced) and not any(not o.exclusions for o in unpriced)
+    priced = run(ins, sn, params={"opportunity_cost_apr": 0.0})
+    assert [o.legs[1][0] for o in priced if not o.exclusions] == ["AAAUSDT", "BBBUSDT"]
+    harsh = run(ins, sn, params={"opportunity_cost_apr": 5.0})                    # a stated 500%/yr: the same rows are PRICED and refused (they do not 'pass by being unknown', nor fail by it)
+    assert all(o.exclusions and "FINANCING_UNKNOWN" not in o.exclusions and o.rank_score is None for o in harsh)

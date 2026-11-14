@@ -1253,6 +1253,10 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
     if unkeyed and not allow_unverified_key_basis_for_tests:
         raise RH.HarnessError(f"{len(unkeyed)} series lack the loader's key_basis token (only load_history_root sets it; a string is not accepted): marks/funding keyed by candle start would leak the future; "
                               f"first: {unkeyed[:3]}")
+    _loaded = universe_info.get("symbols_loaded_names") if (isinstance(universe_info, Mapping) and _verified_verdict(universe_info) is not None) else None
+    if _loaded is not None and sorted(s.symbol for s in series) != list(_loaded):
+        raise RH.HarnessError("SERIES_DISAGREES_WITH_LOADED_INFO: the series differ from the symbols the loader returned, so its coverage, dataset state and identity describe a different universe "
+                              f"(loaded {len(_loaded)}, evaluated {len(series)}); a symbol is never dropped by the caller after the loader judged the root")
     spec = spec if spec is not None else _default_spec()
     c = cost_constants()
     cost = float(round_trip_bps) if round_trip_bps is not None else c["perp_round_trip_total_bps"]
@@ -1285,6 +1289,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                            "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED,
                            "history_coverage": (universe_info or {}).get("history_coverage") if isinstance(universe_info, Mapping) else None,
                            "dataset_state": universe_info.get("dataset_state") if _verified_verdict(universe_info) is not None else None,        # only the loader's own sealed info: a hand-made dict cannot forge it
+                           "frozen_mark_symbols": universe_info.get("frozen_mark_symbols") if _verified_verdict(universe_info) is not None else None,
                            "loaded_identity": universe_info.get("loaded_identity") if _verified_verdict(universe_info) is not None else None,
                            "survivorship_claim_note": ("DELISTINGS_OBSERVED: Closed contracts the venue still serves were observed; an absent symbol is still not proof it was never delisted"
                                                        if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
@@ -1659,7 +1664,9 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     for _fm in frozen_marks:
         state_findings["invalid"].append(f"{_fm['symbol']}: the mark price is frozen ({_fm['run_candles']} identical consecutive candles against a limit of {_fm['min_candles']}"
                                          + (f"; and a window of {_fm['stuck_window_candles']} candles holds at most two distinct closes" if _fm["stuck_window_candles"] else "")
-                                         + f"): not a market price series, its price leg is near zero for every hold (confirm against the venue's public klines, then collect a NEW root without it)")
+                                         + f"): not a market price series, its price leg is near zero for every hold. Confirm it against the venue's public klines. This root can be neither evaluated as complete nor reserved while it holds the symbol, "
+                                         f"and a NEW root without it still lists the symbol as lifecycle-eligible in the universe capture, which reads DATA_INCOMPLETE: an owner-registered exclusion policy (decision D7, "
+                                         f"docs/MONEY_MISSION.md) is needed before any --reserve; nothing here drops a symbol")
     for _nm, _man in (("funding", fman), (mark_name, mman), ("the universe capture", uinfo)):
         _st = _man.get("dataset_status")
         if _st in ("CONFLICTED", "UNVERIFIED"):
@@ -1695,6 +1702,9 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
     if hedge_info is not None:
         info["hedge_verdicts"] = {s.symbol: verdicts.get(s.symbol) for s in series}
         info["hedge"] = hedge_info
+    for _fm in frozen_marks:
+        warnings.append(f"FROZEN_MARK_PRICE:{_fm['symbol']}: {_fm['run_candles']} identical consecutive mark closes; the root is DATA_INVALID and the symbol is NOT removed from the series")
+    info["symbols_loaded_names"] = sorted(x.symbol for x in series)                     # what the loader actually returned: an evaluation refuses a series that differs (SERIES_DISAGREES_WITH_LOADED_INFO)
     if warnings:
         info["warning"] = "; ".join(warnings)
     return series, info

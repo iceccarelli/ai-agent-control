@@ -40,7 +40,7 @@ BOT = os.path.dirname(HERE)
 #: static import closure of the three recorder-side entry points, computed from the repository at ``expected`` time, so a parser, book or
 #: store module the recorder imports is compared too (an earlier version compared a hand-picked 19 files and could say "contains the
 #: recorder" while the book code differed). The REPORT TOOLS are listed after a marker and only the owner's analysis uses them.
-ENTRY_POINTS = ("tools/market_recorder.py", "tools/runner_monitor.py", "tools/runner_supervisor.py")
+ENTRY_POINTS = ("tools/market_recorder.py", "tools/runner_monitor.py", "tools/runner_supervisor.py", "tools/carry_preflight.py")     # carry_preflight is spawned by path (not imported) by runner_monitor every cycle
 REPORT_TOOLS = ("tools/profitability_report.py", "tools/anchor_archive.py", "tools/capacity_summary.py")
 MARKER = "# report-tools (not part of the recorder)"
 
@@ -138,6 +138,21 @@ def parse(text: str) -> Tuple[Dict[str, str], List[str]]:
     return have, missing
 
 
+def conflicts(text: str) -> List[str]:
+    """Paths the text states TWICE in a way that disagrees: two different hashes, or a hash and a 'No such file'. ``parse`` keeps the last line, so concatenated output of two machines or two runs
+    (a wrong hash first, the right one later) read as a match; a conflicting path is never a match."""
+    seen: Dict[str, set] = {}
+    for ln in text.splitlines():
+        m = _LINE.match(ln.strip())
+        if m:
+            seen.setdefault(m.group(2), set()).add(m.group(1))
+            continue
+        m = _MISSING.search(ln)
+        if m:
+            seen.setdefault(m.group(1), set()).add("MISSING")
+    return sorted(k for k, v in seen.items() if len(v) > 1)
+
+
 def _split_expected(text: str) -> Tuple[List[str], List[str]]:
     rec: List[str] = []
     tools: List[str] = []
@@ -152,23 +167,43 @@ def _split_expected(text: str) -> Tuple[List[str], List[str]]:
     return rec, tools
 
 
-def compare(expected_text: str, actual_text: str) -> Dict[str, Any]:
+def compare(expected_text: str, actual_text: str, root: Optional[str] = BOT) -> Dict[str, Any]:
+    """Compare the expected listing with what the machine reported. Fail closed: a path stated inconsistently on either side, an expected listing with no recorder files, a recorder file filed under the
+    report-tools marker, or an expected listing that does not cover THIS checkout's recorder closure is never IDENTICAL. ``root=None`` skips the checkout cross-check (the listing alone is judged)."""
     want, _ = parse(expected_text)
     rec_files, tool_files = _split_expected(expected_text)
     got, missing = parse(actual_text)
+    bad = set(conflicts(actual_text)) | set(conflicts(expected_text))
+    closure_files: List[str] = []
+    if root is not None:
+        try:
+            closure_files = file_sets(root)[0]
+        except (SystemExit, OSError, SyntaxError):
+            closure_files = []
+    misfiled = sorted(f for f in tool_files if f in closure_files)             # a recorder file listed after the marker would be judged as a report tool: judge it as the recorder file it is
+    if misfiled:
+        rec_files = rec_files + misfiled
+        tool_files = [f for f in tool_files if f not in misfiled]
+    uncovered = sorted(f for f in closure_files if f not in rec_files)          # this checkout's recorder closure has files the expected listing does not name
     rows: List[Dict[str, str]] = []
     for rel in rec_files + tool_files:
         part = "recorder" if rel in rec_files else "report_tool"
-        if rel in got:
+        if rel in bad:
+            st = "CONFLICTING_REPORT"
+        elif rel in got:
             st = "MATCH" if got[rel] == want[rel] else "DIFFERENT"
         elif rel in missing:
             st = "MISSING_ON_MACHINE"
         else:
             st = "NOT_REPORTED_BY_MACHINE"
         rows.append({"file": rel, "part": part, "status": st})
-    recorder_ok = bool(rec_files) and all(r["status"] == "MATCH" for r in rows if r["part"] == "recorder")
-    all_ok = bool(rows) and all(r["status"] == "MATCH" for r in rows)
-    if all_ok:
+    recorder_ok = bool(rec_files) and not uncovered and all(r["status"] == "MATCH" for r in rows if r["part"] == "recorder")
+    all_ok = recorder_ok and all(r["status"] == "MATCH" for r in rows)
+    if not rec_files:
+        verdict = "EXPECTED_LISTING_HAS_NO_RECORDER_FILES"
+    elif uncovered:
+        verdict = "EXPECTED_LISTING_DOES_NOT_COVER_THIS_CHECKOUT"
+    elif all_ok:
         verdict = "IDENTICAL_TO_EXPECTED"
     elif recorder_ok:
         verdict = "RECORDER_FILES_IDENTICAL_REPORT_TOOLS_DIFFER"
@@ -177,9 +212,9 @@ def compare(expected_text: str, actual_text: str) -> Dict[str, Any]:
     else:
         verdict = "DOES_NOT_CONTAIN_THIS_RECORDER_IMPLEMENTATION"
     return {"verdict": verdict, "rows": rows, "contains_this_recorder_implementation": recorder_ok,
-            "recorder_files_compared": len(rec_files),
+            "recorder_files_compared": len(rec_files), "conflicting_paths": sorted(bad), "expected_listing_misses": uncovered,
             "differing": [r["file"] for r in rows if r["status"] != "MATCH"],
-            "note": "byte-for-byte comparison of the recorder's whole import closure; it does not identify the commit or the image digest"}
+            "note": "byte-for-byte comparison of the recorder's whole import closure; it does not identify the commit or the image digest. Run `expected`, `command` and `compare` from the SAME checkout"}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

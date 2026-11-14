@@ -594,3 +594,35 @@ def test_the_headline_is_named_and_labelled_realised_cash_and_the_economic_total
     assert "NOT total profit" in rep["headline_caveat"] and "economic_total" in rep["headline_caveat"]
     assert rep["headline_realised_cash_usd"] > 0 > rep["layers"]["economic_total"]["net_economic_pnl_usd"]     # the very case the old name hid
     assert "headline_realised_cash_usd" in rep["lineage"]["figures"] and "REALISED CASH ONLY" in rep["lineage"]["figures"]["headline_realised_cash_usd"]["formula"]
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: a negative balance with no stated borrow is an unknown loan, not a clean book
+
+def _wallet_without_borrow_amount(ts, usdt, btc):
+    w = wallet(ts, usdt, btc)
+    for coin in w["result"]["list"][0]["coin"]:
+        coin.pop("borrowAmount", None)
+    return w
+
+
+@pytest.mark.parametrize("borrow", ["absent", "empty", "zero"])
+def test_a_negative_usdt_balance_without_a_stated_borrow_is_not_reconciled_and_states_no_profit(tmp_path, borrow):
+    """REPRODUCED (Round 20, specialist C): opening USDT -5,000 with borrowAmount absent (or '') imported as RECONCILED with a +$476.28 headline and no flag, while the same file with borrowAmount
+    '5000' was INCOMPLETE. On a unified account a negative balance IS a loan: its principal, accrued interest and collateral treatment are unknown, so no profit is stated."""
+    t = Trip(usdt0=-5000.0)
+    cu, cb = t.closing()
+    w0, w1 = _wallet_without_borrow_amount(F.W0_TS, -5000.0, 1.0), _wallet_without_borrow_amount(F.W1_TS, cu, cb)
+    if borrow == "empty":
+        w0["result"]["list"][0]["coin"][0]["borrowAmount"] = ""
+    elif borrow == "zero":
+        w0["result"]["list"][0]["coin"][0]["borrowAmount"] = "0"
+    rep = run(tmp_path, t, w0=w0, w1=w1)
+    assert "BORROW_PRINCIPAL_UNSTATED" in flag_codes(rep, "GAP"), flag_codes(rep)
+    no_profit_claim(rep)
+    assert rep["status"] == "INCOMPLETE"
+
+
+def test_a_clean_book_with_a_positive_balance_is_still_reconciled(tmp_path):
+    """Control: the new flag never fires on a positive balance, so the clean round trip keeps its RECONCILED status and headline."""
+    rep = run(tmp_path, Trip())
+    assert "BORROW_PRINCIPAL_UNSTATED" not in flag_codes(rep) and rep["headline_realised_cash_usd"] is not None

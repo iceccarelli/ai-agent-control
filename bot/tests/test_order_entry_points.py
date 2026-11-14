@@ -194,3 +194,52 @@ def test_an_armed_drill_whose_hold_could_outlive_the_unrenewed_lease_is_refused_
     assert release is None and "do not renew" in why
     r2, why2 = DRL.single_writer_guard({}, max_runtime_s=900.0)                                        # a short run proceeds to the lease check (refused here only for lack of lease configuration)
     assert r2 is None and "NO_GLOBAL_LEASE_CONFIGURED" in why2
+
+
+# ------------------------------------------------------------------ Round 20: the inventory is alias-proof (it was regex-based and missed `from ms_testnet_executor import X as Y`)
+ORDER_METHODS = {"send_order", "submit_group"}
+EXECUTOR_MODULES = {"ms_testnet_executor"}
+
+
+def _order_capable_spellings(src: str) -> Set[str]:
+    """What in this source makes it able to reach the order-capable executor, by AST: ANY import of the executor module (plain, aliased, from-import, from-import with an alias, a dotted path), a
+    `__import__` / `importlib.import_module` of it by name, or a call to an order method (``send_order`` / ``submit_group``) on anything. The old detector matched only the literal line `import ms_testnet_executor`
+    and the call spelling `TE.TestnetExecutor(`, so `from ms_testnet_executor import TestnetExecutor as _X; _X.__new__(_X).send_order(...)` in a new executable passed unclassified (reproduced)."""
+    tree = ast.parse(src)
+    hits: Set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            hits |= {f"import:{a.name}" for a in n.names if a.name.split(".")[0] in EXECUTOR_MODULES}
+        elif isinstance(n, ast.ImportFrom) and n.module and n.module.split(".")[0] in EXECUTOR_MODULES:
+            hits.add(f"from:{n.module}")
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Attribute) and f.attr in ORDER_METHODS:
+                hits.add(f"call:{f.attr}")
+            elif isinstance(f, ast.Name) and f.id in ("__import__", "import_module") and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value in EXECUTOR_MODULES:
+                hits.add(f"dynamic:{n.args[0].value}")
+            elif isinstance(f, ast.Attribute) and f.attr == "import_module" and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value in EXECUTOR_MODULES:
+                hits.add(f"dynamic:{n.args[0].value}")
+    return hits
+
+
+def test_the_detector_sees_every_spelling_of_reaching_the_executor_and_ignores_prose():
+    planted = {
+        "plain": "import ms_testnet_executor",
+        "aliased": "import ms_testnet_executor as TE",
+        "from": "from ms_testnet_executor import TestnetExecutor",
+        "from_alias": "from ms_testnet_executor import TestnetExecutor as _X\nex = _X.__new__(_X)",
+        "send_order": "def f(ex):\n    ex.send_order(None)",
+        "submit_group": "def f(ex):\n    ex.submit_group(None)",
+        "dunder": "x = __import__('ms_testnet_executor')",
+        "importlib": "import importlib\nx = importlib.import_module('ms_testnet_executor')",
+    }
+    for kind, src in planted.items():
+        assert _order_capable_spellings(src), f"missed the {kind} spelling"
+    assert _order_capable_spellings('"""uses ms_testnet_executor and send_order in prose"""\nx = "ms_testnet_executor"') == set()
+
+
+def test_every_executable_reaching_the_executor_by_any_spelling_is_classified():
+    found = _files(lambda f: _has_main(OPI._rel(f)) and bool(_order_capable_spellings(open(f, encoding="utf-8").read())))
+    unclassified = sorted(found - set(ENTRY_POINTS))
+    assert not unclassified, f"executables that reach the order-capable executor with no classification (add them to ENTRY_POINTS on purpose): {unclassified}"

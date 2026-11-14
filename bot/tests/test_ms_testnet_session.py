@@ -920,3 +920,19 @@ def test_a_blank_execfee_leaves_the_session_net_unknown_not_a_measured_zero(w, m
     assert w.execute(_ready(w)) == 0
     net = w.record()["net"]
     assert net["fees_usd"] is None, net                                                           # unknown, never 0.0
+
+
+@pytest.mark.parametrize("bad", ["REMOVE", None, "1000", True, float("nan"), float("inf")])
+def test_a_plan_whose_preflight_carries_no_numeric_usdt_balance_is_refused_never_assumed_funded(w, monkeypatch, bad):
+    """REPRODUCED (Round 20, specialist C): the cash check that justifies pricing the spot leg's borrow at a structural zero ran only when the USDT read happened to be numeric; a missing or malformed read
+    skipped it. A plan with no proven cash is refused before any order. (The CLI's own preflight always writes a number, so the planner is exercised with the read corrupted on its way in.)"""
+    assert w.run("preflight") == 0
+    real = S.build_plan
+
+    def corrupted(manifest, pre, **kw):
+        pre = {k: v for k, v in pre.items() if k != "usdt"} if bad == "REMOVE" else {**pre, "usdt": bad}
+        return real(manifest, pre, **kw)
+
+    monkeypatch.setattr(S, "build_plan", corrupted)
+    assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "100") != 0
+    assert "USDT_BALANCE_UNREAD" in w.text() and not any(r[0] == "POST" for r in w.fake.requests)

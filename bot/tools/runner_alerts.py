@@ -56,6 +56,7 @@ Exit code is the health report's (0 healthy, 1 problem, 2 no data, 3 alarm).
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import math
 import os
@@ -98,6 +99,11 @@ RECORDER_DOWN_CYCLES = 3
 RECORDER_RESERVE_MB = 512
 RECORDER_FREE_WARN_MB = RECORDER_RESERVE_MB + 1024
 RECORDER_DISK_LOW_CYCLES = 3
+#: A free-space reading below the write reserve that persists for this long, across at least two UTC midnights, is not a transient dip: the daily ramp (the oldest day dropped at each UTC boundary) would
+#: have lifted it. Two causes produce it and the history cannot tell them apart: a volume too small to hold even one day above the reserve (the first segment is protected, so it never recovers), or a
+#: running image that predates the bounded recovery. 48 h and 3 readings; measured against the monitor's own `at` stamps, never against the machine that read them.
+RECORDER_STALL_PERMANENT_HOURS = 48.0
+RECORDER_STALL_PERMANENT_MIN_ROWS = 3
 RESEND_S = 6 * 3600.0
 WATCHDOG_POLL_S = 60.0
 
@@ -322,6 +328,40 @@ def _free_mib(row: Mapping[str, object]) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
+def _row_epoch(row: Mapping[str, object]) -> Optional[float]:
+    """The monitor line's own `at` stamp (UTC, ``YYYY-MM-DDTHH:MM:SSZ``) as epoch seconds, or None when it is absent or unreadable."""
+    at = row.get("at")
+    if not isinstance(at, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(at[:19], "%Y-%m-%dT%H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _recorder_stall_permanent(rows: Sequence[Mapping[str, object]]):
+    """The trailing run of free-space readings that are ALL below the write reserve, when it has at least RECORDER_STALL_PERMANENT_MIN_ROWS readings, spans at least RECORDER_STALL_PERMANENT_HOURS and
+    crosses at least two UTC midnights (so a transient dip that recovers at the next boundary can never qualify); else None. A reading at or above the reserve ends the run; rows with no usable reading
+    or no usable `at` stamp neither extend nor end it (a gap is not evidence either way), but the run needs stamps on its first and last reading."""
+    readings = [r for r in rows if _free_mib(r) is not None]
+    run: List[Mapping[str, object]] = []
+    for r in reversed(readings):
+        if float(_free_mib(r)) < RECORDER_RESERVE_MB:               # type: ignore[arg-type]
+            run.append(r)
+        else:
+            break
+    run.reverse()
+    if len(run) < RECORDER_STALL_PERMANENT_MIN_ROWS:
+        return None
+    first, last = _row_epoch(run[0]), _row_epoch(run[-1])
+    if first is None or last is None or last < first:
+        return None
+    midnights = int(last // 86400) - int(first // 86400)
+    if (last - first) / 3600.0 < RECORDER_STALL_PERMANENT_HOURS or midnights < 2:
+        return None
+    return run, (last - first) / 3600.0, midnights
+
+
 def _recorder_disk_low(rows: Sequence[Mapping[str, object]], n: int):
     """The last `n` rows that carry a usable free-space reading, when EVERY one is below the warning level; else None. Free space is a daily ramp (the oldest day is dropped when a new UTC day
     opens), so the debounce only filters a momentary dip: a volume whose daily low sits under the warning level stays in alert for part of every day. It does not look at `recorder_state`
@@ -470,6 +510,16 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None, rea
             "At the reserve the recorder stops writing; it recovers only at the next UTC day boundary and only if the volume holds the retained days plus the reserve, otherwise it stays stopped. The RUNNING image may predate even that bounded "
             "recovery (merging it changes no running machine): check with RUNBOOKS section 18. Read the volume (fly volumes list -a carry-drill; df -h /data) and either extend it or lower "
             "--recorder-retention-days; see MONEY_MISSION.md (recorder size model) and RUNBOOKS section 14."))
+    perm = _recorder_stall_permanent(rows)
+    if perm:
+        run, hours, midnights = perm
+        alerts.append(Alert(
+            "recorder_stall_permanent", WARNING,
+            f"every free-space reading for the last {hours:.0f} h ({len(run)} readings, {midnights} UTC midnights; latest {float(_free_mib(run[-1])):.0f} MiB) is below the {RECORDER_RESERVE_MB} MiB write reserve. "
+            "A transient dip recovers at the next UTC day boundary; this has not, so the recorder is not coming back by itself. Two causes fit this history and only a read of the machine tells them apart: "
+            "(1) the volume cannot hold even ONE day of data above the reserve (the first segment is never pruned, so it stays stopped for good: extend the volume, RUNBOOKS section 14), or "
+            "(2) the RUNNING image predates the bounded recovery (RUNBOOKS section 18). Read-only checks: fly volumes list -a carry-drill; "
+            "fly ssh console -a carry-drill -C \"ls -l --time-style=full-iso /data/market\" (a single md-<day>.db of a fraction of a GB, and no pruned.jsonl, means cause 1). Nothing is deleted or resized by this alert."))
     rising = _recorder_restarting(rows)
     if rising:
         a, b = rising
