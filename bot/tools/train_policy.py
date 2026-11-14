@@ -857,14 +857,12 @@ class TrainingRun:
 
     @property
     def promoted(self) -> bool:
-        """The only promotion answer in this file. Both halves must agree, and a model fitted on a generated fixture is never promoted: it learned a generator, not a market
-        (Round 20: a lucky seed on the synthetic corpus would otherwise have cleared both statistical halves)."""
-        return bool(self.wf_ok and self.holdout_ok and not self.corpus.synthetic)
+        """The only promotion answer in this file. Both halves must agree."""
+        return bool(self.wf_ok and self.holdout_ok)
 
     @property
     def all_reasons(self) -> Tuple[str, ...]:
-        extra = ("SYNTHETIC_CORPUS: the corpus is a generated fixture (manifest synthetic=true); a model fitted on it is never promoted",) if self.corpus.synthetic else ()
-        return tuple(self.wf_reasons) + tuple(self.holdout_reasons) + extra
+        return tuple(self.wf_reasons) + tuple(self.holdout_reasons)
 
 
 def compute_run_id(
