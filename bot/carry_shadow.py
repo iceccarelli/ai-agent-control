@@ -67,6 +67,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -74,6 +75,8 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+_log = logging.getLogger("carry_shadow")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -785,6 +788,10 @@ class ShadowRuntime:
             ledger=state, venue_perp_qty=perp,
             venue_spot_qty=self.broker.get_spot_inventory(SYMBOL),
             open_orders=[])
+        # The engine's own line ("carry cold start: RESUMED ...") is worded for a real account. Here its "venue" is this book's SIMULATED broker, whose holdings were set from the shadow
+        # database one statement above, so the planner can only agree with itself: say so beside it, so the line is never read as a venue read or as real exposure.
+        _log.warning("carry shadow cold start %s: run against this book's SIMULATED venue (holdings taken from the shadow database: perp short %.10g, spot %.10g). This is NOT a read of any "
+                     "exchange account and says nothing about real exposure.", decision.action.value, perp, acquired)
         if decision.action.value == "HALT":
             self.kill.trip(f"COLD_START: {decision.reason}")
 
