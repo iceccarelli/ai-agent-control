@@ -1,3 +1,8 @@
+# RETIRED AS GUIDANCE (Round 21). This workflow is OFF unless the repository variable CARRY_DRILL_ENABLED is 'true', and it must stay off:
+# the legacy conformance path is not the selected executor, the 2026-11-05 carry-drill image predates the shared-lease guard, and GitHub's
+# runners cannot reach Bybit anyway. Do not enable it, do not add a Bybit secret to its environment, and do not read the description below
+# as an operating procedure. The topology that applies is the 'Operating topology' block at the top of bot/RUNBOOKS.md.
+#
 # UNATTENDED carry drill on the Bybit TESTNET, across a funding settlement.
 #
 # NOTE (2026-10-25): Bybit's CloudFront blocks GitHub-hosted runners (HTTP 403,

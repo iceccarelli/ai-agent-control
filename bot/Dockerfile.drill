@@ -61,9 +61,9 @@ ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]
 # safety preconditions, the venue state and the production entry economics each
 # hour, and cannot place or cancel an order. The order-capable conformance run
 # (tools/unattended_drill.py --conformance) ships in the image but is never the
-# default; it must be invoked explicitly, e.g. `fly machine run ... -- python3
-# tools/unattended_drill.py --conformance --loop --run-dir /data/runs`.
-# That order-capable run takes the SAME global Supabase lease as the autopilot before every armed run
-# (tools/legacy_executor_guard.py) and places nothing without SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and
-# SUPABASE_OWNER_ID: the autopilot is the only order-capable service unless you deliberately wire this one in.
+# default and is NOT to be invoked: this app is the read-only recorder and monitor
+# (RUNBOOKS "Operating topology"). The deployed 2026-11-05 image predates the shared-lease guard, and the
+# code here (tools/legacy_executor_guard.py) takes the SAME global Supabase lease as the autopilot before
+# every armed run and places nothing without SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and SUPABASE_OWNER_ID.
+# The one selected Testnet executor is the only order-capable service, and none is deployed today.
 CMD ["python3", "tools/runner_supervisor.py", "--recorder", "--recorder-dir", "/data/market", "--recorder-environment", "mainnet", "--recorder-min-free-mb", "512", "--recorder-retention-days", "2", "--", "python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db", "--mainnet-db", "/data/mainnet/mainnet_public.jsonl", "--recorder-status", "/data/market/recorder_status.json"]

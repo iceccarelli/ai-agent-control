@@ -168,7 +168,8 @@ not a feature flag to flip on the way to production.
 2. **Move to linear** if the suppressed-short count says you are discarding most
    of your edge. Before you do: write the perp simulator (funding accrual,
    mark-to-market, liquidation price), re-run walk-forward, and only then run
-   paper → testnet → microscopic live, per `DEPLOYMENT.md`.
+   paper → Bybit Testnet only (`DEPLOYMENT.md` is retired: nothing here is a path to
+   live capital; see the topology block in `RUNBOOKS.md`).
 3. **Never** enable leverage as a way to compensate for a weak edge. Leverage
    multiplies an edge; it does not create one, and on a negative expectancy it
    multiplies the loss and shortens the time to ruin.

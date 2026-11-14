@@ -1,18 +1,20 @@
-# The unattended TESTNET runner. A separate app from carry-book.
+# The READ-ONLY recorder and monitor app (carry-drill). Not an order executor: see the
+# "Operating topology" block in RUNBOOKS.md. (Historically it was the unattended TESTNET
+# runner, a separate app from carry-book; that role is retired.)
 # Its default command is READ-ONLY (tools/runner_monitor.py: reachability, safety
 # preconditions, venue state, entry economics; it cannot place an order). The
-# order-capable conformance run is a separate, explicitly invoked command.
+# order-capable conformance run is a separate command that is NOT to be invoked here.
 # Each cycle also records one PUBLIC observation in the post-gate forward shadow
 # book at /data/shadow/post_gate_v1.db once that book has been created by hand
 # (carry_shadow.py forward-init); the monitor never creates it.
-# Deploy with `fly deploy -c fly.drill.toml --ha=false` (never `fly launch`,
-# which rewrites config). tests/test_drill_image.py pins these properties.
+# Any change to this file is an owner-approved deploy (`fly deploy -c fly.drill.toml --ha=false`,
+# never `fly launch`, which rewrites config). tests/test_drill_image.py pins these properties.
 #
 #   one machine, one volume     two runners would be two hedges
 #   no [http_service]           nothing to serve
 #   kill_timeout 300s           the SIGTERM path unwinds the drill and runs the
 #                               reduce-only close; it needs ~4 minutes
-#   no secrets in this file     `fly secrets set BYBIT_API_KEY BYBIT_API_SECRET`
+#   no secrets in this file     credentials are Fly secrets (names only here); generic BYBIT_API_* are not Testnet credentials
 
 app = "carry-drill"
 primary_region = "fra"

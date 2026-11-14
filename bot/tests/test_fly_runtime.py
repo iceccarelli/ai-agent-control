@@ -91,89 +91,46 @@ class TestTheBuildContextCanDeliverEveryCopy:
             assert fly_stack.excluded_by(patterns, path), path
 
 
-class TestTheDeployScriptCannotReachMainnet:
-    """0046 — `scripts/deploy.sh` is the one command from a checkout to a
-    running book. The one thing it must never do is deploy one that can spend
-    real money, and that refusal has to be in the script rather than in the
-    head of whoever runs it."""
+class TestTheDeployScriptIsRetired:
+    """Round 21: `scripts/deploy.sh` used to take a checkout to a running `carry-book` and printed
+    instructions to ARM it (`PAPER_TRADING=0`, `drill.py --arm`). That is not the current mandate
+    (paper and Testnet only; `carry-book` stays stopped). The script is now a refusal that touches
+    nothing, and these tests keep it that way: a deploy path must come back as a NEW, reviewed,
+    owner-approved document, never as a revived script."""
 
     def script(self):
         path = os.path.join(ROOT, "..", "scripts", "deploy.sh")
-        assert os.path.exists(path), "scripts/deploy.sh is missing"
+        assert os.path.exists(path), "scripts/deploy.sh must exist as the refusing tombstone (a missing file would let an old copy or a pasted command take its place)"
         return open(path, encoding="utf-8").read()
 
-    def test_mainnet_is_refused_by_name(self):
+    def code_lines(self):
+        return [ln.strip() for ln in self.script().splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+    def test_it_refuses_before_any_other_command(self):
+        code = self.code_lines()
+        assert code[0] == "set -euo pipefail"
+        assert code[1].startswith("cat >&2 <<'RETIRED'")
+        assert code[-1] == "exit 2"
+        assert code.index("exit 2") == len(code) - 1
+
+    def test_it_runs_no_fly_or_network_or_secret_command(self):
+        body = "\n".join(self.code_lines())
+        for forbidden in ("flyctl", "fly ", "$FLY", "curl", "wget", "secrets", "deploy ", "apps create", "volumes", "ssh", "launch",
+                          "PAPER_TRADING", "LIVE_TRADING_ACK", "USE_TESTNET", "BYBIT_API", "BYBIT_VENUE", "mainnet", "--arm", "drill.py"):
+            assert forbidden not in body, (forbidden, body)
+
+    def test_the_whole_file_prints_no_arming_or_deploy_instruction(self):
+        """Even a comment or a heredoc line must not be a copy-paste instruction to arm or deploy."""
         text = self.script()
-        assert "mainnet)" in text
-        assert "REFUSED: this script does not deploy to mainnet" in text
+        for armed in ("PAPER_TRADING=0", "LIVE_TRADING_ACK=", "USE_TESTNET=0", "drill.py --arm", "fly deploy", "fly secrets set", "fly apps create"):
+            assert armed not in text, armed
 
-    def test_it_deploys_immediate(self):
-        assert "--strategy immediate" in self.script()
-
-    def test_it_arms_nothing(self):
-        """It may PRINT the arming commands. It may not run them.
-
-        Every occurrence of an arming string must fall after the point where
-        the script has stopped executing and started printing instructions.
-        """
-        body = self.script()
-        instructions_begin = body.index("ARMING, when the preflight is clean")
-        for armed in ("PAPER_TRADING=0", "LIVE_TRADING_ACK", "drill.py --arm"):
-            first = body.find(armed)
-            if first == -1:
-                continue
-            assert first > instructions_begin, (
-                f"{armed!r} appears in the executed part of deploy.sh, not "
-                "only in the instructions it prints")
-
-    def test_it_never_calls_fly_launch(self):
-        """`fly launch` REWRITES fly.toml. It did, on the run that first
-        deployed this app, and the rewritten file then failed the checks that
-        had passed minutes earlier. What it adds is what this book cannot
-        have: it reads the Dockerfile's EXPOSE and offers an [http_service],
-        which drags in auto_stop — and a machine stopped while holding a hedge
-        leaves a client unhedged.
-
-        `fly apps create` registers the app and writes nothing."""
-        text = self.script()
-        for invocation in ('"$FLY" launch', "fly launch --", "flyctl launch"):
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("#") or stripped.startswith("echo"):
-                    continue          # a mention is not a call
-                assert invocation not in stripped, \
-                    f"fly launch rewrites fly.toml: {stripped}"
-        assert "apps create" in text
-
-    def test_it_checks_the_config_again_after_launch_rewrites_it(self):
-        """`fly launch` prints "Wrote config file fly.toml" — it REWRITES the
-        document step 2 checked. If it dropped `strategy = immediate` or added
-        an [http_service] with auto_stop, the machine could run two books or
-        be stopped while holding a hedge. So the check runs twice, and the
-        second one stops the deploy."""
-        text = self.script()
-        first = text.index("fly_stack.py --check")
-        launch = text.index("apps create")
-        second = text.index("fly_stack.py --check", launch)
-        assert first < launch < second, \
-            "the config is not re-checked after fly launch rewrites it"
-        after = text[second:second + 600]
-        assert "exit 1" in after, \
-            "a failed post-launch check must stop the deploy, not warn"
-
-    def test_a_missing_egress_ip_explains_the_consequence(self):
-        """Fly disables egress IPs for trial organisations. The script must
-        say what that MEANS — the key cannot be IP-pinned — rather than
-        printing a shrug."""
-        text = self.script()
-        assert "CANNOT BE IP-PINNED" in text
-        assert "MAINNET it is not acceptable" in text
-
-    def test_it_checks_the_config_before_creating_anything(self):
-        """0047 resolved flyctl to one shell variable, so the call reads
-        `"$FLY" launch`. The invariant is the ORDER, not the spelling."""
-        text = self.script()
-        assert text.index("fly_stack.py --check") < text.index("apps create")
+    def test_it_exits_2_and_says_so_when_run(self):
+        import subprocess
+        proc = subprocess.run(["bash", os.path.join(ROOT, "..", "scripts", "deploy.sh")], capture_output=True, text=True, timeout=20,
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/nonexistent"})
+        assert proc.returncode == 2
+        assert "REFUSED" in proc.stderr and "retired" in proc.stderr and proc.stdout == ""
 
 
 class TestTwoMachinesIsTwoBooks:
@@ -340,11 +297,14 @@ class TestTheCommittedTomlIsTheGeneratedToml:
         with open(os.path.join(ROOT, "fly.toml"), encoding="utf-8") as handle:
             assert handle.read() == rendered
 
-    def test_the_printed_commands_never_arm_and_never_use_launch(self):
+    def test_the_printed_commands_are_a_retirement_notice_and_never_a_command(self):
+        """Round 21: `fly_stack.py --commands` printed `fly apps create carry-book`, the generic Bybit key names
+        and a deploy. It now prints a retirement notice: every line is a comment, and no line anywhere contains a
+        command that creates, secrets, deploys or arms."""
         text = fly_stack.COMMANDS
+        assert text.lstrip().startswith("# RETIRED"), text[:80]
         for line in text.splitlines():
-            if line.lstrip().startswith("#") or not line.strip():
-                continue
-            assert "PAPER_TRADING=0" not in line and "LIVE_TRADING_ACK" not in line, line
-            assert "fly launch" not in line, line
-        assert "--ha=false" in text and "fly apps create" in text
+            assert not line.strip() or line.lstrip().startswith("#"), f"an executable-looking line: {line!r}"
+        for forbidden in ("fly apps create", "fly secrets set", "fly deploy", "fly launch --", "fly volumes create", "PAPER_TRADING=0", "LIVE_TRADING_ACK=", "USE_TESTNET=0", "--arm"):
+            assert forbidden not in text, forbidden
+        assert "BYBIT_API_KEY=" not in text and "BYBIT_API_SECRET=" not in text

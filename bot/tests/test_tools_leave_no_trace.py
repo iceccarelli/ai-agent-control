@@ -156,26 +156,3 @@ class TestTheDrillSaysHowToRunIt:
         for needed in ("BOOK_MODE=carry", "CARRY_BORROW_APR",
                        "CARRY_EXECUTION_MODE"):
             assert needed in printed, needed
-
-
-class TestTheDeployScriptFindsTheBinaryThatExists:
-    def script(self):
-        return open(os.path.join(ROOT, "..", "scripts", "deploy.sh"),
-                    encoding="utf-8").read()
-
-    def test_it_looks_for_flyctl_not_only_fly(self):
-        """The installer lays down `flyctl`. `fly` is not guaranteed to
-        exist, and the script checked only for `fly` — so it reinstalled
-        flyctl on a machine that already had it, and then called a command
-        that was not there."""
-        text = self.script()
-        assert "command -v flyctl" in text
-
-    def test_every_invocation_goes_through_one_resolved_name(self):
-        """No bare `fly ` calls left: one variable, resolved once."""
-        for line in self.script().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
-                continue
-            assert not stripped.startswith("fly "), (
-                f"bare `fly` call, which may not exist: {stripped}")

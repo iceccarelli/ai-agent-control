@@ -7,6 +7,20 @@
 
 ## 0. Current state (read this first; every dated claim is a snapshot: re-verify live state)
 
+<!-- topology:begin -->
+**Operating topology (one authoritative statement; this block is byte-identical in `bot/README.md`, `bot/RUNBOOKS.md` and `docs/MONEY_MISSION.md`, and a test enforces it).**
+
+| Place | Role | May it place an order? |
+|---|---|---|
+| Codespace or laptop | development, replay, research, data inspection and read-only venue checks (`status`, `evaluate`, `preflight` once the owner holds a capability) | **No.** Never run `loop`, `grant`, `execute` or `unattended_drill` there. |
+| One selected Testnet executor | the only place a Testnet order may ever originate, and only after (1) it is deployed from the merged commit and its image is compared with that commit's manifest, (2) the Supabase single-writer lease is proven, (3) the owner has typed the capability and a grant for that exact bounded session | **Not selected and not deployed.** `carry-autopilot` does not exist as a Fly app today (owner-observed 2026-11-14). |
+| `carry-drill` (Fly) | read-only market-data recorder and monitor | **No.** Its 2026-11-05 image predates the lease; its conformance path stays disabled (`CARRY_DRILL_ENABLED` absent or not `true`). |
+| `carry-book` (Fly) | legacy carry book | **Stopped.** No document authorises starting, redeploying or resizing it. |
+| `carry-research` (Fly) | research worker | **Does not exist.** Nothing provisions it until the owner approves a data-transfer and storage plan. |
+
+Paper and Bybit Testnet only. Mainnet is out of scope: nothing in this repository arms it, and `LIVE_TRADING_ACK`, `USE_TESTNET=0` and `PAPER_TRADING=0` are never set. Testnet credentials are `BYBIT_TESTNET_API_KEY` and `BYBIT_TESTNET_API_SECRET` only. A passing check, a capability or a deployed image is not a grant to trade.
+<!-- topology:end -->
+
 **Written 2026-11-11 (UTC); updated 2026-11-13 (UTC) with `main` = `56f9da6`** (PR #264, Round 18, merged by the owner at 2026-11-13T18:57Z as `56f9da6`; PR #263, Round 17, merged by the owner at 2026-11-13T15:49Z as `039ddeb`; PR #262, Round 16, as `eb39e86`; PR #261, Round 14, as `bc7bc9f`; PR #256, a dependabot branch whose merged change is the dependabot configuration and the autopilot-image workflow only, as `a216baf`). Round 19 is the mission PR on `claude/owner-wealth-round19-20261113` (base `56f9da6`): whether it is merged, and the SHAs of `main` and of the branch head, are in GitHub and git, not in this file, so this section stays true either way; "code of Round 19" below means what that PR contains. The log rounds further down are history and detail; the last four have the evidence behind each line here.
 
 | Question | State | Source |
