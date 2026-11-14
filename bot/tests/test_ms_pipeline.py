@@ -1330,6 +1330,9 @@ def test_the_realised_net_deducts_a_stated_cost_of_capital_as_its_own_component(
     assert comp["cost_of_capital"]["mean_charge_bps"] > 0
     assert comp["net_bps_after_cost_of_capital"] == pytest.approx(comp["net_bps_horizon"] - comp["cost_of_capital"]["mean_charge_bps"])
     assert "BEFORE cost of capital" in comp["net_definition"]
+    coc = comp["cost_of_capital"]                                                    # independent review (Round 20): the basis of the charge is stated beside it, and how far it is from the executed structure
+    assert coc["capital_factor_used"] == {"min": pytest.approx(factor), "max": pytest.approx(factor)}
+    assert "RESEARCH basis" in coc["capital_factor_basis"] and "2.04x" in coc["capital_factor_basis"] and "UNDERSTATES" in coc["capital_factor_basis"]
     # the ledger identity is untouched: financing is a separate component, not a ledger line
     lp = art(pr, "ledger_pnl.json")
     assert lp["realised_gross_usd"] + lp["funding_usd"] - lp["fees_usd"] - lp["taker_slippage_usd"] - lp["adverse_selection_usd"] == pytest.approx(lp["realised_net_usd"], rel=1e-9, abs=1e-6)

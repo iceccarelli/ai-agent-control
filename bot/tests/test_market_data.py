@@ -1425,7 +1425,9 @@ def test_the_synthetic_switch_is_detected_in_every_spelling_and_ignores_prose():
 
 
 def test_the_synthetic_switch_never_appears_in_shipped_code():
-    """Tools cannot opt in: only market_data.py defines it. (Tests may, and do.) Every shipped .py under bot/, recursively, outside tests."""
+    """Tools cannot opt in: only market_data.py defines it. (Tests may, and do.) Every shipped .py under bot/, recursively, outside tests. THIS IS A TRIPWIRE, NOT A BOUNDARY (independent review, Round 20):
+    a computed spelling (``md.__dict__["SYNTHETIC_" + "FIXTURE_OK"]``) is not detected, and the refusal covers ``load_corpus`` only: ``load_ohlcv`` and a direct read of data/ohlcv are not refused. The
+    boundary that matters is the default: a tool that calls ``load_corpus`` without naming the switch cannot read a fixture."""
     offenders, seen = [], 0
     for root, dirs, files in os.walk(REPO):
         dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("tests", "site-packages", "node_modules", "__pycache__") and not os.path.exists(os.path.join(root, d, "pyvenv.cfg")))
@@ -1439,3 +1441,14 @@ def test_the_synthetic_switch_never_appears_in_shipped_code():
             offenders += [f"{os.path.relpath(path, REPO)}:{line}" for line in _switch_references(ast.parse(open(path, encoding="utf-8").read()))]
     assert seen > 100, "the walker found no shipped code: the tripwire would pass vacuously"
     assert not offenders, f"SYNTHETIC_FIXTURE_OK is for the harness's own tests: {offenders}"
+
+
+def test_the_documented_evaluation_command_refuses_the_synthetic_default_with_guidance_not_a_traceback():
+    """REPRODUCED (independent review, Round 20): `python3 tools/run_evaluation.py` (the documented command, whose --data-dir defaults to the generated fixture corpus) ended in an uncaught
+    SyntheticCorpusRefused traceback. It refuses (correct) and now says what to do instead."""
+    import subprocess
+    r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "run_evaluation.py")], capture_output=True, text=True, timeout=300, cwd=REPO,
+                       env={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"), "PYTHONDONTWRITEBYTECODE": "1", "LEDGER_DISABLED": "1"})
+    assert r.returncode == 2, (r.returncode, r.stderr[-400:])
+    assert "REFUSED" in r.stderr and "SYNTHETIC_CORPUS_REFUSED" in r.stderr and "--data-dir data/real_1d" in r.stderr and "--synthetic" in r.stderr
+    assert "Traceback" not in r.stderr and "Traceback" not in r.stdout

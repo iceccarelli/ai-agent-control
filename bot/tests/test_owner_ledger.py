@@ -1532,3 +1532,17 @@ def test_a_positive_usdt_balance_is_unaffected_by_the_deficit_rule(tmp_path):
     w.lines = _statement(w)
     rep = ledger(w, tmp_path)
     assert "BORROW_INTEREST_NOT_EVIDENCED" not in {f["code"] for f in rep["flags"]}
+
+
+def test_only_a_usd_coin_interest_line_counts_as_interest_evidence_for_a_usdt_deficit(tmp_path):
+    """Independent review (Round 20): ANY interest line of any coin suppressed the flag. A BTC-only INTEREST line is no evidence about the interest on a USDT loan."""
+    w = World(usdt0=-30_000.0)
+    rows = _statement(w)
+    last = max(r["ts_ms"] for r in rows)
+    btc_only = rows + [{"line_id": "LB1", "ts_ms": last, "coin": "BTC", "category": "INTEREST", "change": -0.0001, "cash_balance": None, "ref_id": None}]
+    w.lines = btc_only
+    codes = {f["code"] for f in ledger(w, tmp_path)["flags"] if f["severity"] == "GAP"}
+    assert "BORROW_INTEREST_NOT_EVIDENCED" in codes, "a BTC interest line does not evidence USDT interest"
+    w.lines = rows + [{"line_id": "LU1", "ts_ms": last, "coin": "USDT", "category": "INTEREST", "change": -0.5, "cash_balance": None, "ref_id": None}]
+    codes_usd = {f["code"] for f in ledger(w, tmp_path)["flags"] if f["severity"] == "GAP"}
+    assert "BORROW_INTEREST_NOT_EVIDENCED" not in codes_usd, "a USD-coin INTEREST line clears the presence check (its amount is a stated residual, not checked)"

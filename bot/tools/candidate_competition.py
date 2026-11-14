@@ -216,6 +216,12 @@ def _family_significant(f: Mapping[str, Any]) -> bool:
     return f.get("status") == "WALK_FORWARD_DONE" and _real_number(p) and p <= SIGNIFICANCE_ALPHA and _real_number(n) and n >= CR.MIN_PROMISING_OOS_OBS
 
 
+def _block_significant(b: Mapping[str, Any]) -> bool:
+    """The same test for ONE vs_cash block: the headline is the EXCESS over cash, so the significance that matters is that block's own p and observation count, never the nominal gross mean's."""
+    p, n = b.get("p_adjusted"), b.get("oos_independent_observations")
+    return b.get("status") == "WALK_FORWARD_DONE" and _real_number(p) and p <= SIGNIFICANCE_ALPHA and _real_number(n) and n >= CR.MIN_PROMISING_OOS_OBS
+
+
 def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     if res["status"] != "EVALUATED":
         return {"verdict": "UNTESTED", "net_edge": None, "reasons": [res["reason"]], "families": {}, "evaluation": None, "survivorship": None, "holdout": None}
@@ -226,6 +232,8 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
     best = None
     fam_out: Dict[str, Any] = {}
     excess_by_basis: Dict[str, List[float]] = {}
+    excess_blocks: Dict[str, List[Tuple[float, Mapping[str, Any]]]] = {}
+    best_family: Optional[Mapping[str, Any]] = None
     for k, f in fams.items():
         verdicts.append(f["verdict"])
         oos = f.get("oos_mean_total_bps_per_row") if f.get("status") == "WALK_FORWARD_DONE" else None
@@ -248,8 +256,10 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
             x = b.get("oos_mean_excess_bps_of_capital_per_row")
             if _real_number(x) and b.get("status") == "WALK_FORWARD_DONE":          # a block that did not complete a walk-forward, or holds a NaN / bool, never enters the headline
                 excess_by_basis.setdefault(lbl, []).append(x)
+                excess_blocks.setdefault(lbl, []).append((x, b))
         if oos is not None and (best is None or oos > best):
             best = oos
+            best_family = f
         if f.get("reason"):
             reasons.append(f"{k}: {f['status']}: {str(f['reason'])[:200]}")
     rf = ev
@@ -270,7 +280,17 @@ def _xs_summary(res: Mapping[str, Any]) -> Dict[str, Any]:
         if best is not None and best > 0 and net_edge <= 0:
             reasons.append(f"VS_CASH: the nominal out-of-sample mean is +{best:.1f} bps of gross notional per row but the excess over cash on the capital committed is {net_edge:+.1f} bps of capital per row")
     net_edge = net_edge if _real_number(net_edge) else None
-    significant = any(_family_significant(f) for f in fams.values()) if net_edge is not None else None
+    # Round 20 (independent review): the significance flag must test the quantity the headline IS. With a cash source applied the headline is the lowest, over the sources, of each source's best block, so
+    # it is THAT block's own p and observation count that decide; the nominal gross mean's p (a different quantity, possibly 0.01 while the excess over cash is noise at 0.93) never does. With no cash
+    # source the headline is the best family's nominal mean and that family's own test decides.
+    significant: Optional[bool] = None
+    if net_edge is not None:
+        if excess_blocks:
+            basis_label = min(excess_blocks, key=lambda lbl: (max(x for x, _b in excess_blocks[lbl]), lbl))
+            headline_block = max(excess_blocks[basis_label], key=lambda xb: xb[0])[1]
+            significant = _block_significant(headline_block)
+        else:
+            significant = bool(best_family is not None and _family_significant(best_family))
     return {"verdict": verdict, "net_edge": net_edge, "net_edge_basis": basis, "net_edge_significant": significant, "reasons": reasons, "families": fam_out, "evaluation": ev, "survivorship": ev.get("survivorship"),
             "holdout": dict(ho) if isinstance(ho, Mapping) else None}
 

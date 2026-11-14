@@ -932,13 +932,19 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     coc_apr = rec.params.get("opportunity_cost_apr")
     coc_margin = float(rec.params.get("margin_frac", SC.DEFAULT_PARAMS["margin_frac"]))
     coc_bps: List[float] = []
+    coc_factors: List[float] = []
     coc_complete = coc_apr is not None
     if coc_apr is not None:
         for gid, g in closed_items:
             if g.entry_ts is None or g.exit_ts is None or g.exit_ts < g.entry_ts:
                 coc_complete = False                                                   # a group whose holding time is not stated cannot be charged: never charged zero silently
                 break
-            coc_bps.append(float(coc_apr) / 365.0 * 1e4 * ((g.exit_ts - g.entry_ts) / DAY_MS) * SC.committed_capital_factor(kinds.get(gid, kind_default), coc_margin))
+            fac = SC.committed_capital_factor(kinds.get(gid, kind_default), coc_margin)
+            coc_factors.append(fac)
+            coc_bps.append(float(coc_apr) / 365.0 * 1e4 * ((g.exit_ts - g.entry_ts) / DAY_MS) * fac)
+    # the scanner's committed-capital factor is its RESEARCH basis (margin_frac, 5x). Say so next to the figure, and how far it is from what the autopilot's executed structure commits (the registry).
+    import economic_model as _EM
+    executed_factor = float(_EM.structure_capital_usd(_EM.ACQUIRED_SPOT_PERP, 1, 1).value)
     nets_after = [n - c for n, c in zip(nets, coc_bps)] if coc_complete and len(coc_bps) == len(nets) else None
     traded = sorted({s for g in res.groups.values() for s in g.symbols})
     indep = int(report["observations"]["independent"]) if isinstance(report.get("observations"), Mapping) else 0
@@ -965,7 +971,10 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
             "cost_of_capital": {"state": "STATED" if coc_apr is not None else "UNSTATED", "apr": (float(coc_apr) if coc_apr is not None else None),
                                 "prov": "MODELLED" if coc_apr is not None else "UNKNOWN", "complete": bool(coc_complete and (nets_after is not None or not closed)),
                                 "mean_charge_bps": (sum(coc_bps) / len(coc_bps)) if (coc_apr is not None and coc_bps and nets_after is not None) else None,
-                                "basis": "apr / 365 x holding days x committed capital per unit of notional (the scanner's committed_capital_factor), on each closed group's notional"},
+                                "basis": "apr / 365 x holding days x committed capital per unit of notional (the scanner's committed_capital_factor), on each closed group's notional",
+                                "capital_factor_used": ({"min": min(coc_factors), "max": max(coc_factors)} if coc_factors else None),
+                                "capital_factor_basis": f"the scanner's RESEARCH basis (margin_frac {coc_margin:g}); the autopilot's executed acquire structure commits {executed_factor:.2f}x per unit of notional at leverage 1 "
+                                                        "(economic_model.structure_capital_usd), so this figure UNDERSTATES the financing of the structure that would actually be executed"},
             "n_observations": len(closed), "prov": rprov,
             "net_definition": "BEFORE cost of capital: price leg at mid + funding - fees - taker slippage - adverse selection (the ledger's net), per closed group over its notional; mean of the groups' bps. "
                               "The owner's cost of capital is a separate component: see net_bps_after_cost_of_capital (None, never 0, when the rate is unstated)",

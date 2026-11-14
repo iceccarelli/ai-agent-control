@@ -1616,16 +1616,23 @@ def present_opportunity_cost_lines(r: Dict[str, Any]) -> List[str]:
             "unchanged behaviour; that zero is not the owner's rate)"]
 
 
-def present_break_even_lines(v: Dict[str, Any], market_exposure_pct: float) -> List[str]:
+def present_break_even_lines(v: Dict[str, Any], market_exposure_pct: float, execution_mode: str = "acquire") -> List[str]:
     """Both break-even bases, each with the assumption that makes it the right one. The whole-window figure treats the committed capital as dedicated (idle and earning nothing) between trades; the
     held-capital figure is the same net over the capital-time actually in market, i.e. it assumes the capital earns the alternative while idle (the basis the cash path compares on)."""
     if not v.get("available") or not (isinstance(market_exposure_pct, (int, float)) and market_exposure_pct > 0):
         return []
     whole = float(v["break_even_cost_of_capital_pct"])
     held = whole / (market_exposure_pct / 100.0)
-    return [f"    BREAK-EVEN BASES (the same net over two capital-times; compare an alternative on the SAME basis, never across them):",
-            f"      whole-window, capital dedicated and idle between trades earns NOTHING: {whole:.2f}%/yr  (the printed 'break-even' above)",
-            f"      held-capital, capital earns the alternative while idle (in market {market_exposure_pct:.1f}% of the window): {held:.2f}%/yr  <- the basis a flat cash alternative is compared on"]
+    lines = [f"    BREAK-EVEN BASES (the same net over two capital-times; compare an alternative on the SAME basis, never across them):",
+             f"      whole-window, capital dedicated and idle between trades earns NOTHING: {whole:.2f}%/yr  (the printed 'break-even' above)",
+             f"      held-capital, capital earns the alternative while idle (in market {market_exposure_pct:.1f}% of the window): {held:.2f}%/yr"
+             + ("  <- the basis a flat cash alternative is compared on, FOR CAPITAL THAT CAN BE REDEPLOYED WHEN FLAT" if execution_mode != "overlay" else "")]
+    if execution_mode == "overlay":
+        lines.append("      OVERLAY: about half of the committed capital is the owner's HELD COIN, which stays held between trades and is not redeployed to cash, so the held-capital figure applies to the margin-cash "
+                     "component only and OVERSTATES the break-even against a cash alternative for the whole commitment; the whole-window figure is the conservative one")
+    if v.get("break_even_status") == "UPPER_BOUND_USDT_FINANCING_UNSTATED":
+        lines.append("      BOTH figures are UPPER BOUNDS: the interest on the USDT deficit is not charged (no --usdt-borrow-apr)")
+    return lines
 
 
 def present_ledger_lines(r: Dict[str, Any]) -> List[str]:
@@ -1809,7 +1816,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(line)
     for line in owner_capital_lines(r["owner_capital"]):
         print(line)
-    for line in present_break_even_lines(r["owner_capital"], r["market_exposure_pct"]):
+    for line in present_break_even_lines(r["owner_capital"], r["market_exposure_pct"], r["execution_mode"]):
         print(line)
     r["evidence_basis"] = present_evidence_basis(r, impact_bps=impact, no_impact=bool(args.no_impact))
     for line in present_truth_lines(r, r["evidence_basis"]):

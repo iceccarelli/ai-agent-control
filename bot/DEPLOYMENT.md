@@ -334,10 +334,11 @@ Then regenerate the manifest and verify:
 ```bash
 python3 tools/make_dataset.py --rehash      # recompute sha256 for the new files
 python3 -c "import market_data; print(market_data.verify_manifest())"
-python3 tools/run_evaluation.py
+python3 tools/run_evaluation.py --data-dir data/real_1d --interval D     # a REAL corpus (Round 20: the default --data-dir is the generated
+                                                                         # fixture corpus, which load_corpus refuses; --synthetic runs the in-line path)
 ```
 
-`load_corpus()` refuses to load a corpus that does not match its manifest. That
+`load_corpus()` refuses to load a corpus that does not match its manifest, and refuses any corpus whose manifest does not say `"synthetic": false`. That
 is deliberate: a hand-edited CSV is not the data the tests were written against,
 and silently trading on it is how a backtest and a deployment diverge.
 

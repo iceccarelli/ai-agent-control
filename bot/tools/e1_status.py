@@ -2,8 +2,9 @@
 """e1_status.py -- READ-ONLY integrity and freshness check for the registered forward kill test (E1, docs/MONEY_MISSION.md, Round 19 log).
 
 It answers three questions and computes NO result:
-  1. Is the engine the registered one?  The seven engine files are compared by sha256 with the values they had at the registered revision 56f9da6, and the computation half of tools/carry_replay.py by
-     the AST-text digest tests/test_carry_replay_concentration.py pins. A mismatch means the experiment's engine moved: re-register it with the owner, never "fix" the pin.
+  1. Is the engine the registered one?  The six engine files LISTED in ENGINE_FILE_PINS are compared by sha256 with the values they had at the registered revision 56f9da6, and tools/carry_replay.py by
+     two source-text digests (every definition except the console section, and the head of main() up to the replay call) that tests/test_carry_replay_concentration.py also pins. Modules those files
+     import but that are not listed (execution_record, economic_model, trade_economics) are NOT pinned: the committed replays' nets ($33,049.51 overlay, $16,398.79 acquire) are asserted by a test instead. A mismatch means the experiment's engine moved: re-register it with the owner, never "fix" the pin.
   2. Is there forward data?  The last committed Bybit BTCUSDT funding print and 4h kline are read from the committed corpus and compared with the registered window start. Rows before the window are
      never used. Today none is committed, so the answer is NO_FORWARD_DATA and the test is INCOMPLETE.
   3. When may a statistic exist?  The six-month interim and the twelve-month final are dated from the window start. Before the interim date this tool reports NOT_AVAILABLE_YET and states exactly what is
@@ -49,6 +50,9 @@ ENGINE_FILE_PINS = {
 REPLAY_FILE = "tools/carry_replay.py"
 REPLAY_PRESENTATION = {"main", "capital_lines", "denominator_lines", "usdt_financing_lines", "owner_capital_lines", "concentration_lines"}
 REPLAY_COMPUTATION_DIGEST = "e239af91e29c70fdd4809615a01a36b468565aafb6d06d1c70a7cbfea372f545"
+#: and the part of main() that decides what the registered command RUNS: every statement up to and including the `replay(...)` assignment (the argparse defaults, the corpus choice, the impact haircut, the
+#: cost-of-capital fallback fed to the entry gate, the replay arguments). Only the printing and --json section after it is outside the pin.
+REPLAY_MAIN_HEAD_DIGEST = "e02229601f338f8bc0d135363504fbd79c75422e6a29940661fb19ea03c04c7e"
 
 OWNER_COMMANDS = (
     "cd bot && python3 tools/funding_capture.py --start-ms %d --out-dir <NEW directory outside git>      # Bybit BTCUSDT funding from the window start (network: yours)" % WINDOW_START_MS,
@@ -80,6 +84,19 @@ def replay_computation_digest(src: str) -> str:
     return hashlib.sha256("\n\x00\n".join(parts).encode()).hexdigest()
 
 
+def replay_main_head_digest(src: str) -> Optional[str]:
+    """sha256 of the exact source text of main()'s statements up to and including the replay(...) assignment; None when there is no such statement (a restructured main is not the registered one)."""
+    lines = src.splitlines()
+    for n in ast.parse(src).body:
+        if getattr(n, "name", None) == "main":
+            parts: List[str] = []
+            for st in n.body:
+                parts.append("\n".join(lines[st.lineno - 1:st.end_lineno]))
+                if isinstance(st, ast.Assign) and isinstance(st.value, ast.Call) and getattr(st.value.func, "id", None) == "replay":
+                    return hashlib.sha256("\n\x00\n".join(parts).encode()).hexdigest()
+    return None
+
+
 def engine_integrity(root: str = BOT) -> Dict[str, Any]:
     rows = []
     for rel, pin in sorted(ENGINE_FILE_PINS.items()):
@@ -87,10 +104,12 @@ def engine_integrity(root: str = BOT) -> Dict[str, Any]:
         got = _sha(path) if os.path.isfile(path) else None
         rows.append({"file": rel, "pinned": pin, "actual": got, "match": got == pin})
     try:
-        digest = replay_computation_digest(open(os.path.join(root, REPLAY_FILE), encoding="utf-8").read())
+        src = open(os.path.join(root, REPLAY_FILE), encoding="utf-8").read()
+        digest, head = replay_computation_digest(src), replay_main_head_digest(src)
     except (OSError, SyntaxError):
-        digest = None
+        digest = head = None
     rows.append({"file": REPLAY_FILE + " (computation only)", "pinned": REPLAY_COMPUTATION_DIGEST, "actual": digest, "match": digest == REPLAY_COMPUTATION_DIGEST})
+    rows.append({"file": REPLAY_FILE + " (main(): arguments, corpus, haircut, cost-of-capital fallback, replay call)", "pinned": REPLAY_MAIN_HEAD_DIGEST, "actual": head, "match": head == REPLAY_MAIN_HEAD_DIGEST})
     return {"registered_revision": REGISTERED_ENGINE_REVISION, "files": rows, "engine_is_the_registered_one": all(r["match"] for r in rows)}
 
 

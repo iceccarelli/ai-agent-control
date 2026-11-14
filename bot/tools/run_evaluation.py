@@ -192,7 +192,14 @@ def main(argv) -> int:
     parser.add_argument("--min-agreement", type=float, default=0.40)
     args = parser.parse_args(argv)
 
-    bars_by_symbol, books_by_symbol, provenance = load_inputs(args)
+    try:
+        bars_by_symbol, books_by_symbol, provenance = load_inputs(args)
+    except md.SyntheticCorpusRefused as exc:
+        # Round 20: the default --data-dir is the GENERATED fixture corpus, whose files carry real-looking names (BYBIT_SPOT_BTC_USDT_1H). The loader refuses it; say what to do instead of a traceback.
+        print(f"REFUSED: {exc}\n"
+              "  use a REAL corpus:   python3 tools/run_evaluation.py --data-dir data/real_1d --interval D\n"
+              "  or the in-line, labelled synthetic path:   python3 tools/run_evaluation.py --synthetic", file=sys.stderr)
+        return 2
 
     cfg = bt.BacktestConfig(
         starting_cash=10_000.0,

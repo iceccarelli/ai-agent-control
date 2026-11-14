@@ -288,7 +288,10 @@ def _v_competition(o: Mapping[str, Any]) -> Dict[str, Any]:
             raise _bad(f"candidate {r.get('candidate_id')!r}: a {status} entry must carry a reason")
         kind, hedge = _enum(r, "kind", MST.OPP_KINDS), _enum(r, "spot_hedge", HEDGES)
         out.append({"candidate_id": _str(r, "candidate_id"), "kind": kind, "spot_hedge": hedge, **_opp_label(kind, hedge), "status": status, "reason": reason, "gross_bps_horizon": _num(r, "gross_bps_horizon"),
-                    "net_bps_horizon": _num(r, "net_bps_horizon"), "n_observations": _int(r, "n_observations", null=True), "prov": _enum(r, "prov", MST.PROVS)})
+                    "net_bps_horizon": _num(r, "net_bps_horizon"), "n_observations": _int(r, "n_observations", null=True), "prov": _enum(r, "prov", MST.PROVS),
+                    # Round 20: the producer's net is BEFORE the owner's cost of capital; the after-figure and the state of that input travel with it (absent in an older artifact: unknown, never zero)
+                    "net_bps_after_cost_of_capital": _num(r, "net_bps_after_cost_of_capital") if "net_bps_after_cost_of_capital" in r else None,
+                    "cost_of_capital_state": (r.get("cost_of_capital") or {}).get("state") if isinstance(r.get("cost_of_capital"), Mapping) and (r.get("cost_of_capital") or {}).get("state") in ("STATED", "UNSTATED") else None})
     return {"candidates": out}
 
 
@@ -647,7 +650,8 @@ def _research(cand_rows: Sequence[Mapping[str, Any]], comp: Dict[str, Any], opps
                            "economics_loaded": econ_loaded,
                            "note": "Sufficient evidence is not authorisation: authorisation is the owner's act (config.is_live_authorized AND the signed promotion gate)."
                                    + ("" if econ_loaded else " In-sample corpus economics are not loaded (slow); start with --with-economics to include rejection reasons from them.")}
-    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps", "per closed group, as the producer states it; the multi-symbol pipeline uses the ledger's net (after fees, taker slippage and adverse selection)"),
+    out["competition"] = _artifact_view(comp, lambda d: {"candidates": [{**c, "gross": val(c["gross_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps"), "net": val(c["net_bps_horizon"], PROV_TO_BASIS[c["prov"]], "bps", "per closed group, BEFORE the owner's cost of capital (" + ("stated: see net_after_cost_of_capital" if c.get("cost_of_capital_state") == "STATED" else "UNSTATED or not carried by this artifact: no after-cost figure exists") + "); the multi-symbol pipeline uses the ledger's net (after fees, taker slippage and adverse selection)"),
+                                                                       "net_after_cost_of_capital": val(c.get("net_bps_after_cost_of_capital"), PROV_TO_BASIS[c["prov"]], "bps", "per closed group, after the stated cost of capital on the scanner's committed-capital basis; unknown when the rate is unstated"),
                                                                        }
                                                                       for c in d["candidates"]]},
                                       empty="No competition result yet. Run the candidate competition CLI to write competition.json into the artifacts directory.")

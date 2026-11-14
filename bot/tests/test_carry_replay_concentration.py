@@ -218,6 +218,7 @@ _PRESENTATION = {"main", "capital_lines", "denominator_lines", "usdt_financing_l
 #: sha256 of the exact source text of every OTHER top-level definition of tools/carry_replay.py, taken from the 56f9da6 / 413175f file (byte-identical between them) that the registered forward
 #: kill test (E1, docs/MONEY_MISSION.md) names as its engine. The console section may change; the computation may not.
 _COMPUTATION_DIGEST = "e239af91e29c70fdd4809615a01a36b468565aafb6d06d1c70a7cbfea372f545"
+_MAIN_HEAD_DIGEST = "e02229601f338f8bc0d135363504fbd79c75422e6a29940661fb19ea03c04c7e"       # source text of main()'s statements up to and including the replay(...) assignment (argparse defaults, corpus, haircut, cost-of-capital fallback)
 _REPLAY_CALL_DIGEST = "fe7f673b8efccf746468e4186ddc9560c38a721a138f487cbb1a213f07cc0103"       # ast.unparse of the replay(...) call in main(): the arguments the registered command reaches it with
 
 
@@ -241,6 +242,29 @@ def _replay_call_digest(src):
                 if isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call) and getattr(sub.value.func, "id", None) == "replay":
                     return hashlib.sha256(ast.unparse(sub.value).encode()).hexdigest()
     return None
+
+
+def _main_head_digest(src):
+    lines = src.splitlines()
+    for n in ast.parse(src).body:
+        if getattr(n, "name", None) == "main":
+            parts = []
+            for st in n.body:
+                parts.append("\n".join(lines[st.lineno - 1:st.end_lineno]))
+                if isinstance(st, ast.Assign) and isinstance(st.value, ast.Call) and getattr(st.value.func, "id", None) == "replay":
+                    return hashlib.sha256("\n\x00\n".join(parts).encode()).hexdigest()
+    return None
+
+
+def test_the_part_of_main_that_decides_what_the_registered_command_runs_is_pinned_too():
+    """REPRODUCED (independent review, Round 20): excluding ALL of main() let `impact = (0.0 if True else ...)` and `stated_cost = 0.05` pass the pin while changing what the registered command runs."""
+    src = open(rp.__file__, encoding="utf-8").read()
+    assert _main_head_digest(src) == _MAIN_HEAD_DIGEST
+    for before, after in (("impact = (0.0 if args.no_impact", "impact = (0.0 if True"), ("stated_cost = (0.0 if args.opportunity_cost_apr is None", "stated_cost = (0.05 if args.opportunity_cost_apr is None")):
+        assert before in src, before
+        assert _main_head_digest(src.replace(before, after, 1)) != _MAIN_HEAD_DIGEST, after
+    console = src.replace('print(f"  driver     {r[\'driver\']}")', 'print(f"  driver     {r[\'driver\']} (console edit)")', 1)
+    assert console != src and _main_head_digest(console) == _MAIN_HEAD_DIGEST, "the printing section stays free to change"
 
 
 def test_the_replay_computation_is_byte_identical_to_the_engine_the_forward_test_registers():
@@ -271,8 +295,11 @@ def test_both_break_even_bases_are_printed_with_the_assumption_that_makes_each_o
     v = {"available": True, "break_even_cost_of_capital_pct": 1.46}
     text = "\n".join(rp.present_break_even_lines(v, 15.3))
     assert "whole-window" in text and "1.46%/yr" in text and "idle between trades earns NOTHING" in text
-    assert "held-capital" in text and f"{1.46 / 0.153:.2f}%/yr" in text and "earns the alternative while idle" in text
+    assert "held-capital" in text and f"{1.46 / 0.153:.2f}%/yr" in text and "earns the alternative while idle" in text and "REDEPLOYED WHEN FLAT" in text
     assert rp.present_break_even_lines({"available": False}, 15.3) == [] and rp.present_break_even_lines(v, 0.0) == []
+    # independent review (Round 20): in an OVERLAY half the committed capital is the owner's held coin, which is not redeployed when flat; and both figures are upper bounds while the USDT interest is unstated
+    over = "\n".join(rp.present_break_even_lines(dict(v, break_even_status="UPPER_BOUND_USDT_FINANCING_UNSTATED"), 79.3, "overlay"))
+    assert "HELD COIN" in over and "margin-cash component only" in over and "BOTH figures are UPPER BOUNDS" in over and "REDEPLOYED WHEN FLAT" not in over
 
 
 def test_the_overlay_ledger_block_does_not_sit_a_cash_net_under_a_headline_it_does_not_equal():

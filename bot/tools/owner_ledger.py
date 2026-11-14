@@ -810,9 +810,10 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
     # A negative USDT balance on a unified account IS a loan. With no INTEREST statement line anywhere in the window the interest on it is not zero, it is unknown: booking 0.0 as a known value
     # published a reconciled return on a base shrunk by an unstated principal (Round 20, reproduced: a -$30,000 balance over four days, interest about $33 at 10%/yr, reported as exactly 0).
     _deficit_snaps = [sn.snapshot_id for sn in snaps if sn.usdt < 0]
-    _flag(flags, "BORROW_INTEREST_NOT_EVIDENCED", SEVERITY_GAP, len(_deficit_snaps) if not any(l.category == "INTEREST" for l in lines) else 0,
+    _flag(flags, "BORROW_INTEREST_NOT_EVIDENCED", SEVERITY_GAP, len(_deficit_snaps) if not any(l.category == "INTEREST" and l.coin in USD_COINS for l in lines) else 0,
           "a snapshot holds a NEGATIVE USDT balance (a loan on a unified account) and the statement carries no INTEREST line: the borrow principal, the interest accrued on it and the collateral it ties up are "
-          "unknown, so no return is stated (supply the account statement's INTEREST lines or the borrow figures)", _deficit_snaps)
+          "unknown, so no return is stated (supply the account statement's USD-coin INTEREST lines or the borrow figures). Residual: the PRESENCE of a USD-coin INTEREST line clears this flag; "
+          "its amount is not compared with any accrual on the stated principal", _deficit_snaps)
     other_usd_lines = math.fsum(l.change for l in lines if l.category == "OTHER" and l.coin in USD_COINS)
 
     # ---- statement coverage: the account's own lines are the independent record of every cash movement

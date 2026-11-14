@@ -41,7 +41,7 @@ def test_the_registered_window_start_is_the_protocols_instant():
 def test_the_engine_is_the_registered_one_today():
     eng = E1.engine_integrity()
     assert eng["engine_is_the_registered_one"], [r["file"] for r in eng["files"] if not r["match"]]
-    assert len(eng["files"]) == len(E1.ENGINE_FILE_PINS) + 1
+    assert len(eng["files"]) == len(E1.ENGINE_FILE_PINS) + 2
 
 
 def _tree(tmp_path):
@@ -70,6 +70,12 @@ def test_a_changed_replay_computation_is_detected_but_a_console_change_is_not(tm
     assert console != src
     open(path, "w", encoding="utf-8").write(console)
     assert E1.engine_integrity(root)["engine_is_the_registered_one"] is True
+    for before, after in (("impact = (0.0 if args.no_impact", "impact = (0.0 if True"), ("stated_cost = (0.0 if args.opportunity_cost_apr is None", "stated_cost = (0.05 if args.opportunity_cost_apr is None")):
+        mutated = src.replace(before, after, 1)
+        assert mutated != src
+        open(path, "w", encoding="utf-8").write(mutated)
+        assert E1.engine_integrity(root)["engine_is_the_registered_one"] is False, "a change to what main() hands the replay moves the registered engine: " + after
+    open(path, "w", encoding="utf-8").write(console)
     computation = src.replace("< max(0.01, 1e-6 * abs(net))", "< max(0.02, 1e-6 * abs(net))", 1)
     assert computation != src
     open(path, "w", encoding="utf-8").write(computation)
@@ -78,7 +84,7 @@ def test_a_changed_replay_computation_is_detected_but_a_console_change_is_not(tm
 
 def test_the_two_pins_of_the_replay_computation_cannot_drift_apart():
     import test_carry_replay_concentration as T
-    assert E1.REPLAY_COMPUTATION_DIGEST == T._COMPUTATION_DIGEST and E1.REPLAY_PRESENTATION == T._PRESENTATION
+    assert E1.REPLAY_COMPUTATION_DIGEST == T._COMPUTATION_DIGEST and E1.REPLAY_PRESENTATION == T._PRESENTATION and E1.REPLAY_MAIN_HEAD_DIGEST == T._MAIN_HEAD_DIGEST
     src = open(os.path.join(BOT, E1.REPLAY_FILE), encoding="utf-8").read()
     assert E1.replay_computation_digest(src) == T._computation_digest(src)[0]
 

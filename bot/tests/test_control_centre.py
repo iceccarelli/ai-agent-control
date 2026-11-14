@@ -1344,3 +1344,25 @@ def test_testnet_dir_is_read_for_the_session_file_only_and_defaults_to_the_artif
     out = subprocess.run([sys.executable, os.path.join(BOT, "tools", "control_centre.py"), "--artifacts-dir", str(a), "--testnet-dir", str(n), "--print-state"],
                          capture_output=True, text=True, timeout=120)
     assert out.returncode == 0 and json.loads(out.stdout)["testnet"]["session_state"] == "EXECUTED_FLAT_VERIFIED"
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: the competition net is BEFORE the owner's cost of capital, and the view says so
+
+def _comp_candidate(**extra):
+    base = {"candidate_id": "carry_eth", "kind": "SPOT_PERP_CARRY", "spot_hedge": "HEDGEABLE_ON_BYBIT", "status": "INSUFFICIENT_EVIDENCE", "reason": "replay fills are MODELLED",
+            "gross_bps_horizon": 30.0, "net_bps_horizon": 5.0, "n_observations": 40, "prov": "MODELLED"}
+    base.update(extra)
+    return base
+
+
+def test_the_competition_view_carries_the_after_cost_of_capital_net_and_its_state_and_an_old_artifact_reads_unknown():
+    """REPRODUCED (independent review, Round 20): opportunities.json's net is after the stated financing and competition.json's net is before it, both named net_bps_horizon, and the view showed the
+    producer's number as 'net' with no word about the cost of capital. The after-figure and the input's state now travel with it; an artifact that does not carry them reads UNKNOWN, never zero."""
+    stated = CC._v_competition({"candidates": [_comp_candidate(net_bps_after_cost_of_capital=-1.5, cost_of_capital={"state": "STATED", "apr": 0.05})]})["candidates"][0]
+    assert stated["net_bps_after_cost_of_capital"] == -1.5 and stated["cost_of_capital_state"] == "STATED" and stated["net_bps_horizon"] == 5.0
+    unstated = CC._v_competition({"candidates": [_comp_candidate(net_bps_after_cost_of_capital=None, cost_of_capital={"state": "UNSTATED", "apr": None})]})["candidates"][0]
+    assert unstated["net_bps_after_cost_of_capital"] is None and unstated["cost_of_capital_state"] == "UNSTATED"
+    old = CC._v_competition({"candidates": [_comp_candidate()]})["candidates"][0]
+    assert old["net_bps_after_cost_of_capital"] is None and old["cost_of_capital_state"] is None
+    forged = CC._v_competition({"candidates": [_comp_candidate(cost_of_capital={"state": "FREE"})]})["candidates"][0]
+    assert forged["cost_of_capital_state"] is None, "only the two real states are carried"
