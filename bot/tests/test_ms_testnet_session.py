@@ -936,3 +936,25 @@ def test_a_plan_whose_preflight_carries_no_numeric_usdt_balance_is_refused_never
     monkeypatch.setattr(S, "build_plan", corrupted)
     assert w.run("plan", "--symbol", "BTCUSDT", "--notional-usd", "100") != 0
     assert "USDT_BALANCE_UNREAD" in w.text() and not any(r[0] == "POST" for r in w.fake.requests)
+
+
+# ---------------------------------------------------------------- Round 22: the session's flat proof covers the WHOLE account's perps
+
+def _flat_stub(positions, *, baseline=None, orders=None, foreign=()):
+    import types
+    leg = types.SimpleNamespace(symbol="BTCUSDT", qty=D("0.001"))
+    stub = types.SimpleNamespace(group_plan=types.SimpleNamespace(legs=[leg]), baseline=baseline or {"spot:BTCUSDT": 0.0},
+                                 ex=types.SimpleNamespace(filters=lambda *_a: types.SimpleNamespace(qty_step=0.001)))
+    view = {"complete": True, "positions": positions, "orders": orders or {}, "foreign_open_orders": list(foreign)}
+    return stub, view
+
+
+def test_a_perp_position_on_another_symbol_is_not_flat():
+    """REPRODUCED (Round 22 execution review): `Run.venue_flat` looked only at the group's symbols, so an open perp on ETHUSDT left the session 'flat' and resolved the group while exposure remained."""
+    stub, view = _flat_stub({"linear:BTCUSDT": 0.0, "spot:BTCUSDT": 0.0, "linear:ETHUSDT": -0.2})
+    assert S.Run.venue_flat(stub, view) is False
+    stub, view = _flat_stub({"linear:BTCUSDT": 0.0, "spot:BTCUSDT": 0.0, "linear:ETHUSDT": 0.0, "spot:ETHUSDT": 5.0})
+    assert S.Run.venue_flat(stub, view) is True, "a spot balance in a symbol the session never traded is not an open position"
+    stub, view = _flat_stub({"linear:BTCUSDT": 0.0, "spot:BTCUSDT": 0.0})
+    assert S.Run.venue_flat(stub, view) is True
+    assert S.Run.venue_flat(stub, {**view, "complete": False}) is False and S.Run.venue_flat(stub, None) is False

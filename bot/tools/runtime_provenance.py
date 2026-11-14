@@ -168,6 +168,10 @@ def build_manifest(root: str, *, git_sha: str, environment_class: str, built_at_
             "config_fingerprint": _digest(sorted(cfg.items())) if cfg else None, "config_files": cfg, "files": dict(sorted(files.items()))}
 
 
+#: the platform identity the check reads from the process (set by Fly itself): the app name, the image reference and the machine version. Nothing else, and none is a secret.
+IDENTITY_ENV = ("FLY_APP_NAME", "FLY_IMAGE_REF", "FLY_MACHINE_VERSION")
+
+
 def _result(status: str, detail: str, man: Optional[Mapping[str, Any]] = None, env: Optional[Mapping[str, str]] = None, differing: Sequence[str] = (), code: str = "OK") -> Dict[str, Any]:
     env = env or {}
     return {"status": status, "code": code, "detail": detail[:400], "git_sha": (man or {}).get("git_sha"), "environment_class": (man or {}).get("environment_class"), "built_at_utc": (man or {}).get("built_at_utc"),
@@ -180,7 +184,8 @@ def verify_runtime(root: str, *, manifest_path: Optional[str] = None, expect: Op
                    require_app: Optional[bool] = None) -> Dict[str, Any]:
     """Re-check the manifest against the files and packages actually present. Never raises: any failure to establish provenance is MISSING or MISMATCH, with a closed ``code``.
     ``require_app``: the Fly app name must be set and match the image class (default: required for a TESTNET_EXECUTOR image, optional otherwise)."""
-    env = dict(os.environ) if env is None else env
+    process = os.environ
+    env = {k: process[k] for k in IDENTITY_ENV if k in process} if env is None else env       # ONLY the three named, non-secret platform identity variables: the whole environment (secrets included) is never copied
     path = manifest_path or os.path.join(root, MANIFEST_NAME)
     try:
         size = os.path.getsize(path)

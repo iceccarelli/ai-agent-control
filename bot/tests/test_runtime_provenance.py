@@ -345,3 +345,13 @@ def test_an_executor_image_runs_only_in_its_fly_app_and_a_missing_app_name_is_re
     open(os.path.join(root, RP.MANIFEST_NAME), "w").write(json.dumps(man))
     res = verify(root, expect="TESTNET_EXECUTOR", env={"FLY_APP_NAME": "carry-autopilot"})
     assert res["status"] == "MISMATCH" and res["code"] == "FILE_CHANGED"
+
+
+def test_the_default_environment_is_only_the_three_named_identity_variables(monkeypatch, tmp_path):
+    """Round 22: with no mapping handed in the check reads the process environment, and must copy only the named non-secret platform identity (never a credential into a local that could be logged)."""
+    assert RP.IDENTITY_ENV == ("FLY_APP_NAME", "FLY_IMAGE_REF", "FLY_MACHINE_VERSION")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "should-never-be-copied")
+    monkeypatch.setenv("FLY_APP_NAME", "carry-drill")
+    res = RP.verify_runtime(str(tmp_path))                  # no manifest: MISSING, and the result carries only identity fields
+    assert res["status"] == "MISSING" and res["app"] == "carry-drill"
+    assert "should-never-be-copied" not in json.dumps(res)

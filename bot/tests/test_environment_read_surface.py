@@ -33,6 +33,7 @@ ALLOWED = {
     "tools/history_holdout.py": 1,         # reads ONE named, non-secret PATH variable (HISTORY_HOLDOUT_LEDGER) to place the per-user holdout registry; no credential, no secret, off the order path (research only)
     "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
     "tools/control_centre.py": 1,        # read-only localhost UI: hands os.environ to owner_console.build (config.is_live_authorized); secrets reported as set/unset only, no value logged or served
+    "tools/runtime_provenance.py": 1,    # Round 22: reads ONLY the three named, non-secret Fly identity variables (FLY_APP_NAME, FLY_IMAGE_REF, FLY_MACHINE_VERSION; IDENTITY_ENV) when no mapping is handed in; the environment is never copied wholesale, nothing is logged
     "tools/runner_alerts.py": 1,         # alert transport settings
     "tools/runner_monitor.py": 4,        # credential presence, alert settings
     "tools/unattended_drill.py": 3,      # credential presence, testnet env

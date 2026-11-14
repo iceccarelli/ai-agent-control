@@ -452,9 +452,34 @@ def test_a_flat_venue_after_an_unresolved_prior_session_is_recorded_and_allowed(
     prior = w.tmp / "auto" / "ms_auto_20261110T000000"
     os.makedirs(prior)
     open(prior / S.FILES["journal"], "w").write("x\n")                                  # a session started (the REAL journal file) and never reached flat_verified
+    json.dump({"baseline": {"spot:BTCUSDT": 0.0}}, open(prior / "run_limits.json", "w"))        # a started session always wrote its spot baseline first (Round 22: without it recovery refuses)
+    json.dump({"group": {"legs": [{"symbol": "BTCUSDT", "qty": "0.005"}]}}, open(prior / "plan.json", "w"))      # ... and its plan: the symbols it traded are the ones that need a baseline
     ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
-    assert ok and why == [] and info["unresolved"] is True
+    assert ok and why == [] and info["unresolved"] is True, (ok, why, info)
     assert json.load(open(prior / "recovery.json"))["accounting_must_be_reconciled"] is True
+
+
+def test_recovery_refuses_an_unresolved_session_whose_spot_baseline_is_unknown(w, tmp_path):
+    """REPRODUCED (Round 22 execution review): a session that started and never reached flat_verified, with no run_limits baseline, was 'flat' because the spot check was silently skipped."""
+    write_grant(w, min_funding_bps=0.5)
+    prior = w.tmp / "auto" / "ms_auto_20261110T000000"
+    os.makedirs(prior)
+    open(prior / S.FILES["journal"], "w").write("x\n")
+    json.dump({"group": {"legs": [{"symbol": "BTCUSDT", "qty": "0.005"}]}}, open(prior / "plan.json", "w"))
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert not ok and why == ["BASELINE_UNKNOWN:BTCUSDT"] and info["venue_read_complete"] is True      # only the symbol the session TRADED needs a baseline
+    (prior / "plan.json").unlink()                                                                       # an unreadable plan: which symbols were traded is unknown, so every allowlisted one needs it
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert not ok and "BASELINE_UNKNOWN:BTCUSDT" in why and "BASELINE_UNKNOWN:ETHUSDT" in why
+    # a prior session that NEVER started (no journal, no orders) has nothing unresolved: the account's own spot balance is not ours to baseline
+    (prior / S.FILES["journal"]).unlink()
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert ok and info["unresolved"] is False
+    # an already-resolved session (flat_verified) is not unresolved either
+    open(prior / S.FILES["journal"], "w").write("x\n")
+    json.dump({"flat_verified": True}, open(prior / "testnet_session.json", "w"))
+    ok, why, info = AP.recover(w.env, inner=w.fake, clock=w.clock.now, state_root=str(w.tmp / "auto"))
+    assert ok and info["unresolved"] is False
 
 
 def test_recovery_refuses_when_the_spot_balance_differs_from_the_sessions_baseline(w, tmp_path):
@@ -2090,3 +2115,94 @@ def test_the_write_method_guard_can_fail():
         open(p, "w").write(src)
         found, seen = _calls_in(p, {"evaluate_readonly"})
     assert seen == {"evaluate_readonly"} and "send_order" in found and found & EXECUTOR_WRITE_METHODS
+
+
+# ---------------------------------------------------------------- Round 22: a mis-armed or full machine refuses visibly and never crashes the loop
+
+def test_forbidden_environment_names_are_found_never_their_values():
+    assert AP.forbidden_environment({}) == [] and AP.forbidden_environment({"USE_TESTNET": "1", "PAPER_TRADING": "1"}) == []
+    sentinel = "sentinel-not-a-credential-1"
+    assert AP.forbidden_environment({"LIVE_TRADING_ACK": sentinel}) == ["LIVE_TRADING_ACK"]
+    assert AP.forbidden_environment({"BYBIT_API_KEY": sentinel, "BYBIT_API_SECRET": sentinel}) == ["BYBIT_API_KEY", "BYBIT_API_SECRET"]
+    for v in ("0", "false", "No", "off", ""):
+        assert AP.forbidden_environment({"USE_TESTNET": v}) == ["USE_TESTNET"], v
+    for v in ("0", "false", "No", "off"):
+        assert AP.forbidden_environment({"PAPER_TRADING": v}) == ["PAPER_TRADING"], v
+    assert AP.forbidden_environment({"LIVE_TRADING_ACK": "  "}) == []                          # blank is not set
+    assert AP.forbidden_environment({"LIVE_ANYTHING": "1", "BYBIT_API_ANY": "x", "BYBIT_TESTNET_API_KEY": "dedicated", "BYBIT_TESTNET_API_SECRET": "dedicated"}) == ["BYBIT_API_ANY", "LIVE_ANYTHING"]   # prefixes; the dedicated Testnet pair is NOT forbidden
+
+
+@pytest.mark.parametrize("name,value", [("LIVE_TRADING_ACK", "I-ACCEPT"), ("USE_TESTNET", "0"), ("PAPER_TRADING", "0"), ("BYBIT_API_KEY", "generic-key"), ("BYBIT_API_SECRET", "generic-secret")])
+def test_run_once_refuses_a_deployment_that_carries_an_arming_switch_before_any_read(w, name, value):
+    write_grant(w, min_funding_bps=0.5)
+    w.fake.requests.clear()
+    res = AP.run_once({**w.env, name: value}, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(w.tmp / "ap"))
+    assert res["result"] == "REFUSED" and res["why"] == [f"BAD_ENVIRONMENT:{name}"], res
+    assert w.fake.requests == [], "a refused mis-armed deployment must not touch the network"
+    assert value not in json.dumps(res)
+
+
+def test_the_loop_pauses_on_a_bad_environment_without_an_alert_marker_and_without_a_session(w, tmp_path):
+    root = tmp_path / "ap"
+    write_grant(w, min_funding_bps=0.5)
+    out = []
+    kw = dict(root=str(root), clock=w.clock.now, sleep=lambda _s: None, out=out.append, max_iterations=2, inner=w.fake, state_root=str(w.tmp / "auto"), recover_fn=OK_RECOVERY)
+    AP.loop({**w.env, "LIVE_TRADING_ACK": "x"}, **kw)
+    st = ES.EngineState(str(root), w.clock.now)
+    assert st.load()["state"] == "PAUSED" and not st.has("ALERT")
+    assert "BAD_ENVIRONMENT:LIVE_TRADING_ACK" in st.load()["source"]
+
+
+def test_a_low_state_volume_refuses_the_session_and_the_floor_can_only_be_raised(w, monkeypatch):
+    write_grant(w, min_funding_bps=0.5)
+    import collections
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(AP.shutil, "disk_usage", lambda p: usage(5 * 10 ** 9, 5 * 10 ** 9 - 100 * 1024 ** 2, 100 * 1024 ** 2))
+    res = AP.run_once(w.env, inner=w.fake, clock=w.clock.now, sleep=w.clock.sleep, out=lambda _m: None, state_root=str(w.tmp / "auto"), engine_root=str(w.tmp / "ap"))
+    assert res["result"] == "REFUSED" and res["why"][0].startswith("DISK_LOW:") and "268435456B" in res["why"][0]
+    assert AP.disk_gate({"EXECUTOR_MIN_FREE_BYTES": "1"}, str(w.tmp)) is not None            # a LOWER floor than 256 MiB is ignored
+    monkeypatch.setattr(AP.shutil, "disk_usage", lambda p: usage(5 * 10 ** 9, 0, 300 * 1024 ** 2))
+    assert AP.disk_gate({}, str(w.tmp)) is None and AP.disk_gate({"EXECUTOR_MIN_FREE_BYTES": str(400 * 1024 ** 2)}, str(w.tmp)).startswith("DISK_LOW:")
+    monkeypatch.setattr(AP.shutil, "disk_usage", lambda p: (_ for _ in ()).throw(OSError("nope")))
+    assert AP.disk_gate({}, str(w.tmp)) == "DISK_UNREADABLE"                                  # unknown is not "enough"
+
+
+def test_a_full_state_volume_does_not_crash_the_loop_and_no_session_starts_while_it_stays_full(w, tmp_path):
+    """REPRODUCED (Round 22 execution review): once the volume filled, an OSError out of go()/last_result.json escaped the loop and killed the process (an always-restart policy then looped on it)."""
+    import errno
+    root = tmp_path / "ap"
+    real = ES.write_json_atomic
+    state = {"full": False}
+
+    def writer(path, obj):
+        if state["full"]:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(path, obj)
+    sessions = []
+
+    def once(env, **k):
+        sessions.append(1)
+        k["on_state"]("EXECUTING", "execute_started")
+        state["full"] = True                                                                       # the volume fills DURING the session
+        return {"result": "DONE", "flat_verified": True, "why": []}
+    ES.write_json_atomic = writer
+    try:
+        rc, out = run_loop(w, root, once, n=8, recover_fn=OK_RECOVERY)
+        assert rc == 0, "the loop must return normally, not raise"
+        assert len(sessions) == 1, "no second session may start while the state cannot be persisted"
+        assert any("STATE_WRITE_FAILED" in line or "LAST_RESULT_WRITE_FAILED" in line for line in out)
+        state["full"] = False                                                                      # space is freed: the loop probes, recovers and trades again
+        rc2, _ = run_loop(w, root, once, n=3, recover_fn=OK_RECOVERY)
+        assert rc2 == 0 and len(sessions) >= 2
+    finally:
+        ES.write_json_atomic = real
+
+
+def test_a_session_whose_first_entry_is_aborted_before_any_order_is_a_skip_with_the_reason_not_done(w, tmp_path, stop_state):
+    """REPRODUCED (Round 22 execution review): authority lost / a stop at the pre-order check sent nothing, the venue was flat, and the result was DONE: a 30-minute cooldown and a counted session for a hedge that never ran."""
+    prepared(w)
+    res = run(w, tmp_path / "ap", lease=CountingLease(ok_calls=1, raises=True))
+    assert creates(w) == [] and res["orders"] == 0 and res["flat_verified"] is True
+    assert res["result"] == "SKIPPED" and res["why"] and res["why"][0].startswith("EXECUTE_ABORTED_BEFORE_ANY_ORDER:"), res
+    log = os.path.join(str(tmp_path / "ap"), "exec_quality_log.jsonl")
+    assert not os.path.exists(log) or not open(log).read().strip()

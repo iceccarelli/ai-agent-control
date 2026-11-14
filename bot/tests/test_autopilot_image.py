@@ -130,3 +130,15 @@ def test_the_safe_deploy_script_drains_checks_and_only_then_deploys_and_refuses_
     assert sh.index("drain --wait") < sh.index("deploy-check") < sh.index("fly deploy -c fly.autopilot.toml --ha=false")
     assert sh.count("exit 1") >= 2 and "set -eu" in sh and "fly launch" not in sh.replace("never fly launch", "")
     assert "resume --reason" in sh
+
+
+def test_the_owner_control_wrapper_passes_the_cost_of_capital_variables_the_decision_reads():
+    """REPRODUCED (Round 22 execution review): `autopilot-ctl evaluate` ran with a whitelisted copy of PID 1's environment that lacked the owner's STATED cash alternative, so the read-only economics
+    the owner asks for reported an UNKNOWN cost of capital on a machine whose loop had it. Every name the economics reads must be on the whitelist."""
+    import ms_edge_gate as EG
+    sh = _read("deploy/autopilot-ctl.sh")
+    line = next(ln for ln in sh.splitlines() if "BYBIT_TESTNET_API_KEY|" in ln)
+    for name in (EG.ENV_CASH_APR, EG.ENV_CASH_SOURCE, EG.ENV_CASH_STATED_UTC, "EXECUTOR_MIN_FREE_BYTES"):
+        assert name in line, name
+    for forbidden in ("LIVE_", "BYBIT_API_KEY", "BYBIT_API_SECRET"):
+        assert forbidden not in line, forbidden                    # the wrapper must never copy an arming switch or a generic credential
