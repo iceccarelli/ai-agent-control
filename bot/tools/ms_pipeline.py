@@ -55,7 +55,7 @@ SCHEMA = "pipeline_summary/v1"
 DATA_INJECTED = "INJECTED_TEST_DATA"
 DATA_HISTORY = "VERIFIED_HISTORY_ROOT"
 MODES = ("REPLAY", "PAPER")                   # what this pipeline (and its CLI) runs; TESTNET is a separate, owner-invoked session tool and is refused here; there is NO mainnet mode anywhere
-STATUS_CODES = ("REJECTED_CANDIDATE", "INADEQUATE_HISTORY", "NO_OPPORTUNITY", "NO_ALLOCATION", "RISK_REFUSAL", "NO_FILL", "UNKNOWN_OR_UNRECONCILED", "INADEQUATE_SAMPLE", "SIMULATED_EXECUTION")
+STATUS_CODES = ("REJECTED_CANDIDATE", "INADEQUATE_HISTORY", "INSUFFICIENT_OWNER_INPUT", "NO_OPPORTUNITY", "NO_ALLOCATION", "RISK_REFUSAL", "NO_FILL", "UNKNOWN_OR_UNRECONCILED", "INADEQUATE_SAMPLE", "SIMULATED_EXECUTION")
 #: the competition readiness levels at which candidate_competition itself ranks a candidate in its top tier (candidate_competition._tier == PROMISING); nothing below may allocate
 PROMOTED_READINESS = ("PROMISING", "PROSPECTIVE", "EXECUTION_READY", "OWNER_PROFIT_EVIDENCED")
 BLOCKING_VERDICTS = ("REJECTED", "UNTESTED", "INSUFFICIENT_DATA")
@@ -898,12 +898,26 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
 
     # ---- competition (one candidate; never SUFFICIENT_EVIDENCE)
     n_pos_any = sum(1 for _ms, ops in scans for o in ops if not o.exclusions and o.net_bps_horizon is not None and o.net_bps_horizon > 0)
-    closed = [g for g in res.groups.values() if g.closed and g.notional_usd > 0]
+    closed_items = [(gid, g) for gid, g in res.groups.items() if g.closed and g.notional_usd > 0]
+    closed = [g for _gid, g in closed_items]
     # ONE net definition for the whole run (the ledger's): gross = price leg AT MID (actual fill prices + the taker walk added back) + funding; net = gross - fees - taker slippage - adverse selection
     gross_usd = [g.price_usd + g.taker_slip_usd + g.funding_usd for g in closed]
     net_usd = [gu - g.fees_usd - g.taker_slip_usd - g.adverse_usd for gu, g in zip(gross_usd, closed)]
     nets = [n / g.notional_usd * 1e4 for n, g in zip(net_usd, closed)]
     grosses = [n / g.notional_usd * 1e4 for n, g in zip(gross_usd, closed)]
+    # cost of capital, from the SAME stated input and the SAME capital factor the scanner priced the entry with. The ledger net above is BEFORE it (the replay books no financing): it is
+    # deducted here as its own component when the owner stated a rate, and the figure is None (never zero) when the rate is unstated.
+    coc_apr = rec.params.get("opportunity_cost_apr")
+    coc_margin = float(rec.params.get("margin_frac", SC.DEFAULT_PARAMS["margin_frac"]))
+    coc_bps: List[float] = []
+    coc_complete = coc_apr is not None
+    if coc_apr is not None:
+        for gid, g in closed_items:
+            if g.entry_ts is None or g.exit_ts is None or g.exit_ts < g.entry_ts:
+                coc_complete = False                                                   # a group whose holding time is not stated cannot be charged: never charged zero silently
+                break
+            coc_bps.append(float(coc_apr) / 365.0 * 1e4 * ((g.exit_ts - g.entry_ts) / DAY_MS) * SC.committed_capital_factor(kinds.get(gid, kind_default), coc_margin))
+    nets_after = [n - c for n, c in zip(nets, coc_bps)] if coc_complete and len(coc_bps) == len(nets) else None
     traded = sorted({s for g in res.groups.values() for s in g.symbols})
     indep = int(report["observations"]["independent"]) if isinstance(report.get("observations"), Mapping) else 0
     rprov = _prov_cap(str(report["provenance"]["weakest"]) if isinstance(report.get("provenance"), Mapping) else "ASSUMED", label)
@@ -913,6 +927,9 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
                           "INSUFFICIENT_DATA": ("INSUFFICIENT_EVIDENCE", f"candidate_competition verdict INSUFFICIENT_DATA, not promoted: {top}")}.get(gate.verdict, ("RESEARCHING", None))
     elif not scans:
         status, reason = "RESEARCHING", None
+    elif n_pos_any == 0 and any("FINANCING_UNKNOWN" in o.exclusions for _ms, ops in scans for o in ops):
+        status, reason = "INSUFFICIENT_EVIDENCE", ("INSUFFICIENT_OWNER_INPUT: the owner's alternative return on committed capital is not stated, so no scanned row has a net; this is a missing input, "
+                                                   "not a finding that the market offered nothing (state --opportunity-cost-apr; 0 is a legitimate statement)")
     elif n_pos_any == 0:
         status, reason = "REJECTED", f"NO_EDGE_IN_WINDOW: none of {len(scans)} scan(s) had an eligible opportunity with positive net after costs (this window only; not a general rejection)"
     elif indep < MIN_INDEPENDENT:
@@ -922,8 +939,14 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
     comp_kind = kinds.get(next((g for g in sorted(res.groups) if g in kinds), ""), kind_default)
     cand = {"candidate_id": candidate_id, "kind": comp_kind, "spot_hedge": _hedge_label([hedge_of.get(s, "HEDGE_UNKNOWN") for s in traded]) if traded else "HEDGE_UNKNOWN",
             "status": status, "reason": reason, "gross_bps_horizon": (sum(grosses) / len(grosses)) if grosses else None, "net_bps_horizon": (sum(nets) / len(nets)) if nets else None,
+            "net_bps_after_cost_of_capital": (sum(nets_after) / len(nets_after)) if nets_after else None,
+            "cost_of_capital": {"state": "STATED" if coc_apr is not None else "UNSTATED", "apr": (float(coc_apr) if coc_apr is not None else None),
+                                "prov": "MODELLED" if coc_apr is not None else "UNKNOWN", "complete": bool(coc_complete and (nets_after is not None or not closed)),
+                                "mean_charge_bps": (sum(coc_bps) / len(coc_bps)) if (coc_apr is not None and coc_bps and nets_after is not None) else None,
+                                "basis": "apr / 365 x holding days x committed capital per unit of notional (the scanner's committed_capital_factor), on each closed group's notional"},
             "n_observations": len(closed), "prov": rprov,
-            "net_definition": "price leg at mid + funding - fees - taker slippage - adverse selection (the ledger's net), per closed group over its notional; mean of the groups' bps",
+            "net_definition": "BEFORE cost of capital: price leg at mid + funding - fees - taker slippage - adverse selection (the ledger's net), per closed group over its notional; mean of the groups' bps. "
+                              "The owner's cost of capital is a separate component: see net_bps_after_cost_of_capital (None, never 0, when the rate is unstated)",
             "net_usd_closed_groups": sum(net_usd) if closed else None, "notional_usd_closed_groups": sum(g.notional_usd for g in closed) if closed else None}
     competition = {"schema": "competition/v1", "basis": "SIMULATED" if closed else "ESTIMATED", **common, "candidates": [cand]}
     return {"replay_report.json": replay_report, "portfolio_state.json": portfolio, "risk_state.json": risk_state, "ledger_pnl.json": ledger_pnl, "competition.json": competition,
@@ -945,6 +968,10 @@ def classify_status(*, gate: AllocationGate, res: RP.ReplayResult, rec: ScanReco
         av = history["available_days"]
         codes["INADEQUATE_HISTORY"] = (f"{history['min_holding_rows']} independent holding rows need {history['required_days']:.0f} days of history ({history['formula']}); "
                                        f"{'unknown' if av is None else f'{av:.1f}'} available to this window")
+    n_fin_unknown = sum(1 for _ms, ops in rec.scans for o in ops if "FINANCING_UNKNOWN" in o.exclusions)
+    if n_fin_unknown > 0 and n_pos == 0:           # a critical cost is unknown, so nothing could be priced: that is a missing owner input, NOT "the market offered nothing"
+        codes["INSUFFICIENT_OWNER_INPUT"] = (f"the owner's alternative return on committed capital (--opportunity-cost-apr) is not stated, so {n_fin_unknown} scanned row(s) have no net and no rank; "
+                                             "an unknown cost is never priced as zero. State the rate (0 is a legitimate statement) to price the window")
     if n_pos == 0:
         codes["NO_OPPORTUNITY"] = f"none of {n_scans} scan(s) had an eligible opportunity with positive net after costs (this window only)"
     n_groups = len(res.groups)
@@ -1124,6 +1151,8 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
             k = str(r).split(":", 1)[0]
             reasons[k] = reasons.get(k, 0) + 1
     assumed = sorted(set(res.assumed) | ({"INSTRUMENT_FILTERS_DEFAULTED"} if label == DATA_HISTORY else set()))
+    if params.get("opportunity_cost_apr") is None:
+        assumed = sorted(set(assumed) | {"COST_OF_CAPITAL_UNSTATED"})
     pnl = led.pnl()
     rec_doc = _reconcile_document(gates, led, ident, label, gen, evidence)
     status = classify_status(gate=gate, res=res, rec=recorder, report=report, ledger_pnl=pnl, authority=gates.stats(), history=history, min_rows=min_holding_rows, decision_reasons=reasons, reconcile=rec_doc)
@@ -1135,6 +1164,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
                              "exits_on_wider_book_cap": int(res.stats.get("transport", {}).get("exits_on_wider_book_cap", 0)),
                              "exits_refused_stale_quote": int(res.stats.get("transport", {}).get("exits_refused_stale_quote", 0)),
                              "taker_entries_refused_stale_quote": int(res.stats.get("transport", {}).get("refused", {}).get("STALE_QUOTE", 0))},
+               "cost_of_capital": {"state": "STATED" if params.get("opportunity_cost_apr") is not None else "UNSTATED", "apr": params.get("opportunity_cost_apr"), "prov": "MODELLED" if params.get("opportunity_cost_apr") is not None else "UNKNOWN"},
                "trials_total": trials_total, "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
                "ledger": {"net": pnl["net"] if pnl["net_complete"] else None, "net_subtotal": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
                "reconcile": {"ever_disagreed": rec_doc["ever_disagreed"], "halt_new_exposure": rec_doc["halt_new_exposure"], "n_steps_checked": rec_doc["n_steps_checked"],
@@ -1196,6 +1226,7 @@ class Validated:
     risk_policy: Optional[Dict[str, Any]]
     max_daily_loss_usd: Optional[float]
     max_drawdown_frac: Optional[float]
+    opportunity_cost_apr: Optional[float]
     mode: str
     clock_ms: int
     code_revision: str
@@ -1408,6 +1439,14 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
             frac = float("nan")
         if not (math.isfinite(frac) and 0 < frac <= 1):
             raise CliRefused("LOSS_LIMIT_INVALID", "--max-drawdown-frac must be a number in (0, 1]")
+    coc: Optional[float] = None                                              # the owner's alternative return per year on the capital a position commits: None = NOT STATED (never zero)
+    if ns.opportunity_cost_apr is not None:
+        try:
+            coc = float(ns.opportunity_cost_apr)
+        except ValueError:
+            coc = float("nan")
+        if not (math.isfinite(coc) and 0.0 <= coc <= 1.0):
+            raise CliRefused("COST_OF_CAPITAL_INVALID", "--opportunity-cost-apr must be a finite number in [0, 1] per year (0.04 = 4%/yr; 0 is a legitimate statement, an absent flag is not zero)")
     if ns.risk_policy is not None and (daily is not None or frac is not None):
         raise CliRefused("LOSS_LIMIT_NEEDS_DERIVED_POLICY", "--max-daily-loss-usd / --max-drawdown-frac set the DERIVED policy; a --risk-policy file carries its own limits")
     if ns.risk_policy is None and not ns.derive_risk_policy:
@@ -1466,7 +1505,7 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
         lacks = sorted({s.symbol for s in loaded.series} - set(policy["allowed_symbols"]))
         if lacks:
             raise CliRefused("RISK_POLICY_ALLOW_LIST_LACKS", "the risk policy allow-list lacks verified symbols (it is never widened): " + ",".join(lacks)[:200])
-    return Validated(hist, uni, spot, col, art, led, start, end, ns.mark_interval, rows, hold, every, ns.execution_policy, policy, daily, frac, ns.mode, clock, rev, os.path.abspath(ns.candidate), spec, cid,
+    return Validated(hist, uni, spot, col, art, led, start, end, ns.mark_interval, rows, hold, every, ns.execution_policy, policy, daily, frac, coc, ns.mode, clock, rev, os.path.abspath(ns.candidate), spec, cid,
                      digest, kind, loaded, micro, coll_digest, data_digest_of(parts), parts, unreserved)
 
 
@@ -1507,6 +1546,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--derive-risk-policy", action="store_true", help="derive a conservative policy from the verified symbol allow-list (explicit opt-in)")
     p.add_argument("--max-daily-loss-usd", default=None, help="hard daily-loss limit (USD) for the derived policy and the allocator; entries are refused when breached or when the inputs are unknown")
     p.add_argument("--max-drawdown-frac", default=None, help="hard drawdown limit in (0, 1] (default: the portfolio policy's 0.10)")
+    p.add_argument("--opportunity-cost-apr", default=None, help="the owner's STATED alternative return per year on the capital a position commits (0.04 = 4%%/yr). Required to price any opportunity: "
+                   "without it every scanned row is FINANCING_UNKNOWN, the run reports INSUFFICIENT_OWNER_INPUT, and nothing is ranked or traded. 0 is a legitimate statement; an absent flag is never read as 0")
     p.add_argument("--mode", default="REPLAY", help="REPLAY or PAPER (simulated transport both; TESTNET is not accepted here)")
     p.add_argument("--clock-ms", default=None, help="the run's fixed timestamp for determinism (default: --end-ms; the wall clock is never read)")
     p.add_argument("--code-revision", default=None, help="40-hex git revision stamped on the artifacts (default: git rev-parse HEAD, else UNKNOWN)")
@@ -1541,7 +1582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = build_replay_config(v)
         pr = run(v.loaded, spec={"kind": v.kind, "style": v.execution_policy}, candidate_id=v.candidate_id, spec_digest=v.spec_digest, risk_policy=v.risk_policy, replay_cfg=cfg,
                  artifacts_dir=v.artifacts_dir, mode=v.mode, generated_ms=v.clock_ms, clock=StepClock(v.start_ms, cfg.step_ms) if v.mode == "PAPER" else None, competition_row=row, micro=v.micro,
-                 code_revision=v.code_revision, min_holding_rows=v.min_holding_rows, max_daily_loss_usd=v.max_daily_loss_usd, max_drawdown_frac=v.max_drawdown_frac, trial_ledger=os.path.join(v.ledger_dir, "ms_pipeline_trials.jsonl"), data_parts=v.data_parts)
+                 code_revision=v.code_revision, min_holding_rows=v.min_holding_rows, max_daily_loss_usd=v.max_daily_loss_usd, max_drawdown_frac=v.max_drawdown_frac, scan_params=({"opportunity_cost_apr": v.opportunity_cost_apr} if v.opportunity_cost_apr is not None else None), trial_ledger=os.path.join(v.ledger_dir, "ms_pipeline_trials.jsonl"), data_parts=v.data_parts)
         _emit({**base, "artifacts_dir": v.artifacts_dir, "identity": pr.summary["identity"], "status": {"primary": pr.summary["status"]["primary"], "codes": pr.summary["status"]["codes"]},
                "files": {n: os.path.basename(p) for n, p in sorted(pr.files.items())}, "digests": file_digests(v.artifacts_dir), "warnings": warnings})
         return 0

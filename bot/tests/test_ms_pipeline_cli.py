@@ -89,7 +89,7 @@ def tampered(tmp_path_factory):
 def argv(w, art, cmd="run", **over):
     base = {"--history-root": w.root, "--universe-dir": w.uni, "--spot-dir": w.spot, "--mark-interval": TCR.MARK_IV, "--artifacts-dir": art, "--ledger-dir": w.ledger,
             "--start-ms": str(START), "--end-ms": str(END), "--candidate": CAND_PATH, "--execution-policy": "MAKER_FIRST", "--derive-risk-policy": True, "--mode": "REPLAY",
-            "--clock-ms": str(END), "--code-revision": REV, "--hold-days": "2",
+            "--clock-ms": str(END), "--code-revision": REV, "--hold-days": "2", "--opportunity-cost-apr": "0",
             "--unreserved-exploratory": True}            # these tests are about the CLI's other contracts; the reserved-holdout guard has its own file (test_history_holdout.py)
     for k, v in over.items():
         base["--" + k.replace("_", "-")] = v
@@ -725,3 +725,18 @@ def test_the_limits_text_states_what_the_replay_does_for_the_spot_leg_and_the_ma
     text = " ".join(MP.MICRO_LIMITS)
     assert "SYNTHETIC_BOOK_DEPTH_AND_SPREAD" in text and "2 bps" in text and "place_maker_from_micro" in text and "MODELLED" in text
     assert "REJECTED (NO_RECORDED_BOOK_FOR_CATEGORY)" not in text                              # the replay does not reject the spot leg; it gives it a synthetic book
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: the owner's stated alternative return is a flag, and an absent flag is never zero
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-0.01", "1.01", "abc", "4%"])
+def test_a_malformed_or_out_of_range_cost_of_capital_is_refused(world, tmp_path, capsys, bad):
+    refusal(capsys, argv(world, str(tmp_path / "a"), opportunity_cost_apr=bad), "COST_OF_CAPITAL_INVALID", str(tmp_path / "a"))
+
+
+def test_the_flag_is_documented_and_an_absent_flag_yields_insufficient_owner_input(world, tmp_path, capsys, monkeypatch):
+    r = subprocess.run([sys.executable, os.path.join(BOT, "tools", "ms_pipeline.py"), "run", "--help"], capture_output=True, text=True, timeout=120)
+    assert "--opportunity-cost-apr" in r.stdout
+    allowed_competition(monkeypatch)
+    code, doc = cli(capsys, argv(world, str(tmp_path / "unstated"), opportunity_cost_apr=None))
+    assert code == 0 and doc["status"]["primary"] == "INSUFFICIENT_OWNER_INPUT"
