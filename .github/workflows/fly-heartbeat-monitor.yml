@@ -45,6 +45,8 @@ jobs:
     # Round 19: a repository-level secret is delivered to a workflow run from ANY branch (workflow_dispatch from a pushed branch whose copy of this file drops the `if:` above), an environment
     # secret with a main-only deployment-branch policy is not (carry-drill-testnet.yml does the same). OWNER: create the environment `monitor-readonly` (Settings > Environments, deployment branches: main only),
     # move the secrets below into it, then delete the repository-level copies. Naming the environment here changes nothing until then (repository secrets still resolve).
+    # Round 20: `vars.FLY_MONITOR_ENABLED` in the `if:` above is evaluated BEFORE the environment is bound, so it must be a REPOSITORY variable (Settings > Secrets and variables > Actions > Variables > Repository variables).
+    # Put it in the environment and this job is silently `skipped`: no alert, no failure. A `skipped` run is not a health check. Only the SECRETS move into the environment.
     environment: monitor-readonly
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -100,6 +100,8 @@ __all__ = [
     "ReplayStep",
     "ManifestReport",
     "DATA_ROOT",
+    "SYNTHETIC_FIXTURE_OK",
+    "SyntheticCorpusRefused",
     "UPDATE_TYPES",
     "PRICE_DECIMALS",
     "load_ohlcv",
@@ -121,6 +123,37 @@ class MarketDataError(ValueError):
 
 class ManifestError(MarketDataError):
     """The shipped manifest is missing, malformed, or disagrees with the disk."""
+
+
+class SyntheticCorpusRefused(ManifestError):
+    """A corpus whose manifest says it is a generated test fixture (``"synthetic": true``), or does not say it is not, was handed to a loader that feeds a measurement. Its files carry real-looking
+    names (BYBIT_SPOT_BTC_USDT_1H, ...), so nothing else tells a researcher the numbers describe a generator and not a market."""
+
+
+class _SyntheticFixtureSwitch:
+    """The one named switch that lets ``load_corpus`` read a synthetic fixture. It is a class instance (like ``history_holdout.UNGUARDED``) so a truthy literal cannot stand in for it, and
+    ``tests/test_market_data.py`` forbids any shipped file other than this one from naming it: tools cannot opt in, only the harness's own tests."""
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "market_data.SYNTHETIC_FIXTURE_OK"
+
+
+SYNTHETIC_FIXTURE_OK = _SyntheticFixtureSwitch()
+
+
+def corpus_is_synthetic(root: str) -> Optional[bool]:
+    """True when ``root``'s manifest says synthetic, False only when it says ``"synthetic": false`` explicitly, None when there is no readable manifest (provenance unknown: treated as not
+    proven real). Reads the manifest only; it does not verify any hash, so ``verify=False`` cannot bypass it."""
+    try:
+        with open(os.path.join(root, "MANIFEST.json"), "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict) or "synthetic" not in manifest:
+        return None
+    flag = manifest["synthetic"]
+    return flag if isinstance(flag, bool) else None
 
 
 class BookIntegrityError(MarketDataError):
@@ -1839,8 +1872,12 @@ def load_corpus(
     levels: int = 25,
     cfg: Optional[Any] = None,
     verify: bool = True,
+    synthetic_ok: Optional[Any] = None,
 ) -> Tuple[Dict[str, List[Bar]], Dict[str, List[Optional[Tuple[List[List[float]], List[List[float]]]]]], List[str]]:
     """Load the whole corpus into the shapes ``Backtester`` consumes.
+
+    A corpus whose manifest says ``"synthetic": true`` (the generated ``data/`` fixtures), or has no readable ``synthetic`` flag, is REFUSED with ``SyntheticCorpusRefused`` whatever ``verify`` is,
+    unless ``synthetic_ok is SYNTHETIC_FIXTURE_OK`` (the harness's own tests). The refusal is the default because the fixtures carry real-looking names and nothing downstream can tell.
 
     Returns ``(bars_by_symbol, books_by_symbol, notes)`` where ``books_by_symbol``
     is **index-aligned with the bars**: entry *i* is the L2 ladder pair
@@ -1859,6 +1896,13 @@ def load_corpus(
     omission.
     """
     notes: List[str] = []
+    _synthetic = corpus_is_synthetic(root)
+    if _synthetic is not False and synthetic_ok is not SYNTHETIC_FIXTURE_OK:
+        raise SyntheticCorpusRefused(
+            f"SYNTHETIC_CORPUS_REFUSED: {root!r} is "
+            + ("a generated test fixture (manifest synthetic=true)" if _synthetic else "of unproven provenance (no readable MANIFEST.json with an explicit \"synthetic\": false)")
+            + "; a measurement on it describes a generator, not a market. Point at a real corpus (data/real_*) or, in-line, a series built for the test. Nothing was read."
+        )
     if verify:
         report = verify_manifest(root)
         if report.problems:
@@ -1954,7 +1998,7 @@ def load_corpus(
     #
     # Raw epoch-ms is passed deliberately: formatting would need `datetime`,
     # which is not on this module's allowlist either. The observer formats.
-    if READ_OBSERVER is not None:
+    if READ_OBSERVER is not None and _synthetic is False:        # a generated fixture is not a market window: it must never burn a real symbol's window in the holdout ledger
         for _symbol, _bars in bars_by_symbol.items():
             if not _bars:
                 continue

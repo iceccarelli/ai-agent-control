@@ -115,3 +115,21 @@ def test_every_workflow_that_reads_a_secret_declares_a_job_level_environment():
         if re.search(r"secrets\.(?!GITHUB_TOKEN)[A-Z_]+", code) and not re.search(r"^    environment: \S+$", code, re.M):
             bad.append(name)
     assert not bad, bad
+
+
+# ------------------------------------------------------------------------------------------------ Round 20: the enable variable is a REPOSITORY variable (a job-level `if` cannot see an environment-scoped one)
+
+import os as _os  # noqa: E402
+
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+
+def test_each_read_only_workflow_says_its_enable_variable_must_stay_a_repository_variable():
+    """REPRODUCED (Round 20, specialist A): `fly-heartbeat-monitor` runs as `skipped`. The job-level `if` reads `vars.<ENABLE>` before the job's environment is bound, so an environment-scoped variable
+    is empty there and the job is skipped silently. The Round 19 owner step said only 'move the secrets'; an owner who also moved the variable would have lost the alarm that found the recorder incident."""
+    for rel, var in ((".github/workflows/fly-heartbeat-monitor.yml", "FLY_MONITOR_ENABLED"), (".github/workflows/carry-watch.yml", "CARRY_WATCH_ENABLED")):
+        text = open(_os.path.join(_ROOT, rel), encoding="utf-8").read()
+        assert f"vars.{var} == 'true'" in text
+        assert "REPOSITORY variable" in text and "silently `skipped`" in text and "A `skipped` run is not a health check" in text, rel
+    handover = open(_os.path.join(_ROOT, "docs", "MONEY_MISSION.md"), encoding="utf-8").read()
+    assert "must stay REPOSITORY variables" in handover and "FLY_MONITOR_ENABLED" in handover and "CARRY_WATCH_ENABLED" in handover

@@ -60,6 +60,17 @@ pytestmark = pytest.mark.skipif(
     reason=f"scikit-learn is unavailable: {pol.unavailability_reason()}",
 )
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _the_synthetic_fixtures_are_the_subject_here():
+    """Round 20: market_data.load_corpus refuses a synthetic corpus unless the caller names market_data.SYNTHETIC_FIXTURE_OK, and no shipped tool may name it (tests/test_market_data.py pins that).
+    These tests exercise the TRAINER's mechanics on a generated corpus on purpose, so the opt-in is applied here, in the test, for this module only."""
+    mp = pytest.MonkeyPatch()
+    real = md.load_corpus
+    mp.setattr(md, "load_corpus", lambda *a, **k: real(*a, **{"synthetic_ok": md.SYNTHETIC_FIXTURE_OK, **k}))
+    yield
+    mp.undo()
+
 _OHLCV_COLUMNS = (
     "time_period_start", "time_period_end", "time_open", "time_close",
     "price_open", "price_high", "price_low", "price_close",
